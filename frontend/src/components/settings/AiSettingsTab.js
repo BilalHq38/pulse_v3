@@ -1,0 +1,347 @@
+import api from '@/lib/api';
+import {
+  Save, Plus, Trash2, Edit, Bot, Wand2,
+} from 'lucide-react';
+
+const LLM_MODELS = {
+  gemini: ['gemini-3-pro-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o3-mini'],
+  anthropic: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
+  custom: [],
+};
+
+const MODEL_MAX_TOKENS = {
+  'gemini-3-pro-preview': 65536,
+  'gemini-2.5-pro': 65536, 'gemini-2.5-flash': 65536, 'gemini-2.5-flash-lite': 65536,
+  'gemini-2.0-flash': 8192, 'gemini-2.0-flash-lite': 8192,
+  'gemini-1.5-pro': 8192, 'gemini-1.5-flash': 8192,
+  'gpt-4o': 16384, 'gpt-4o-mini': 16384,
+  'gpt-4-turbo': 4096, 'gpt-4': 8192, 'gpt-3.5-turbo': 4096,
+  'o1': 32768, 'o1-mini': 65536, 'o3-mini': 100000,
+  'claude-3-7-sonnet-20250219': 8192, 'claude-3-5-sonnet-20241022': 8192,
+  'claude-3-5-haiku-20241022': 8192, 'claude-3-opus-20240229': 4096, 'claude-3-haiku-20240307': 4096,
+};
+
+export default function AiSettingsTab({
+  company, setCompany, saveCompany,
+  saving, setSaving,
+  llmEngines, selectedLlmEngine, refreshAiConfig,
+  aiAgents, setAiAgents,
+  editingLlmId, setEditingLlmId, llmDraft, setLlmDraft,
+  showAddLlmForm, setShowAddLlmForm, addLlmForm, setAddLlmForm,
+  editingAgentId, setEditingAgentId, agentDraft, setAgentDraft,
+  showAddAgentForm, setShowAddAgentForm, addAgentForm, setAddAgentForm,
+  isAdmin,
+}) {
+  return (
+    <div className="space-y-6">
+      <h2 className="text-lg font-semibold text-slate-900">AI Configuration</h2>
+
+      {/* Core AI Settings */}
+      <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-medium text-slate-900">Enable AI Responses</h3>
+            <p className="text-xs text-slate-400">Allow AI to automatically respond to customer messages</p>
+          </div>
+          <button
+            onClick={() => { const enabling = !company.ai_enabled; setCompany({ ...company, ai_enabled: enabling, auto_assign: !enabling }); }}
+            className={`relative w-11 h-6 rounded-full transition-colors ${company.ai_enabled ? 'bg-blue-600' : 'bg-gray-300'}`}
+          >
+            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform shadow ${company.ai_enabled ? 'translate-x-5' : ''}`} />
+          </button>
+        </div>
+
+        <div>
+          <label className="text-xs text-slate-400 mb-2 block">AI Confidence Threshold: {((company.ai_confidence_threshold || 0.7) * 100).toFixed(0)}%</label>
+          <input type="range" min="0.1" max="1" step="0.05" value={company.ai_confidence_threshold || 0.7}
+            onChange={(e) => setCompany({ ...company, ai_confidence_threshold: parseFloat(e.target.value) })}
+            className="w-full accent-violet-600" />
+          <div className="flex justify-between text-[10px] text-slate-300"><span>More AI responses</span><span>More human handoff</span></div>
+        </div>
+
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-medium text-slate-900">Auto-assign Conversations</h3>
+            <p className="text-xs text-slate-400">Automatically assign escalated conversations to available agents</p>
+          </div>
+          <button
+            onClick={() => setCompany({ ...company, auto_assign: !company.auto_assign })}
+            className={`relative w-11 h-6 rounded-full transition-colors ${company.auto_assign ? 'bg-blue-600' : 'bg-gray-300'}`}
+          >
+            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform shadow ${company.auto_assign ? 'translate-x-5' : ''}`} />
+          </button>
+        </div>
+
+        {!company.ai_enabled && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 flex items-start gap-2">
+            <span className="text-amber-500 mt-0.5 flex-shrink-0 text-sm">⚠</span>
+            <p className="text-xs text-amber-700"><b>AI Engine is off</b> — Auto-assign is enabled. Incoming conversations will be routed to available team agents.</p>
+          </div>
+        )}
+
+        <button onClick={saveCompany} disabled={saving === 'company'}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50">
+          <Save size={14} /> Save
+        </button>
+      </div>
+
+      {/* System Status Log */}
+      <div className="bg-slate-900 rounded-xl p-4 font-mono text-xs space-y-1.5">
+        <p className="text-slate-500 mb-2 text-[10px] uppercase tracking-widest">System Status</p>
+        <p><span className="text-slate-500">ai_engine </span><span className={company.ai_enabled ? 'text-emerald-400' : 'text-red-400'}>{company.ai_enabled ? '● enabled' : '○ disabled'}</span></p>
+        <p><span className="text-slate-500">auto_assign </span><span className={company.auto_assign ? 'text-emerald-400' : 'text-slate-400'}>{company.auto_assign ? '● on' : '○ off'}</span></p>
+        <p><span className="text-slate-500">confidence  </span><span className="text-violet-300">{((company.ai_confidence_threshold || 0.7) * 100).toFixed(0)}%</span></p>
+        <p>
+          <span className="text-slate-500">llm_engines </span>
+          <span className="text-blue-300">{llmEngines.length} total</span>
+          <span className="text-slate-600"> / </span>
+          <span className="text-emerald-400">{selectedLlmEngine ? '1 selected live' : '0 selected live'}</span>
+        </p>
+        {selectedLlmEngine ? (
+          <p className="pl-4">
+            <span className="text-slate-600">└ </span>
+            <span className="text-amber-300">{selectedLlmEngine.provider ? selectedLlmEngine.provider.charAt(0).toUpperCase() + selectedLlmEngine.provider.slice(1) : '?'} — {selectedLlmEngine.model_name || 'unknown'}</span>
+            <span className="text-slate-600"> (temp: {selectedLlmEngine.temperature ?? 0.7}, max_tokens: {selectedLlmEngine.max_tokens ?? 2048})</span>
+          </p>
+        ) : (
+          <p className="pl-4 text-slate-500">No live engine selected yet.</p>
+        )}
+        <p>
+          <span className="text-slate-500">ai_agents   </span>
+          <span className="text-blue-300">{aiAgents.length} total</span>
+          <span className="text-slate-600"> / </span>
+          <span className="text-emerald-400">{aiAgents.filter(a => a.is_active).length} active</span>
+        </p>
+        {aiAgents.filter(a => a.is_active).map(a => (
+          <p key={a.id} className="pl-4">
+            <span className="text-slate-600">└ </span>
+            <span className="text-cyan-300 capitalize">{a.agent_type || 'support'}</span>
+            <span className="text-slate-600"> ({a.provider || '?'} / {a.model_name || 'default'})</span>
+          </p>
+        ))}
+      </div>
+
+      {/* LLM Engines */}
+      <div className="bg-white border border-slate-100 rounded-xl p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Wand2 size={14} className="text-violet-500" /> LLM Engines ({llmEngines.length})</h3>
+          {isAdmin && (
+            <button onClick={() => { const m = LLM_MODELS.gemini[0]; setShowAddLlmForm(true); setAddLlmForm({ model_name: m, provider: 'gemini', temperature: 0.7, max_tokens: MODEL_MAX_TOKENS[m] || 2048 }); }}
+              className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
+              <Plus size={12} /> Add Engine
+            </button>
+          )}
+        </div>
+
+        {llmEngines.length === 0 ? (
+          <p className="text-xs text-slate-400 py-3">No LLM engines configured yet. They are auto-provisioned on first AI interaction.</p>
+        ) : (
+          <div className="space-y-3">
+            {llmEngines.map(e => (
+              <div key={e.id} className="border border-slate-200 rounded-lg overflow-hidden">
+                <div className="flex items-center justify-between p-3 bg-slate-50">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-slate-700">{e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : '—'} — {e.model_name || 'No model'}</p>
+                    <p className="text-[10px] text-slate-400">Temp: {e.temperature ?? 0.7} | Max tokens: {e.max_tokens ?? 2048}</p>
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.is_selected ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{e.is_selected ? 'Live now' : 'Catalog only'}</span>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.provider_ready ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'}`}>{e.provider_ready ? 'Provider ready' : 'Provider missing key'}</span>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.supports_vision ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-500'}`}>{e.supports_vision ? 'Vision capable' : 'Text only'}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+                    {isAdmin && (
+                      <button
+                        onClick={async () => { setSaving(`llm-select-${e.id}`); const r = await api.post(`/ai/llm-engines/${e.id}/select`).catch(err => err); setSaving(''); if (r?.data?.ok) { await refreshAiConfig(); return; } alert(r?.response?.data?.detail || 'Failed to select live engine'); }}
+                        disabled={saving === `llm-select-${e.id}` || e.is_selected}
+                        className={`px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors ${e.is_selected ? 'bg-emerald-100 text-emerald-700 cursor-default' : 'bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-50'}`}
+                      >
+                        {e.is_selected ? 'Selected' : saving === `llm-select-${e.id}` ? 'Switching…' : 'Use Live'}
+                      </button>
+                    )}
+                    {isAdmin && (
+                      <button onClick={() => { setEditingLlmId(editingLlmId === e.id ? null : e.id); setLlmDraft({ model_name: e.model_name || '', provider: e.provider || 'gemini', temperature: e.temperature ?? 0.7, max_tokens: e.max_tokens ?? 2048 }); }}
+                        className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
+                    )}
+                    {isAdmin && (
+                      <button onClick={async () => { if (!window.confirm('Delete this LLM engine?')) return; await api.delete(`/ai/llm-engines/${e.id}`).catch(() => null); await refreshAiConfig(); setEditingLlmId(null); }}
+                        className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>
+                    )}
+                  </div>
+                </div>
+                {editingLlmId === e.id && (
+                  <div className="p-4 bg-white border-t border-slate-100 space-y-3">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
+                        <select value={llmDraft.provider}
+                          onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setLlmDraft(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
+                        {llmDraft.provider === 'custom'
+                          ? <input value={llmDraft.model_name} onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value }))} placeholder="custom-model-name" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" />
+                          : <select value={llmDraft.model_name} onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[llmDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>}
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Temperature ({llmDraft.temperature})</label>
+                        <input type="range" min="0" max="1" step="0.05" value={llmDraft.temperature} onChange={ev => setLlmDraft(p => ({ ...p, temperature: parseFloat(ev.target.value) }))} className="w-full accent-violet-600" />
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Max Tokens</label>
+                        <input type="number" value={llmDraft.max_tokens} onChange={ev => setLlmDraft(p => ({ ...p, max_tokens: parseInt(ev.target.value) || 2048 }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" />
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={async () => { const r = await api.put(`/ai/llm-engines/${e.id}`, llmDraft).catch(() => null); if (r) { await refreshAiConfig(); setEditingLlmId(null); } }}
+                        disabled={saving === 'llm' + e.id}
+                        className="px-4 py-2 bg-violet-600 text-white rounded-lg text-xs font-medium hover:bg-violet-500 disabled:opacity-50">
+                        {saving === 'llm' + e.id ? 'Saving…' : 'Save Changes'}
+                      </button>
+                      <button onClick={() => setEditingLlmId(null)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-200">Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {showAddLlmForm && (
+          <div className="mt-4 border border-violet-200 bg-violet-50/40 rounded-xl p-4 space-y-3">
+            <p className="text-xs font-semibold text-violet-700">New LLM Engine</p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider *</label>
+                <select value={addLlmForm.provider}
+                  onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model *</label>
+                {addLlmForm.provider === 'custom'
+                  ? <input value={addLlmForm.model_name} onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value }))} placeholder="custom-model-name" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm" />
+                  : <select value={addLlmForm.model_name} onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[addLlmForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>}
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={async () => { if (!addLlmForm.model_name.trim()) return; const r = await api.post('/ai/llm-engines', addLlmForm).catch(() => null); if (r?.data) { await refreshAiConfig(); setShowAddLlmForm(false); } }}
+                className="px-4 py-2 bg-violet-600 text-white rounded-lg text-xs font-medium hover:bg-violet-500">Add Engine</button>
+              <button onClick={() => setShowAddLlmForm(false)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* AI Agents */}
+      <div className="bg-white border border-slate-100 rounded-xl p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Bot size={14} className="text-blue-500" /> AI Agents ({aiAgents.length})</h3>
+          {isAdmin && (
+            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', provider: 'gemini', model_name: LLM_MODELS.gemini[0], is_active: true }); }}
+              className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
+              <Plus size={12} /> Add Agent
+            </button>
+          )}
+        </div>
+
+        {aiAgents.length === 0 ? (
+          <p className="text-xs text-slate-400 py-3">No AI agents found. The system AI agent is created automatically when a user signs in.</p>
+        ) : (
+          <div className="space-y-3">
+            {aiAgents.map(a => (
+              <div key={a.id} className="border border-slate-200 rounded-lg overflow-hidden">
+                <div className="flex items-center justify-between p-3 bg-slate-50">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-slate-700 capitalize">{a.agent_type || 'support'} Agent</p>
+                    <p className="text-[10px] text-slate-400">Provider: {a.provider || '—'} | Model: {a.model_name || 'default'} | LLM: {a.llm_id?.substring(0, 8) || 'default'}…</p>
+                  </div>
+                  <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+                    <button onClick={async () => { const r = await api.put(`/ai/agents/${a.id}`, { is_active: !a.is_active }).catch(() => null); if (r) setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, is_active: !x.is_active } : x)); }}
+                      className={`relative w-9 h-5 rounded-full transition-colors ${a.is_active ? 'bg-green-500' : 'bg-gray-300'}`}>
+                      <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${a.is_active ? 'translate-x-4' : ''}`} />
+                    </button>
+                    {isAdmin && (
+                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', provider: a.provider || 'gemini', model_name: a.model_name || '' }); }}
+                        className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
+                    )}
+                    {isAdmin && (
+                      <button onClick={async () => { if (!window.confirm('Delete this AI agent?')) return; await api.delete(`/ai/agents/${a.id}`).catch(() => null); setAiAgents(prev => prev.filter(x => x.id !== a.id)); setEditingAgentId(null); }}
+                        className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>
+                    )}
+                  </div>
+                </div>
+                {editingAgentId === a.id && (
+                  <div className="p-4 bg-white border-t border-slate-100 space-y-3">
+                    <div className="grid grid-cols-3 gap-3">
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Agent Type</label>
+                        <select value={agentDraft.agent_type} onChange={ev => setAgentDraft(p => ({ ...p, agent_type: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          <option value="support">Support</option><option value="sales">Sales</option><option value="onboarding">Onboarding</option><option value="generic">Generic</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
+                        <select value={agentDraft.provider} onChange={ev => setAgentDraft(p => ({ ...p, provider: ev.target.value, model_name: (LLM_MODELS[ev.target.value] || [])[0] || '' }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
+                        <select value={agentDraft.model_name} onChange={ev => setAgentDraft(p => ({ ...p, model_name: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          {(LLM_MODELS[agentDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={async () => { const r = await api.put(`/ai/agents/${a.id}`, agentDraft).catch(() => null); if (r) { setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, ...r.data } : x)); setEditingAgentId(null); } }}
+                        className="px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">Save Changes</button>
+                      <button onClick={() => setEditingAgentId(null)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {showAddAgentForm && (
+          <div className="mt-4 border border-blue-200 bg-blue-50/40 rounded-xl p-4 space-y-3">
+            <p className="text-xs font-semibold text-blue-700">New AI Agent</p>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Agent Type</label>
+                <select value={addAgentForm.agent_type} onChange={ev => setAddAgentForm(p => ({ ...p, agent_type: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  <option value="support">Support</option><option value="sales">Sales</option><option value="onboarding">Onboarding</option><option value="generic">Generic</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
+                <select value={addAgentForm.provider} onChange={ev => setAddAgentForm(p => ({ ...p, provider: ev.target.value, model_name: (LLM_MODELS[ev.target.value] || [])[0] || '' }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
+                <select value={addAgentForm.model_name} onChange={ev => setAddAgentForm(p => ({ ...p, model_name: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  {(LLM_MODELS[addAgentForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={async () => { const r = await api.post('/ai/agents', addAgentForm).catch(() => null); if (r?.data) { setAiAgents(prev => [r.data, ...prev]); setShowAddAgentForm(false); } }}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">Add AI Agent</button>
+              <button onClick={() => setShowAddAgentForm(false)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

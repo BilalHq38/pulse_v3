@@ -1,0 +1,2628 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import api from '@/lib/api';
+import { normalizeAvatarUrl, displayNameInitial } from '@/lib/avatar';
+import AiSettingsTab from '@/components/settings/AiSettingsTab';
+import UnificationTab from '@/components/settings/UnificationTab';
+import {
+  Shield,
+  Users,
+  Bell,
+  Key,
+  Globe,
+  Bot,
+  Save,
+  Plus,
+  X,
+  Trash2,
+  Eye,
+  EyeOff,
+  Check,
+  AlertCircle,
+  MessageSquare,
+  Package,
+  HelpCircle,
+  Lock,
+  CheckCircle,
+  Link2,
+  Copy,
+  Activity,
+  Edit,
+  UserMinus,
+  ChevronLeft,
+  ChevronRight,
+  Phone,
+  Mail,
+  MapPin,
+  Building2,
+  Image,
+  Briefcase,
+  UserCircle,
+  Wand2,
+  QrCode,
+} from 'lucide-react';
+
+const CHANNEL_CONFIG = {
+  whatsapp: { label: 'WhatsApp Business', color: 'emerald', fields: ['phone_number_id', 'access_token'], bgClass: 'bg-emerald-50', textClass: 'text-emerald-500' },
+  instagram: { label: 'Instagram', color: 'pink', fields: ['page_id', 'access_token'], bgClass: 'bg-pink-50', textClass: 'text-pink-500' },
+  facebook: { label: 'Facebook Messenger', color: 'blue', fields: ['page_id', 'access_token'], bgClass: 'bg-blue-50', textClass: 'text-blue-500' },
+  email: { label: 'Email', color: 'sky', fields: ['email_address', 'email_provider', 'imap_host', 'smtp_host'], bgClass: 'bg-sky-50', textClass: 'text-sky-500' },
+  web_chat: { label: 'Web Chat Widget', color: 'violet', fields: [], bgClass: 'bg-violet-50', textClass: 'text-violet-500' },
+};
+
+/** Order shown in Settings → Channels; fills gaps if API omits a row (e.g. legacy DB). */
+const CHANNEL_LIST_ORDER = ['whatsapp', 'instagram', 'facebook', 'email', 'web_chat'];
+
+function normalizeChannelsResponse(raw) {
+  const rows = Array.isArray(raw) ? raw : [];
+  const byKey = new Map();
+  for (const row of rows) {
+    const k = String(row?.channel || '').trim().toLowerCase();
+    if (!k || k === 'twitter') continue;
+    byKey.set(k, { ...row, channel: k });
+  }
+  const defaults = {
+    whatsapp: { channel: 'whatsapp', display_name: 'WhatsApp Business', enabled: false, phone_number_id: '', access_token: '', webhook_url: '', verify_token: '' },
+    instagram: { channel: 'instagram', display_name: 'Instagram', enabled: false, page_id: '', access_token: '', webhook_url: '' },
+    facebook: { channel: 'facebook', display_name: 'Facebook Messenger', enabled: false, page_id: '', access_token: '', webhook_url: '' },
+    email: {
+      channel: 'email',
+      display_name: 'Email',
+      enabled: false,
+      email_address: '',
+      email_provider: 'smtp_imap',
+      imap_host: '',
+      imap_port: 993,
+      imap_user: '',
+      imap_pass_enc: '',
+      smtp_host: '',
+      smtp_port: 587,
+      smtp_user: '',
+      smtp_pass_enc: '',
+      email_receive_enabled: true,
+      email_send_enabled: true,
+      webhook_url: '',
+      api_key: '',
+    },
+    web_chat: { channel: 'web_chat', display_name: 'Web Chat Widget', enabled: true, webhook_url: '' },
+  };
+  return CHANNEL_LIST_ORDER.map((id) => {
+    const existing = byKey.get(id);
+    const base = defaults[id] || { channel: id, display_name: id, enabled: false };
+    return existing ? { ...base, ...existing, channel: id } : base;
+  });
+}
+const ROLE_OPTIONS = ['admin', 'company_agent'];
+const ROLE_LABELS = { admin: 'Admin', company_agent: 'Company Agent' };
+const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_PRODUCT_IMAGES = 3;
+const MAX_PRODUCT_IMAGE_SIZE_MB = 5;
+
+/* eslint-disable no-useless-escape -- punctuation class mirrors backend password policy */
+const PASSWORD_SPECIAL_CHAR_RE = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?`~]/;
+/* eslint-enable no-useless-escape */
+
+function validatePassword(password) {
+  const errors = [];
+  if (password.length < 8) errors.push('At least 8 characters');
+  if (!/[a-zA-Z]/.test(password)) errors.push('At least one letter');
+  if (!/[0-9]/.test(password)) errors.push('At least one number');
+  if (!PASSWORD_SPECIAL_CHAR_RE.test(password)) errors.push('At least one special character');
+  return { isValid: errors.length === 0, errors };
+}
+
+export default function SettingsPage() {
+  const { user, logout, refreshUser } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const standaloneUnification = location.pathname.startsWith('/unification');
+  const activeTab = standaloneUnification ? 'unification' : (searchParams.get('tab') || 'personal');
+  const onboardingInviteMode =
+    !standaloneUnification && activeTab === 'users' && searchParams.get('onboarding') === '1';
+  const setActiveTab = (tab) => {
+    if (standaloneUnification) return;
+    setSearchParams({ tab }, { replace: true });
+  };
+  const [channels, setChannels] = useState([]);
+  const [company, setCompany] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [templates, setTemplates] = useState([]);
+  const [showKeyMap, setShowKeyMap] = useState({});
+  const [saving, setSaving] = useState('');
+  const [showTemplateForm, setShowTemplateForm] = useState(false);
+  const [templateForm, setTemplateForm] = useState({ name: '', content: '', category: 'general', channel: 'all' });
+  const [products, setProducts] = useState([]);
+  const [faqs, setFaqs] = useState([]);
+  const [personalSettings, setPersonalSettings] = useState(null);
+  const [personalAvatarUrl, setPersonalAvatarUrl] = useState(() => normalizeAvatarUrl(localStorage.getItem('pe_avatar') || ''));
+  const savePersonalAvatar = (rawUrl) => {
+    const avatar = normalizeAvatarUrl(rawUrl || '');
+    setPersonalAvatarUrl(avatar);
+    if (avatar) {
+      localStorage.setItem('pe_avatar', avatar);
+    } else {
+      localStorage.removeItem('pe_avatar');
+    }
+    window.dispatchEvent(new CustomEvent('pe-avatar-changed', { detail: avatar }));
+    return avatar;
+  };
+  const personalAvatarRef = useRef(null);
+  const [showProductForm, setShowProductForm] = useState(false);
+  const [editingProduct, setEditingProduct] = useState(null);
+  const [selectedProduct, setSelectedProduct] = useState(null);
+  const [lightboxImages, setLightboxImages] = useState([]);
+  const [lightboxIndex, setLightboxIndex] = useState(0);
+  const [showFaqForm, setShowFaqForm] = useState(false);
+  const [productForm, setProductForm] = useState({ name: '', product_title: '', description: '', price: '', price_currency: 'USD', category: 'general', product_type: '', images: [] });
+  const [productImageError, setProductImageError] = useState('');
+  const [productDragActive, setProductDragActive] = useState(false);
+  const [generatingDesc, setGeneratingDesc] = useState(false);
+  const [genDescNudge, setGenDescNudge] = useState(false);
+  const [faqForm, setFaqForm] = useState({ question: '', answer: '', category: 'general' });
+
+  // Password change state
+  const [passwordModal, setPasswordModal] = useState(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [passwordSaving, setPasswordSaving] = useState(false);
+  const [passwordSuccess, setPasswordSuccess] = useState('');
+  const [passwordError, setPasswordError] = useState('');
+  const [deleteAccountModal, setDeleteAccountModal] = useState(false);
+  const [deleteAccountMethod, setDeleteAccountMethod] = useState(user?.auth_provider === 'email' ? 'password' : 'email');
+  const [deleteAccountPassword, setDeleteAccountPassword] = useState('');
+  const [deleteAccountCode, setDeleteAccountCode] = useState('');
+  const [deleteAccountConfirmText, setDeleteAccountConfirmText] = useState('');
+  const [deleteAccountError, setDeleteAccountError] = useState('');
+  const [deleteAccountInfo, setDeleteAccountInfo] = useState('');
+  const [deleteAccountSending, setDeleteAccountSending] = useState(false);
+  const [deleteAccountSubmitting, setDeleteAccountSubmitting] = useState(false);
+
+  // User edit state
+  const [editUserModal, setEditUserModal] = useState(null);
+  const [editUserForm, setEditUserForm] = useState({});
+  const [showCreateUserModal, setShowCreateUserModal] = useState(false);
+  const [createUserForm, setCreateUserForm] = useState({ name: '', email: '', role: 'company_agent', sub_role: '', status: 'active' });
+
+  // Security state
+  const [oauthLinkBusy, setOauthLinkBusy] = useState('');
+  const [oauthLinkBanner, setOauthLinkBanner] = useState('');
+  const [securityOverview, setSecurityOverview] = useState(null);
+  const [sessions, setSessions] = useState([]);
+  const [, setLoginHistory] = useState([]);
+  const [apiKeys, setApiKeys] = useState([]);
+  const [showApiKeyForm, setShowApiKeyForm] = useState(false);
+  const [apiKeyName, setApiKeyName] = useState('');
+  const [newApiKey, setNewApiKey] = useState('');
+
+  // Webhook state
+  const [webhookInfo, setWebhookInfo] = useState(null);
+
+  // AI / MCP / Social / Logs state
+  const [llmEngines, setLlmEngines] = useState([]);
+  const [aiAgents, setAiAgents] = useState([]);
+  const [mcpServers, setMcpServers] = useState([]);
+  const [socialAccounts, setSocialAccounts] = useState([]);
+  const [systemLogs, setSystemLogs] = useState([]);
+
+  // Unification state
+  const [unifiedProfiles, setUnifiedProfiles] = useState([]);
+  const [mergeSuggestions, setMergeSuggestions] = useState([]);
+  const [unificationLoading, setUnificationLoading] = useState(false);
+  const [selectedUnifiedProfile, setSelectedUnifiedProfile] = useState(null);
+  const [suggestionDetail, setSuggestionDetail] = useState(null);
+  const [manualMergeIds, setManualMergeIds] = useState(['', '']);
+
+  const [waQrModalOpen, setWaQrModalOpen] = useState(false);
+  const [waQrLoading, setWaQrLoading] = useState(false);
+  const [waQrImageSrc, setWaQrImageSrc] = useState('');
+  const [waQrStatus, setWaQrStatus] = useState('');
+  const [waQrError, setWaQrError] = useState('');
+  const waQrPollRef = useRef(null);
+
+  // AI Config interactive state
+  const [editingLlmId, setEditingLlmId] = useState(null);
+  const [llmDraft, setLlmDraft] = useState({});
+  const [editingAgentId, setEditingAgentId] = useState(null);
+  const [agentDraft, setAgentDraft] = useState({});
+  const [showAddLlmForm, setShowAddLlmForm] = useState(false);
+  const [addLlmForm, setAddLlmForm] = useState({ model_name: '', provider: 'gemini', temperature: 0.7, max_tokens: 2048 });
+  const [showAddAgentForm, setShowAddAgentForm] = useState(false);
+  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', provider: 'gemini', model_name: '', is_active: true });
+
+  // Integrations interactive state
+  const [editingMcpId, setEditingMcpId] = useState(null);
+  const [mcpDraft, setMcpDraft] = useState({});
+  const [showAddMcpForm, setShowAddMcpForm] = useState(false);
+  const [addMcpForm, setAddMcpForm] = useState({ endpoint: '', region: '', status: 'active' });
+  const [editingSocialPlatform, setEditingSocialPlatform] = useState(null);
+  const [socialDraft, setSocialDraft] = useState({});
+
+  const isAdmin = user?.role === 'admin';
+  const selectedLlmEngine = llmEngines.find((engine) => engine.is_selected) || null;
+  const availableCreateRoles = ROLE_OPTIONS;
+  const getAvailableEditRoles = () => ROLE_OPTIONS;
+
+  const refreshAiConfig = useCallback(async () => {
+    const [le, ag] = await Promise.all([
+      api.get('/ai/llm-engines').catch(() => ({ data: [] })),
+      api.get('/ai/agents').catch(() => ({ data: [] })),
+    ]);
+    setLlmEngines(le.data || []);
+    setAiAgents(ag.data || []);
+  }, []);
+
+  const loadUnificationData = useCallback(async () => {
+    setUnificationLoading(true);
+    try {
+      const [profilesRes, suggestionsRes] = await Promise.all([
+        api.get('/identity/profiles').catch(() => ({ data: [] })),
+        api.get('/identity/suggestions').catch(() => ({ data: [] })),
+      ]);
+      setUnifiedProfiles(profilesRes.data || []);
+      setMergeSuggestions(suggestionsRes.data || []);
+    } catch (err) { console.error(err); }
+    finally { setUnificationLoading(false); }
+  }, []);
+
+  const runAutoDetect = async () => {
+    setUnificationLoading(true);
+    try {
+      const res = await api.post('/identity/auto-detect');
+      await loadUnificationData();
+      alert(`Auto-detection complete. Found ${res.data.new_suggestions} new suggestion(s).`);
+    } catch (err) { alert('Auto-detection failed'); }
+    finally { setUnificationLoading(false); }
+  };
+
+  const acceptSuggestion = async (suggestionId) => {
+    try {
+      await api.post(`/identity/suggestions/${suggestionId}/resolve`, { action: 'accept' });
+      await loadUnificationData();
+    } catch (err) { alert(err.response?.data?.detail || 'Failed to accept suggestion'); }
+  };
+
+  const rejectSuggestion = async (suggestionId) => {
+    try {
+      await api.post(`/identity/suggestions/${suggestionId}/resolve`, { action: 'reject' });
+      await loadUnificationData();
+    } catch (err) { alert('Failed to reject suggestion'); }
+  };
+
+  const manualMerge = async () => {
+    const ids = manualMergeIds.filter(Boolean);
+    if (ids.length < 2) { alert('Select at least 2 customers to merge'); return; }
+    try {
+      await api.post('/identity/merge', { customer_ids: ids });
+      setManualMergeIds(['', '']);
+      await loadUnificationData();
+      alert('Customers merged successfully');
+    } catch (err) { alert(err.response?.data?.detail || 'Merge failed'); }
+  };
+
+  const splitFromProfile = async (profileId, customerId) => {
+    if (!window.confirm('Remove this customer from the unified profile?')) return;
+    try {
+      await api.post('/identity/split', { profile_id: profileId, customer_id: customerId });
+      await loadUnificationData();
+      setSelectedUnifiedProfile(null);
+    } catch (err) { alert('Split failed'); }
+  };
+
+  const loadSettings = useCallback(async () => {
+    try {
+      if (onboardingInviteMode) {
+        const [co, personal] = await Promise.all([
+          api.get('/settings/company').catch(() => ({ data: null })),
+          api.get('/settings/personal').catch(() => ({ data: null })),
+        ]);
+
+        setChannels(normalizeChannelsResponse([]));
+        setCompany(co.data || null);
+        setUsers(user ? [{
+          id: user.id || 'current-user',
+          name: user.name || '',
+          email: user.email || '',
+          role: user.role || 'admin',
+          sub_role: user.sub_role || '',
+          status: user.status || 'active',
+          last_login: user.last_login || null,
+          auth_provider: user.auth_provider || 'email',
+        }] : []);
+        setTemplates([]);
+        setProducts([]);
+        setFaqs([]);
+
+        const fallbackPersonal = {
+          name: user?.name || '',
+          company_name: co?.data?.company_name || '',
+          email: user?.email || '',
+          mobile_number: user?.phone || '',
+          role: user?.role || '',
+          website_address: co?.data?.website_address || '',
+          address_info: co?.data?.address_info || '',
+          locale_information: co?.data?.locale_information || co?.data?.language || 'en',
+          timezone: co?.data?.timezone || 'UTC',
+          preferred_language: co?.data?.language || 'en',
+          date_format: co?.data?.date_format || 'YYYY-MM-DD',
+          currency: co?.data?.currency || 'USD',
+        };
+        setPersonalSettings(personal.data || fallbackPersonal);
+        if (personal.data?.avatar) savePersonalAvatar(personal.data.avatar);
+        return;
+      }
+
+      const [ch, co, us, tm, pr, fq, personal] = await Promise.all([
+        api.get('/settings/channels').catch(() => ({ data: [] })),
+        api.get('/settings/company').catch(() => ({ data: null })),
+        api.get('/users').catch(() => ({ data: [] })),
+        api.get('/settings/templates').catch(() => ({ data: [] })),
+        api.get('/company-data/products').catch(() => ({ data: [] })),
+        api.get('/company-data/faqs').catch(() => ({ data: [] })),
+        api.get('/settings/personal').catch(() => ({ data: null })),
+      ]);
+
+      setChannels(normalizeChannelsResponse(ch.data));
+      setCompany(co.data || null);
+      setUsers(us.data || []);
+      setTemplates(tm.data || []);
+      setProducts(pr.data || []);
+      setFaqs(fq.data || []);
+
+      const fallbackPersonal = {
+        name: user?.name || '',
+        company_name: co?.data?.company_name || '',
+        email: user?.email || '',
+        mobile_number: user?.phone || '',
+        role: user?.role || '',
+        website_address: co?.data?.website_address || '',
+        address_info: co?.data?.address_info || '',
+        locale_information: co?.data?.locale_information || co?.data?.language || 'en',
+        timezone: co?.data?.timezone || 'UTC',
+        preferred_language: co?.data?.language || 'en',
+        date_format: co?.data?.date_format || 'YYYY-MM-DD',
+        currency: co?.data?.currency || 'USD',
+      };
+      setPersonalSettings(personal.data || fallbackPersonal);
+      if (personal.data?.avatar) savePersonalAvatar(personal.data.avatar);
+    } catch (err) {
+      console.error(err);
+      setPersonalSettings({
+        name: user?.name || '',
+        company_name: '',
+        email: user?.email || '',
+        mobile_number: user?.phone || '',
+        role: user?.role || '',
+        website_address: '',
+        address_info: '',
+        locale_information: 'en',
+        timezone: 'UTC',
+        preferred_language: 'en',
+        date_format: 'YYYY-MM-DD',
+        currency: 'USD',
+      });
+    }
+  }, [onboardingInviteMode, user]);
+
+  useEffect(() => { loadSettings(); }, [loadSettings]);
+
+  useEffect(() => {
+    if (!onboardingInviteMode || !isAdmin || searchParams.get('invite') !== '1') return;
+    const firstRole = availableCreateRoles[0] || 'company_agent';
+    setCreateUserForm((prev) => ({ ...prev, role: prev.role || firstRole }));
+    setShowCreateUserModal(true);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('invite');
+      return next;
+    }, { replace: true });
+  }, [onboardingInviteMode, isAdmin, searchParams, setSearchParams, availableCreateRoles]);
+
+  useEffect(() => {
+    if (standaloneUnification) return;
+    if (searchParams.get('tab') === 'email') {
+      setSearchParams({ tab: 'channels' }, { replace: true });
+    }
+  }, [standaloneUnification, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (standaloneUnification) return;
+    const linked = searchParams.get('oauth_linked');
+    const linkErr = searchParams.get('oauth_link_error');
+    if (!linked && !linkErr) return;
+    let msg = '';
+    if (linked === 'google' || linked === 'facebook') {
+      msg = `Successfully linked ${linked === 'google' ? 'Google' : 'Facebook'} to your account.`;
+    } else if (linkErr === '1') {
+      msg =
+        'Could not complete linking. Ensure the social account email matches your workspace email, then try again.';
+    } else if (linkErr === 'cancelled') {
+      msg = 'Sign-in with the provider was cancelled.';
+    } else if (linkErr === 'missing_code') {
+      msg = 'OAuth did not complete. Try linking again.';
+    }
+    if (msg) setOauthLinkBanner(msg);
+    if (typeof refreshUser === 'function') {
+      refreshUser();
+    }
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        p.delete('oauth_linked');
+        p.delete('oauth_link_error');
+        if (!p.get('tab')) p.set('tab', 'security');
+        return p;
+      },
+      { replace: true },
+    );
+  }, [standaloneUnification, searchParams, setSearchParams, refreshUser]);
+
+  // Lazy-load data for AI/Integrations/Logs tabs
+  useEffect(() => {
+    if (activeTab === 'ai') {
+      refreshAiConfig();
+    }
+    if (activeTab === 'integrations') {
+      api.get('/mcp/servers').catch(() => ({ data: [] })).then(r => setMcpServers(r.data || []));
+    }
+    if (activeTab === 'channels') {
+      api.get('/social/accounts').catch(() => ({ data: [] })).then(r => setSocialAccounts(r.data || []));
+    }
+    if (activeTab === 'logs') {
+      api.get('/system/logs?limit=50').catch(() => ({ data: [] })).then(r => setSystemLogs(r.data || []));
+    }
+  }, [activeTab, refreshAiConfig]);
+
+  const maskOAuthSubject = (id) => {
+    const s = String(id || '');
+    if (!s) return '—';
+    if (s.length <= 12) return s;
+    return `${s.slice(0, 6)}…${s.slice(-4)}`;
+  };
+
+  const startOAuthLink = async (provider) => {
+    if (!user || user.role === 'super_admin') return;
+    const key = provider === 'facebook' ? 'facebook' : 'google';
+    setOauthLinkBusy(key);
+    setOauthLinkBanner('');
+    try {
+      const path =
+        key === 'facebook'
+          ? '/auth/oauth/link/facebook/start'
+          : '/auth/oauth/link/google/start';
+      const res = await api.post(path);
+      const url = res.data?.authorization_url;
+      if (url) {
+        window.location.href = url;
+      } else {
+        setOauthLinkBanner('Could not start OAuth linking.');
+      }
+    } catch (e) {
+      const d = e.response?.data?.detail;
+      setOauthLinkBanner(
+        typeof d === 'string' ? d : e.response?.data?.error || 'Could not start OAuth linking.',
+      );
+    } finally {
+      setOauthLinkBusy('');
+    }
+  };
+
+  const loadSecurity = async () => {
+    try {
+      const [overview, sess, hist, keys] = await Promise.all([
+        api.get('/security/overview').catch(() => ({ data: null })),
+        api.get('/security/sessions').catch(() => ({ data: [] })),
+        api.get('/security/login-history').catch(() => ({ data: [] })),
+        api.get('/security/api-keys').catch(() => ({ data: [] })),
+      ]);
+      setSecurityOverview(overview.data);
+      setSessions(sess.data);
+      setLoginHistory(hist.data);
+      setApiKeys(keys.data);
+    } catch (err) { console.error(err); }
+  };
+
+  const loadWebhookInfo = async () => {
+    try {
+      const res = await api.get('/webhooks/info');
+      setWebhookInfo(res.data);
+    } catch (err) { console.error(err); }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'security') loadSecurity();
+    if (activeTab === 'webhooks') loadWebhookInfo();
+    if (activeTab === 'notifications') loadNotifSettings();
+    if (activeTab === 'unification') loadUnificationData();
+  }, [activeTab, loadUnificationData]);
+
+  // â”€â”€ Notification settings â”€â”€
+  const [notifSettings, setNotifSettings] = useState(null);
+  const [notifSaving, setNotifSaving] = useState(false);
+  const [notifSaved, setNotifSaved] = useState(false);
+
+  const loadNotifSettings = async () => {
+    try {
+      const res = await api.get('/notification-settings');
+      setNotifSettings(res.data);
+    } catch {}
+  };
+
+  const saveNotifSettings = async () => {
+    if (!notifSettings) return;
+    setNotifSaving(true);
+    try {
+      await api.put('/notification-settings', notifSettings);
+      setNotifSaved(true);
+      setTimeout(() => setNotifSaved(false), 2500);
+    } catch {}
+    setNotifSaving(false);
+  };
+
+  const saveChannel = async (channel) => {
+    setSaving(channel.channel);
+    try { await api.put(`/settings/channels/${channel.channel}`, channel); setSaving(''); } catch (err) { console.error(err); setSaving(''); }
+  };
+
+  const updateChannelField = (channelName, field, value) => {
+    setChannels(prev => prev.map(ch => ch.channel === channelName ? { ...ch, [field]: value } : ch));
+  };
+
+  const saveCompany = async () => {
+    setSaving('company');
+    try {
+      const res = await api.put('/settings/company', company);
+      if (res?.data) setCompany(res.data);
+      setSaving('company_done');
+      setTimeout(() => setSaving(''), 2000);
+    } catch (err) {
+      console.error(err);
+      setSaving('');
+    }
+  };
+
+  const savePersonalProfile = async () => {
+    if (!personalSettings) return;
+    setSaving('personal');
+    try {
+      const payload = {
+        name: personalSettings.name || '',
+        email: personalSettings.email || '',
+        mobile_number: personalSettings.mobile_number || '',
+      };
+      if (personalAvatarUrl) payload.avatar = personalAvatarUrl;
+      try {
+        const res = await api.put('/settings/personal', payload);
+        setPersonalSettings(res.data);
+        if (res.data?.avatar) savePersonalAvatar(res.data.avatar);
+        else if (personalAvatarUrl) savePersonalAvatar(personalAvatarUrl);
+      } catch (err) {
+        if (err?.response?.status !== 404) throw err;
+        await api.put(`/users/${user?.id}`, { name: payload.name, email: payload.email, phone: payload.mobile_number, avatar: personalAvatarUrl || undefined });
+        setPersonalSettings(prev => ({ ...prev, ...payload }));
+      }
+      setSaving('personal_done');
+      setTimeout(() => setSaving(''), 2000);
+    } catch (err) { console.error(err); setSaving(''); }
+  };
+
+  const handlePersonalAvatarChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const dataUrl = normalizeAvatarUrl(ev.target.result || '');
+      savePersonalAvatar(dataUrl);
+      // Immediately persist to backend so Layout can pick it up on next fetch
+      try {
+        await api.put('/settings/personal', { avatar: dataUrl });
+      } catch {
+        try { await api.put(`/users/${user?.id}`, { avatar: dataUrl }); } catch {}
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const createTemplate = async () => {
+    try { await api.post('/settings/templates', templateForm); setShowTemplateForm(false); setTemplateForm({ name: '', content: '', category: 'general', channel: 'all' }); const res = await api.get('/settings/templates'); setTemplates(res.data); } catch (err) { console.error(err); }
+  };
+
+  const deleteTemplate = async (id) => { try { await api.delete(`/settings/templates/${id}`); setTemplates(prev => prev.filter(t => t.id !== id)); } catch (err) { console.error(err); } };
+
+  const openPasswordModal = (u) => { setPasswordModal(u); setNewPassword(''); setConfirmPassword(''); setShowPassword(false); setPasswordError(''); setPasswordSuccess(''); };
+  const closePasswordModal = () => { setPasswordModal(null); setNewPassword(''); setConfirmPassword(''); setPasswordError(''); setPasswordSuccess(''); };
+  const openDeleteAccountModal = () => {
+    setDeleteAccountModal(true);
+    setDeleteAccountMethod(user?.auth_provider === 'email' ? 'password' : 'email');
+    setDeleteAccountPassword('');
+    setDeleteAccountCode('');
+    setDeleteAccountConfirmText('');
+    setDeleteAccountError('');
+    setDeleteAccountInfo('');
+  };
+  const closeDeleteAccountModal = () => {
+    if (deleteAccountSending || deleteAccountSubmitting) return;
+    setDeleteAccountModal(false);
+    setDeleteAccountPassword('');
+    setDeleteAccountCode('');
+    setDeleteAccountConfirmText('');
+    setDeleteAccountError('');
+    setDeleteAccountInfo('');
+  };
+
+  const handlePasswordChange = async () => {
+    setPasswordError(''); setPasswordSuccess('');
+    const { isValid, errors } = validatePassword(newPassword);
+    if (!isValid) { setPasswordError(errors.join('; ')); return; }
+    if (newPassword !== confirmPassword) { setPasswordError('Passwords do not match'); return; }
+    setPasswordSaving(true);
+    try {
+      await api.put(`/users/${passwordModal.id}/password`, { new_password: newPassword });
+      setPasswordSuccess('Password updated successfully!');
+      setTimeout(() => closePasswordModal(), 1500);
+    } catch (err) { setPasswordError(err.response?.data?.detail || 'Failed to update password'); }
+    finally { setPasswordSaving(false); }
+  };
+
+  const sendDeleteVerificationFingerprint = async () => {
+    setDeleteAccountError('');
+    setDeleteAccountInfo('');
+    setDeleteAccountSending(true);
+    try {
+      const res = await api.post('/account/delete/request-verification', { method: 'email' });
+      setDeleteAccountInfo(res.data?.message || 'A verification fingerprint has been sent to your email address.');
+    } catch (err) {
+      setDeleteAccountError(err.response?.data?.detail || 'Failed to send verification fingerprint');
+    } finally {
+      setDeleteAccountSending(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    setDeleteAccountError('');
+    setDeleteAccountInfo('');
+    if (deleteAccountConfirmText.trim().toUpperCase() !== 'DELETE') {
+      setDeleteAccountError('Type DELETE to confirm account removal.');
+      return;
+    }
+
+    const payload = { method: deleteAccountMethod };
+    if (deleteAccountMethod === 'password') {
+      if (!deleteAccountPassword) {
+        setDeleteAccountError('Current password is required.');
+        return;
+      }
+      payload.current_password = deleteAccountPassword;
+    } else {
+      if (!deleteAccountCode.trim()) {
+        setDeleteAccountError('Verification fingerprint is required.');
+        return;
+      }
+      payload.verification_code = deleteAccountCode.trim();
+    }
+
+    setDeleteAccountSubmitting(true);
+    try {
+      await api.post('/account/delete/confirm', payload);
+      await logout();
+      window.location.href = '/signin';
+    } catch (err) {
+      const status = err.response?.status;
+      const detail = err.response?.data?.detail || '';
+      if (status === 401 || status === 404) {
+        await logout();
+        window.location.href = '/signin';
+        return;
+      }
+      setDeleteAccountError(detail || 'Failed to delete account');
+    } finally {
+      setDeleteAccountSubmitting(false);
+    }
+  };
+
+  const openEditUser = (u) => { setEditUserModal(u); setEditUserForm({ name: u.name, email: u.email, role: u.role, sub_role: u.sub_role || '', status: u.status }); };
+
+  const saveUserEdit = async () => {
+    try {
+      await api.put(`/users/${editUserModal.id}`, editUserForm);
+      setEditUserModal(null);
+      loadSettings();
+    } catch (err) { alert(err.response?.data?.detail || 'Failed to update user'); }
+  };
+
+  const deleteUser = async (u) => {
+    if (!window.confirm(`Are you sure you want to delete ${u.name}? This action cannot be undone.`)) return;
+    try { await api.delete(`/users/${u.id}`); loadSettings(); } catch (err) { alert(err.response?.data?.detail || 'Failed to delete user'); }
+  };
+
+  const createUser = async () => {
+    if (!createUserForm.name.trim() || !createUserForm.email.trim()) {
+      alert('Name and email are required.');
+      return;
+    }
+    try {
+      await api.post('/auth/onboarding/invite', createUserForm);
+      setShowCreateUserModal(false);
+      const invitedEmail = createUserForm.email.trim();
+      setCreateUserForm({ name: '', email: '', role: 'company_agent', sub_role: '', status: 'active' });
+      if (onboardingInviteMode) {
+        alert(`Invitation sent to ${invitedEmail}. Continue to billing when you're ready.`);
+        navigate('/billing', { replace: true });
+        return;
+      }
+      alert(`Invitation sent to ${invitedEmail}.`);
+      loadSettings();
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to send invitation');
+    }
+  };
+
+  const revokeSession = async (sessionToken) => {
+    try { await api.delete(`/security/sessions/${sessionToken}`); loadSecurity(); } catch (err) { console.error(err); }
+  };
+
+  const createApiKey = async () => {
+    const trimmedName = apiKeyName.trim();
+    if (!trimmedName) {
+      alert('API key name is required.');
+      return;
+    }
+    try {
+      const res = await api.post('/security/api-keys', { name: trimmedName });
+      setNewApiKey(res.data.key);
+      setShowApiKeyForm(false); setApiKeyName('');
+      loadSecurity();
+    } catch (err) {
+      console.error(err);
+      alert(err.response?.data?.detail || 'Failed to generate API key');
+    }
+  };
+
+  const revokeApiKey = async (keyId) => {
+    if (!window.confirm('Revoke this API key?')) return;
+    try { await api.delete(`/security/api-keys/${keyId}`); loadSecurity(); } catch (err) { console.error(err); }
+  };
+
+  const copyToClipboard = (text) => { navigator.clipboard.writeText(text); };
+
+  const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+  const handleProductFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+
+    const remainingSlots = MAX_PRODUCT_IMAGES - (productForm.images?.length || 0);
+    if (remainingSlots <= 0) {
+      setProductImageError(`Maximum ${MAX_PRODUCT_IMAGES} images allowed`);
+      return;
+    }
+
+    const accepted = files.slice(0, remainingSlots);
+    const nextImages = [];
+
+    for (const file of accepted) {
+      if (!PRODUCT_IMAGE_TYPES.includes(file.type)) {
+        setProductImageError('Only JPG, PNG, and WEBP images are allowed');
+        continue;
+      }
+      if (file.size > MAX_PRODUCT_IMAGE_SIZE_MB * 1024 * 1024) {
+        setProductImageError(`Each image must be <= ${MAX_PRODUCT_IMAGE_SIZE_MB}MB`);
+        continue;
+      }
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        nextImages.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          dataUrl,
+        });
+      } catch {
+        setProductImageError('Failed to read one of the selected files');
+      }
+    }
+
+    if (nextImages.length) {
+      setProductImageError('');
+      setProductForm((prev) => ({ ...prev, images: [...(prev.images || []), ...nextImages].slice(0, MAX_PRODUCT_IMAGES) }));
+    }
+  };
+
+  const removeProductImage = (imageId) => {
+    setProductForm((prev) => ({ ...prev, images: (prev.images || []).filter((img) => img.id !== imageId) }));
+  };
+
+  const openLightbox = useCallback((images, index) => {
+    setLightboxImages(images);
+    setLightboxIndex(index);
+  }, []);
+
+  const closeLightbox = useCallback(() => setLightboxImages([]), []);
+
+  useEffect(() => {
+    if (!lightboxImages.length) return;
+    const handler = (e) => {
+      if (e.key === 'ArrowRight') setLightboxIndex(i => (i + 1) % lightboxImages.length);
+      if (e.key === 'ArrowLeft') setLightboxIndex(i => (i - 1 + lightboxImages.length) % lightboxImages.length);
+      if (e.key === 'Escape') closeLightbox();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [lightboxImages, closeLightbox]);
+
+  const generateProductDescription = async () => {
+    if (!productForm.name) {
+      setGenDescNudge(true);
+      setTimeout(() => setGenDescNudge(false), 2800);
+      return;
+    }
+    if (generatingDesc) return;
+    setGeneratingDesc(true);
+    try {
+      const res = await api.post('/company-data/products/generate-description', {
+        name: productForm.name,
+        product_title: productForm.product_title || '',
+        product_type: productForm.product_type || '',
+        category: productForm.category || 'general',
+        price: productForm.price || '',
+        price_currency: productForm.price_currency || 'USD',
+        images: (productForm.images || []).map(img => img.dataUrl || img).filter(Boolean),
+      });
+      if (res.data?.description) {
+        setProductForm(prev => ({ ...prev, description: res.data.description }));
+      }
+    } catch (err) {
+      console.error('Failed to generate description:', err);
+    } finally {
+      setGeneratingDesc(false);
+    }
+  };
+
+  const resetProductForm = () => {
+    setProductForm({ name: '', product_title: '', description: '', price: '', price_currency: 'USD', category: 'general', product_type: '', images: [] });
+    setProductImageError('');
+    setProductDragActive(false);
+    setEditingProduct(null);
+    setShowProductForm(false);
+  };
+
+  const openEditProduct = (product) => {
+    setEditingProduct(product);
+    setProductImageError('');
+    setProductDragActive(false);
+    setProductForm({
+      name: product.name || '',
+      product_title: product.product_title || '',
+      description: product.description || '',
+      price: product.price || '',
+      price_currency: product.price_currency || 'USD',
+      category: product.category || 'general',
+      product_type: product.product_type || '',
+      images: Array.isArray(product.images)
+        ? product.images.slice(0, MAX_PRODUCT_IMAGES).map((img, idx) => ({
+          id: `${product.id}-existing-${idx}`,
+          name: `image-${idx + 1}`,
+          type: 'image',
+          size: 0,
+          dataUrl: img,
+        }))
+        : [],
+    });
+    setShowProductForm(true);
+  };
+
+  const saveProduct = async () => {
+    try {
+      const payload = {
+        ...productForm,
+        product_type: productForm.product_type || 'standard',
+        images: (productForm.images || []).map((img) => img.dataUrl).slice(0, MAX_PRODUCT_IMAGES),
+      };
+      if (editingProduct?.id) {
+        await api.put(`/company-data/products/${editingProduct.id}`, payload);
+      } else {
+        await api.post('/company-data/products', payload);
+      }
+      resetProductForm();
+      const r = await api.get('/company-data/products');
+      setProducts(r.data);
+    } catch (err) { console.error(err); }
+  };
+  const deleteProduct = async (id) => { try { await api.delete(`/company-data/products/${id}`); setProducts(prev => prev.filter(p => p.id !== id)); setSelectedProduct(prev => prev?.id === id ? null : prev); } catch (err) { console.error(err); } };
+  const createFaq = async () => { try { await api.post('/company-data/faqs', faqForm); setShowFaqForm(false); setFaqForm({ question: '', answer: '', category: 'general' }); const r = await api.get('/company-data/faqs'); setFaqs(r.data); } catch (err) { console.error(err); } };
+  const deleteFaq = async (id) => { try { await api.delete(`/company-data/faqs/${id}`); setFaqs(prev => prev.filter(f => f.id !== id)); } catch (err) { console.error(err); } };
+
+  const passwordValidation = validatePassword(newPassword);
+
+  const fetchWaBridgeQr = useCallback(async () => {
+    try {
+      const res = await api.get('/settings/channels/whatsapp/bridge-qr');
+      const d = res.data || {};
+      setWaQrError('');
+      setWaQrStatus(d.bridge_status || d.status || '');
+      if (d.qr_data_url) {
+        setWaQrImageSrc(d.qr_data_url);
+      } else if (d.qr_png_base64) {
+        setWaQrImageSrc(`data:image/png;base64,${d.qr_png_base64}`);
+      } else {
+        setWaQrImageSrc('');
+      }
+      setWaQrLoading(false);
+      return d;
+    } catch (err) {
+      const raw = err.response?.data?.detail;
+      const msg = typeof raw === 'string' ? raw : (Array.isArray(raw) ? raw.map((x) => x.msg || x).join(' ') : err.message) || 'Bridge unavailable';
+      setWaQrError(String(msg));
+      setWaQrImageSrc('');
+      setWaQrLoading(false);
+      return null;
+    }
+  }, []);
+
+  const openWaQrModal = () => {
+    setWaQrModalOpen(true);
+    setWaQrLoading(true);
+    setWaQrError('');
+    setWaQrImageSrc('');
+    setWaQrStatus('');
+    fetchWaBridgeQr();
+    if (waQrPollRef.current) clearInterval(waQrPollRef.current);
+    waQrPollRef.current = setInterval(() => { fetchWaBridgeQr(); }, 2500);
+  };
+
+  const closeWaQrModal = () => {
+    setWaQrModalOpen(false);
+    if (waQrPollRef.current) {
+      clearInterval(waQrPollRef.current);
+      waQrPollRef.current = null;
+    }
+  };
+
+  useEffect(() => () => {
+    if (waQrPollRef.current) clearInterval(waQrPollRef.current);
+  }, []);
+
+  const tabs = [
+    { id: 'personal',      label: 'Personal',       icon: Users },
+    { id: 'company',       label: 'Company',        icon: Globe },
+    { id: 'channels',      label: 'Channels',       icon: MessageSquare },
+    { id: 'ai',            label: 'AI Config',      icon: Bot },
+    { id: 'templates',     label: 'Templates',      icon: MessageSquare },
+    { id: 'users',         label: 'Teams',          icon: Users },
+    { id: 'notifications', label: 'Notifications',  icon: Bell },
+    { id: 'webhooks',      label: 'Webhooks',       icon: Link2 },
+    { id: 'integrations',  label: 'Integrations',   icon: Package },
+    { id: 'logs',          label: 'System Logs',    icon: Activity },
+    { id: 'security',      label: 'Security',       icon: Shield },
+  ];
+
+  return (
+    <div className="p-6 lg:p-8" data-testid="settings-page">
+      <h1 className="text-2xl font-bold text-slate-900 mb-6">{standaloneUnification ? 'Unification' : 'Settings'}</h1>
+
+      <div className={`flex ${standaloneUnification ? '' : 'gap-8'}`}>
+        {!standaloneUnification && (
+          <div className="w-48 flex-shrink-0 space-y-0.5">
+            {tabs.map(tab => (
+              <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+                className={`group w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-200 hover:translate-x-1 active:scale-95 ${
+                  activeTab === tab.id
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-500 hover:text-slate-900 hover:bg-slate-100 hover:shadow-sm'
+                }`}>
+                <tab.icon size={15} className={`transition-transform duration-200 group-hover:scale-110 ${activeTab === tab.id ? 'text-white' : 'text-slate-400'}`} />
+                <span className="flex-1 text-left">{tab.label}</span>
+                {activeTab === tab.id && <span className="w-1.5 h-1.5 rounded-full bg-white/70" />}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className={`${standaloneUnification ? 'w-full' : 'flex-1 min-w-0'}`}>
+
+          {/* â•â•â• PERSONAL SETTINGS â•â•â• */}
+          {activeTab === 'personal' && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-slate-900">Personal Profile</h2>
+
+              {!personalSettings && (
+                <div className="bg-white border border-slate-100 rounded-xl p-6 text-sm text-slate-500">
+                  Loading personal settings...
+                </div>
+              )}
+
+              {personalSettings && (
+                <>
+                  {/* Profile preview banner */}
+                  <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 rounded-xl p-5 flex items-center gap-5">
+                    <div className="relative flex-shrink-0">
+                      <div className="w-16 h-16 rounded-xl bg-white border border-blue-200 shadow flex items-center justify-center text-blue-500 font-bold text-xl select-none overflow-hidden">
+                        {personalAvatarUrl
+                          ? <img src={personalAvatarUrl} alt="avatar" referrerPolicy="no-referrer" className="w-full h-full object-cover" onError={() => savePersonalAvatar('')} />
+                          : displayNameInitial(personalSettings.name)
+                        }
+                      </div>
+                      <button
+                        onClick={() => personalAvatarRef.current?.click()}
+                        className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full bg-blue-600 border-2 border-white flex items-center justify-center hover:bg-blue-500 transition-colors shadow"
+                        title="Change profile photo"
+                      >
+                        <Plus size={10} className="text-white" />
+                      </button>
+                      <input ref={personalAvatarRef} type="file" accept="image/*" className="hidden" onChange={handlePersonalAvatarChange} />
+                    </div>
+                    <div>
+                      <p className="text-base font-bold text-slate-900">{personalSettings.name || 'Your Name'}</p>
+                      {personalSettings.email && <p className="text-xs text-slate-500 mt-0.5">{personalSettings.email}</p>}
+                      {personalSettings.role && <span className="mt-1 inline-block text-[10px] font-medium bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full capitalize">{personalSettings.role.charAt(0).toUpperCase() + personalSettings.role.slice(1)}{company?.company_name ? ` at ${company.company_name}` : ''}</span>}
+                      <p className="text-[10px] text-slate-400 mt-1">Click the + to change your photo. Save to apply.</p>
+                    </div>
+                  </div>
+
+                  {/* â”€â”€ Account Information â”€â”€ */}
+                  <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                    <div className="flex items-center gap-2"><UserCircle size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Account Information</span></div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div><label className="text-xs text-slate-400 mb-1 block">Full Name</label><input value={personalSettings.name || ''} onChange={(e) => setPersonalSettings({ ...personalSettings, name: e.target.value })} placeholder="Jane Smith" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                      <div><label className="text-xs text-slate-400 mb-1 block">Email Address</label><input value={personalSettings.email || ''} onChange={(e) => setPersonalSettings({ ...personalSettings, email: e.target.value })} placeholder="jane@company.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                      <div><label className="text-xs text-slate-400 mb-1 block">Mobile Number</label><input value={personalSettings.mobile_number || ''} onChange={(e) => setPersonalSettings({ ...personalSettings, mobile_number: e.target.value })} placeholder="+1 555 000 0000" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                      <div><label className="text-xs text-slate-400 mb-1 block">Role</label><input value={personalSettings.role ? (personalSettings.role.charAt(0).toUpperCase() + personalSettings.role.slice(1) + (company?.company_name ? ` at ${company.company_name}` : '')) : ''} disabled className="w-full px-3 py-2 bg-slate-100 border border-slate-200 rounded-lg text-sm text-slate-400" /></div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button onClick={savePersonalProfile} disabled={saving === 'personal'} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"><Save size={14} /> {saving === 'personal' ? 'Savingâ€¦' : 'Save Personal Profile'}</button>
+                    {saving === 'personal_done' && <span className="flex items-center gap-1 text-emerald-600 text-xs"><Check size={13} /> Saved</span>}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Channels (includes email mailbox) */}
+          {activeTab === 'channels' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900 mb-1">Channels</h2>
+                <p className="text-sm text-slate-400">Configure messaging channels, email (IMAP / SMTP or Brevo), and social accounts</p>
+              </div>
+              {channels.map((channel) => {
+                const config = CHANNEL_CONFIG[channel.channel] || { label: channel.channel, color: 'gray', fields: [] };
+                const showKeys = showKeyMap[channel.channel] || false;
+                const emailProv = (channel.email_provider || 'smtp_imap').toLowerCase();
+                const recvOn = channel.email_receive_enabled !== false;
+                const sendOn = channel.email_send_enabled !== false;
+                return (
+                  <div key={channel.channel} className="bg-white border border-slate-100 rounded-xl p-6">
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-3">
+                        <div className={`w-10 h-10 rounded-lg ${config.bgClass} flex items-center justify-center`}>{channel.channel === 'email' ? <Mail size={18} className={config.textClass} /> : <MessageSquare size={18} className={config.textClass} />}</div>
+                        <div><h3 className="text-sm font-semibold text-slate-900">{config.label}</h3><p className="text-xs text-slate-400">{channel.enabled ? 'Active' : 'Inactive'}</p></div>
+                      </div>
+                      <button onClick={() => updateChannelField(channel.channel, 'enabled', !channel.enabled)} className={`relative w-11 h-6 rounded-full transition-colors ${channel.enabled ? 'bg-blue-600' : 'bg-gray-300'}`}>
+                        <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform shadow ${channel.enabled ? 'translate-x-5' : ''}`}></span>
+                      </button>
+                    </div>
+                    {channel.channel !== 'web_chat' && (
+                      <div className="space-y-3">
+                        {channel.channel === 'whatsapp' && (
+                          <>
+                            <div><label className="text-xs text-slate-400 mb-1 block">Phone Number ID</label><input value={channel.phone_number_id || ''} onChange={(e) => updateChannelField(channel.channel, 'phone_number_id', e.target.value)} placeholder="WhatsApp Phone Number ID from Meta" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                            <div><label className="text-xs text-slate-400 mb-1 block">Access Token</label><div className="relative"><input type={showKeys ? 'text' : 'password'} value={channel.access_token || ''} onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)} placeholder="Permanent or long-lived system user token" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({ ...showKeyMap, [channel.channel]: !showKeys })} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div>
+                            <div><label className="text-xs text-slate-400 mb-1 block">Webhook URL</label><input value={channel.webhook_url || ''} onChange={(e) => updateChannelField(channel.channel, 'webhook_url', e.target.value)} placeholder="https://your-domain.com/api/webhooks/..." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /></div>
+                            <div className="rounded-lg border border-emerald-100 bg-emerald-50/60 p-3 space-y-2">
+                              <p className="text-xs text-slate-600">WhatsApp Web (linked device): run the Node bridge with <code className="text-[10px] bg-white px-1 rounded">WHATSAPP_MODE=bridge</code> on the backend, then scan the QR here.</p>
+                              <button type="button" onClick={openWaQrModal} className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500"><QrCode size={14} /> Connect with WhatsApp Web (QR)</button>
+                            </div>
+                          </>
+                        )}
+                        {(channel.channel === 'instagram' || channel.channel === 'facebook') && (<><div><label className="text-xs text-slate-400 mb-1 block">Page ID</label><input value={channel.page_id || ''} onChange={(e) => updateChannelField(channel.channel, 'page_id', e.target.value)} placeholder={`Enter ${config.label} Page ID`} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div><div><label className="text-xs text-slate-400 mb-1 block">Access Token</label><div className="relative"><input type={showKeys ? 'text' : 'password'} value={channel.access_token || ''} onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)} placeholder="Enter Access Token" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({...showKeyMap, [channel.channel]: !showKeys})} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div></>)}
+                        {channel.channel === 'email' && (
+                          <>
+                            <div><label className="text-xs text-slate-400 mb-1 block">Email address</label><input type="email" value={channel.email_address || ''} onChange={(e) => updateChannelField(channel.channel, 'email_address', e.target.value)} placeholder="you@yourdomain.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                            <div><label className="text-xs text-slate-400 mb-1 block">Connection</label><select value={emailProv === 'brevo' ? 'brevo' : emailProv === 'oauth_google' ? 'oauth_google' : 'smtp_imap'} onChange={(e) => updateChannelField(channel.channel, 'email_provider', e.target.value)} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm"><option value="smtp_imap">IMAP + SMTP (personal / workspace mailbox)</option><option value="brevo">Brevo (API key)</option><option value="oauth_google">Google (OAuth) — link via admin when available</option></select></div>
+                            {emailProv === 'oauth_google' && (
+                              <p className="text-xs text-slate-500">OAuth-based sign-in for Gmail is planned for a dedicated connect flow. Use IMAP + SMTP with an app password, or Brevo, for production today.</p>
+                            )}
+                            {emailProv === 'brevo' && (
+                              <div><label className="text-xs text-slate-400 mb-1 block">Brevo API key</label><div className="relative"><input type={showKeys ? 'text' : 'password'} value={channel.api_key || ''} onChange={(e) => updateChannelField(channel.channel, 'api_key', e.target.value)} placeholder="xkeysib-..." className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({ ...showKeyMap, [channel.channel]: !showKeys })} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div>
+                            )}
+                            {(emailProv === 'smtp_imap' || emailProv === 'smtp' || !emailProv) && (
+                              <>
+                                <p className="text-[11px] text-slate-500 font-medium uppercase tracking-wide">IMAP (receive)</p>
+                                <div className="grid grid-cols-2 gap-3">
+                                  <div className="col-span-2 sm:col-span-1"><label className="text-xs text-slate-400 mb-1 block">IMAP host</label><input value={channel.imap_host || ''} onChange={(e) => updateChannelField(channel.channel, 'imap_host', e.target.value)} placeholder="imap.gmail.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                                  <div><label className="text-xs text-slate-400 mb-1 block">IMAP port</label><input type="number" value={channel.imap_port ?? 993} onChange={(e) => updateChannelField(channel.channel, 'imap_port', parseInt(e.target.value, 10) || 993)} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                                  <div className="col-span-2"><label className="text-xs text-slate-400 mb-1 block">IMAP username</label><input value={channel.imap_user || ''} onChange={(e) => updateChannelField(channel.channel, 'imap_user', e.target.value)} placeholder="Usually your email address" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                                  <div className="col-span-2"><label className="text-xs text-slate-400 mb-1 block">IMAP password / app password</label><div className="relative"><input type={showKeyMap.email_imap ? 'text' : 'password'} value={channel.imap_pass_enc || ''} onChange={(e) => updateChannelField(channel.channel, 'imap_pass_enc', e.target.value)} placeholder="Stored for mailbox access" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({ ...showKeyMap, email_imap: !showKeyMap.email_imap })} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeyMap.email_imap ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div>
+                                </div>
+                                <p className="text-[11px] text-slate-500 font-medium uppercase tracking-wide pt-2">SMTP (send)</p>
+                                <div className="grid grid-cols-2 gap-3">
+                                  <div className="col-span-2 sm:col-span-1"><label className="text-xs text-slate-400 mb-1 block">SMTP host</label><input value={channel.smtp_host || ''} onChange={(e) => updateChannelField(channel.channel, 'smtp_host', e.target.value)} placeholder="smtp.gmail.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                                  <div><label className="text-xs text-slate-400 mb-1 block">SMTP port</label><input type="number" value={channel.smtp_port ?? 587} onChange={(e) => updateChannelField(channel.channel, 'smtp_port', parseInt(e.target.value, 10) || 587)} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                                  <div className="col-span-2"><label className="text-xs text-slate-400 mb-1 block">SMTP username</label><input value={channel.smtp_user || ''} onChange={(e) => updateChannelField(channel.channel, 'smtp_user', e.target.value)} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                                  <div className="col-span-2"><label className="text-xs text-slate-400 mb-1 block">SMTP password</label><div className="relative"><input type={showKeyMap.email_smtp ? 'text' : 'password'} value={channel.smtp_pass_enc || ''} onChange={(e) => updateChannelField(channel.channel, 'smtp_pass_enc', e.target.value)} className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({ ...showKeyMap, email_smtp: !showKeyMap.email_smtp })} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeyMap.email_smtp ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div>
+                                </div>
+                              </>
+                            )}
+                            <div className="flex flex-wrap items-center gap-6 pt-2 border-t border-slate-100">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-slate-600">Receive into inbox</span>
+                                <button type="button" onClick={() => updateChannelField(channel.channel, 'email_receive_enabled', !recvOn)} className={`relative w-11 h-6 rounded-full transition-colors ${recvOn ? 'bg-sky-600' : 'bg-gray-300'}`}><span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform shadow ${recvOn ? 'translate-x-5' : ''}`} /></button>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-slate-600">Send messages</span>
+                                <button type="button" onClick={() => updateChannelField(channel.channel, 'email_send_enabled', !sendOn)} className={`relative w-11 h-6 rounded-full transition-colors ${sendOn ? 'bg-sky-600' : 'bg-gray-300'}`}><span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform shadow ${sendOn ? 'translate-x-5' : ''}`} /></button>
+                              </div>
+                            </div>
+                            <div><label className="text-xs text-slate-400 mb-1 block">Inbound webhook URL (optional)</label><input value={channel.webhook_url || ''} onChange={(e) => updateChannelField(channel.channel, 'webhook_url', e.target.value)} placeholder="Provider inbound parse URL → your /api/webhooks/..." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /></div>
+                          </>
+                        )}
+                        {channel.channel !== 'email' && channel.channel !== 'whatsapp' && (
+                          <div><label className="text-xs text-slate-400 mb-1 block">Webhook URL</label><input value={channel.webhook_url || ''} onChange={(e) => updateChannelField(channel.channel, 'webhook_url', e.target.value)} placeholder="https://your-domain.com/api/webhooks/..." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /></div>
+                        )}
+                        <button type="button" onClick={() => saveChannel(channel)} disabled={saving === channel.channel} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50"><Save size={14} /> Save</button>
+                      </div>
+                    )}
+                    {channel.channel === 'web_chat' && (<div className="bg-slate-50 rounded-lg p-4"><div className="flex items-center gap-2"><Check size={14} className="text-emerald-600" /><span className="text-xs text-emerald-600">Ready to use</span></div></div>)}
+                  </div>
+                );
+              })}
+
+              {/* Social Analytics */}
+              {activeTab === 'channels' && (
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <div className="mb-5">
+                  <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><MessageSquare size={14} className="text-pink-500" /> Social Analytics</h3>
+                  <p className="text-[10px] text-slate-400 mt-1">Connect Meta business accounts to pull performance analytics. Access tokens are stored as references only.</p>
+                </div>
+                <div className="space-y-3">
+                  {[
+                    { platform: 'whatsapp', label: 'WhatsApp Business', iconBg: 'bg-emerald-100', iconText: 'text-emerald-700', btnCls: 'bg-emerald-600 hover:bg-emerald-500', abbr: 'WA',
+                      fields: [
+                        { key: 'account_handle', label: 'Account Name', ph: 'My Business' },
+                        { key: 'page_id', label: 'WABA ID (Business Account)', ph: '123456789' },
+                        { key: 'phone_number_id', label: 'Phone Number ID', ph: '987654321' },
+                        { key: 'app_id', label: 'App ID', ph: '111222333' },
+                        { key: 'access_token_ref', label: 'System User Token', ph: 'EAAUâ€¦', secret: true },
+                      ]},
+                    { platform: 'instagram', label: 'Instagram Business', iconBg: 'bg-pink-100', iconText: 'text-pink-700', btnCls: 'bg-pink-600 hover:bg-pink-500', abbr: 'IG',
+                      fields: [
+                        { key: 'account_handle', label: 'Account Handle', ph: '@yourbrand' },
+                        { key: 'page_id', label: 'Business Account ID', ph: '123456789' },
+                        { key: 'app_id', label: 'App ID', ph: '111222333' },
+                        { key: 'access_token_ref', label: 'Page Access Token', ph: 'EAAUâ€¦', secret: true },
+                      ]},
+                    { platform: 'facebook', label: 'Facebook Page', iconBg: 'bg-blue-100', iconText: 'text-blue-700', btnCls: 'bg-blue-600 hover:bg-blue-500', abbr: 'FB',
+                      fields: [
+                        { key: 'account_handle', label: 'Page Name', ph: 'My Brand Page' },
+                        { key: 'page_id', label: 'Page ID', ph: '123456789' },
+                        { key: 'app_id', label: 'App ID', ph: '111222333' },
+                        { key: 'access_token_ref', label: 'Page Access Token', ph: 'EAAUâ€¦', secret: true },
+                      ]},
+                  ].map(({ platform, label, iconBg, iconText, btnCls, abbr, fields }) => {
+                    const acct = socialAccounts.find(a => a.platform === platform);
+                    const isEditing = editingSocialPlatform === platform;
+                    return (
+                      <div key={platform} className="border border-slate-200 rounded-lg overflow-hidden">
+                        <div className="flex items-center justify-between p-3 bg-slate-50">
+                          <div className="flex items-center gap-3">
+                            <div className={`w-8 h-8 rounded-full ${iconBg} flex items-center justify-center ${iconText} text-xs font-bold flex-shrink-0`}>{abbr}</div>
+                            <div>
+                              <p className="text-sm font-medium text-slate-700">{label}</p>
+                              <p className="text-[10px] text-slate-400">{acct ? `Connected â€” ${acct.account_handle || acct.page_id || ''}` : 'Not configured'}</p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {acct && <span className={`text-[10px] px-2 py-0.5 rounded font-medium ${acct.is_active !== false ? 'bg-green-50 text-green-600' : 'bg-gray-100 text-gray-400'}`}>{acct.is_active !== false ? 'Active' : 'Inactive'}</span>}
+                            {isAdmin && <button onClick={() => { if (isEditing) { setEditingSocialPlatform(null); } else { setEditingSocialPlatform(platform); setSocialDraft(acct ? { account_handle: acct.account_handle || '', page_id: acct.page_id || '', access_token_ref: '', app_id: acct.app_id || '', phone_number_id: acct.phone_number_id || '' } : { account_handle: '', page_id: '', access_token_ref: '', app_id: '', phone_number_id: '' }); } }} className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-lg text-xs text-slate-600 font-medium">{isEditing ? 'Close' : acct ? 'Edit' : 'Configure'}</button>}
+                            {isAdmin && acct && <button onClick={async () => { if (!window.confirm(`Disconnect ${label}?`)) return; await api.delete(`/social/accounts/${acct.id}`).catch(() => null); setSocialAccounts(prev => prev.filter(x => x.id !== acct.id)); if (editingSocialPlatform === platform) setEditingSocialPlatform(null); }} className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>}
+                          </div>
+                        </div>
+                        {isEditing && (
+                          <div className="p-4 bg-white border-t border-slate-100 space-y-3">
+                            <div className="grid grid-cols-2 gap-3">
+                              {fields.map(f => (
+                                <div key={f.key}>
+                                  <label className="text-[10px] text-slate-400 font-medium mb-1 block">{f.label}</label>
+                                  <input type={f.secret ? 'password' : 'text'} value={socialDraft[f.key] || ''} onChange={ev => setSocialDraft(p => ({...p, [f.key]: ev.target.value}))} placeholder={f.ph} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" />
+                                </div>
+                              ))}
+                            </div>
+                            <div className="flex gap-2">
+                              <button onClick={async () => {
+                                const payload = { ...socialDraft, platform };
+                                let r;
+                                if (acct) {
+                                  r = await api.put(`/social/accounts/${acct.id}`, payload).catch(() => null);
+                                  if (r?.data) setSocialAccounts(prev => prev.map(x => x.id === acct.id ? r.data : x));
+                                } else {
+                                  r = await api.post('/social/accounts', payload).catch(() => null);
+                                  if (r?.data) setSocialAccounts(prev => [...prev, r.data]);
+                                }
+                                if (r) setEditingSocialPlatform(null);
+                              }} className={`px-4 py-2 text-white rounded-lg text-xs font-medium ${btnCls}`}>{acct ? 'Update' : 'Connect'}</button>
+                              <button onClick={() => setEditingSocialPlatform(null)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              )}
+            </div>
+          )}
+
+          {/* â•â•â• COMPANY â•â•â• */}
+          {activeTab === 'company' && company && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-slate-900">Company Profile</h2>
+
+              {/* Profile preview card */}
+              <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 rounded-xl p-5 flex items-center gap-5">
+                {company.logo_url
+                  ? <img src={company.logo_url} alt="logo" className="w-16 h-16 rounded-xl object-cover border border-white shadow" />
+                  : <div className="w-16 h-16 rounded-xl bg-white border border-blue-200 shadow flex items-center justify-center"><Building2 size={28} className="text-blue-400" /></div>
+                }
+                <div>
+                  <p className="text-base font-bold text-slate-900">{company.company_name || 'Your Company'}</p>
+                  {company.tagline && <p className="text-xs text-slate-500 italic mt-0.5">{company.tagline}</p>}
+                  {company.industry && <span className="mt-1 inline-block text-[10px] font-medium bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">{company.industry}</span>}
+                </div>
+              </div>
+
+              {/* â”€â”€ Brand Identity â”€â”€ */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                <div className="flex items-center gap-2 mb-1"><Briefcase size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Brand Identity</span></div>
+                <div><label className="text-xs text-slate-400 mb-1 block">Company Name <span className="text-red-400">*</span></label><input value={company.company_name || ''} onChange={(e) => setCompany({...company, company_name: e.target.value})} placeholder="Acme Corp" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div><label className="text-xs text-slate-400 mb-1 block">Tagline</label><input value={company.tagline || ''} onChange={(e) => setCompany({...company, tagline: e.target.value})} placeholder="A short catchy phrase that describes your brand" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div><label className="text-xs text-slate-400 mb-1 block">Industry</label>
+                  <select value={company.industry || ''} onChange={(e) => setCompany({...company, industry: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">
+                    <option value="">â€” Select industry â€”</option>
+                    {['Technology', 'E-commerce', 'Finance & Banking', 'Healthcare', 'Education', 'Real Estate', 'Marketing & Advertising', 'Logistics', 'Hospitality', 'Retail', 'Manufacturing', 'Consulting', 'Other'].map(i => <option key={i} value={i}>{i}</option>)}
+                  </select>
+                </div>
+                <div><label className="text-xs text-slate-400 mb-1 block">Description</label><textarea value={company.description || ''} onChange={(e) => setCompany({...company, description: e.target.value})} rows={3} placeholder="Brief description of your company â€” the AI will use this when introducing itself to customers." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div><label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Image size={11} /> Logo URL</label><input value={company.logo_url || ''} onChange={(e) => setCompany({...company, logo_url: e.target.value})} placeholder="https://yourcompany.com/logo.png" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+              </div>
+
+              {/* â”€â”€ Contact Info â”€â”€ */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                <div className="flex items-center gap-2 mb-1"><Phone size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Contact Information</span></div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><label className="text-xs text-slate-400 mb-1 block">Phone Number</label><input value={company.phone || ''} onChange={(e) => setCompany({...company, phone: e.target.value})} placeholder="+1 555 000 0000" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                  <div><label className="text-xs text-slate-400 mb-1 block">Support Email</label><input type="email" value={company.support_email || ''} onChange={(e) => setCompany({...company, support_email: e.target.value})} placeholder="support@yourcompany.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                </div>
+                <div><label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Globe size={11} /> Website</label><input value={company.website_address || ''} onChange={(e) => setCompany({...company, website_address: e.target.value})} placeholder="https://yourcompany.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+              </div>
+
+              {/* â”€â”€ Address â”€â”€ */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                <div className="flex items-center gap-2 mb-1"><MapPin size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Address</span></div>
+                <div><label className="text-xs text-slate-400 mb-1 block">Street Address</label><input value={company.address_line1 || ''} onChange={(e) => setCompany({...company, address_line1: e.target.value})} placeholder="123 Main St, Suite 400" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><label className="text-xs text-slate-400 mb-1 block">City</label><input value={company.city || ''} onChange={(e) => setCompany({...company, city: e.target.value})} placeholder="San Francisco" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                  <div><label className="text-xs text-slate-400 mb-1 block">State / Province</label><input value={company.state || ''} onChange={(e) => setCompany({...company, state: e.target.value})} placeholder="CA" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><label className="text-xs text-slate-400 mb-1 block">Country</label><input value={company.country || ''} onChange={(e) => setCompany({...company, country: e.target.value})} placeholder="United States" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                  <div><label className="text-xs text-slate-400 mb-1 block">Postal Code</label><input value={company.postal_code || ''} onChange={(e) => setCompany({...company, postal_code: e.target.value})} placeholder="94105" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                </div>
+              </div>
+
+              {/* â”€â”€ Social Links â”€â”€ */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                <div className="flex items-center gap-2 mb-1"><Link2 size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Social Links</span></div>
+                <div className="grid grid-cols-2 gap-4">
+                  {[['linkedin', 'LinkedIn', 'https://linkedin.com/company/...'], ['twitter', 'Twitter / X', 'https://twitter.com/...'], ['facebook', 'Facebook', 'https://facebook.com/...'], ['instagram', 'Instagram', 'https://instagram.com/...']]
+                    .map(([key, label, ph]) => (
+                      <div key={key}>
+                        <label className="text-xs text-slate-400 mb-1 block">{label}</label>
+                        <input value={(company.social_links || {})[key] || ''} onChange={(e) => setCompany({...company, social_links: {...(company.social_links || {}), [key]: e.target.value}})} placeholder={ph} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" />
+                      </div>
+                    ))
+                  }
+                </div>
+              </div>
+
+              {/* â”€â”€ Locale â”€â”€ */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                <div className="flex items-center gap-2 mb-1"><Globe size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Locale</span></div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><label className="text-xs text-slate-400 mb-1 block">Timezone</label><select value={company.timezone || 'UTC'} onChange={(e) => setCompany({...company, timezone: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">{[
+                        { value: 'UTC', label: 'UTC / GMT (+00:00)' },
+                        { value: 'Pacific/Honolulu', label: 'Hawaii (HST, -10:00)' },
+                        { value: 'America/Anchorage', label: 'Alaska (AKST, -09:00)' },
+                        { value: 'America/Los_Angeles', label: 'Pacific Time - Los Angeles (PST, -08:00)' },
+                        { value: 'America/Vancouver', label: 'Pacific Time - Vancouver (PST, -08:00)' },
+                        { value: 'America/Denver', label: 'Mountain Time - Denver (MST, -07:00)' },
+                        { value: 'America/Phoenix', label: 'Arizona - Phoenix (MST, -07:00)' },
+                        { value: 'America/Chicago', label: 'Central Time - Chicago (CST, -06:00)' },
+                        { value: 'America/Mexico_City', label: 'Mexico City (CST, -06:00)' },
+                        { value: 'America/New_York', label: 'Eastern Time - New York (EST, -05:00)' },
+                        { value: 'America/Toronto', label: 'Eastern Time - Toronto (EST, -05:00)' },
+                        { value: 'America/Bogota', label: 'Bogota (COT, -05:00)' },
+                        { value: 'America/Lima', label: 'Lima (PET, -05:00)' },
+                        { value: 'America/Caracas', label: 'Caracas (VET, -04:00)' },
+                        { value: 'America/Halifax', label: 'Atlantic Time - Halifax (AST, -04:00)' },
+                        { value: 'America/Santiago', label: 'Santiago (CLT, -04:00)' },
+                        { value: 'America/St_Johns', label: 'Newfoundland (NST, -03:30)' },
+                        { value: 'America/Sao_Paulo', label: 'Sao Paulo (BRT, -03:00)' },
+                        { value: 'America/Argentina/Buenos_Aires', label: 'Buenos Aires (ART, -03:00)' },
+                        { value: 'Atlantic/Reykjavik', label: 'Reykjavik (GMT, +00:00)' },
+                        { value: 'Europe/London', label: 'London (GMT/BST, +00:00)' },
+                        { value: 'Europe/Dublin', label: 'Dublin (GMT/IST, +00:00)' },
+                        { value: 'Europe/Lisbon', label: 'Lisbon (WET, +00:00)' },
+                        { value: 'Africa/Casablanca', label: 'Casablanca (WET, +00:00)' },
+                        { value: 'Europe/Paris', label: 'Paris (CET, +01:00)' },
+                        { value: 'Europe/Berlin', label: 'Berlin (CET, +01:00)' },
+                        { value: 'Europe/Madrid', label: 'Madrid (CET, +01:00)' },
+                        { value: 'Europe/Rome', label: 'Rome (CET, +01:00)' },
+                        { value: 'Europe/Amsterdam', label: 'Amsterdam (CET, +01:00)' },
+                        { value: 'Europe/Brussels', label: 'Brussels (CET, +01:00)' },
+                        { value: 'Europe/Zurich', label: 'Zurich (CET, +01:00)' },
+                        { value: 'Europe/Vienna', label: 'Vienna (CET, +01:00)' },
+                        { value: 'Europe/Stockholm', label: 'Stockholm (CET, +01:00)' },
+                        { value: 'Europe/Oslo', label: 'Oslo (CET, +01:00)' },
+                        { value: 'Europe/Copenhagen', label: 'Copenhagen (CET, +01:00)' },
+                        { value: 'Europe/Warsaw', label: 'Warsaw (CET, +01:00)' },
+                        { value: 'Europe/Prague', label: 'Prague (CET, +01:00)' },
+                        { value: 'Europe/Budapest', label: 'Budapest (CET, +01:00)' },
+                        { value: 'Africa/Lagos', label: 'Lagos / West Africa (WAT, +01:00)' },
+                        { value: 'Europe/Helsinki', label: 'Helsinki (EET, +02:00)' },
+                        { value: 'Europe/Athens', label: 'Athens (EET, +02:00)' },
+                        { value: 'Europe/Bucharest', label: 'Bucharest (EET, +02:00)' },
+                        { value: 'Europe/Kyiv', label: 'Kyiv (EET, +02:00)' },
+                        { value: 'Africa/Cairo', label: 'Cairo (EET, +02:00)' },
+                        { value: 'Africa/Johannesburg', label: 'Johannesburg (SAST, +02:00)' },
+                        { value: 'Asia/Jerusalem', label: 'Jerusalem (IST, +02:00)' },
+                        { value: 'Asia/Beirut', label: 'Beirut (EET, +02:00)' },
+                        { value: 'Europe/Istanbul', label: 'Istanbul (TRT, +03:00)' },
+                        { value: 'Europe/Moscow', label: 'Moscow (MSK, +03:00)' },
+                        { value: 'Asia/Baghdad', label: 'Baghdad (AST, +03:00)' },
+                        { value: 'Asia/Riyadh', label: 'Riyadh (AST, +03:00)' },
+                        { value: 'Asia/Qatar', label: 'Qatar (AST, +03:00)' },
+                        { value: 'Africa/Nairobi', label: 'Nairobi / East Africa (EAT, +03:00)' },
+                        { value: 'Asia/Tehran', label: 'Tehran (IRST, +03:30)' },
+                        { value: 'Asia/Dubai', label: 'Dubai (GST, +04:00)' },
+                        { value: 'Asia/Muscat', label: 'Muscat (GST, +04:00)' },
+                        { value: 'Asia/Karachi', label: 'Karachi / Pakistan (PKT, +05:00)' },
+                        { value: 'Asia/Tashkent', label: 'Tashkent (UZT, +05:00)' },
+                        { value: 'Asia/Kolkata', label: 'India / Kolkata (IST, +05:30)' },
+                        { value: 'Asia/Colombo', label: 'Colombo (IST, +05:30)' },
+                        { value: 'Asia/Kathmandu', label: 'Kathmandu (NPT, +05:45)' },
+                        { value: 'Asia/Dhaka', label: 'Dhaka (BST, +06:00)' },
+                        { value: 'Asia/Almaty', label: 'Almaty (ALMT, +06:00)' },
+                        { value: 'Asia/Yangon', label: 'Yangon (MMT, +06:30)' },
+                        { value: 'Asia/Bangkok', label: 'Bangkok (ICT, +07:00)' },
+                        { value: 'Asia/Jakarta', label: 'Jakarta (WIB, +07:00)' },
+                        { value: 'Asia/Ho_Chi_Minh', label: 'Ho Chi Minh City (ICT, +07:00)' },
+                        { value: 'Asia/Shanghai', label: 'China / Shanghai (CST, +08:00)' },
+                        { value: 'Asia/Hong_Kong', label: 'Hong Kong (HKT, +08:00)' },
+                        { value: 'Asia/Taipei', label: 'Taipei (CST, +08:00)' },
+                        { value: 'Asia/Singapore', label: 'Singapore (SGT, +08:00)' },
+                        { value: 'Asia/Kuala_Lumpur', label: 'Kuala Lumpur (MYT, +08:00)' },
+                        { value: 'Asia/Manila', label: 'Manila (PHT, +08:00)' },
+                        { value: 'Asia/Seoul', label: 'Seoul (KST, +09:00)' },
+                        { value: 'Asia/Tokyo', label: 'Tokyo (JST, +09:00)' },
+                        { value: 'Australia/Perth', label: 'Perth (AWST, +08:00)' },
+                        { value: 'Australia/Darwin', label: 'Darwin (ACST, +09:30)' },
+                        { value: 'Australia/Adelaide', label: 'Adelaide (ACST, +09:30)' },
+                        { value: 'Australia/Brisbane', label: 'Brisbane (AEST, +10:00)' },
+                        { value: 'Australia/Sydney', label: 'Sydney (AEST, +10:00)' },
+                        { value: 'Australia/Melbourne', label: 'Melbourne (AEST, +10:00)' },
+                        { value: 'Pacific/Auckland', label: 'Auckland (NZST, +12:00)' },
+                        { value: 'Pacific/Fiji', label: 'Fiji (FJT, +12:00)' },
+                      ].map(tz => <option key={tz.value} value={tz.value}>{tz.label}</option>)}</select></div>
+                  <div><label className="text-xs text-slate-400 mb-1 block">Language</label><select value={company.language || 'en'} onChange={(e) => setCompany({...company, language: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">{[['en','English'],['es','Spanish'],['fr','French'],['de','German'],['pt','Portuguese'],['ar','Arabic'],['ja','Japanese'],['ko','Korean'],['zh','Chinese']].map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button onClick={saveCompany} disabled={saving === 'company'} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"><Save size={14} /> {saving === 'company' ? 'Savingâ€¦' : 'Save Company Profile'}</button>
+                {saving === 'company_done' && <span className="flex items-center gap-1 text-emerald-600 text-xs"><Check size={13} /> Saved</span>}
+              </div>
+            </div>
+          )}
+
+          {/* â•â•â• AI CONFIG â•â•â• */}
+          {activeTab === 'ai' && company && (
+            <AiSettingsTab
+              company={company} setCompany={setCompany} saveCompany={saveCompany}
+              saving={saving} setSaving={setSaving}
+              llmEngines={llmEngines} selectedLlmEngine={selectedLlmEngine} refreshAiConfig={refreshAiConfig}
+              aiAgents={aiAgents} setAiAgents={setAiAgents}
+              editingLlmId={editingLlmId} setEditingLlmId={setEditingLlmId} llmDraft={llmDraft} setLlmDraft={setLlmDraft}
+              showAddLlmForm={showAddLlmForm} setShowAddLlmForm={setShowAddLlmForm} addLlmForm={addLlmForm} setAddLlmForm={setAddLlmForm}
+              editingAgentId={editingAgentId} setEditingAgentId={setEditingAgentId} agentDraft={agentDraft} setAgentDraft={setAgentDraft}
+              showAddAgentForm={showAddAgentForm} setShowAddAgentForm={setShowAddAgentForm} addAgentForm={addAgentForm} setAddAgentForm={setAddAgentForm}
+              isAdmin={isAdmin}
+            />
+          )}
+
+
+          {/* â•â•â• TEMPLATES â•â•â• */}
+          {activeTab === 'templates' && (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between"><h2 className="text-lg font-semibold text-slate-900">Response Templates</h2><button onClick={() => setShowTemplateForm(true)} className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500"><Plus size={14} /> New Template</button></div>
+              <div className="space-y-3">{templates.map(tmpl => (<div key={tmpl.id} className="bg-white border border-slate-100 rounded-xl p-4 flex items-start justify-between"><div><h4 className="text-sm font-medium text-slate-700">{tmpl.name}</h4><p className="text-xs text-slate-400 mt-1">{tmpl.content}</p><div className="flex gap-2 mt-2"><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-400">{tmpl.category}</span><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-400">{tmpl.channel}</span></div></div><button onClick={() => deleteTemplate(tmpl.id)} className="text-slate-400 hover:text-red-500 p-1"><Trash2 size={14} /></button></div>))}{templates.length === 0 && <p className="text-center text-slate-400 text-sm py-8">No templates yet</p>}</div>
+              {showTemplateForm && (<div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4"><div className="bg-white rounded-2xl w-full max-w-lg p-6"><div className="flex items-center justify-between mb-6"><h3 className="text-lg font-bold text-slate-900">New Template</h3><button onClick={() => setShowTemplateForm(false)} className="text-slate-400"><X size={20} /></button></div><div className="space-y-4"><input value={templateForm.name} onChange={(e) => setTemplateForm({...templateForm, name: e.target.value})} placeholder="Template Name" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /><textarea value={templateForm.content} onChange={(e) => setTemplateForm({...templateForm, content: e.target.value})} placeholder="Template content..." rows={4} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm resize-none" /><button onClick={createTemplate} className="w-full py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium">Create Template</button></div></div></div>)}
+
+              {/* â•â•â• FAQs â•â•â• */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <div className="flex items-center justify-between mb-4"><div className="flex items-center gap-2"><HelpCircle size={16} className="text-blue-600" /><h3 className="text-sm font-semibold text-slate-900">FAQs ({faqs.length})</h3></div><button onClick={() => setShowFaqForm(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700"><Plus size={12} /> Add FAQ</button></div>
+                <div className="space-y-2">{faqs.map(f => (<div key={f.id} className="flex items-start justify-between p-3 bg-slate-50 rounded-lg border border-slate-100"><div><h4 className="text-sm font-medium text-slate-800">Q: {f.question}</h4><p className="text-xs text-slate-500 mt-0.5">A: {f.answer}</p></div><button onClick={() => deleteFaq(f.id)} className="text-slate-400 hover:text-red-500 p-1"><Trash2 size={14} /></button></div>))}{faqs.length === 0 && <p className="text-center text-slate-400 text-sm py-4">No FAQs added yet.</p>}</div>
+              </div>
+              {showFaqForm && (<div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4"><div className="bg-white rounded-2xl w-full max-w-lg p-6"><div className="flex items-center justify-between mb-4"><h3 className="text-lg font-bold text-slate-900">Add FAQ</h3><button onClick={() => setShowFaqForm(false)} className="text-slate-400"><X size={20} /></button></div><div className="space-y-3"><input value={faqForm.question} onChange={(e) => setFaqForm({...faqForm, question: e.target.value})} placeholder="Question *" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm" /><textarea value={faqForm.answer} onChange={(e) => setFaqForm({...faqForm, answer: e.target.value})} placeholder="Answer *" rows={3} className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm resize-none" /><button onClick={createFaq} className="w-full py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium">Add FAQ</button></div></div></div>)}
+            </div>
+          )}
+
+          {/* â•â•â• TEAM MEMBERS â•â•â• */}
+          {activeTab === 'users' && (
+            <div className="space-y-6">
+              {onboardingInviteMode && (
+                <div className="rounded-2xl border border-blue-200 bg-blue-50 px-5 py-4">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-blue-900">Final onboarding step: invite your first teammate</p>
+                      <p className="text-xs text-blue-700 mt-1">
+                        We brought you straight to the add-user page after company setup. Send an invite now, or continue to billing and add teammates later from Settings.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => navigate('/billing', { replace: true })}
+                      className="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800"
+                    >
+                      Continue to Billing
+                    </button>
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center justify-between">
+                <div><h2 className="text-lg font-semibold text-slate-900">Team Members</h2>
+                <p className="text-sm text-slate-400">{onboardingInviteMode ? 'Invite a teammate to finish setup, then continue to billing.' : isAdmin ? 'Full access: edit roles, change passwords, delete members' : 'View only'}</p></div>
+                {isAdmin && (
+                  <button
+                    onClick={() => {
+                      const firstRole = availableCreateRoles[0] || '';
+                      setCreateUserForm((prev) => ({ ...prev, role: firstRole }));
+                      setShowCreateUserModal(true);
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500"
+                    data-testid="add-team-user-btn"
+                  >
+                    <Plus size={14} /> Add User
+                  </button>
+                )}
+              </div>
+              <div className="bg-white border border-slate-100 rounded-xl overflow-hidden">
+                <table className="w-full">
+                  <thead><tr className="border-b border-slate-100">
+                    <th className="text-left text-xs text-slate-400 font-medium px-5 py-3">User</th>
+                    <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Role</th>
+                    <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Sub Role</th>
+                    <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Status</th>
+                    <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Last Login</th>
+                    <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Actions</th>
+                  </tr></thead>
+                  <tbody>
+                    {users.map(u => (
+                      <tr key={u.id} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
+                        <td className="px-5 py-3"><div className="flex items-center gap-3"><div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center text-xs font-bold text-blue-600">{u.name?.charAt(0)}</div><div><p className="text-sm text-slate-700 font-medium">{u.name}</p><p className="text-[11px] text-slate-400">{u.email}</p></div></div></td>
+                        <td className="px-4 py-3"><span className={`text-xs px-2 py-0.5 rounded font-medium ${u.role === 'admin' ? 'bg-red-50 text-red-600' : u.role === 'company_agent' ? 'bg-green-50 text-green-600' : 'bg-slate-100 text-slate-500'}`}>{ROLE_LABELS[u.role] || u.role}</span></td>
+                        <td className="px-4 py-3 text-xs text-slate-500">{u.sub_role || '-'}</td>
+                        <td className="px-4 py-3"><span className={`text-xs px-2 py-0.5 rounded ${u.status === 'active' ? 'bg-emerald-50 text-emerald-600' : 'bg-gray-100 text-slate-400'}`}>{u.status}</span></td>
+                        <td className="px-4 py-3 text-xs text-slate-400">{u.last_login ? new Date(u.last_login).toLocaleDateString() : 'Never'}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5">
+                            {/* Edit Button - Admin only */}
+                            {isAdmin && u.id !== user?.id && (
+                              <button onClick={() => openEditUser(u)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Edit user"><Edit size={13} /></button>
+                            )}
+                            {/* Password Change - Admin or self */}
+                            {(isAdmin || u.id === user?.id) && u.auth_provider !== 'google' && (
+                              <button onClick={() => openPasswordModal(u)} className="p-1.5 text-slate-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors" title="Change password"><Lock size={13} /></button>
+                            )}
+                            {/* Delete - Admin only */}
+                            {isAdmin && u.id !== user?.id && (
+                              <button onClick={() => deleteUser(u)} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete user"><UserMinus size={13} /></button>
+                            )}
+                            {u.auth_provider === 'google' && <span className="text-[10px] text-slate-300 italic ml-1">Google Auth</span>}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                    {users.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="px-5 py-8 text-center text-sm text-slate-400">
+                          {onboardingInviteMode ? 'No teammates invited yet. Use Add User to send the first invitation.' : 'No team members found.'}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              {/* Permissions info */}
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                <h4 className="text-xs font-semibold text-slate-600 mb-2">Role Permissions</h4>
+                <div className="grid grid-cols-2 gap-3 text-[11px] text-slate-500">
+                  <div><span className="font-medium text-red-600">Admin:</span> Full access - add, edit, delete users and configure everything</div>
+                  <div><span className="font-medium text-green-600">Agent:</span> Inbox, leads, customers, tickets</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* â•â•â• WEBHOOKS â•â•â• */}
+          {activeTab === 'webhooks' && (
+            <div className="space-y-6">
+              <div><h2 className="text-lg font-semibold text-slate-900 mb-1">Webhook Integration</h2><p className="text-sm text-slate-400">Connect your social media platforms using these webhook URLs</p></div>
+
+              {webhookInfo ? (
+                <>
+                  {/* Webhook URLs */}
+                  <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                    <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-2"><Link2 size={16} className="text-blue-600" /> Webhook URLs</h3>
+                    {Object.entries(webhookInfo.webhook_urls || {}).map(([key, url]) => (
+                      <div key={key} className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200">
+                        <span className="text-xs font-medium text-slate-600 w-24 capitalize">{key.replace('_', ' ')}</span>
+                        <code className="flex-1 text-[11px] text-slate-500 font-mono bg-white px-3 py-1.5 rounded border border-slate-200 truncate">{url}</code>
+                        <button onClick={() => copyToClipboard(url)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Copy"><Copy size={14} /></button>
+                      </div>
+                    ))}
+                    <div className="flex items-center gap-2 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                      <Key size={14} className="text-blue-600" />
+                      <span className="text-xs text-blue-700">Verify Token: <code className="font-mono bg-white px-2 py-0.5 rounded border border-blue-200">{webhookInfo.verify_token}</code></span>
+                      <button onClick={() => copyToClipboard(webhookInfo.verify_token)} className="ml-auto text-blue-400 hover:text-blue-600"><Copy size={12} /></button>
+                    </div>
+                  </div>
+
+                  {/* Setup Guides */}
+                  {Object.entries(webhookInfo.setup_guide || {}).map(([platform, guide]) => (
+                    <div key={platform} className="bg-white border border-slate-100 rounded-xl p-6">
+                      <h3 className="text-sm font-semibold text-slate-800 mb-3 capitalize flex items-center gap-2">
+                        <MessageSquare size={16} className={platform === 'whatsapp' ? 'text-emerald-500' : platform === 'facebook' ? 'text-blue-500' : platform === 'instagram' ? 'text-pink-500' : platform === 'email' ? 'text-sky-500' : 'text-violet-500'} />
+                        {platform.replace('_', ' ')} Setup
+                      </h3>
+                      <ol className="space-y-2">
+                        {(guide.steps || []).map((step, i) => (
+                          <li key={i} className="flex items-start gap-2">
+                            <span className="text-[10px] w-5 h-5 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0 font-medium text-slate-500 mt-0.5">{i + 1}</span>
+                            <span className="text-xs text-slate-600">{step.replace(/^\d+\.\s*/, '')}</span>
+                          </li>
+                        ))}
+                      </ol>
+                      {guide.fields_to_subscribe && (
+                        <div className="mt-3 flex items-center gap-2">
+                          <span className="text-[10px] text-slate-400">Subscribe to:</span>
+                          {guide.fields_to_subscribe.map(f => (
+                            <span key={f} className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded font-mono">{f}</span>
+                          ))}
+                        </div>
+                      )}
+                      {guide.sample_payload && (
+                        <div className="mt-3 bg-slate-50 rounded-lg p-3">
+                          <p className="text-[10px] text-slate-400 mb-1">Sample Payload:</p>
+                          <pre className="text-[10px] text-slate-600 font-mono whitespace-pre-wrap">{JSON.stringify(guide.sample_payload, null, 2)}</pre>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                    <h4 className="text-sm font-medium text-amber-800 mb-2">How Lead Capture Works</h4>
+                    <ul className="space-y-1 text-xs text-amber-700">
+                      <li>â€¢ When someone sends a message via WhatsApp/Facebook/Instagram/Email/Chat Widget, they're automatically added as a lead</li>
+                      <li>â€¢ Social media ad form submissions are captured via the Lead Form webhook</li>
+                      <li>â€¢ AI automatically scores each new lead and determines their nurturing phase</li>
+                      <li>â€¢ Nurture messages are auto-generated based on lead score and phase</li>
+                    </ul>
+                  </div>
+                </>
+              ) : (
+                <div className="text-center py-10 text-slate-400"><p className="text-sm">Loading webhook information...</p></div>
+              )}
+            </div>
+          )}
+
+          {/* â•â•â• INTEGRATIONS â•â•â• */}
+          {activeTab === 'integrations' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900">Integrations</h2>
+                <p className="text-xs text-slate-400 mt-1">Connect external tool servers via Model Context Protocol (MCP).</p>
+              </div>
+
+              {/* MCP Servers */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Globe size={14} className="text-emerald-500" /> MCP Servers ({mcpServers.length})</h3>
+                    <p className="text-[10px] text-slate-400 mt-0.5">Model Context Protocol servers â€” connect external AI tool servers.</p>
+                  </div>
+                  {isAdmin && <button onClick={() => { setShowAddMcpForm(true); setAddMcpForm({ endpoint: '', region: '', status: 'active' }); }} className="flex items-center gap-1 px-2.5 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500"><Plus size={12} /> Add Server</button>}
+                </div>
+                {mcpServers.length === 0 ? (
+                  <p className="text-xs text-slate-400 py-3">No MCP servers registered yet.</p>
+                ) : (
+                  <div className="space-y-3">{mcpServers.map(s => (
+                    <div key={s.id} className="border border-slate-200 rounded-lg overflow-hidden">
+                      <div className="flex items-center justify-between p-3 bg-slate-50">
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-medium text-slate-700 font-mono truncate">{s.endpoint || 'â€”'}</p>
+                          <p className="text-[10px] text-slate-400">Region: {s.region || 'â€”'} | Status: {s.status || 'active'}</p>
+                        </div>
+                        <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+                          <button onClick={async () => { const newStatus = s.status === 'active' ? 'inactive' : 'active'; const r = await api.put(`/mcp/servers/${s.id}`, { status: newStatus }).catch(() => null); if (r) setMcpServers(prev => prev.map(x => x.id === s.id ? { ...x, status: newStatus } : x)); }} className={`relative w-9 h-5 rounded-full transition-colors ${s.status === 'active' ? 'bg-green-500' : 'bg-gray-300'}`}><span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${s.status === 'active' ? 'translate-x-4' : ''}`} /></button>
+                          {isAdmin && <button onClick={() => { setEditingMcpId(editingMcpId === s.id ? null : s.id); setMcpDraft({ endpoint: s.endpoint || '', region: s.region || '', status: s.status || 'active' }); }} className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>}
+                          {isAdmin && <button onClick={async () => { if (!window.confirm('Remove this MCP server?')) return; await api.delete(`/mcp/servers/${s.id}`).catch(() => null); setMcpServers(prev => prev.filter(x => x.id !== s.id)); }} className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>}
+                        </div>
+                      </div>
+                      {editingMcpId === s.id && (
+                        <div className="p-4 bg-white border-t border-slate-100 space-y-3">
+                          <div className="grid grid-cols-2 gap-3">
+                            <div className="col-span-2"><label className="text-[10px] text-slate-400 font-medium mb-1 block">Endpoint URL *</label><input value={mcpDraft.endpoint} onChange={ev => setMcpDraft(p => ({...p, endpoint: ev.target.value}))} placeholder="https://mcp.example.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /></div>
+                            <div><label className="text-[10px] text-slate-400 font-medium mb-1 block">Region</label><input value={mcpDraft.region} onChange={ev => setMcpDraft(p => ({...p, region: ev.target.value}))} placeholder="us-east-1" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
+                            <div><label className="text-[10px] text-slate-400 font-medium mb-1 block">Status</label><select value={mcpDraft.status} onChange={ev => setMcpDraft(p => ({...p, status: ev.target.value}))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm"><option value="active">Active</option><option value="inactive">Inactive</option><option value="maintenance">Maintenance</option></select></div>
+                          </div>
+                          <div className="flex gap-2">
+                            <button onClick={async () => { const r = await api.put(`/mcp/servers/${s.id}`, mcpDraft).catch(() => null); if (r) { setMcpServers(prev => prev.map(x => x.id === s.id ? { ...x, ...r.data } : x)); setEditingMcpId(null); } }} className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500">Save Changes</button>
+                            <button onClick={() => setEditingMcpId(null)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}</div>
+                )}
+                {showAddMcpForm && (
+                  <div className="mt-4 border border-emerald-200 bg-emerald-50/40 rounded-xl p-4 space-y-3">
+                    <p className="text-xs font-semibold text-emerald-700">Register MCP Server</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="col-span-2"><label className="text-[10px] text-slate-400 font-medium mb-1 block">Endpoint URL *</label><input value={addMcpForm.endpoint} onChange={ev => setAddMcpForm(p => ({...p, endpoint: ev.target.value}))} placeholder="https://mcp.example.com" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-mono" /></div>
+                      <div><label className="text-[10px] text-slate-400 font-medium mb-1 block">Region</label><input value={addMcpForm.region} onChange={ev => setAddMcpForm(p => ({...p, region: ev.target.value}))} placeholder="us-east-1" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm" /></div>
+                      <div><label className="text-[10px] text-slate-400 font-medium mb-1 block">Status</label><select value={addMcpForm.status} onChange={ev => setAddMcpForm(p => ({...p, status: ev.target.value}))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"><option value="active">Active</option><option value="inactive">Inactive</option></select></div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={async () => { if (!addMcpForm.endpoint.trim()) return; const r = await api.post('/mcp/servers', addMcpForm).catch(() => null); if (r?.data) { setMcpServers(prev => [r.data, ...prev]); setShowAddMcpForm(false); } }} className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500">Register Server</button>
+                      <button onClick={() => setShowAddMcpForm(false)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* â•â•â• UNIFICATION â•â•â• */}
+          {activeTab === 'unification' && (
+            <UnificationTab
+              isAdmin={isAdmin}
+              unificationLoading={unificationLoading} runAutoDetect={runAutoDetect}
+              unifiedProfiles={unifiedProfiles} mergeSuggestions={mergeSuggestions}
+              acceptSuggestion={acceptSuggestion} rejectSuggestion={rejectSuggestion}
+              manualMergeIds={manualMergeIds} setManualMergeIds={setManualMergeIds} manualMerge={manualMerge}
+              selectedUnifiedProfile={selectedUnifiedProfile} setSelectedUnifiedProfile={setSelectedUnifiedProfile}
+              suggestionDetail={suggestionDetail} setSuggestionDetail={setSuggestionDetail}
+              splitFromProfile={splitFromProfile}
+            />
+          )}
+
+          {/* â•â•â• SYSTEM LOGS â•â•â• */}
+          {activeTab === 'logs' && (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-slate-900">System Logs</h2>
+                <button onClick={() => api.get('/system/logs?limit=50').then(r => setSystemLogs(r.data || [])).catch(() => {})} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 rounded-lg text-xs text-slate-600 hover:bg-slate-200">
+                  <Activity size={12} /> Refresh
+                </button>
+              </div>
+              {systemLogs.length === 0 ? (
+                <div className="text-center py-12 text-slate-400 text-sm">No system logs recorded yet.</div>
+              ) : (
+                <div className="bg-white border border-slate-100 rounded-xl overflow-hidden">
+                  <table className="w-full">
+                    <thead><tr className="border-b border-slate-100">
+                      <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Time</th>
+                      <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Level</th>
+                      <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Action</th>
+                      <th className="text-left text-xs text-slate-400 font-medium px-4 py-3">Details</th>
+                    </tr></thead>
+                    <tbody>
+                      {systemLogs.map(l => (
+                        <tr key={l.id} className="border-b border-slate-50">
+                          <td className="px-4 py-2.5 text-xs text-slate-400 whitespace-nowrap">{new Date(l.created_at).toLocaleString()}</td>
+                          <td className="px-4 py-2.5"><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${l.level === 'error' ? 'bg-red-50 text-red-600' : l.level === 'warn' ? 'bg-amber-50 text-amber-600' : 'bg-slate-100 text-slate-500'}`}>{l.level || 'info'}</span></td>
+                          <td className="px-4 py-2.5 text-xs text-slate-600">{l.action}</td>
+                          <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[300px] truncate">{typeof l.details === 'object' ? JSON.stringify(l.details) : l.details || '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* â•â•â• NOTIFICATIONS â•â•â• */}
+          {activeTab === 'notifications' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900 mb-1">Notification Preferences</h2>
+                <p className="text-sm text-slate-400">Control which in-app and email notifications you receive.</p>
+              </div>
+
+              {!notifSettings ? (
+                <div className="flex items-center justify-center py-16 text-slate-400 text-sm">Loadingâ€¦</div>
+              ) : (
+                <>
+                  {/* In-app notifications */}
+                  <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-1">
+                    <h3 className="text-sm font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                      <Bell size={15} className="text-blue-500" /> In-App Notifications
+                    </h3>
+                    {[
+                      { key: 'notify_new_message',           label: 'New message received',           desc: 'Get notified when a customer sends a new message' },
+                      { key: 'notify_new_lead',              label: 'New lead created',                desc: 'Get notified when a new lead is added' },
+                      { key: 'notify_new_ticket',            label: 'New support ticket',              desc: 'Get notified when a new ticket is opened' },
+                      { key: 'notify_ticket_updated',        label: 'Ticket status updated',           desc: 'Get notified when a ticket status changes' },
+                      { key: 'notify_conversation_assigned', label: 'Conversation assigned to you',    desc: 'Get notified when a conversation is assigned to you' },
+                      { key: 'notify_system_updates',        label: 'System & setup reminders',        desc: 'Setup tips, feature announcements, and system alerts' },
+                    ].map(item => (
+                      <div key={item.key} className="flex items-center justify-between py-3 border-b border-slate-50 last:border-0">
+                        <div>
+                          <p className="text-sm font-medium text-slate-700">{item.label}</p>
+                          <p className="text-xs text-slate-400 mt-0.5">{item.desc}</p>
+                        </div>
+                        <button
+                          onClick={() => setNotifSettings(prev => ({ ...prev, [item.key]: !prev[item.key] }))}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors duration-200 focus:outline-none ${notifSettings[item.key] ? 'bg-blue-500' : 'bg-slate-200'}`}
+                        >
+                          <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform duration-200 ${notifSettings[item.key] ? 'translate-x-4' : 'translate-x-1'}`} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Email digest */}
+                  <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
+                    <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-indigo-500"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>
+                      Email Digest
+                    </h3>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium text-slate-700">Receive email digest</p>
+                        <p className="text-xs text-slate-400 mt-0.5">Get a summary of activity sent to your email</p>
+                      </div>
+                      <button
+                        onClick={() => setNotifSettings(prev => ({ ...prev, email_digest: !prev.email_digest }))}
+                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors duration-200 ${notifSettings.email_digest ? 'bg-blue-500' : 'bg-slate-200'}`}
+                      >
+                        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform duration-200 ${notifSettings.email_digest ? 'translate-x-4' : 'translate-x-1'}`} />
+                      </button>
+                    </div>
+                    {notifSettings.email_digest && (
+                      <div>
+                        <label className="text-xs text-slate-500 font-medium mb-1.5 block">Frequency</label>
+                        <div className="flex gap-2">
+                          {['daily', 'weekly', 'never'].map(freq => (
+                            <button
+                              key={freq}
+                              onClick={() => setNotifSettings(prev => ({ ...prev, email_digest_frequency: freq }))}
+                              className={`px-4 py-1.5 rounded-lg text-xs font-medium border transition-colors capitalize ${notifSettings.email_digest_frequency === freq ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                            >
+                              {freq}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={saveNotifSettings}
+                      disabled={notifSaving}
+                      className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"
+                    >
+                      {notifSaving ? 'Savingâ€¦' : notifSaved ? <><Check size={14} /> Saved</> : <><Save size={14} /> Save preferences</>}
+                    </button>
+                    {notifSaved && <span className="text-xs text-emerald-600 font-medium">Preferences updated!</span>}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* â•â•â• SECURITY â•â•â• */}
+          {activeTab === 'security' && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-slate-900">Security Center</h2>
+
+              {oauthLinkBanner ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                  {oauthLinkBanner}
+                </div>
+              ) : null}
+
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <h3 className="text-sm font-semibold text-slate-800 mb-2 flex items-center gap-2">
+                  <Link2 size={16} className="text-blue-600" /> Linked sign-in (Google / Facebook)
+                </h3>
+                <p className="text-xs text-slate-500 mb-4">
+                  Link a social account so you can use &quot;Continue with Google&quot; or &quot;Continue with
+                  Facebook&quot; for this workspace. The provider email must match your account email (
+                  {user?.email || '—'}).
+                </p>
+                {user?.role === 'super_admin' ? (
+                  <p className="text-xs text-slate-500">Not available for platform super admins.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => startOAuthLink('google')}
+                      disabled={!!oauthLinkBusy}
+                      className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {oauthLinkBusy === 'google' ? 'Opening…' : 'Link Google'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => startOAuthLink('facebook')}
+                      disabled={!!oauthLinkBusy}
+                      className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {oauthLinkBusy === 'facebook' ? 'Opening…' : 'Link Facebook'}
+                    </button>
+                  </div>
+                )}
+                <div className="mt-4 space-y-1">
+                  <p className="text-xs font-medium text-slate-600">Connected providers</p>
+                  {(!user?.oauth_providers || user.oauth_providers.length === 0) ? (
+                    <p className="text-xs text-slate-400">None linked yet.</p>
+                  ) : (
+                    user.oauth_providers.map((row) => (
+                      <div
+                        key={`${row.provider}-${row.provider_id || ''}`}
+                        className="text-xs text-slate-600 flex justify-between gap-2 border border-slate-100 rounded px-2 py-1.5"
+                      >
+                        <span className="font-medium capitalize">{row.provider || '—'}</span>
+                        <span
+                          className="font-mono text-slate-400 truncate max-w-[180px]"
+                          title={row.provider_id || ''}
+                        >
+                          {maskOAuthSubject(row.provider_id)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Overview Cards */}
+              {securityOverview && (
+                <div className="grid grid-cols-4 gap-4">
+                  {[
+                    { label: 'Total Users', value: securityOverview.total_users, bgClass: 'bg-blue-50 border-blue-200', textClass: 'text-blue-600' },
+                    { label: 'Active Sessions', value: securityOverview.active_sessions, bgClass: 'bg-green-50 border-green-200', textClass: 'text-green-600' },
+                    { label: 'API Keys', value: securityOverview.active_api_keys, bgClass: 'bg-purple-50 border-purple-200', textClass: 'text-purple-600' },
+                    { label: 'Pending Resets', value: securityOverview.pending_password_resets, bgClass: 'bg-amber-50 border-amber-200', textClass: 'text-amber-600' },
+                  ].map(s => (
+                    <div key={s.label} className={`${s.bgClass} border rounded-xl p-4 text-center`}>
+                      <p className={`text-2xl font-bold ${s.textClass}`}>{s.value}</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">{s.label}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Password Policy */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <h3 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2"><Shield size={16} className="text-emerald-600" /> Password Policy</h3>
+                <div className="grid grid-cols-2 gap-3">
+                  {[
+                    { label: 'Minimum Length', value: '8 characters', active: true },
+                    { label: 'Requires Letters', value: 'Yes', active: true },
+                    { label: 'Requires Numbers', value: 'Yes', active: true },
+                    { label: 'Requires Special Characters', value: 'Yes', active: true },
+                    { label: 'JWT Token Expiry', value: '8 hours', active: true },
+                    { label: 'Session Expiry', value: '7 days', active: true },
+                  ].map(p => (
+                    <div key={p.label} className="flex items-center justify-between p-2.5 bg-slate-50 rounded-lg">
+                      <span className="text-xs text-slate-600">{p.label}</span>
+                      <span className="text-xs font-medium text-emerald-600 flex items-center gap-1"><CheckCircle size={12} /> {p.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Active Sessions */}
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <h3 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2"><Activity size={16} className="text-blue-600" /> Active Sessions ({sessions.length})</h3>
+                <div className="space-y-2">
+                  {sessions.slice(0, 10).map(s => (
+                    <div key={s.session_token || s.id} className="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-100">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center text-xs font-bold text-blue-600">{(s.user_name || '?').charAt(0)}</div>
+                        <div>
+                          <p className="text-xs font-medium text-slate-700">{s.user_name || 'Unknown'}</p>
+                          <p className="text-[10px] text-slate-400">{s.user_email} â€¢ {new Date(s.created_at).toLocaleDateString()}</p>
+                        </div>
+                      </div>
+                      {isAdmin && (
+                        <button onClick={() => revokeSession(s.session_token)} className="text-[10px] px-2 py-1 text-red-500 hover:bg-red-50 rounded border border-red-200">Revoke</button>
+                      )}
+                    </div>
+                  ))}
+                  {sessions.length === 0 && <p className="text-center text-slate-400 text-xs py-4">No active sessions</p>}
+                </div>
+              </div>
+
+              {/* API Keys */}
+              {isAdmin && (
+                <div className="bg-white border border-slate-100 rounded-xl p-6">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-2"><Key size={16} className="text-purple-600" /> API Keys ({apiKeys.length})</h3>
+                    <button onClick={() => setShowApiKeyForm(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 text-white rounded-lg text-xs font-medium hover:bg-purple-500"><Plus size={12} /> Generate Key</button>
+                  </div>
+
+                  {newApiKey && (
+                    <div className="mb-4 bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+                      <p className="text-xs text-emerald-700 mb-1 font-medium">New API Key (copy now - won't be shown again):</p>
+                      <div className="flex items-center gap-2">
+                        <code className="flex-1 text-[11px] font-mono bg-white px-2 py-1 rounded border border-emerald-200 break-all">{newApiKey}</code>
+                        <button onClick={() => { copyToClipboard(newApiKey); }} className="p-1.5 text-emerald-600 hover:bg-emerald-100 rounded"><Copy size={14} /></button>
+                      </div>
+                      <button onClick={() => setNewApiKey('')} className="mt-2 text-[10px] text-slate-400 hover:text-slate-600">Dismiss</button>
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    {apiKeys.map(k => (
+                      <div key={k.id} className="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-100">
+                        <div>
+                          <p className="text-xs font-medium text-slate-700">{k.name}</p>
+                          <p className="text-[10px] text-slate-400 font-mono">{k.key_prefix} â€¢ Created by {k.created_by_name} â€¢ {new Date(k.created_at).toLocaleDateString()}</p>
+                        </div>
+                        <button onClick={() => revokeApiKey(k.id)} className="text-[10px] px-2 py-1 text-red-500 hover:bg-red-50 rounded border border-red-200">Revoke</button>
+                      </div>
+                    ))}
+                    {apiKeys.length === 0 && <p className="text-center text-slate-400 text-xs py-4">No API keys generated</p>}
+                  </div>
+
+                  {showApiKeyForm && (
+                    <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                      <div className="bg-white rounded-2xl w-full max-w-sm p-6">
+                        <h3 className="text-lg font-bold text-slate-900 mb-4">Generate API Key</h3>
+                        <input value={apiKeyName} onChange={(e) => setApiKeyName(e.target.value)} placeholder="Key name (e.g., Production API)" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm mb-4" />
+                        <div className="flex gap-3">
+                          <button onClick={() => setShowApiKeyForm(false)} className="flex-1 py-2 text-sm text-slate-600 bg-slate-100 rounded-xl">Cancel</button>
+                          <button onClick={createApiKey} disabled={!apiKeyName.trim()} className="flex-1 py-2 text-sm text-white bg-purple-600 rounded-xl disabled:opacity-50">Generate</button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Danger Zone */}
+              <div className="bg-white border border-red-200 rounded-xl p-6 space-y-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <div className="flex items-center gap-2"><Trash2 size={13} className="text-red-500" /><span className="text-[11px] font-semibold text-red-500 uppercase tracking-wider">Danger Zone</span></div>
+                    <h3 className="text-sm font-semibold text-slate-900 mt-2">Delete Account</h3>
+                    <p className="text-xs text-slate-500 mt-1">This permanently deletes your sign-in account. Verification is required through your current password or an emailed fingerprint before deletion is allowed.</p>
+                  </div>
+                  <button onClick={openDeleteAccountModal} className="inline-flex items-center gap-2 px-4 py-2.5 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-500 transition-colors shrink-0">
+                    <Trash2 size={14} />
+                    Delete Account
+                  </button>
+                </div>
+              </div>
+
+              {/* Security Status */}
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+                <div className="flex items-start gap-3">
+                  <Shield size={16} className="text-emerald-600 mt-0.5" />
+                  <div>
+                    <h4 className="text-sm font-medium text-emerald-700">Security Status: Good</h4>
+                    <p className="text-xs text-emerald-600 mt-1">All communications are encrypted with TLS 1.3. JWT tokens expire after 8 hours. Sessions expire after 7 days. Passwords require 8+ characters with letters, numbers, and special characters.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* company-data tab removed â€” products managed via /products page */}
+          {false && (
+            <div className="space-y-6">
+              <div><h2 className="text-lg font-semibold text-slate-900 mb-1">Company Products</h2><p className="text-sm text-slate-400">Product data feeds into the AI to provide accurate, personalized responses.</p></div>
+              <div className="bg-white border border-slate-100 rounded-xl p-6">
+                <div className="flex items-center justify-between mb-4"><div className="flex items-center gap-2"><Package size={16} className="text-blue-600" /><h3 className="text-sm font-semibold text-slate-900">Products & Services ({products.length})</h3></div><button onClick={() => setShowProductForm(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700"><Plus size={12} /> Add Product</button></div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {products.map(p => (
+                    <div
+                      key={p.id}
+                      onClick={() => setSelectedProduct(p)}
+                      className="bg-white border border-slate-100 rounded-xl overflow-hidden hover:border-blue-200 hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 cursor-pointer group"
+                    >
+                      <div className="h-32 bg-slate-50 overflow-hidden relative">
+                        {Array.isArray(p.images) && p.images.length > 0 ? (
+                          p.images.length === 1 ? (
+                            <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
+                          ) : p.images.length === 2 ? (
+                            <div className="grid grid-cols-2 h-full gap-0.5">
+                              <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
+                              <img src={p.images[1]} alt={p.name} className="w-full h-full object-cover" />
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-2 h-full gap-0.5">
+                              <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
+                              <div className="grid grid-rows-2 gap-0.5">
+                                <img src={p.images[1]} alt={p.name} className="w-full h-full object-cover" />
+                                <div className="relative">
+                                  <img src={p.images[2]} alt={p.name} className="w-full h-full object-cover" />
+                                  {p.images.length > 3 && <div className="absolute inset-0 bg-black/40 flex items-center justify-center"><span className="text-white text-[11px] font-bold">+{p.images.length - 3}</span></div>}
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-blue-50 to-slate-100">
+                            <Package size={28} className="text-blue-200" />
+                          </div>
+                        )}
+                      </div>
+                      <div className="p-3">
+                        <h4 className="text-sm font-semibold text-slate-800 truncate group-hover:text-blue-700 transition-colors">{p.name}</h4>
+                        {p.product_title && <p className="text-xs text-slate-500 truncate mt-0.5">{p.product_title}</p>}
+                        <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                          {p.price && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200 font-medium">{p.price_currency ? `${p.price_currency} ${p.price}` : p.price}</span>}
+                          {p.product_type && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200">{p.product_type}</span>}
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">{p.category}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {products.length === 0 && <p className="col-span-3 text-center text-slate-400 text-sm py-8">No products added yet.</p>}
+                </div>
+              </div>
+              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4"><div className="flex items-start gap-3"><Bot size={16} className="text-blue-600 mt-0.5" /><div><h4 className="text-sm font-medium text-blue-800">How this works</h4><p className="text-xs text-blue-600 mt-1 leading-relaxed">Products and FAQs are automatically used by AI (Gemini 2.5 Flash/Pro) when responding to messages and scoring leads.</p></div></div></div>
+              {showProductForm && (
+                <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                  <div className="bg-white rounded-2xl w-full max-w-2xl p-6">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-lg font-bold text-slate-900">{editingProduct ? 'Edit Product' : 'Add Product'}</h3>
+                      <button onClick={resetProductForm} className="text-slate-400"><X size={20} /></button>
+                    </div>
+                    <div className="space-y-3">
+                      <input value={productForm.name} onChange={(e) => setProductForm({ ...productForm, name: e.target.value })} placeholder="Product Name *" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm" />
+                      <input value={productForm.product_title || ''} onChange={(e) => setProductForm({ ...productForm, product_title: e.target.value })} placeholder="Product Code" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm" />
+                      <input value={productForm.product_type || ''} onChange={(e) => setProductForm({ ...productForm, product_type: e.target.value })} placeholder="Type Variety (exact product type)" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm" />
+                      <div className="relative group/descwrap">
+                        <textarea
+                          value={productForm.description}
+                          onChange={(e) => setProductForm({ ...productForm, description: e.target.value })}
+                          placeholder="Describe this product â€” or let AI write it for you."
+                          rows={3}
+                          className="w-full px-3 py-2.5 pb-10 bg-white border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                        />
+                        {/* AI Generate button area â€” always visible */}
+                        <div className="absolute bottom-2.5 right-2.5 group/aibtn">
+
+                          {/* Hover tooltip â€” content changes based on locked state */}
+                          <div className="absolute bottom-full right-0 mb-2.5 w-64 bg-slate-900 rounded-xl p-3.5 shadow-2xl opacity-0 group-hover/aibtn:opacity-100 pointer-events-none transition-all duration-200 translate-y-1 group-hover/aibtn:translate-y-0 z-20">
+                            {!productForm.name ? (
+                              <>
+                                <p className="text-[11px] font-semibold text-amber-400 uppercase tracking-wide mb-1.5">ðŸ”’ One thing missing</p>
+                                <p className="text-xs text-slate-300 leading-relaxed mb-3">AI needs at least a product name to craft a great description. Fill in what you can â€” more detail = better copy.</p>
+                                <div className="space-y-2">
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-4 h-4 rounded-full bg-red-500/20 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" /></span>
+                                    <span className="text-xs text-red-300 font-medium">Product Name <span className="text-red-500/70 text-[10px]">â† start here</span></span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-slate-500" /></span>
+                                    <span className="text-xs text-slate-400">Type / Variety <span className="text-slate-600 text-[10px]">optional but helpful</span></span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-slate-500" /></span>
+                                    <span className="text-xs text-slate-400">Images <span className="text-slate-600 text-[10px]">optional â€” AI uses if present</span></span>
+                                  </div>
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <p className="text-[11px] font-semibold text-emerald-400 uppercase tracking-wide mb-1.5">âœ¦ Ready to generate</p>
+                                <p className="text-xs text-slate-300 leading-relaxed mb-3">AI will use all filled fields to write a ~100-word marketing description. Images are included if uploaded.</p>
+                                <div className="space-y-2">
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-4 h-4 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0"><Check size={9} className="text-emerald-400" /></span>
+                                    <span className="text-xs text-emerald-300">Product Name</span>
+                                  </div>
+                                  {productForm.product_type && <div className="flex items-center gap-2">
+                                    <span className="w-4 h-4 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0"><Check size={9} className="text-emerald-400" /></span>
+                                    <span className="text-xs text-emerald-300">Type / Variety</span>
+                                  </div>}
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-4 h-4 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0"><Check size={9} className="text-emerald-400" /></span>
+                                    <span className="text-xs text-emerald-300">Category <span className="text-slate-500 text-[10px]">({productForm.category})</span></span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    {productForm.images?.length > 0
+                                      ? <span className="w-4 h-4 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0"><Check size={9} className="text-emerald-400" /></span>
+                                      : <span className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-slate-500" /></span>}
+                                    <span className={`text-xs ${productForm.images?.length > 0 ? 'text-emerald-300' : 'text-slate-400'}`}>Images <span className="text-slate-600 text-[10px]">{productForm.images?.length > 0 ? `${productForm.images.length} uploaded` : 'none â€” text only'}</span></span>
+                                  </div>
+                                </div>
+                              </>
+                            )}
+                            <div className="absolute -bottom-[5px] right-5 w-2.5 h-2.5 bg-slate-900 rotate-45 rounded-sm" />
+                          </div>
+
+                          {/* Nudge message shown when clicking while locked */}
+                          {genDescNudge && (
+                            <div className="absolute bottom-full right-0 mb-10 w-56 bg-amber-950/95 border border-amber-500/30 rounded-xl px-3.5 py-2.5 shadow-2xl z-30 pointer-events-none">
+                              <p className="text-xs text-amber-300 font-medium leading-snug">Give me a name first! ðŸŽ¯</p>
+                              <p className="text-[11px] text-amber-400/70 mt-0.5">Fill in <span className="text-amber-300 font-semibold">Product Name</span> above to unlock AI writing.</p>
+                              <div className="absolute -bottom-[5px] right-5 w-2.5 h-2.5 bg-amber-950 rotate-45 rounded-sm border-r border-b border-amber-500/30" />
+                            </div>
+                          )}
+
+                          {/* The button â€” always clickable, style reflects locked/unlocked */}
+                          <button
+                            type="button"
+                            onClick={generateProductDescription}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 ${
+                              generatingDesc
+                                ? 'bg-gradient-to-r from-indigo-500 to-violet-500 text-white shadow-md shadow-indigo-200 cursor-wait'
+                                : productForm.name
+                                  ? 'bg-gradient-to-r from-indigo-500 to-violet-500 text-white shadow-md shadow-indigo-200 hover:from-indigo-600 hover:to-violet-600 hover:shadow-lg hover:shadow-indigo-300 hover:-translate-y-px active:translate-y-0 cursor-pointer'
+                                  : `bg-slate-800/80 text-slate-400 border border-slate-700/60 cursor-pointer hover:bg-slate-700/80 hover:text-slate-300 ${genDescNudge ? 'animate-bounce' : ''}`
+                            }`}
+                          >
+                            {generatingDesc ? (
+                              <><div className="w-3 h-3 border-[1.5px] border-white/30 border-t-white rounded-full animate-spin" /><span>Writingâ€¦</span></>
+                            ) : productForm.name ? (
+                              <><Wand2 size={11} /><span>Generate with AI</span></>
+                            ) : (
+                              <><Lock size={10} /><span>Generate with AI</span></>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="flex rounded-lg border border-slate-200 overflow-hidden bg-white">
+                          <input
+                            value={productForm.price}
+                            onChange={(e) => setProductForm({ ...productForm, price: e.target.value })}
+                            placeholder="Price"
+                            className="w-[75%] px-3 py-2.5 text-sm bg-white focus:outline-none"
+                          />
+                          <div className="w-px bg-slate-200 flex-shrink-0" />
+                          <select
+                            value={productForm.price_currency}
+                            onChange={(e) => setProductForm({ ...productForm, price_currency: e.target.value })}
+                            className="w-[25%] px-1 py-2.5 text-xs bg-slate-50 text-slate-600 focus:outline-none appearance-none text-center cursor-pointer"
+                          >
+                            <option value="USD">USD</option>
+                            <option value="EUR">EUR</option>
+                            <option value="GBP">GBP</option>
+                            <option value="INR">INR</option>
+                            <option value="JPY">JPY</option>
+                            <option value="CAD">CAD</option>
+                            <option value="AUD">AUD</option>
+                            <option value="AED">AED</option>
+                            <option value="SGD">SGD</option>
+                            <option value="CHF">CHF</option>
+                          </select>
+                        </div>
+                        <select value={productForm.category} onChange={(e) => setProductForm({ ...productForm, category: e.target.value })} className="px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm">
+                          <option value="general">General</option><option value="software">Software</option><option value="service">Service</option><option value="hardware">Hardware</option><option value="subscription">Subscription</option><option value="consulting">Consulting</option><option value="support">Support</option><option value="training">Training</option><option value="integration">Integration</option>
+                        </select>
+                      </div>
+
+                      <div
+                        onDragOver={(e) => { e.preventDefault(); setProductDragActive(true); }}
+                        onDragLeave={() => setProductDragActive(false)}
+                        onDrop={(e) => { e.preventDefault(); setProductDragActive(false); handleProductFiles(e.dataTransfer.files); }}
+                        className={`border-2 border-dashed rounded-lg p-4 transition-colors ${productDragActive ? 'border-blue-400 bg-blue-50' : 'border-slate-300 bg-slate-50'}`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-xs text-slate-500">Drag & drop up to {MAX_PRODUCT_IMAGES} images (JPG, PNG, WEBP, max {MAX_PRODUCT_IMAGE_SIZE_MB}MB each)</p>
+                          <label className="px-3 py-1.5 bg-white border border-slate-200 rounded-md text-xs font-medium text-slate-600 cursor-pointer hover:bg-slate-100">
+                            Choose Files
+                            <input
+                              type="file"
+                              accept="image/jpeg,image/png,image/webp"
+                              multiple
+                              className="hidden"
+                              onChange={(e) => handleProductFiles(e.target.files)}
+                            />
+                          </label>
+                        </div>
+                      </div>
+
+                      {productImageError && <p className="text-xs text-red-500">{productImageError}</p>}
+
+                      {(productForm.images || []).length > 0 && (
+                        <div className="grid grid-cols-3 gap-3">
+                          {productForm.images.map((img) => (
+                            <div key={img.id} className="relative rounded-lg overflow-hidden border border-slate-200 bg-white">
+                              <img src={img.dataUrl} alt={img.name} className="w-full h-24 object-cover" />
+                              <button onClick={() => removeProductImage(img.id)} className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/60 text-white text-xs flex items-center justify-center">Ã—</button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <button onClick={saveProduct} className="w-full py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium">{editingProduct ? 'Save Changes' : 'Add Product'}</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {selectedProduct && (
+                <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setSelectedProduct(null)}>
+                  <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg max-h-[82vh] overflow-y-auto shadow-xl" onClick={(e) => e.stopPropagation()}>
+                    {Array.isArray(selectedProduct.images) && selectedProduct.images.length > 0 && (
+                      <div className="h-52 overflow-hidden rounded-t-2xl bg-slate-100 relative">
+                        {selectedProduct.images.length === 1 ? (
+                          <img
+                            src={selectedProduct.images[0]} alt={selectedProduct.name}
+                            className="w-full h-full object-cover cursor-zoom-in"
+                            onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 0); }}
+                          />
+                        ) : selectedProduct.images.length === 2 ? (
+                          <div className="grid grid-cols-2 h-full gap-0.5">
+                            {selectedProduct.images.map((img, idx) => (
+                              <img key={idx} src={img} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
+                                onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, idx); }} />
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-2 h-full gap-0.5">
+                            <img src={selectedProduct.images[0]} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
+                              onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 0); }} />
+                            <div className="grid grid-rows-2 gap-0.5">
+                              <img src={selectedProduct.images[1]} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
+                                onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 1); }} />
+                              <div className="relative cursor-zoom-in" onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 2); }}>
+                                <img src={selectedProduct.images[2]} alt={selectedProduct.name} className="w-full h-full object-cover" />
+                                {selectedProduct.images.length > 3 && (
+                                  <div className="absolute inset-0 bg-black/50 flex items-center justify-center rounded-br-2xl">
+                                    <span className="text-white text-sm font-bold">+{selectedProduct.images.length - 3}</span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        <span className="absolute bottom-2 right-2 text-[10px] bg-black/50 text-white rounded-full px-2 py-0.5">{selectedProduct.images.length} photo{selectedProduct.images.length > 1 ? 's' : ''} Â· tap to expand</span>
+                      </div>
+                    )}
+                    <div className="p-6">
+                      <div className="flex items-start justify-between mb-5">
+                        <div className="min-w-0 pr-3">
+                          <h3 className="text-xl font-bold text-slate-900 truncate">{selectedProduct.name}</h3>
+                          {selectedProduct.product_title && <p className="text-sm text-slate-500 mt-0.5">{selectedProduct.product_title}</p>}
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <button
+                            onClick={() => { setSelectedProduct(null); openEditProduct(selectedProduct); }}
+                            className="px-2.5 py-1.5 bg-slate-50 border border-slate-200 text-slate-700 rounded-lg text-xs font-medium hover:bg-slate-100 transition-colors inline-flex items-center gap-1"
+                          >
+                            <Edit size={12} /> Edit
+                          </button>
+                          <button onClick={() => setSelectedProduct(null)} className="text-slate-400 hover:text-slate-600"><X size={20} /></button>
+                        </div>
+                      </div>
+                      <div className="space-y-3">
+                        {selectedProduct.description && (
+                          <div className="bg-slate-50 rounded-xl p-3">
+                            <p className="text-xs text-slate-400 font-medium mb-1">Description</p>
+                            <p className="text-sm text-slate-700 leading-relaxed">{selectedProduct.description}</p>
+                          </div>
+                        )}
+                        <div className="grid grid-cols-2 gap-3">
+                          {selectedProduct.price && (
+                            <div className="bg-green-50 border border-green-100 rounded-xl p-3">
+                              <p className="text-[10px] text-green-500 font-medium mb-0.5">Price</p>
+                              <p className="text-sm font-semibold text-green-700">{selectedProduct.price_currency ? `${selectedProduct.price_currency} ${selectedProduct.price}` : selectedProduct.price}</p>
+                            </div>
+                          )}
+                          {selectedProduct.product_type && (
+                            <div className="bg-blue-50 border border-blue-100 rounded-xl p-3">
+                              <p className="text-[10px] text-blue-500 font-medium mb-0.5">Type</p>
+                              <p className="text-sm font-semibold text-blue-700">{selectedProduct.product_type}</p>
+                            </div>
+                          )}
+                          <div className="bg-slate-50 border border-slate-100 rounded-xl p-3">
+                            <p className="text-[10px] text-slate-400 font-medium mb-0.5">Category</p>
+                            <p className="text-sm font-semibold text-slate-700 capitalize">{selectedProduct.category}</p>
+                          </div>
+                          {Array.isArray(selectedProduct.features) && selectedProduct.features.length > 0 && (
+                            <div className="bg-slate-50 border border-slate-100 rounded-xl p-3">
+                              <p className="text-[10px] text-slate-400 font-medium mb-1">Features</p>
+                              <ul className="space-y-0.5">{selectedProduct.features.slice(0, 4).map((f, i) => <li key={i} className="text-xs text-slate-600 flex items-start gap-1"><span className="text-blue-400 mt-0.5">â€¢</span>{f}</li>)}</ul>
+                            </div>
+                          )}
+                        </div>
+                        <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); if (window.confirm(`Delete "${selectedProduct.name}"?`)) { deleteProduct(selectedProduct.id); } }}
+                            className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"
+                          >
+                            <Trash2 size={13} /> Delete product
+                          </button>
+                          <button onClick={() => setSelectedProduct(null)} className="text-xs text-slate-400 hover:text-slate-600">Close</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* â•â•â• LIGHTBOX â•â•â• */}
+              {lightboxImages.length > 0 && (
+                <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center" onClick={closeLightbox}>
+                  <button onClick={(e) => { e.stopPropagation(); setLightboxIndex(i => (i - 1 + lightboxImages.length) % lightboxImages.length); }}
+                    className="absolute left-3 sm:left-6 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors z-10">
+                    <ChevronLeft size={22} />
+                  </button>
+                  <img
+                    src={lightboxImages[lightboxIndex]}
+                    alt={`Attachment ${lightboxIndex + 1}`}
+                    className="max-h-[88vh] max-w-[90vw] object-contain rounded-lg shadow-2xl"
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                  <button onClick={(e) => { e.stopPropagation(); setLightboxIndex(i => (i + 1) % lightboxImages.length); }}
+                    className="absolute right-3 sm:right-6 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors z-10">
+                    <ChevronRight size={22} />
+                  </button>
+                  <button onClick={closeLightbox} className="absolute top-4 right-4 w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center">
+                    <X size={18} />
+                  </button>
+                  <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex gap-1.5">
+                    {lightboxImages.map((_, idx) => (
+                      <button key={idx} onClick={(e) => { e.stopPropagation(); setLightboxIndex(idx); }}
+                        className={`w-1.5 h-1.5 rounded-full transition-colors ${idx === lightboxIndex ? 'bg-white' : 'bg-white/40'}`} />
+                    ))}
+                  </div>
+                  <span className="absolute top-4 left-1/2 -translate-x-1/2 text-white/70 text-xs">{lightboxIndex + 1} / {lightboxImages.length}</span>
+                </div>
+              )}
+
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      {deleteAccountModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-lg p-6 shadow-xl">
+            <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center">
+                  <Trash2 size={18} className="text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900">Delete Account</h3>
+                  <p className="text-xs text-slate-400">This action is permanent and cannot be undone.</p>
+                </div>
+              </div>
+              <button onClick={closeDeleteAccountModal} className="text-slate-400 p-1" disabled={deleteAccountSending || deleteAccountSubmitting}>
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+                <p className="text-sm font-medium text-red-700">Deleting this account removes your login access immediately after verification.</p>
+                <p className="text-xs text-red-600 mt-1">Use your current password or request a unique fingerprint by email.</p>
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-500 font-medium mb-2 block">Verification method</label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    disabled={user?.auth_provider !== 'email'}
+                    onClick={() => { setDeleteAccountMethod('password'); setDeleteAccountError(''); setDeleteAccountInfo(''); }}
+                    className={`rounded-xl border px-4 py-3 text-left transition-colors ${deleteAccountMethod === 'password' ? 'border-blue-300 bg-blue-50' : 'border-slate-200 bg-slate-50'} ${user?.auth_provider !== 'email' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <div className="flex items-center gap-2 text-sm font-medium text-slate-900"><Lock size={14} /> Password</div>
+                    <p className="text-xs text-slate-500 mt-1">Confirm with your current password.</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setDeleteAccountMethod('email'); setDeleteAccountError(''); setDeleteAccountInfo(''); }}
+                    className={`rounded-xl border px-4 py-3 text-left transition-colors ${deleteAccountMethod === 'email' ? 'border-blue-300 bg-blue-50' : 'border-slate-200 bg-slate-50'}`}
+                  >
+                    <div className="flex items-center gap-2 text-sm font-medium text-slate-900"><Mail size={14} /> Email fingerprint</div>
+                    <p className="text-xs text-slate-500 mt-1">Send a one-time fingerprint to {personalSettings?.email || user?.email}.</p>
+                  </button>
+                </div>
+              </div>
+
+              {deleteAccountMethod === 'password' ? (
+                <div>
+                  <label className="text-xs text-slate-500 font-medium mb-1.5 block">Current Password</label>
+                  <input
+                    type="password"
+                    value={deleteAccountPassword}
+                    onChange={(e) => setDeleteAccountPassword(e.target.value)}
+                    placeholder="Enter your current password"
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm"
+                  />
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex gap-3">
+                    <button onClick={sendDeleteVerificationFingerprint} disabled={deleteAccountSending} className="px-4 py-2.5 bg-slate-900 text-white rounded-xl text-sm font-medium disabled:opacity-50">
+                      {deleteAccountSending ? 'Sendingâ€¦' : 'Send Fingerprint'}
+                    </button>
+                    <div className="flex-1">
+                      <label className="text-xs text-slate-500 font-medium mb-1.5 block">Verification Fingerprint</label>
+                      <input
+                        value={deleteAccountCode}
+                        onChange={(e) => setDeleteAccountCode(e.target.value.toUpperCase())}
+                        placeholder="Enter the fingerprint from your email"
+                        className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm uppercase tracking-[0.2em]"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="text-xs text-slate-500 font-medium mb-1.5 block">Type DELETE to confirm</label>
+                <input
+                  value={deleteAccountConfirmText}
+                  onChange={(e) => setDeleteAccountConfirmText(e.target.value)}
+                  placeholder="DELETE"
+                  className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm"
+                />
+              </div>
+
+              {deleteAccountError && <div className="flex items-center gap-2 px-3 py-2 bg-red-50 border border-red-200 rounded-lg"><AlertCircle size={14} className="text-red-500" /><span className="text-xs text-red-600">{deleteAccountError}</span></div>}
+              {deleteAccountInfo && <div className="flex items-center gap-2 px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg"><CheckCircle size={14} className="text-blue-500" /><span className="text-xs text-blue-700">{deleteAccountInfo}</span></div>}
+
+              <div className="flex gap-3 pt-1">
+                <button onClick={closeDeleteAccountModal} disabled={deleteAccountSending || deleteAccountSubmitting} className="flex-1 py-2.5 text-sm font-medium text-slate-600 bg-slate-100 rounded-xl hover:bg-slate-200 disabled:opacity-50">Cancel</button>
+                <button onClick={handleDeleteAccount} disabled={deleteAccountSubmitting || deleteAccountSending} className="flex-1 py-2.5 text-sm font-medium text-white bg-red-600 rounded-xl hover:bg-red-500 disabled:opacity-50 flex items-center justify-center gap-2">
+                  {deleteAccountSubmitting ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Trash2 size={14} />}
+                  Delete Permanently
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {waQrModalOpen && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <QrCode size={20} className="text-emerald-600" />
+                <h3 className="text-lg font-bold text-slate-900">WhatsApp Web (QR)</h3>
+              </div>
+              <button type="button" onClick={closeWaQrModal} className="text-slate-400 p-1 hover:text-slate-600"><X size={20} /></button>
+            </div>
+            <p className="text-xs text-slate-500 mb-4">Open WhatsApp on your phone → Settings → Linked devices → Link a device, then scan the code below.</p>
+            {waQrError && (
+              <div className="mb-3 flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">{waQrError}</div>
+            )}
+            {waQrStatus && (
+              <p className="text-xs font-medium text-slate-600 mb-2">Status: <span className="text-emerald-700">{waQrStatus}</span></p>
+            )}
+            <div className="flex min-h-[220px] items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-4">
+              {waQrImageSrc ? (
+                <img src={waQrImageSrc} alt="WhatsApp QR" className="max-w-[240px] max-h-[240px] w-full h-auto" />
+              ) : (
+                <div className="text-center text-sm text-slate-500">
+                  {waQrLoading && !waQrError ? 'Waiting for QR from bridge…' : 'No QR yet. Start the bridge process and ensure WHATSAPP_BRIDGE_URL / WHATSAPP_BRIDGE_SECRET match the server.'}
+                </div>
+              )}
+            </div>
+            <p className="text-[10px] text-slate-400 mt-3">Bridge must map inbound to your company via BRIDGE_COMPANY_ID in the bridge environment.</p>
+            <div className="flex gap-2 mt-4">
+              <button type="button" onClick={() => fetchWaBridgeQr()} className="flex-1 py-2 text-sm font-medium text-slate-700 bg-slate-100 rounded-xl hover:bg-slate-200">Refresh</button>
+              <button type="button" onClick={closeWaQrModal} className="flex-1 py-2 text-sm font-medium text-white bg-emerald-600 rounded-xl hover:bg-emerald-500">Done</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* â•â•â• PASSWORD MODAL â•â•â• */}
+      {passwordModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+            <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center gap-3"><div className="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center"><Lock size={18} className="text-blue-600" /></div><div><h3 className="text-lg font-bold text-slate-900">Change Password</h3><p className="text-xs text-slate-400">{passwordModal.name} ({passwordModal.role})</p></div></div>
+              <button onClick={closePasswordModal} className="text-slate-400 p-1"><X size={20} /></button>
+            </div>
+            <div className="space-y-4">
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">New Password</label><div className="relative"><input type={showPassword ? 'text' : 'password'} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="Enter new password" className="w-full px-4 py-2.5 pr-10 bg-slate-50 border border-slate-200 rounded-xl text-sm" /><button onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" type="button">{showPassword ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></div>
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Confirm Password</label><input type={showPassword ? 'text' : 'password'} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} placeholder="Confirm new password" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              {newPassword.length > 0 && (<div className="bg-slate-50 rounded-xl p-3.5 space-y-1.5"><p className="text-[11px] font-semibold text-slate-500 mb-2">Password Requirements</p>{[{ label: 'At least 8 characters', met: newPassword.length >= 8 },{ label: 'Contains a letter', met: /[a-zA-Z]/.test(newPassword) },{ label: 'Contains a number', met: /[0-9]/.test(newPassword) },{ label: 'Contains a special character', met: PASSWORD_SPECIAL_CHAR_RE.test(newPassword) },{ label: 'Passwords match', met: confirmPassword.length > 0 && newPassword === confirmPassword },].map((r, i) => (<div key={i} className="flex items-center gap-2">{r.met ? <CheckCircle size={13} className="text-emerald-500" /> : <AlertCircle size={13} className="text-slate-300" />}<span className={`text-[11px] ${r.met ? 'text-emerald-600 font-medium' : 'text-slate-400'}`}>{r.label}</span></div>))}</div>)}
+              {passwordError && <div className="flex items-center gap-2 px-3 py-2 bg-red-50 border border-red-200 rounded-lg"><AlertCircle size={14} className="text-red-500" /><span className="text-xs text-red-600">{passwordError}</span></div>}
+              {passwordSuccess && <div className="flex items-center gap-2 px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-lg"><CheckCircle size={14} className="text-emerald-500" /><span className="text-xs text-emerald-600">{passwordSuccess}</span></div>}
+              <div className="flex gap-3 pt-1"><button onClick={closePasswordModal} className="flex-1 py-2.5 text-sm font-medium text-slate-600 bg-slate-100 rounded-xl hover:bg-slate-200">Cancel</button><button onClick={handlePasswordChange} disabled={passwordSaving || !passwordValidation.isValid || newPassword !== confirmPassword} className="flex-1 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-xl disabled:opacity-50 flex items-center justify-center gap-2">{passwordSaving ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Lock size={14} />} Update Password</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* â•â•â• EDIT USER MODAL â•â•â• */}
+      {showCreateUserModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="text-lg font-bold text-slate-900">Add Team User</h3>
+              <button onClick={() => setShowCreateUserModal(false)} className="text-slate-400"><X size={20} /></button>
+            </div>
+            <div className="space-y-4">
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Name</label><input value={createUserForm.name} onChange={(e) => setCreateUserForm({ ...createUserForm, name: e.target.value })} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Email</label><input value={createUserForm.email} onChange={(e) => setCreateUserForm({ ...createUserForm, email: e.target.value })} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              <div>
+                <label className="text-xs text-slate-500 font-medium mb-1.5 block">Role</label>
+                <select value={createUserForm.role} onChange={(e) => setCreateUserForm({ ...createUserForm, role: e.target.value })} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm">
+                  {availableCreateRoles.map((role) => (
+                    <option key={role} value={role}>{ROLE_LABELS[role] || (role.charAt(0).toUpperCase() + role.slice(1))}</option>
+                  ))}
+                </select>
+              </div>
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Sub Role</label><input value={createUserForm.sub_role} onChange={(e) => setCreateUserForm({ ...createUserForm, sub_role: e.target.value })} placeholder="e.g., Sales Lead, QA Specialist" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Status</label><select value={createUserForm.status} onChange={(e) => setCreateUserForm({ ...createUserForm, status: e.target.value })} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm"><option value="active">Active</option><option value="inactive">Inactive</option></select></div>
+              <p className="text-[11px] text-slate-500">A secure invitation email will be sent to this user. They will set their password when accepting the invite.</p>
+              <div className="flex gap-3 pt-1"><button onClick={() => setShowCreateUserModal(false)} className="flex-1 py-2.5 text-sm font-medium text-slate-600 bg-slate-100 rounded-xl">Cancel</button><button onClick={createUser} className="flex-1 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-xl">Send Invite</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editUserModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="text-lg font-bold text-slate-900">Edit User</h3>
+              <button onClick={() => setEditUserModal(null)} className="text-slate-400"><X size={20} /></button>
+            </div>
+            <div className="space-y-4">
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Name</label><input value={editUserForm.name || ''} onChange={(e) => setEditUserForm({...editUserForm, name: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Email</label><input value={editUserForm.email || ''} onChange={(e) => setEditUserForm({...editUserForm, email: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              {isAdmin && (
+                <div>
+                  <label className="text-xs text-slate-500 font-medium mb-1.5 block">Role</label>
+                  <select value={editUserForm.role || ''} onChange={(e) => setEditUserForm({...editUserForm, role: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm">
+                    {getAvailableEditRoles(editUserModal).map((role) => (
+                      <option key={role} value={role}>{ROLE_LABELS[role] || (role.charAt(0).toUpperCase() + role.slice(1))}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {isAdmin && (
+                <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Sub Role</label><input value={editUserForm.sub_role || ''} onChange={(e) => setEditUserForm({...editUserForm, sub_role: e.target.value})} placeholder="Custom sub role" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /></div>
+              )}
+              <div><label className="text-xs text-slate-500 font-medium mb-1.5 block">Status</label><select value={editUserForm.status || ''} onChange={(e) => setEditUserForm({...editUserForm, status: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm"><option value="active">Active</option><option value="inactive">Inactive</option></select></div>
+              <div className="flex gap-3 pt-1"><button onClick={() => setEditUserModal(null)} className="flex-1 py-2.5 text-sm font-medium text-slate-600 bg-slate-100 rounded-xl">Cancel</button><button onClick={saveUserEdit} className="flex-1 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-xl">Save Changes</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

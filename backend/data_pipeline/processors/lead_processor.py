@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+from services.ai_service.facade import generate_lead_score
+
+from data_pipeline.constants import RAW_LEAD_TABLE
+from data_pipeline.processors.base import ProcessorBase, row_to_dict
+from data_pipeline.storage import upsert_analytics_event, upsert_lead_metrics
+from data_pipeline.utils import (
+    metric_date_for,
+    normalize_email,
+    normalize_phone,
+    parse_timestamp,
+    safe_int,
+)
+
+
+class LeadProcessor(ProcessorBase):
+    async def process(self, raw_record: dict) -> dict:
+        payload = dict(raw_record.get("payload") or {})
+        metadata = dict(raw_record.get("metadata") or {})
+        lead_id = str(raw_record.get("canonical_lead_id") or payload.get("id") or "").strip()
+        lead_row = {}
+        if lead_id:
+            lead_row = row_to_dict(await self.db.fetchrow("SELECT * FROM leads WHERE id=$1 LIMIT 1", lead_id))
+
+        lead_data = {**payload, **lead_row}
+        lead_data["company_id"] = raw_record.get("company_id", lead_data.get("company_id", ""))
+        lead_data["id"] = lead_id or str(lead_data.get("id") or "")
+        lead_data["email"] = normalize_email(lead_data.get("email"))
+        lead_data["phone"] = normalize_phone(lead_data.get("phone"))
+        lead_data["name"] = str(lead_data.get("name") or "").strip()
+        lead_data["source"] = str(lead_data.get("source") or raw_record.get("source") or "lead").strip().lower()
+        lead_data["status"] = str(lead_data.get("status") or "new").strip().lower()
+        lead_data["phase"] = str(lead_data.get("phase") or "awareness").strip().lower()
+        lead_data["grade"] = str(lead_data.get("grade") or "cold").strip().lower()
+
+        duplicate_count = 0
+        duplicate_filters = []
+        duplicate_args = [raw_record.get("company_id", "")]
+        if lead_data["email"]:
+            duplicate_filters.append(f"LOWER(email)=${len(duplicate_args) + 1}")
+            duplicate_args.append(lead_data["email"])
+        if lead_data["phone"]:
+            duplicate_filters.append(f"phone=${len(duplicate_args) + 1}")
+            duplicate_args.append(lead_data["phone"])
+        if duplicate_filters:
+            exclusion = ""
+            if lead_data["id"]:
+                exclusion = f" AND id<>${len(duplicate_args) + 1}"
+                duplicate_args.append(lead_data["id"])
+            duplicate_count = int(
+                await self.db.fetchval(
+                    f"SELECT COUNT(*) FROM leads WHERE company_id=$1 AND ({' OR '.join(duplicate_filters)}){exclusion}",
+                    *duplicate_args,
+                )
+                or 0
+            )
+        converted_count = 0
+        if lead_data["id"]:
+            converted_count = int(
+                await self.db.fetchval(
+                    "SELECT COUNT(*) FROM customers WHERE company_id=$1 AND lead_id=$2",
+                    raw_record.get("company_id", ""),
+                    lead_data["id"],
+                )
+                or 0
+            )
+        is_converted = bool(metadata.get("is_converted")) or converted_count > 0
+        ai_score = await generate_lead_score(
+            lead_data,
+            db=self.db,
+            company_id=raw_record.get("company_id", ""),
+        )
+        occurred_at = parse_timestamp(raw_record.get("occurred_at"))
+        metric = await upsert_lead_metrics(
+            self.db,
+            {
+                "company_id": raw_record.get("company_id", ""),
+                "lead_id": lead_data.get("id") or raw_record.get("dedupe_key", ""),
+                "metric_date": metric_date_for(occurred_at),
+                "source": lead_data.get("source", ""),
+                "status": lead_data.get("status", ""),
+                "phase": lead_data.get("phase", ""),
+                "grade": lead_data.get("grade", ""),
+                "name": lead_data.get("name", ""),
+                "email": lead_data.get("email", ""),
+                "phone": lead_data.get("phone", ""),
+                "current_score": safe_int(lead_data.get("score"), 0),
+                "recommended_score": safe_int(
+                    ai_score.get("score"),
+                    safe_int(lead_data.get("score"), 0),
+                ),
+                "recommended_grade": str(ai_score.get("grade") or lead_data.get("grade") or ""),
+                "scoring_reason": str(ai_score.get("reasoning") or lead_data.get("scoring_reason") or ""),
+                "next_action": str(ai_score.get("next_action") or lead_data.get("next_action") or ""),
+                "duplicate_count": duplicate_count,
+                "is_duplicate": duplicate_count > 0,
+                "is_converted": is_converted,
+                "payload": {
+                    "raw_source": raw_record.get("source", ""),
+                    "action": metadata.get("action", "lead_snapshot"),
+                    "current_phase": lead_data.get("phase", ""),
+                    "recommended_phase": ai_score.get("phase", ""),
+                    "raw_payload": payload,
+                },
+            },
+        )
+        event_kind = str(metadata.get("action") or "lead_snapshot").strip().lower()
+        analytics_event = await upsert_analytics_event(
+            self.db,
+            {
+                "company_id": raw_record.get("company_id", ""),
+                "raw_table": RAW_LEAD_TABLE,
+                "raw_id": raw_record.get("id", ""),
+                "event_kind": event_kind,
+                "event_source": raw_record.get("source", ""),
+                "entity_type": "lead",
+                "entity_id": lead_data.get("id") or raw_record.get("dedupe_key", ""),
+                "lead_id": lead_data.get("id") or raw_record.get("dedupe_key", ""),
+                "metric_date": metric_date_for(occurred_at),
+                "occurred_at": occurred_at,
+                "payload": {
+                    "status": metric.get("status", ""),
+                    "phase": metric.get("phase", ""),
+                    "grade": metric.get("grade", ""),
+                    "recommended_score": metric.get("recommended_score", 0),
+                    "is_duplicate": metric.get("is_duplicate", False),
+                    "is_converted": metric.get("is_converted", False),
+                },
+            },
+        )
+        return {
+            "lead_metrics": metric,
+            "analytics_event": analytics_event,
+            "ai_score": ai_score,
+        }

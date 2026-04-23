@@ -1,0 +1,38 @@
+# Pulse Engine - PostgreSQL edition
+# Install: pip install -r requirements.txt
+
+# Web framework (keep pydantic/starlette aligned for pip's resolver in slim images)
+fastapi>=0.115.0,<0.137
+uvicorn[standard]>=0.29.0,<0.45
+pydantic>=2.10.0,<2.14.0
+
+# PostgreSQL (asyncpg replaces motor/pymongo entirely)
+asyncpg>=0.29.0
+greenlet>=3.4.0,<4
+
+# WebSockets / real-time
+python-socketio>=5.11.0
+
+# HTTP client (OAuth flows, AI API calls)
+httpx>=0.27.0
+google-genai>=1.11.0
+openai>=1.68.0
+anthropic>=0.49.0
+redis>=5.0.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
+cryptography>=43.0.0
+passlib[bcrypt]>=1.7.4
+stripe>=11.0.0
+
+# File uploads
+python-multipart>=0.0.9
+aiofiles>=23.2.1
+
+# Office file handling (onboarding doc uploads)
+Pillow>=10.0.0
+openpyxl>=3.1.0
+
+# Environment variables
+python-dotenv>=1.0.0

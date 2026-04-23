@@ -1,0 +1,432 @@
+x-common-env: &common-env
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+  # Browser URL for Stripe return URLs and OAuth redirects when Origin is missing (e.g. GET callbacks).
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  CACHE_REDIS_URL: ${CACHE_REDIS_URL:-redis://redis:6379/1}
+  RATE_LIMIT_REDIS_URL: ${RATE_LIMIT_REDIS_URL:-redis://redis:6379/2}
+  BACKGROUND_QUEUE_URL: ${BACKGROUND_QUEUE_URL:-redis://redis:6379/3}
+  BACKGROUND_QUEUE_ENABLED: ${BACKGROUND_QUEUE_ENABLED:-true}
+  BACKGROUND_QUEUE_MAX_RETRIES: ${BACKGROUND_QUEUE_MAX_RETRIES:-5}
+  BACKGROUND_QUEUE_VISIBILITY_TIMEOUT: ${BACKGROUND_QUEUE_VISIBILITY_TIMEOUT:-300}
+  BACKGROUND_QUEUE_JOB_TIMEOUT_SECONDS: ${BACKGROUND_QUEUE_JOB_TIMEOUT_SECONDS:-600}
+  BACKGROUND_QUEUE_JOB_TTL_SECONDS: ${BACKGROUND_QUEUE_JOB_TTL_SECONDS:-86400}
+  INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET is required}
+  AUTH_SERVICE_URL: http://auth:8001
+  USER_SERVICE_URL: http://user:8002
+  CUSTOMER_SERVICE_URL: http://customer:8003
+  LEAD_SERVICE_URL: http://lead:8004
+  AI_SERVICE_URL: http://ai:8005
+  ORCHESTRATOR_SERVICE_URL: http://agent-orchestrator:8009
+  ANALYTICS_SERVICE_URL: http://analytics:8006
+  DATA_PIPELINE_SERVICE_URL: http://data-pipeline:8012
+  PRODUCT_SERVICE_URL: http://product:8007
+  NOTIFICATION_SERVICE_URL: http://notification:8008
+  IDENTITY_SERVICE_URL: http://identity:8010
+  SUPER_ADMIN_SERVICE_URL: http://super-admin:8011
+  DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:?DEFAULT_TENANT_ID is required}
+  DEFAULT_TENANT_API_KEY: ${DEFAULT_TENANT_API_KEY:?DEFAULT_TENANT_API_KEY is required}
+  DEFAULT_TENANT_SALT: ${DEFAULT_TENANT_SALT:?DEFAULT_TENANT_SALT is required}
+  TENANT_API_KEYS: ${TENANT_API_KEYS:-}
+  TENANT_SALTS: ${TENANT_SALTS:?TENANT_SALTS is required}
+  IDENTITY_ADMIN_EMAIL: ${IDENTITY_ADMIN_EMAIL:?IDENTITY_ADMIN_EMAIL is required}
+  IDENTITY_ADMIN_PASSWORD: ${IDENTITY_ADMIN_PASSWORD:?IDENTITY_ADMIN_PASSWORD is required}
+  TENANT_RATE_LIMIT_PER_MINUTE: ${TENANT_RATE_LIMIT_PER_MINUTE:-1000}
+  META_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
+  WEB_CHAT_WEBHOOK_SECRET: ${WEB_CHAT_WEBHOOK_SECRET:?WEB_CHAT_WEBHOOK_SECRET is required}
+  EXTERNAL_WEBHOOK_SECRET: ${EXTERNAL_WEBHOOK_SECRET:?EXTERNAL_WEBHOOK_SECRET is required}
+  # Demo / CI: set DEMO_MODE=true to seed demo users and relax onboarding + billing gates. STRIPE_OPTIONAL=true skips Stripe subscription enforcement without seeding.
+  DEMO_MODE: ${DEMO_MODE:-false}
+  STRIPE_OPTIONAL: ${STRIPE_OPTIONAL:-false}
+  # Stripe-off self-serve trial (no DEMO_MODE): set STRIPE_ENABLED=false optionally with TRIAL_PERIOD_DAYS (default 90).
+  STRIPE_ENABLED: ${STRIPE_ENABLED:-auto}
+  TRIAL_PERIOD_DAYS: ${TRIAL_PERIOD_DAYS:-90}
+
+x-service-defaults: &service-defaults
+  env_file:
+    - .env
+  restart: always
+
+services:
+  postgres:
+    <<: *service-defaults
+    image: pgvector/pgvector:pg16
+    container_name: pulse-postgres-engine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pulse_engine_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-pulse_engine}
+    expose:
+      - "5432"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/sql_schema.sql:/docker-entrypoint-initdb.d/10-monolith-schema.sql:ro
+      - ./backend/shared/db/bootstrap_microservices.sql:/docker-entrypoint-initdb.d/20-microservices.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pulse_engine_app} -d ${POSTGRES_DB:-pulse_engine}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    container_name: pulse-redis-engine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  auth:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/auth_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: auth-service
+      PORT: 8001
+      DB_SCHEMA: auth_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8001"
+
+  user:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/user_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: user-service
+      PORT: 8002
+      DB_SCHEMA: user_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8002"
+
+  customer:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/customer_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: customer-service
+      PORT: 8003
+      DB_SCHEMA: customer_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8003"
+
+  lead:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/lead_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: lead-service
+      PORT: 8004
+      DB_SCHEMA: lead_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8004"
+
+  ai:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/ai_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: ai-service
+      PORT: 8005
+      DB_SCHEMA: ai_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8005"
+
+  agent-orchestrator:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/agent_orchestrator/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: agent-orchestrator-service
+      PORT: 8009
+      DB_SCHEMA: agent_orchestrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8009"
+
+  product:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/product_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: product-service
+      PORT: 8007
+      DB_SCHEMA: product_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8007/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8007"
+
+  analytics:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/analytics_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: analytics-service
+      PORT: 8006
+      DB_SCHEMA: analytics_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8006"
+
+  data-pipeline:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/data_pipeline_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: data-pipeline
+      PORT: 8012
+      DB_SCHEMA: analytics_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8012"
+
+  notification:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/notification_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: notification-service
+      PORT: 8008
+      DB_SCHEMA: notification_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8008"
+
+  identity:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/identity_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: identity-service
+      PORT: 8010
+      DB_SCHEMA: identity_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8010"
+
+  super-admin:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/super_admin_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: super-admin-service
+      PORT: 8011
+      DB_SCHEMA: super_admin_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8011:8011"
+    expose:
+      - "8011"
+
+  gateway:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/api_gateway/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-gateway
+      PORT: 8000
+      GATEWAY_RATE_LIMIT_REQUESTS: ${GATEWAY_RATE_LIMIT_REQUESTS:-120}
+      GATEWAY_RATE_LIMIT_WINDOW_SECONDS: ${GATEWAY_RATE_LIMIT_WINDOW_SECONDS:-60}
+    depends_on:
+      auth:
+        condition: service_healthy
+      user:
+        condition: service_healthy
+      customer:
+        condition: service_healthy
+      lead:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+      agent-orchestrator:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      super-admin:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8000:8000"
+
+  frontend:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-http://localhost:8000}
+        REACT_APP_DEMO_MODE: ${DEMO_MODE:-false}
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:

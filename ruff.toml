@@ -1,0 +1,13 @@
+# Aligns with .github/workflows/ci.yml (ruff check/format on backend/).
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W"]
+
+# Re-export shim: intentional star-import surface for SQLAlchemy models.
+[lint.per-file-ignores]
+"backend/services/identity_service/app/db/schema.py" = ["F403"]
+
+# Scan backend only when invoking: `ruff check backend/`
+# (No exclude needed for root-level tools if paths are passed explicitly.)

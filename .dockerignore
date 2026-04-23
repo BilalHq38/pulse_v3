@@ -1,0 +1,17 @@
+.git
+.vscode
+frontend/node_modules
+frontend/build
+backend/.venv
+backend/__pycache__
+backend/*/__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.log
+*.sqlite3
+postgres-data
+backend/whatsapp_bridge/.wwebjs_auth
+backend/whatsapp_bridge/.wwebjs_cache
+backend/whatsapp_bridge/node_modules
+

@@ -1,0 +1,149 @@
+# IDE and editors
+.idea/
+
+# Node and frontend artifacts
+node_modules/
+frontend/node_modules/
+frontend/build/
+.cache/
+/.pnp
+.pnp.js
+.yarn/install-state.gz
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Python artifacts
+__pycache__/
+*.pyc
+venv/
+.venv/
+.venv.*/
+backend/.pydeps/
+backend/__pycache__/
+
+# Environment files
+*.env
+*.env.*
+*token.json*
+*credentials.json*
+!.env.example
+memory/test_credentials.md
+.gitconfig
+
+# Logs and runtime output
+*.log
+*.err.log
+*.out.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dump.rdb
+
+# Build and coverage output
+/coverage
+/build
+dist/
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# System files
+.DS_Store
+*.pem
+
+# Misc development files
+chainlit.md
+.chainlit
+.docker/
+.tmp/
+.ipynb_checkpoints/
+.ac
+.vercel
+.pg-local/
+.emergent/
+.vscode/
+
+# Archive files and large assets
+**/*.zip
+**/*.tar.gz
+**/*.tar
+**/*.tgz
+*.pack
+*.deb
+*.dylib
+
+# Misc project data
+agenthub/agents/youtube/db
+
+# Node / Python
+node_modules/
+__pycache__/
+*.pyc
+
+# Env
+.env
+!.env.example
+
+# Logs
+*.log
+
+# WhatsApp session (IMPORTANT)
+backend/whatsapp_bridge/.wwebjs_auth/
+backend/whatsapp_bridge/.wwebjs_cache/
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Docker runtime assets
+docker-logs.txt
+docker-postgres-logs.txt
+
+# Service-specific auth/cache
+backend/.wwebjs_auth/
+backend/.wwebjs_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
+!.env.example
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
+!.env.example
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
