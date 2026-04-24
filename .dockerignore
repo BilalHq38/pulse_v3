@@ -1,5 +1,10 @@
 .git
+**/.git
 .vscode
+.idea
+**/.pytest_cache
+backend/tests
+**/test_reports
 frontend/node_modules
 frontend/build
 backend/.venv

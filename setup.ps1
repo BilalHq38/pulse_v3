@@ -237,6 +237,7 @@ function Save-EnvMap {
         "WHATSAPP_BRIDGE_SECRET",
         "BRIDGE_SECRET",
         "BRIDGE_PORT",
+        "BRIDGE_COMPANY_ID",
         "WHATSAPP_MODE",
         "WHATSAPP_BRIDGE_URL",
         "WHATSAPP_ACCESS_TOKEN",
@@ -563,8 +564,9 @@ function Initialize-EnvFile {
         WHATSAPP_BRIDGE_SECRET         = New-SecureToken -Bytes 24
         BRIDGE_SECRET                  = New-SecureToken -Bytes 24
         BRIDGE_PORT                    = "3001"
-        WHATSAPP_MODE                  = "meta"
-        WHATSAPP_BRIDGE_URL            = "http://host.docker.internal:3001"
+        BRIDGE_COMPANY_ID              = $tenantId
+        WHATSAPP_MODE                  = "bridge"
+        WHATSAPP_BRIDGE_URL            = "http://whatsapp-bridge:3001"
         WHATSAPP_ACCESS_TOKEN          = "replace-with-meta-whatsapp-access-token"
         WHATSAPP_PHONE_NUMBER_ID       = "replace-with-whatsapp-phone-number-id"
         PHONE_NUMBER_ID                = "replace-with-whatsapp-phone-number-id"
@@ -632,6 +634,9 @@ function Initialize-EnvFile {
         $map["WHATSAPP_BRIDGE_SECRET"] = if ($legacyBridgeSecret) { $legacyBridgeSecret } else { New-SecureToken -Bytes 24 }
     }
     $map["BRIDGE_SECRET"] = ($map["WHATSAPP_BRIDGE_SECRET"] | Out-String).Trim()
+    if (-not (($map["BRIDGE_COMPANY_ID"] | Out-String).Trim())) {
+        $map["BRIDGE_COMPANY_ID"] = ($map["DEFAULT_TENANT_ID"] | Out-String).Trim()
+    }
     if (-not (($map["WHATSAPP_PHONE_NUMBER_ID"] | Out-String).Trim())) {
         $map["WHATSAPP_PHONE_NUMBER_ID"] = ($map["PHONE_NUMBER_ID"] | Out-String).Trim()
     }

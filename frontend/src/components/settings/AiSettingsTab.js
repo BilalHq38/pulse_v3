@@ -1,6 +1,7 @@
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import api from '@/lib/api';
 import {
-  Save, Plus, Trash2, Edit, Bot, Wand2,
+  Save, Plus, Trash2, Edit, Bot, Wand2, RefreshCw, Activity,
 } from 'lucide-react';
 
 const LLM_MODELS = {
@@ -33,6 +34,47 @@ export default function AiSettingsTab({
   showAddAgentForm, setShowAddAgentForm, addAgentForm, setAddAgentForm,
   isAdmin,
 }) {
+  const [orchExecutions, setOrchExecutions] = useState([]);
+  const [orchLoading, setOrchLoading] = useState(true);
+  const [orchErr, setOrchErr] = useState('');
+  const [mcpList, setMcpList] = useState([]);
+
+  const loadExecutions = useCallback(async () => {
+    try {
+      setOrchErr('');
+      const res = await api.get('/orchestrator/executions?limit=30');
+      setOrchExecutions(res.data?.executions || []);
+    } catch (e) {
+      const d = e.response?.data;
+      const msg = typeof d?.detail === 'string' ? d.detail : (d?.error || e.message || 'Failed to load');
+      setOrchErr(msg);
+    } finally {
+      setOrchLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadExecutions();
+    const id = setInterval(loadExecutions, 20000);
+    return () => clearInterval(id);
+  }, [loadExecutions]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await api.get('/mcp/servers');
+        setMcpList(Array.isArray(r.data) ? r.data : []);
+      } catch {
+        setMcpList([]);
+      }
+    })();
+  }, []);
+
+  const mcpSelectOptions = useMemo(
+    () => mcpList.map((s) => ({ id: s.id, label: `${(s.endpoint || s.id).slice(0, 64)}${s.status && s.status !== 'active' ? ` (${s.status})` : ''}` })),
+    [mcpList],
+  );
+
   return (
     <div className="space-y-6">
       <h2 className="text-lg font-semibold text-slate-900">AI Configuration</h2>
@@ -120,6 +162,64 @@ export default function AiSettingsTab({
             <span className="text-slate-600"> ({a.provider || '?'} / {a.model_name || 'default'})</span>
           </p>
         ))}
+      </div>
+
+      {/* Orchestrator: rule-based agent / workflow activity */}
+      <div className="bg-white border border-slate-100 rounded-xl p-6">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+              <Activity size={14} className="text-cyan-600" /> Recent agent / workflow activity
+            </h3>
+            <p className="text-[10px] text-slate-400 mt-0.5">Steps from the rule-based orchestrator (Capture, Qualification, Support, …). Refreshes every 20s.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => { setOrchLoading(true); loadExecutions(); }}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200"
+          >
+            <RefreshCw size={12} /> Refresh
+          </button>
+        </div>
+        {orchErr && <p className="text-xs text-amber-700 mb-2">{orchErr}</p>}
+        {orchLoading && orchExecutions.length === 0 ? (
+          <p className="text-xs text-slate-400">Loading…</p>
+        ) : orchExecutions.length === 0 ? (
+          <p className="text-xs text-slate-400">No workflow steps yet. They appear when messages or leads run through the orchestrator.</p>
+        ) : (
+          <div className="overflow-x-auto border border-slate-100 rounded-lg">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-100">
+                  <th className="px-2 py-2 font-medium text-slate-500">Time</th>
+                  <th className="px-2 py-2 font-medium text-slate-500">Agent</th>
+                  <th className="px-2 py-2 font-medium text-slate-500">Status</th>
+                  <th className="px-2 py-2 font-medium text-slate-500">Kind</th>
+                  <th className="px-2 py-2 font-medium text-slate-500">ms</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orchExecutions.map((row) => (
+                  <tr key={row.id} className="border-b border-slate-50 last:border-0">
+                    <td className="px-2 py-1.5 text-slate-600 whitespace-nowrap">{(row.started_at || '').replace('T', ' ').slice(0, 19)}</td>
+                    <td className="px-2 py-1.5 font-medium text-slate-800 capitalize">{row.agent_name || '—'}</td>
+                    <td className="px-2 py-1.5 text-slate-600">{row.status || '—'}</td>
+                    <td className="px-2 py-1.5 text-slate-500">{row.workflow_kind || '—'}</td>
+                    <td className="px-2 py-1.5 text-slate-500">{row.duration_ms != null ? Math.round(row.duration_ms) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <details className="px-2 py-2 bg-slate-50/80 border-t border-slate-100 text-[10px] text-slate-500">
+              <summary className="cursor-pointer select-none">Debug: routing + output (first row)</summary>
+              {orchExecutions[0] && (
+                <pre className="mt-2 p-2 overflow-x-auto text-[10px] text-slate-600 whitespace-pre-wrap break-all">
+{JSON.stringify({ routing_decision: orchExecutions[0].routing_decision, output_summary: orchExecutions[0].output_summary, error: orchExecutions[0].error }, null, 0)}
+                </pre>
+              )}
+            </details>
+          </div>
+        )}
       </div>
 
       {/* LLM Engines */}
@@ -244,7 +344,7 @@ export default function AiSettingsTab({
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Bot size={14} className="text-blue-500" /> AI Agents ({aiAgents.length})</h3>
           {isAdmin && (
-            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', provider: 'gemini', model_name: LLM_MODELS.gemini[0], is_active: true }); }}
+            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', provider: 'gemini', model_name: LLM_MODELS.gemini[0], is_active: true, mcp_server_id: '' }); }}
               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
               <Plus size={12} /> Add Agent
             </button>
@@ -268,7 +368,7 @@ export default function AiSettingsTab({
                       <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${a.is_active ? 'translate-x-4' : ''}`} />
                     </button>
                     {isAdmin && (
-                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', provider: a.provider || 'gemini', model_name: a.model_name || '' }); }}
+                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', provider: a.provider || 'gemini', model_name: a.model_name || '', mcp_server_id: a.mcp_server_id || '' }); }}
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
@@ -296,6 +396,13 @@ export default function AiSettingsTab({
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
                         <select value={agentDraft.model_name} onChange={ev => setAgentDraft(p => ({ ...p, model_name: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
                           {(LLM_MODELS[agentDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                      </div>
+                      <div className="col-span-3">
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">MCP server (optional)</label>
+                        <select value={agentDraft.mcp_server_id || ''} onChange={ev => setAgentDraft(p => ({ ...p, mcp_server_id: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          <option value="">None</option>
+                          {mcpSelectOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
                         </select>
                       </div>
                     </div>
@@ -331,6 +438,13 @@ export default function AiSettingsTab({
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
                 <select value={addAgentForm.model_name} onChange={ev => setAddAgentForm(p => ({ ...p, model_name: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
                   {(LLM_MODELS[addAgentForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </div>
+              <div className="col-span-3">
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">MCP server (optional)</label>
+                <select value={addAgentForm.mcp_server_id || ''} onChange={ev => setAddAgentForm(p => ({ ...p, mcp_server_id: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  <option value="">None</option>
+                  {mcpSelectOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
                 </select>
               </div>
             </div>

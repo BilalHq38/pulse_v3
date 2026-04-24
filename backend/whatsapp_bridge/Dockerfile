@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM node:20-bookworm
 
 WORKDIR /app
@@ -7,7 +8,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/whatsapp_bridge/package.json backend/whatsapp_bridge/package-lock.json ./
-RUN npm ci --omit=dev
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --prefer-offline --no-audit
 
 COPY backend/whatsapp_bridge/ ./
 

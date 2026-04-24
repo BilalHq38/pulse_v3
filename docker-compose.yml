@@ -42,6 +42,10 @@ x-common-env: &common-env
   # Stripe-off self-serve trial (no DEMO_MODE): set STRIPE_ENABLED=false optionally with TRIAL_PERIOD_DAYS (default 90).
   STRIPE_ENABLED: ${STRIPE_ENABLED:-auto}
   TRIAL_PERIOD_DAYS: ${TRIAL_PERIOD_DAYS:-90}
+  # WhatsApp Web (linked device) Node bridge — see service whatsapp-bridge
+  WHATSAPP_BRIDGE_URL: ${WHATSAPP_BRIDGE_URL:-http://whatsapp-bridge:3001}
+  WHATSAPP_BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:-}
+  WHATSAPP_MODE: ${WHATSAPP_MODE:-bridge}
 
 x-service-defaults: &service-defaults
   env_file:
@@ -85,6 +89,42 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # WhatsApp Web.js bridge (QR link device) — forwards to gateway webhooks
+  whatsapp-bridge:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/whatsapp_bridge/Dockerfile
+    container_name: pulse-whatsapp-bridge
+    environment:
+      BRIDGE_PORT: "3001"
+      PYTHON_BACKEND: http://gateway:8000
+      WHATSAPP_WEBHOOK_PATH: /api/webhook/meta/whatsapp
+      WHATSAPP_BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:-}
+      BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:-}
+      META_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
+      WHATSAPP_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
+      BRIDGE_COMPANY_ID: ${BRIDGE_COMPANY_ID:-${DEFAULT_TENANT_ID}}
+    expose:
+      - "3001"
+    ports:
+      - "${WHATSAPP_BRIDGE_HOST_PORT:-3001}:3001"
+    volumes:
+      - whatsapp-bridge-auth:/app/.wwebjs_auth
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
 
   auth:
     <<: *service-defaults
@@ -430,3 +470,4 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  whatsapp-bridge-auth:

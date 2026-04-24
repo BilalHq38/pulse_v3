@@ -44,7 +44,7 @@ import {
 } from 'lucide-react';
 
 const CHANNEL_CONFIG = {
-  whatsapp: { label: 'WhatsApp Business', color: 'emerald', fields: ['phone_number_id', 'access_token'], bgClass: 'bg-emerald-50', textClass: 'text-emerald-500' },
+  whatsapp: { label: 'WhatsApp Web', color: 'emerald', fields: [], bgClass: 'bg-emerald-50', textClass: 'text-emerald-500' },
   instagram: { label: 'Instagram', color: 'pink', fields: ['page_id', 'access_token'], bgClass: 'bg-pink-50', textClass: 'text-pink-500' },
   facebook: { label: 'Facebook Messenger', color: 'blue', fields: ['page_id', 'access_token'], bgClass: 'bg-blue-50', textClass: 'text-blue-500' },
   email: { label: 'Email', color: 'sky', fields: ['email_address', 'email_provider', 'imap_host', 'smtp_host'], bgClass: 'bg-sky-50', textClass: 'text-sky-500' },
@@ -63,7 +63,7 @@ function normalizeChannelsResponse(raw) {
     byKey.set(k, { ...row, channel: k });
   }
   const defaults = {
-    whatsapp: { channel: 'whatsapp', display_name: 'WhatsApp Business', enabled: false, phone_number_id: '', access_token: '', webhook_url: '', verify_token: '' },
+    whatsapp: { channel: 'whatsapp', display_name: 'WhatsApp Web', enabled: false, phone_number_id: '', access_token: '', webhook_url: '', verify_token: '' },
     instagram: { channel: 'instagram', display_name: 'Instagram', enabled: false, page_id: '', access_token: '', webhook_url: '' },
     facebook: { channel: 'facebook', display_name: 'Facebook Messenger', enabled: false, page_id: '', access_token: '', webhook_url: '' },
     email: {
@@ -187,8 +187,6 @@ export default function SettingsPage() {
   const [createUserForm, setCreateUserForm] = useState({ name: '', email: '', role: 'company_agent', sub_role: '', status: 'active' });
 
   // Security state
-  const [oauthLinkBusy, setOauthLinkBusy] = useState('');
-  const [oauthLinkBanner, setOauthLinkBanner] = useState('');
   const [securityOverview, setSecurityOverview] = useState(null);
   const [sessions, setSessions] = useState([]);
   const [, setLoginHistory] = useState([]);
@@ -215,12 +213,13 @@ export default function SettingsPage() {
   const [suggestionDetail, setSuggestionDetail] = useState(null);
   const [manualMergeIds, setManualMergeIds] = useState(['', '']);
 
-  const [waQrModalOpen, setWaQrModalOpen] = useState(false);
+  const [waQrPanelOpen, setWaQrPanelOpen] = useState(false);
   const [waQrLoading, setWaQrLoading] = useState(false);
   const [waQrImageSrc, setWaQrImageSrc] = useState('');
   const [waQrStatus, setWaQrStatus] = useState('');
   const [waQrError, setWaQrError] = useState('');
   const waQrPollRef = useRef(null);
+  const waStatusPollRef = useRef(null);
 
   // AI Config interactive state
   const [editingLlmId, setEditingLlmId] = useState(null);
@@ -230,7 +229,7 @@ export default function SettingsPage() {
   const [showAddLlmForm, setShowAddLlmForm] = useState(false);
   const [addLlmForm, setAddLlmForm] = useState({ model_name: '', provider: 'gemini', temperature: 0.7, max_tokens: 2048 });
   const [showAddAgentForm, setShowAddAgentForm] = useState(false);
-  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', provider: 'gemini', model_name: '', is_active: true });
+  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', provider: 'gemini', model_name: '', is_active: true, mcp_server_id: '' });
 
   // Integrations interactive state
   const [editingMcpId, setEditingMcpId] = useState(null);
@@ -239,6 +238,12 @@ export default function SettingsPage() {
   const [addMcpForm, setAddMcpForm] = useState({ endpoint: '', region: '', status: 'active' });
   const [editingSocialPlatform, setEditingSocialPlatform] = useState(null);
   const [socialDraft, setSocialDraft] = useState({});
+
+  const waChannelRow = channels.find((c) => c.channel === 'whatsapp');
+  const waMetaBlocksQr = !!(
+    String(waChannelRow?.phone_number_id || '').trim() && String(waChannelRow?.access_token || '').trim()
+  );
+  const waQrBlocksMeta = waQrStatus === 'ready';
 
   const isAdmin = user?.role === 'admin';
   const selectedLlmEngine = llmEngines.find((engine) => engine.is_selected) || null;
@@ -432,18 +437,6 @@ export default function SettingsPage() {
     const linked = searchParams.get('oauth_linked');
     const linkErr = searchParams.get('oauth_link_error');
     if (!linked && !linkErr) return;
-    let msg = '';
-    if (linked === 'google' || linked === 'facebook') {
-      msg = `Successfully linked ${linked === 'google' ? 'Google' : 'Facebook'} to your account.`;
-    } else if (linkErr === '1') {
-      msg =
-        'Could not complete linking. Ensure the social account email matches your workspace email, then try again.';
-    } else if (linkErr === 'cancelled') {
-      msg = 'Sign-in with the provider was cancelled.';
-    } else if (linkErr === 'missing_code') {
-      msg = 'OAuth did not complete. Try linking again.';
-    }
-    if (msg) setOauthLinkBanner(msg);
     if (typeof refreshUser === 'function') {
       refreshUser();
     }
@@ -469,45 +462,27 @@ export default function SettingsPage() {
     }
     if (activeTab === 'channels') {
       api.get('/social/accounts').catch(() => ({ data: [] })).then(r => setSocialAccounts(r.data || []));
+      api.get('/webhooks/info').catch(() => ({ data: null })).then((r) => {
+        if (r?.data) setWebhookInfo((prev) => ({ ...(prev || {}), ...r.data }));
+      });
     }
     if (activeTab === 'logs') {
       api.get('/system/logs?limit=50').catch(() => ({ data: [] })).then(r => setSystemLogs(r.data || []));
     }
   }, [activeTab, refreshAiConfig]);
 
-  const maskOAuthSubject = (id) => {
-    const s = String(id || '');
-    if (!s) return '—';
-    if (s.length <= 12) return s;
-    return `${s.slice(0, 6)}…${s.slice(-4)}`;
-  };
-
-  const startOAuthLink = async (provider) => {
-    if (!user || user.role === 'super_admin') return;
-    const key = provider === 'facebook' ? 'facebook' : 'google';
-    setOauthLinkBusy(key);
-    setOauthLinkBanner('');
-    try {
-      const path =
-        key === 'facebook'
-          ? '/auth/oauth/link/facebook/start'
-          : '/auth/oauth/link/google/start';
-      const res = await api.post(path);
-      const url = res.data?.authorization_url;
-      if (url) {
-        window.location.href = url;
-      } else {
-        setOauthLinkBanner('Could not start OAuth linking.');
-      }
-    } catch (e) {
-      const d = e.response?.data?.detail;
-      setOauthLinkBanner(
-        typeof d === 'string' ? d : e.response?.data?.error || 'Could not start OAuth linking.',
-      );
-    } finally {
-      setOauthLinkBusy('');
-    }
-  };
+  useEffect(() => {
+    if (activeTab !== 'channels') return;
+    const suggested = (webhookInfo?.webhook_urls?.whatsapp || '').trim();
+    if (!suggested) return;
+    setChannels((prev) =>
+      prev.map((ch) => {
+        if (ch.channel !== 'whatsapp') return ch;
+        if ((ch.webhook_url || '').trim()) return ch;
+        return { ...ch, webhook_url: suggested };
+      }),
+    );
+  }, [activeTab, webhookInfo?.webhook_urls?.whatsapp]);
 
   const loadSecurity = async () => {
     try {
@@ -538,7 +513,7 @@ export default function SettingsPage() {
     if (activeTab === 'unification') loadUnificationData();
   }, [activeTab, loadUnificationData]);
 
-  // â”€â”€ Notification settings â”€â”€
+  // -- Notification settings --
   const [notifSettings, setNotifSettings] = useState(null);
   const [notifSaving, setNotifSaving] = useState(false);
   const [notifSaved, setNotifSaved] = useState(false);
@@ -942,52 +917,92 @@ export default function SettingsPage() {
 
   const passwordValidation = validatePassword(newPassword);
 
-  const fetchWaBridgeQr = useCallback(async () => {
+  const fetchWaBridgeQr = useCallback(async (opts = {}) => {
+    const silent = opts.silent === true;
+    if (!silent) {
+      setWaQrLoading(true);
+    }
     try {
       const res = await api.get('/settings/channels/whatsapp/bridge-qr');
       const d = res.data || {};
-      setWaQrError('');
-      setWaQrStatus(d.bridge_status || d.status || '');
-      if (d.qr_data_url) {
-        setWaQrImageSrc(d.qr_data_url);
-      } else if (d.qr_png_base64) {
-        setWaQrImageSrc(`data:image/png;base64,${d.qr_png_base64}`);
+      const st = d.bridge_status || d.status || '';
+      setWaQrStatus(st);
+      if (d.detail && !d.qr_data_url && !d.qr_png_base64 && st !== 'ready') {
+        setWaQrError(String(d.detail));
       } else {
-        setWaQrImageSrc('');
+        setWaQrError('');
       }
-      setWaQrLoading(false);
+      if (!silent) {
+        if (d.qr_data_url) {
+          setWaQrImageSrc(d.qr_data_url);
+        } else if (d.qr_png_base64) {
+          setWaQrImageSrc(`data:image/png;base64,${d.qr_png_base64}`);
+        } else if (st === 'ready') {
+          setWaQrImageSrc('');
+        } else {
+          setWaQrImageSrc('');
+        }
+        setWaQrLoading(false);
+      }
       return d;
     } catch (err) {
       const raw = err.response?.data?.detail;
       const msg = typeof raw === 'string' ? raw : (Array.isArray(raw) ? raw.map((x) => x.msg || x).join(' ') : err.message) || 'Bridge unavailable';
-      setWaQrError(String(msg));
-      setWaQrImageSrc('');
-      setWaQrLoading(false);
+      if (!silent) {
+        setWaQrError(String(msg));
+        setWaQrImageSrc('');
+        setWaQrLoading(false);
+      }
       return null;
     }
   }, []);
 
-  const openWaQrModal = () => {
-    setWaQrModalOpen(true);
+  const collapseWaWebPanel = useCallback(() => {
+    setWaQrPanelOpen(false);
+    if (waQrPollRef.current) {
+      clearInterval(waQrPollRef.current);
+      waQrPollRef.current = null;
+    }
+  }, []);
+
+  const expandWaWebPanel = () => {
+    if (waMetaBlocksQr) return;
+    setWaQrPanelOpen(true);
     setWaQrLoading(true);
     setWaQrError('');
     setWaQrImageSrc('');
     setWaQrStatus('');
     fetchWaBridgeQr();
     if (waQrPollRef.current) clearInterval(waQrPollRef.current);
-    waQrPollRef.current = setInterval(() => { fetchWaBridgeQr(); }, 2500);
+    waQrPollRef.current = setInterval(() => {
+      fetchWaBridgeQr();
+    }, 1500);
   };
 
-  const closeWaQrModal = () => {
-    setWaQrModalOpen(false);
-    if (waQrPollRef.current) {
-      clearInterval(waQrPollRef.current);
-      waQrPollRef.current = null;
+  useEffect(() => {
+    if (activeTab === 'channels') {
+      void fetchWaBridgeQr({ silent: true });
+      waStatusPollRef.current = setInterval(() => {
+        void fetchWaBridgeQr({ silent: true });
+      }, 3500);
+      return () => {
+        if (waStatusPollRef.current) {
+          clearInterval(waStatusPollRef.current);
+          waStatusPollRef.current = null;
+        }
+      };
     }
-  };
+    return undefined;
+  }, [activeTab, fetchWaBridgeQr]);
+
+  useEffect(() => {
+    if (activeTab !== 'channels' || !waMetaBlocksQr) return;
+    collapseWaWebPanel();
+  }, [activeTab, waMetaBlocksQr, collapseWaWebPanel]);
 
   useEffect(() => () => {
     if (waQrPollRef.current) clearInterval(waQrPollRef.current);
+    if (waStatusPollRef.current) clearInterval(waStatusPollRef.current);
   }, []);
 
   const tabs = [
@@ -1028,7 +1043,7 @@ export default function SettingsPage() {
 
         <div className={`${standaloneUnification ? 'w-full' : 'flex-1 min-w-0'}`}>
 
-          {/* â•â•â• PERSONAL SETTINGS â•â•â• */}
+          {/* === PERSONAL SETTINGS === */}
           {activeTab === 'personal' && (
             <div className="space-y-6">
               <h2 className="text-lg font-semibold text-slate-900">Personal Profile</h2>
@@ -1067,7 +1082,7 @@ export default function SettingsPage() {
                     </div>
                   </div>
 
-                  {/* â”€â”€ Account Information â”€â”€ */}
+                  {/* -- Account Information -- */}
                   <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                     <div className="flex items-center gap-2"><UserCircle size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Account Information</span></div>
                     <div className="grid grid-cols-2 gap-4">
@@ -1079,7 +1094,7 @@ export default function SettingsPage() {
                   </div>
 
                   <div className="flex items-center gap-3">
-                    <button onClick={savePersonalProfile} disabled={saving === 'personal'} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"><Save size={14} /> {saving === 'personal' ? 'Savingâ€¦' : 'Save Personal Profile'}</button>
+                    <button onClick={savePersonalProfile} disabled={saving === 'personal'} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"><Save size={14} /> {saving === 'personal' ? 'Saving...' : 'Save Personal Profile'}</button>
                     {saving === 'personal_done' && <span className="flex items-center gap-1 text-emerald-600 text-xs"><Check size={13} /> Saved</span>}
                   </div>
                 </>
@@ -1114,15 +1129,157 @@ export default function SettingsPage() {
                     {channel.channel !== 'web_chat' && (
                       <div className="space-y-3">
                         {channel.channel === 'whatsapp' && (
-                          <>
-                            <div><label className="text-xs text-slate-400 mb-1 block">Phone Number ID</label><input value={channel.phone_number_id || ''} onChange={(e) => updateChannelField(channel.channel, 'phone_number_id', e.target.value)} placeholder="WhatsApp Phone Number ID from Meta" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
-                            <div><label className="text-xs text-slate-400 mb-1 block">Access Token</label><div className="relative"><input type={showKeys ? 'text' : 'password'} value={channel.access_token || ''} onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)} placeholder="Permanent or long-lived system user token" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({ ...showKeyMap, [channel.channel]: !showKeys })} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div>
-                            <div><label className="text-xs text-slate-400 mb-1 block">Webhook URL</label><input value={channel.webhook_url || ''} onChange={(e) => updateChannelField(channel.channel, 'webhook_url', e.target.value)} placeholder="https://your-domain.com/api/webhooks/..." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /></div>
-                            <div className="rounded-lg border border-emerald-100 bg-emerald-50/60 p-3 space-y-2">
-                              <p className="text-xs text-slate-600">WhatsApp Web (linked device): run the Node bridge with <code className="text-[10px] bg-white px-1 rounded">WHATSAPP_MODE=bridge</code> on the backend, then scan the QR here.</p>
-                              <button type="button" onClick={openWaQrModal} className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500"><QrCode size={14} /> Connect with WhatsApp Web (QR)</button>
+                          <div className="w-full space-y-3" data-testid="whatsapp-channel-settings">
+                            <div id="settings-whatsapp-meta" className="space-y-3 w-full" data-testid="whatsapp-meta-api">
+                              <p className="text-xs text-slate-500">
+                                Configure in Meta Business Manager → WhatsApp → API Setup, then save (same style as other Meta channels).
+                              </p>
+                              {waQrBlocksMeta && (
+                                <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/90 px-3 py-2 text-xs text-amber-950">
+                                  <Lock size={14} className="text-amber-700 flex-shrink-0 mt-0.5" aria-hidden />
+                                  <span>
+                                    WhatsApp Web is connected via QR. Unlink the device in WhatsApp (Linked devices) to edit these fields.
+                                  </span>
+                                </div>
+                              )}
+                              <div>
+                                <label className="text-xs text-slate-400 mb-1 block">Phone number ID</label>
+                                <input
+                                  value={channel.phone_number_id || ''}
+                                  onChange={(e) => updateChannelField(channel.channel, 'phone_number_id', e.target.value)}
+                                  placeholder="Enter WhatsApp Phone number ID"
+                                  disabled={waQrBlocksMeta}
+                                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm disabled:bg-slate-100 disabled:text-slate-500"
+                                />
+                              </div>
+                              <div>
+                                <label className="text-xs text-slate-400 mb-1 block">Access Token</label>
+                                <div className="relative">
+                                  <input
+                                    type={showKeys ? 'text' : 'password'}
+                                    value={channel.access_token || ''}
+                                    onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)}
+                                    placeholder="Enter Access Token"
+                                    disabled={waQrBlocksMeta}
+                                    className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono disabled:bg-slate-100 disabled:text-slate-500"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => setShowKeyMap({ ...showKeyMap, [channel.channel]: !showKeys })}
+                                    disabled={waQrBlocksMeta}
+                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 disabled:opacity-40"
+                                  >
+                                    {showKeys ? <EyeOff size={14} /> : <Eye size={14} />}
+                                  </button>
+                                </div>
+                              </div>
+                              <div>
+                                <label className="text-xs text-slate-400 mb-1 block">Webhook URL</label>
+                                <div className="flex items-stretch gap-2">
+                                  <input
+                                    value={channel.webhook_url || ''}
+                                    onChange={(e) => updateChannelField(channel.channel, 'webhook_url', e.target.value)}
+                                    placeholder={webhookInfo?.webhook_urls?.whatsapp || 'https://your-domain.com/api/webhooks/whatsapp'}
+                                    disabled={waQrBlocksMeta}
+                                    className="flex-1 min-w-0 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono disabled:bg-slate-100 disabled:text-slate-500"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const t = (channel.webhook_url || webhookInfo?.webhook_urls?.whatsapp || '').trim();
+                                      if (!t) return;
+                                      void navigator.clipboard?.writeText(t).catch(() => {});
+                                    }}
+                                    disabled={waQrBlocksMeta || (!(channel.webhook_url || '').trim() && !((webhookInfo?.webhook_urls?.whatsapp || '').trim()))}
+                                    className="flex-shrink-0 px-3 py-2 text-slate-600 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 disabled:opacity-40 disabled:pointer-events-none"
+                                    title="Copy webhook URL"
+                                  >
+                                    <Copy size={14} className="mx-auto" />
+                                  </button>
+                                </div>
+                              </div>
+                              <div>
+                                <label className="text-xs text-slate-400 mb-1 block">Verify token</label>
+                                <input
+                                  value={channel.verify_token || ''}
+                                  onChange={(e) => updateChannelField(channel.channel, 'verify_token', e.target.value)}
+                                  placeholder="Meta webhook verify token"
+                                  disabled={waQrBlocksMeta}
+                                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono disabled:bg-slate-100 disabled:text-slate-500"
+                                />
+                              </div>
                             </div>
-                          </>
+                            <div className={`pt-3 border-t border-slate-100 space-y-3 w-full min-w-0 ${waMetaBlocksQr ? 'opacity-90' : ''}`}>
+                              <p className="text-[11px] font-medium text-slate-500">WhatsApp Web (QR)</p>
+                              <p className="text-xs text-slate-500">
+                                Not both: clear Phone number ID and Access token and save to use QR, or unlink the device in WhatsApp to return to Meta API fields.
+                              </p>
+                              {waMetaBlocksQr && (
+                                <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/90 px-3 py-2 text-xs text-amber-950">
+                                  <Lock size={14} className="text-amber-700 flex-shrink-0 mt-0.5" aria-hidden />
+                                  <span>Meta API fields are set. Remove Phone number ID and Access token and save, then you can use QR here.</span>
+                                </div>
+                              )}
+                              {!waQrPanelOpen ? (
+                                <button
+                                  type="button"
+                                  onClick={expandWaWebPanel}
+                                  disabled={waMetaBlocksQr}
+                                  className="inline-flex items-center gap-2 px-3 py-2 bg-slate-800 text-white rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  <QrCode size={16} /> Connect with WhatsApp Web (QR)
+                                </button>
+                              ) : (
+                                <div className="space-y-3">
+                                  {waQrError && (
+                                    <div className="flex items-start gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900">{waQrError}</div>
+                                  )}
+                                  {waQrStatus === 'ready' && !waQrError && (
+                                    <div className="flex items-center gap-2 px-3 py-2 bg-emerald-100 border border-emerald-200 rounded-lg text-sm text-emerald-900 font-medium">
+                                      <CheckCircle size={16} className="text-emerald-600 flex-shrink-0" />
+                                      Connected. You can close this panel and use WhatsApp in the inbox.
+                                    </div>
+                                  )}
+                                  {waQrStatus && waQrStatus !== 'ready' && (
+                                    <p className="text-xs font-medium text-slate-600">
+                                      Status: <span className="text-emerald-800">{waQrStatus}</span>
+                                    </p>
+                                  )}
+                                  <div className="flex min-h-[200px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50/80 p-4">
+                                    {waQrImageSrc ? (
+                                      <img src={waQrImageSrc} alt="WhatsApp QR" className="max-w-[260px] max-h-[260px] w-full h-auto" />
+                                    ) : (
+                                      <div className="text-center text-sm text-slate-500 px-4">
+                                        {waQrLoading && !waQrError
+                                          ? 'Starting session… If this is the first run, the QR can take a few seconds.'
+                                          : 'No QR yet. Ensure the WhatsApp bridge service is running (included in Docker Compose).'}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="flex flex-wrap gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setWaQrLoading(true);
+                                        fetchWaBridgeQr();
+                                      }}
+                                      disabled={waMetaBlocksQr}
+                                      className="px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                      Refresh QR
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={collapseWaWebPanel}
+                                      className="px-3 py-2 text-xs font-medium text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200"
+                                    >
+                                      Hide
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
                         )}
                         {(channel.channel === 'instagram' || channel.channel === 'facebook') && (<><div><label className="text-xs text-slate-400 mb-1 block">Page ID</label><input value={channel.page_id || ''} onChange={(e) => updateChannelField(channel.channel, 'page_id', e.target.value)} placeholder={`Enter ${config.label} Page ID`} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div><div><label className="text-xs text-slate-400 mb-1 block">Access Token</label><div className="relative"><input type={showKeys ? 'text' : 'password'} value={channel.access_token || ''} onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)} placeholder="Enter Access Token" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({...showKeyMap, [channel.channel]: !showKeys})} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div></>)}
                         {channel.channel === 'email' && (
@@ -1186,27 +1343,19 @@ export default function SettingsPage() {
                 </div>
                 <div className="space-y-3">
                   {[
-                    { platform: 'whatsapp', label: 'WhatsApp Business', iconBg: 'bg-emerald-100', iconText: 'text-emerald-700', btnCls: 'bg-emerald-600 hover:bg-emerald-500', abbr: 'WA',
-                      fields: [
-                        { key: 'account_handle', label: 'Account Name', ph: 'My Business' },
-                        { key: 'page_id', label: 'WABA ID (Business Account)', ph: '123456789' },
-                        { key: 'phone_number_id', label: 'Phone Number ID', ph: '987654321' },
-                        { key: 'app_id', label: 'App ID', ph: '111222333' },
-                        { key: 'access_token_ref', label: 'System User Token', ph: 'EAAUâ€¦', secret: true },
-                      ]},
                     { platform: 'instagram', label: 'Instagram Business', iconBg: 'bg-pink-100', iconText: 'text-pink-700', btnCls: 'bg-pink-600 hover:bg-pink-500', abbr: 'IG',
                       fields: [
                         { key: 'account_handle', label: 'Account Handle', ph: '@yourbrand' },
                         { key: 'page_id', label: 'Business Account ID', ph: '123456789' },
                         { key: 'app_id', label: 'App ID', ph: '111222333' },
-                        { key: 'access_token_ref', label: 'Page Access Token', ph: 'EAAUâ€¦', secret: true },
+                        { key: 'access_token_ref', label: 'Page Access Token', ph: 'EAAU...', secret: true },
                       ]},
                     { platform: 'facebook', label: 'Facebook Page', iconBg: 'bg-blue-100', iconText: 'text-blue-700', btnCls: 'bg-blue-600 hover:bg-blue-500', abbr: 'FB',
                       fields: [
                         { key: 'account_handle', label: 'Page Name', ph: 'My Brand Page' },
                         { key: 'page_id', label: 'Page ID', ph: '123456789' },
                         { key: 'app_id', label: 'App ID', ph: '111222333' },
-                        { key: 'access_token_ref', label: 'Page Access Token', ph: 'EAAUâ€¦', secret: true },
+                        { key: 'access_token_ref', label: 'Page Access Token', ph: 'EAAU...', secret: true },
                       ]},
                   ].map(({ platform, label, iconBg, iconText, btnCls, abbr, fields }) => {
                     const acct = socialAccounts.find(a => a.platform === platform);
@@ -1218,7 +1367,7 @@ export default function SettingsPage() {
                             <div className={`w-8 h-8 rounded-full ${iconBg} flex items-center justify-center ${iconText} text-xs font-bold flex-shrink-0`}>{abbr}</div>
                             <div>
                               <p className="text-sm font-medium text-slate-700">{label}</p>
-                              <p className="text-[10px] text-slate-400">{acct ? `Connected â€” ${acct.account_handle || acct.page_id || ''}` : 'Not configured'}</p>
+                              <p className="text-[10px] text-slate-400">{acct ? `Connected — ${acct.account_handle || acct.page_id || ''}` : 'Not configured'}</p>
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
@@ -1263,7 +1412,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• COMPANY â•â•â• */}
+          {/* === COMPANY === */}
           {activeTab === 'company' && company && (
             <div className="space-y-6">
               <h2 className="text-lg font-semibold text-slate-900">Company Profile</h2>
@@ -1281,22 +1430,22 @@ export default function SettingsPage() {
                 </div>
               </div>
 
-              {/* â”€â”€ Brand Identity â”€â”€ */}
+              {/* -- Brand Identity -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Briefcase size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Brand Identity</span></div>
                 <div><label className="text-xs text-slate-400 mb-1 block">Company Name <span className="text-red-400">*</span></label><input value={company.company_name || ''} onChange={(e) => setCompany({...company, company_name: e.target.value})} placeholder="Acme Corp" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
                 <div><label className="text-xs text-slate-400 mb-1 block">Tagline</label><input value={company.tagline || ''} onChange={(e) => setCompany({...company, tagline: e.target.value})} placeholder="A short catchy phrase that describes your brand" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
                 <div><label className="text-xs text-slate-400 mb-1 block">Industry</label>
                   <select value={company.industry || ''} onChange={(e) => setCompany({...company, industry: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">
-                    <option value="">â€” Select industry â€”</option>
+                    <option value="">— Select industry —</option>
                     {['Technology', 'E-commerce', 'Finance & Banking', 'Healthcare', 'Education', 'Real Estate', 'Marketing & Advertising', 'Logistics', 'Hospitality', 'Retail', 'Manufacturing', 'Consulting', 'Other'].map(i => <option key={i} value={i}>{i}</option>)}
                   </select>
                 </div>
-                <div><label className="text-xs text-slate-400 mb-1 block">Description</label><textarea value={company.description || ''} onChange={(e) => setCompany({...company, description: e.target.value})} rows={3} placeholder="Brief description of your company â€” the AI will use this when introducing itself to customers." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div><label className="text-xs text-slate-400 mb-1 block">Description</label><textarea value={company.description || ''} onChange={(e) => setCompany({...company, description: e.target.value})} rows={3} placeholder="Brief description of your company — the AI will use this when introducing itself to customers." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
                 <div><label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Image size={11} /> Logo URL</label><input value={company.logo_url || ''} onChange={(e) => setCompany({...company, logo_url: e.target.value})} placeholder="https://yourcompany.com/logo.png" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
               </div>
 
-              {/* â”€â”€ Contact Info â”€â”€ */}
+              {/* -- Contact Info -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Phone size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Contact Information</span></div>
                 <div className="grid grid-cols-2 gap-4">
@@ -1306,7 +1455,7 @@ export default function SettingsPage() {
                 <div><label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Globe size={11} /> Website</label><input value={company.website_address || ''} onChange={(e) => setCompany({...company, website_address: e.target.value})} placeholder="https://yourcompany.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
               </div>
 
-              {/* â”€â”€ Address â”€â”€ */}
+              {/* -- Address -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><MapPin size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Address</span></div>
                 <div><label className="text-xs text-slate-400 mb-1 block">Street Address</label><input value={company.address_line1 || ''} onChange={(e) => setCompany({...company, address_line1: e.target.value})} placeholder="123 Main St, Suite 400" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
@@ -1320,7 +1469,7 @@ export default function SettingsPage() {
                 </div>
               </div>
 
-              {/* â”€â”€ Social Links â”€â”€ */}
+              {/* -- Social Links -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Link2 size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Social Links</span></div>
                 <div className="grid grid-cols-2 gap-4">
@@ -1335,7 +1484,7 @@ export default function SettingsPage() {
                 </div>
               </div>
 
-              {/* â”€â”€ Locale â”€â”€ */}
+              {/* -- Locale -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Globe size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Locale</span></div>
                 <div className="grid grid-cols-2 gap-4">
@@ -1429,13 +1578,13 @@ export default function SettingsPage() {
               </div>
 
               <div className="flex items-center gap-3">
-                <button onClick={saveCompany} disabled={saving === 'company'} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"><Save size={14} /> {saving === 'company' ? 'Savingâ€¦' : 'Save Company Profile'}</button>
+                <button onClick={saveCompany} disabled={saving === 'company'} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"><Save size={14} /> {saving === 'company' ? 'Saving...' : 'Save Company Profile'}</button>
                 {saving === 'company_done' && <span className="flex items-center gap-1 text-emerald-600 text-xs"><Check size={13} /> Saved</span>}
               </div>
             </div>
           )}
 
-          {/* â•â•â• AI CONFIG â•â•â• */}
+          {/* === AI CONFIG === */}
           {activeTab === 'ai' && company && (
             <AiSettingsTab
               company={company} setCompany={setCompany} saveCompany={saveCompany}
@@ -1451,14 +1600,14 @@ export default function SettingsPage() {
           )}
 
 
-          {/* â•â•â• TEMPLATES â•â•â• */}
+          {/* === TEMPLATES === */}
           {activeTab === 'templates' && (
             <div className="space-y-6">
               <div className="flex items-center justify-between"><h2 className="text-lg font-semibold text-slate-900">Response Templates</h2><button onClick={() => setShowTemplateForm(true)} className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500"><Plus size={14} /> New Template</button></div>
               <div className="space-y-3">{templates.map(tmpl => (<div key={tmpl.id} className="bg-white border border-slate-100 rounded-xl p-4 flex items-start justify-between"><div><h4 className="text-sm font-medium text-slate-700">{tmpl.name}</h4><p className="text-xs text-slate-400 mt-1">{tmpl.content}</p><div className="flex gap-2 mt-2"><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-400">{tmpl.category}</span><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-400">{tmpl.channel}</span></div></div><button onClick={() => deleteTemplate(tmpl.id)} className="text-slate-400 hover:text-red-500 p-1"><Trash2 size={14} /></button></div>))}{templates.length === 0 && <p className="text-center text-slate-400 text-sm py-8">No templates yet</p>}</div>
               {showTemplateForm && (<div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4"><div className="bg-white rounded-2xl w-full max-w-lg p-6"><div className="flex items-center justify-between mb-6"><h3 className="text-lg font-bold text-slate-900">New Template</h3><button onClick={() => setShowTemplateForm(false)} className="text-slate-400"><X size={20} /></button></div><div className="space-y-4"><input value={templateForm.name} onChange={(e) => setTemplateForm({...templateForm, name: e.target.value})} placeholder="Template Name" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /><textarea value={templateForm.content} onChange={(e) => setTemplateForm({...templateForm, content: e.target.value})} placeholder="Template content..." rows={4} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm resize-none" /><button onClick={createTemplate} className="w-full py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium">Create Template</button></div></div></div>)}
 
-              {/* â•â•â• FAQs â•â•â• */}
+              {/* === FAQs === */}
               <div className="bg-white border border-slate-100 rounded-xl p-6">
                 <div className="flex items-center justify-between mb-4"><div className="flex items-center gap-2"><HelpCircle size={16} className="text-blue-600" /><h3 className="text-sm font-semibold text-slate-900">FAQs ({faqs.length})</h3></div><button onClick={() => setShowFaqForm(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700"><Plus size={12} /> Add FAQ</button></div>
                 <div className="space-y-2">{faqs.map(f => (<div key={f.id} className="flex items-start justify-between p-3 bg-slate-50 rounded-lg border border-slate-100"><div><h4 className="text-sm font-medium text-slate-800">Q: {f.question}</h4><p className="text-xs text-slate-500 mt-0.5">A: {f.answer}</p></div><button onClick={() => deleteFaq(f.id)} className="text-slate-400 hover:text-red-500 p-1"><Trash2 size={14} /></button></div>))}{faqs.length === 0 && <p className="text-center text-slate-400 text-sm py-4">No FAQs added yet.</p>}</div>
@@ -1467,7 +1616,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• TEAM MEMBERS â•â•â• */}
+          {/* === TEAM MEMBERS === */}
           {activeTab === 'users' && (
             <div className="space-y-6">
               {onboardingInviteMode && (
@@ -1564,7 +1713,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• WEBHOOKS â•â•â• */}
+          {/* === WEBHOOKS === */}
           {activeTab === 'webhooks' && (
             <div className="space-y-6">
               <div><h2 className="text-lg font-semibold text-slate-900 mb-1">Webhook Integration</h2><p className="text-sm text-slate-400">Connect your social media platforms using these webhook URLs</p></div>
@@ -1623,10 +1772,10 @@ export default function SettingsPage() {
                   <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
                     <h4 className="text-sm font-medium text-amber-800 mb-2">How Lead Capture Works</h4>
                     <ul className="space-y-1 text-xs text-amber-700">
-                      <li>â€¢ When someone sends a message via WhatsApp/Facebook/Instagram/Email/Chat Widget, they're automatically added as a lead</li>
-                      <li>â€¢ Social media ad form submissions are captured via the Lead Form webhook</li>
-                      <li>â€¢ AI automatically scores each new lead and determines their nurturing phase</li>
-                      <li>â€¢ Nurture messages are auto-generated based on lead score and phase</li>
+                      <li>• When someone sends a message via WhatsApp/Facebook/Instagram/Email/Chat Widget, they're automatically added as a lead</li>
+                      <li>• Social media ad form submissions are captured via the Lead Form webhook</li>
+                      <li>• AI automatically scores each new lead and determines their nurturing phase</li>
+                      <li>• Nurture messages are auto-generated based on lead score and phase</li>
                     </ul>
                   </div>
                 </>
@@ -1636,7 +1785,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• INTEGRATIONS â•â•â• */}
+          {/* === INTEGRATIONS === */}
           {activeTab === 'integrations' && (
             <div className="space-y-6">
               <div>
@@ -1649,7 +1798,9 @@ export default function SettingsPage() {
                 <div className="flex items-center justify-between mb-4">
                   <div>
                     <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Globe size={14} className="text-emerald-500" /> MCP Servers ({mcpServers.length})</h3>
-                    <p className="text-[10px] text-slate-400 mt-0.5">Model Context Protocol servers â€” connect external AI tool servers.</p>
+                    <p className="text-[10px] text-slate-400 mt-0.5 max-w-3xl">
+                      Register tool/automation endpoints here. In AI Config you can link an agent to a server; strict MCP tool routing may require <span className="font-mono">AI_PROVIDER=mcp</span> in deployment.
+                    </p>
                   </div>
                   {isAdmin && <button onClick={() => { setShowAddMcpForm(true); setAddMcpForm({ endpoint: '', region: '', status: 'active' }); }} className="flex items-center gap-1 px-2.5 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500"><Plus size={12} /> Add Server</button>}
                 </div>
@@ -1660,8 +1811,8 @@ export default function SettingsPage() {
                     <div key={s.id} className="border border-slate-200 rounded-lg overflow-hidden">
                       <div className="flex items-center justify-between p-3 bg-slate-50">
                         <div className="min-w-0 flex-1">
-                          <p className="text-sm font-medium text-slate-700 font-mono truncate">{s.endpoint || 'â€”'}</p>
-                          <p className="text-[10px] text-slate-400">Region: {s.region || 'â€”'} | Status: {s.status || 'active'}</p>
+                          <p className="text-sm font-medium text-slate-700 font-mono truncate">{s.endpoint || '—'}</p>
+                          <p className="text-[10px] text-slate-400">Region: {s.region || '—'} | Status: {s.status || 'active'}</p>
                         </div>
                         <div className="flex items-center gap-2 ml-3 flex-shrink-0">
                           <button onClick={async () => { const newStatus = s.status === 'active' ? 'inactive' : 'active'; const r = await api.put(`/mcp/servers/${s.id}`, { status: newStatus }).catch(() => null); if (r) setMcpServers(prev => prev.map(x => x.id === s.id ? { ...x, status: newStatus } : x)); }} className={`relative w-9 h-5 rounded-full transition-colors ${s.status === 'active' ? 'bg-green-500' : 'bg-gray-300'}`}><span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${s.status === 'active' ? 'translate-x-4' : ''}`} /></button>
@@ -1703,7 +1854,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• UNIFICATION â•â•â• */}
+          {/* === UNIFICATION === */}
           {activeTab === 'unification' && (
             <UnificationTab
               isAdmin={isAdmin}
@@ -1717,7 +1868,7 @@ export default function SettingsPage() {
             />
           )}
 
-          {/* â•â•â• SYSTEM LOGS â•â•â• */}
+          {/* === SYSTEM LOGS === */}
           {activeTab === 'logs' && (
             <div className="space-y-6">
               <div className="flex items-center justify-between">
@@ -1753,7 +1904,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• NOTIFICATIONS â•â•â• */}
+          {/* === NOTIFICATIONS === */}
           {activeTab === 'notifications' && (
             <div className="space-y-6">
               <div>
@@ -1762,7 +1913,7 @@ export default function SettingsPage() {
               </div>
 
               {!notifSettings ? (
-                <div className="flex items-center justify-center py-16 text-slate-400 text-sm">Loadingâ€¦</div>
+                <div className="flex items-center justify-center py-16 text-slate-400 text-sm">Loading...</div>
               ) : (
                 <>
                   {/* In-app notifications */}
@@ -1835,7 +1986,7 @@ export default function SettingsPage() {
                       disabled={notifSaving}
                       className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-colors"
                     >
-                      {notifSaving ? 'Savingâ€¦' : notifSaved ? <><Check size={14} /> Saved</> : <><Save size={14} /> Save preferences</>}
+                      {notifSaving ? 'Saving...' : notifSaved ? <><Check size={14} /> Saved</> : <><Save size={14} /> Save preferences</>}
                     </button>
                     {notifSaved && <span className="text-xs text-emerald-600 font-medium">Preferences updated!</span>}
                   </div>
@@ -1844,70 +1995,10 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* â•â•â• SECURITY â•â•â• */}
+          {/* === SECURITY === */}
           {activeTab === 'security' && (
             <div className="space-y-6">
               <h2 className="text-lg font-semibold text-slate-900">Security Center</h2>
-
-              {oauthLinkBanner ? (
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                  {oauthLinkBanner}
-                </div>
-              ) : null}
-
-              <div className="bg-white border border-slate-100 rounded-xl p-6">
-                <h3 className="text-sm font-semibold text-slate-800 mb-2 flex items-center gap-2">
-                  <Link2 size={16} className="text-blue-600" /> Linked sign-in (Google / Facebook)
-                </h3>
-                <p className="text-xs text-slate-500 mb-4">
-                  Link a social account so you can use &quot;Continue with Google&quot; or &quot;Continue with
-                  Facebook&quot; for this workspace. The provider email must match your account email (
-                  {user?.email || '—'}).
-                </p>
-                {user?.role === 'super_admin' ? (
-                  <p className="text-xs text-slate-500">Not available for platform super admins.</p>
-                ) : (
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => startOAuthLink('google')}
-                      disabled={!!oauthLinkBusy}
-                      className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      {oauthLinkBusy === 'google' ? 'Opening…' : 'Link Google'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => startOAuthLink('facebook')}
-                      disabled={!!oauthLinkBusy}
-                      className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      {oauthLinkBusy === 'facebook' ? 'Opening…' : 'Link Facebook'}
-                    </button>
-                  </div>
-                )}
-                <div className="mt-4 space-y-1">
-                  <p className="text-xs font-medium text-slate-600">Connected providers</p>
-                  {(!user?.oauth_providers || user.oauth_providers.length === 0) ? (
-                    <p className="text-xs text-slate-400">None linked yet.</p>
-                  ) : (
-                    user.oauth_providers.map((row) => (
-                      <div
-                        key={`${row.provider}-${row.provider_id || ''}`}
-                        className="text-xs text-slate-600 flex justify-between gap-2 border border-slate-100 rounded px-2 py-1.5"
-                      >
-                        <span className="font-medium capitalize">{row.provider || '—'}</span>
-                        <span
-                          className="font-mono text-slate-400 truncate max-w-[180px]"
-                          title={row.provider_id || ''}
-                        >
-                          {maskOAuthSubject(row.provider_id)}
-                        </span>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
 
               {/* Overview Cards */}
               {securityOverview && (
@@ -1956,7 +2047,7 @@ export default function SettingsPage() {
                         <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center text-xs font-bold text-blue-600">{(s.user_name || '?').charAt(0)}</div>
                         <div>
                           <p className="text-xs font-medium text-slate-700">{s.user_name || 'Unknown'}</p>
-                          <p className="text-[10px] text-slate-400">{s.user_email} â€¢ {new Date(s.created_at).toLocaleDateString()}</p>
+                          <p className="text-[10px] text-slate-400">{s.user_email} • {new Date(s.created_at).toLocaleDateString()}</p>
                         </div>
                       </div>
                       {isAdmin && (
@@ -1992,7 +2083,7 @@ export default function SettingsPage() {
                       <div key={k.id} className="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-100">
                         <div>
                           <p className="text-xs font-medium text-slate-700">{k.name}</p>
-                          <p className="text-[10px] text-slate-400 font-mono">{k.key_prefix} â€¢ Created by {k.created_by_name} â€¢ {new Date(k.created_at).toLocaleDateString()}</p>
+                          <p className="text-[10px] text-slate-400 font-mono">{k.key_prefix} • Created by {k.created_by_name} • {new Date(k.created_at).toLocaleDateString()}</p>
                         </div>
                         <button onClick={() => revokeApiKey(k.id)} className="text-[10px] px-2 py-1 text-red-500 hover:bg-red-50 rounded border border-red-200">Revoke</button>
                       </div>
@@ -2043,7 +2134,7 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* company-data tab removed â€” products managed via /products page */}
+          {/* company-data tab removed — products managed via /products page */}
           {false && (
             <div className="space-y-6">
               <div><h2 className="text-lg font-semibold text-slate-900 mb-1">Company Products</h2><p className="text-sm text-slate-400">Product data feeds into the AI to provide accurate, personalized responses.</p></div>
@@ -2113,23 +2204,23 @@ export default function SettingsPage() {
                         <textarea
                           value={productForm.description}
                           onChange={(e) => setProductForm({ ...productForm, description: e.target.value })}
-                          placeholder="Describe this product â€” or let AI write it for you."
+                          placeholder="Describe this product — or let AI write it for you."
                           rows={3}
                           className="w-full px-3 py-2.5 pb-10 bg-white border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-200"
                         />
-                        {/* AI Generate button area â€” always visible */}
+                        {/* AI Generate button area — always visible */}
                         <div className="absolute bottom-2.5 right-2.5 group/aibtn">
 
-                          {/* Hover tooltip â€” content changes based on locked state */}
+                          {/* Hover tooltip — content changes based on locked state */}
                           <div className="absolute bottom-full right-0 mb-2.5 w-64 bg-slate-900 rounded-xl p-3.5 shadow-2xl opacity-0 group-hover/aibtn:opacity-100 pointer-events-none transition-all duration-200 translate-y-1 group-hover/aibtn:translate-y-0 z-20">
                             {!productForm.name ? (
                               <>
-                                <p className="text-[11px] font-semibold text-amber-400 uppercase tracking-wide mb-1.5">ðŸ”’ One thing missing</p>
-                                <p className="text-xs text-slate-300 leading-relaxed mb-3">AI needs at least a product name to craft a great description. Fill in what you can â€” more detail = better copy.</p>
+                                <p className="text-[11px] font-semibold text-amber-400 uppercase tracking-wide mb-1.5"> One thing missing</p>
+                                <p className="text-xs text-slate-300 leading-relaxed mb-3">AI needs at least a product name to craft a great description. Fill in what you can — more detail = better copy.</p>
                                 <div className="space-y-2">
                                   <div className="flex items-center gap-2">
                                     <span className="w-4 h-4 rounded-full bg-red-500/20 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" /></span>
-                                    <span className="text-xs text-red-300 font-medium">Product Name <span className="text-red-500/70 text-[10px]">â† start here</span></span>
+                                    <span className="text-xs text-red-300 font-medium">Product Name <span className="text-red-500/70 text-[10px]">start here</span></span>
                                   </div>
                                   <div className="flex items-center gap-2">
                                     <span className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-slate-500" /></span>
@@ -2137,13 +2228,13 @@ export default function SettingsPage() {
                                   </div>
                                   <div className="flex items-center gap-2">
                                     <span className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-slate-500" /></span>
-                                    <span className="text-xs text-slate-400">Images <span className="text-slate-600 text-[10px]">optional â€” AI uses if present</span></span>
+                                    <span className="text-xs text-slate-400">Images <span className="text-slate-600 text-[10px]">optional — AI uses if present</span></span>
                                   </div>
                                 </div>
                               </>
                             ) : (
                               <>
-                                <p className="text-[11px] font-semibold text-emerald-400 uppercase tracking-wide mb-1.5">âœ¦ Ready to generate</p>
+                                <p className="text-[11px] font-semibold text-emerald-400 uppercase tracking-wide mb-1.5">* Ready to generate</p>
                                 <p className="text-xs text-slate-300 leading-relaxed mb-3">AI will use all filled fields to write a ~100-word marketing description. Images are included if uploaded.</p>
                                 <div className="space-y-2">
                                   <div className="flex items-center gap-2">
@@ -2162,7 +2253,7 @@ export default function SettingsPage() {
                                     {productForm.images?.length > 0
                                       ? <span className="w-4 h-4 rounded-full bg-emerald-500/20 flex items-center justify-center flex-shrink-0"><Check size={9} className="text-emerald-400" /></span>
                                       : <span className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-slate-500" /></span>}
-                                    <span className={`text-xs ${productForm.images?.length > 0 ? 'text-emerald-300' : 'text-slate-400'}`}>Images <span className="text-slate-600 text-[10px]">{productForm.images?.length > 0 ? `${productForm.images.length} uploaded` : 'none â€” text only'}</span></span>
+                                    <span className={`text-xs ${productForm.images?.length > 0 ? 'text-emerald-300' : 'text-slate-400'}`}>Images <span className="text-slate-600 text-[10px]">{productForm.images?.length > 0 ? `${productForm.images.length} uploaded` : 'none — text only'}</span></span>
                                   </div>
                                 </div>
                               </>
@@ -2173,13 +2264,13 @@ export default function SettingsPage() {
                           {/* Nudge message shown when clicking while locked */}
                           {genDescNudge && (
                             <div className="absolute bottom-full right-0 mb-10 w-56 bg-amber-950/95 border border-amber-500/30 rounded-xl px-3.5 py-2.5 shadow-2xl z-30 pointer-events-none">
-                              <p className="text-xs text-amber-300 font-medium leading-snug">Give me a name first! ðŸŽ¯</p>
+                              <p className="text-xs text-amber-300 font-medium leading-snug">Give me a name first! </p>
                               <p className="text-[11px] text-amber-400/70 mt-0.5">Fill in <span className="text-amber-300 font-semibold">Product Name</span> above to unlock AI writing.</p>
                               <div className="absolute -bottom-[5px] right-5 w-2.5 h-2.5 bg-amber-950 rotate-45 rounded-sm border-r border-b border-amber-500/30" />
                             </div>
                           )}
 
-                          {/* The button â€” always clickable, style reflects locked/unlocked */}
+                          {/* The button — always clickable, style reflects locked/unlocked */}
                           <button
                             type="button"
                             onClick={generateProductDescription}
@@ -2192,7 +2283,7 @@ export default function SettingsPage() {
                             }`}
                           >
                             {generatingDesc ? (
-                              <><div className="w-3 h-3 border-[1.5px] border-white/30 border-t-white rounded-full animate-spin" /><span>Writingâ€¦</span></>
+                              <><div className="w-3 h-3 border-[1.5px] border-white/30 border-t-white rounded-full animate-spin" /><span>Writing...</span></>
                             ) : productForm.name ? (
                               <><Wand2 size={11} /><span>Generate with AI</span></>
                             ) : (
@@ -2261,7 +2352,7 @@ export default function SettingsPage() {
                           {productForm.images.map((img) => (
                             <div key={img.id} className="relative rounded-lg overflow-hidden border border-slate-200 bg-white">
                               <img src={img.dataUrl} alt={img.name} className="w-full h-24 object-cover" />
-                              <button onClick={() => removeProductImage(img.id)} className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/60 text-white text-xs flex items-center justify-center">Ã—</button>
+                              <button onClick={() => removeProductImage(img.id)} className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/60 text-white text-xs flex items-center justify-center">×</button>
                             </div>
                           ))}
                         </div>
@@ -2308,7 +2399,7 @@ export default function SettingsPage() {
                             </div>
                           </div>
                         )}
-                        <span className="absolute bottom-2 right-2 text-[10px] bg-black/50 text-white rounded-full px-2 py-0.5">{selectedProduct.images.length} photo{selectedProduct.images.length > 1 ? 's' : ''} Â· tap to expand</span>
+                        <span className="absolute bottom-2 right-2 text-[10px] bg-black/50 text-white rounded-full px-2 py-0.5">{selectedProduct.images.length} photo{selectedProduct.images.length > 1 ? 's' : ''} · tap to expand</span>
                       </div>
                     )}
                     <div className="p-6">
@@ -2354,7 +2445,7 @@ export default function SettingsPage() {
                           {Array.isArray(selectedProduct.features) && selectedProduct.features.length > 0 && (
                             <div className="bg-slate-50 border border-slate-100 rounded-xl p-3">
                               <p className="text-[10px] text-slate-400 font-medium mb-1">Features</p>
-                              <ul className="space-y-0.5">{selectedProduct.features.slice(0, 4).map((f, i) => <li key={i} className="text-xs text-slate-600 flex items-start gap-1"><span className="text-blue-400 mt-0.5">â€¢</span>{f}</li>)}</ul>
+                              <ul className="space-y-0.5">{selectedProduct.features.slice(0, 4).map((f, i) => <li key={i} className="text-xs text-slate-600 flex items-start gap-1"><span className="text-blue-400 mt-0.5">•</span>{f}</li>)}</ul>
                             </div>
                           )}
                         </div>
@@ -2373,7 +2464,7 @@ export default function SettingsPage() {
                 </div>
               )}
 
-              {/* â•â•â• LIGHTBOX â•â•â• */}
+              {/* === LIGHTBOX === */}
               {lightboxImages.length > 0 && (
                 <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center" onClick={closeLightbox}>
                   <button onClick={(e) => { e.stopPropagation(); setLightboxIndex(i => (i - 1 + lightboxImages.length) % lightboxImages.length); }}
@@ -2471,7 +2562,7 @@ export default function SettingsPage() {
                 <div className="space-y-3">
                   <div className="flex gap-3">
                     <button onClick={sendDeleteVerificationFingerprint} disabled={deleteAccountSending} className="px-4 py-2.5 bg-slate-900 text-white rounded-xl text-sm font-medium disabled:opacity-50">
-                      {deleteAccountSending ? 'Sendingâ€¦' : 'Send Fingerprint'}
+                      {deleteAccountSending ? 'Sending...' : 'Send Fingerprint'}
                     </button>
                     <div className="flex-1">
                       <label className="text-xs text-slate-500 font-medium mb-1.5 block">Verification Fingerprint</label>
@@ -2511,42 +2602,7 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {waQrModalOpen && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <QrCode size={20} className="text-emerald-600" />
-                <h3 className="text-lg font-bold text-slate-900">WhatsApp Web (QR)</h3>
-              </div>
-              <button type="button" onClick={closeWaQrModal} className="text-slate-400 p-1 hover:text-slate-600"><X size={20} /></button>
-            </div>
-            <p className="text-xs text-slate-500 mb-4">Open WhatsApp on your phone → Settings → Linked devices → Link a device, then scan the code below.</p>
-            {waQrError && (
-              <div className="mb-3 flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">{waQrError}</div>
-            )}
-            {waQrStatus && (
-              <p className="text-xs font-medium text-slate-600 mb-2">Status: <span className="text-emerald-700">{waQrStatus}</span></p>
-            )}
-            <div className="flex min-h-[220px] items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-4">
-              {waQrImageSrc ? (
-                <img src={waQrImageSrc} alt="WhatsApp QR" className="max-w-[240px] max-h-[240px] w-full h-auto" />
-              ) : (
-                <div className="text-center text-sm text-slate-500">
-                  {waQrLoading && !waQrError ? 'Waiting for QR from bridge…' : 'No QR yet. Start the bridge process and ensure WHATSAPP_BRIDGE_URL / WHATSAPP_BRIDGE_SECRET match the server.'}
-                </div>
-              )}
-            </div>
-            <p className="text-[10px] text-slate-400 mt-3">Bridge must map inbound to your company via BRIDGE_COMPANY_ID in the bridge environment.</p>
-            <div className="flex gap-2 mt-4">
-              <button type="button" onClick={() => fetchWaBridgeQr()} className="flex-1 py-2 text-sm font-medium text-slate-700 bg-slate-100 rounded-xl hover:bg-slate-200">Refresh</button>
-              <button type="button" onClick={closeWaQrModal} className="flex-1 py-2 text-sm font-medium text-white bg-emerald-600 rounded-xl hover:bg-emerald-500">Done</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* â•â•â• PASSWORD MODAL â•â•â• */}
+      {/* === PASSWORD MODAL === */}
       {passwordModal && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
@@ -2566,7 +2622,7 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {/* â•â•â• EDIT USER MODAL â•â•â• */}
+      {/* === EDIT USER MODAL === */}
       {showCreateUserModal && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">

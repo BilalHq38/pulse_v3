@@ -102,6 +102,7 @@ _DDL = (
     "CREATE INDEX IF NOT EXISTS idx_workflows_company_status ON workflows(company_id, status, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_workflows_trace ON workflows(trace_id, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_workflow_executions_workflow ON workflow_executions(workflow_id, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_workflow_executions_company ON workflow_executions(company_id, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_workflow_transitions_workflow ON workflow_transitions(workflow_id, created_at DESC)",  # noqa: E501
 )
 

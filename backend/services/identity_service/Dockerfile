@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -12,9 +13,10 @@ ENV PIP_PROGRESS_BAR=off
 
 COPY requirements.txt /app/requirements.txt
 COPY backend/services/identity_service/requirements.txt /app/identity_requirements.txt
-RUN pip install --no-cache-dir --retries 10 --timeout 300 -r /app/requirements.txt && \
-	pip install --no-cache-dir --retries 10 --timeout 300 torch==2.5.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu && \
-	pip install --no-cache-dir --retries 10 --timeout 300 -r /app/identity_requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 300 -r /app/requirements.txt && \
+    pip install --retries 10 --timeout 300 torch==2.5.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu && \
+    pip install --retries 10 --timeout 300 -r /app/identity_requirements.txt
 
 COPY backend /app/backend
 

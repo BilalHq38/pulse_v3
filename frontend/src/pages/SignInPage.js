@@ -3,6 +3,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
 import { postAuthDestination } from '@/lib/auth-gates';
+import { startOAuthLoginRedirect } from '@/lib/oauthLoginRedirect';
 import PlatformLogo from '@/components/PlatformLogo';
 import { LogIn, Mail, Lock, Eye, EyeOff, ArrowLeft, CheckCircle, AlertCircle } from 'lucide-react';
 
@@ -117,13 +118,7 @@ export default function SignInPage() {
     finally { setLoading(false); }
   };
 
-  const startOAuth = (provider) => {
-    const params = new URLSearchParams({
-      frontend_origin: window.location.origin,
-      next: '/dashboard',
-    });
-    window.location.href = `${backendBaseUrl}/api/auth/${provider}?${params.toString()}`;
-  };
+  const startOAuth = (provider) => startOAuthLoginRedirect(backendBaseUrl, provider);
 
   const handleForgotPassword = async (e) => {
     e.preventDefault();

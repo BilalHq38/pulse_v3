@@ -17,12 +17,10 @@ import {
 import PlatformLogo from '@/components/PlatformLogo';
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
+import { startOAuthLoginRedirect } from '@/lib/oauthLoginRedirect';
 import { getSignupStripePlanOptions, getSignupTrialPlanOptions } from '@/data/publicPricingPlans';
 
 const F = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
-
-/** Must match backend `OAUTH_SIGNUP_PREFILL_NEXT_PATH` (oauth_service). */
-const OAUTH_SIGNUP_PREFILL_NEXT = '/__signup_oauth_prefill__';
 
 const GoogleIcon = () => (
   <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg" aria-hidden>
@@ -117,7 +115,7 @@ export default function SignUpPage() {
     }
     if (oauthErr === 'no_account') {
       setError(
-        'No workspace is linked to that Google or Facebook account yet. To create one: use Continue with Google or Continue with Facebook for signup at the top of this page to prefill your details, then finish this form (company name and password). Paid checkout only runs when Stripe is configured. If you already have an account, go to Sign in. When the API has DEMO_MODE or STRIPE_OPTIONAL enabled, Sign in with Google on the Sign in page creates a workspace automatically without checkout.',
+        'No workspace is linked to that Google or Facebook account yet. Use Continue with Google or Facebook above (same as Sign in) if your team already uses the platform, or complete the form below to register a new workspace. Paid checkout only runs when Stripe is configured.',
       );
       navigate('/signup', { replace: true });
       return;
@@ -150,13 +148,7 @@ export default function SignUpPage() {
     setForm((prev) => (prev.plan_code === p ? prev : { ...prev, plan_code: p }));
   }, [searchParams]);
 
-  const startOAuthSignupPrefill = (provider) => {
-    const params = new URLSearchParams({
-      frontend_origin: window.location.origin,
-      next: OAUTH_SIGNUP_PREFILL_NEXT,
-    });
-    window.location.href = `${backendBaseUrl}/api/auth/${provider}?${params.toString()}`;
-  };
+  const startOAuth = (provider) => startOAuthLoginRedirect(backendBaseUrl, provider);
 
   const set = (key, value) => setForm((prev) => ({ ...prev, [key]: value }));
 
@@ -394,10 +386,10 @@ export default function SignUpPage() {
           )}
 
           <div style={{ background: '#fff', borderRadius: 24, border: '1px solid rgba(148,163,184,0.18)', padding: 20, boxShadow: '0 18px 42px rgba(15,23,42,0.06)', marginBottom: 14 }}>
-            <p style={{ fontSize: 13, fontWeight: 600, color: '#475569', marginBottom: 12 }}>Prefill with your account</p>
+            <p style={{ fontSize: 13, fontWeight: 600, color: '#475569', marginBottom: 12 }}>Continue with Google or Facebook</p>
             <button
               type="button"
-              onClick={() => startOAuthSignupPrefill('google')}
+              onClick={() => startOAuth('google')}
               onMouseEnter={(e) => {
                 e.currentTarget.style.background = '#f8fafc';
                 e.currentTarget.style.borderColor = '#adb5bd';
@@ -416,7 +408,7 @@ export default function SignUpPage() {
             </button>
             <button
               type="button"
-              onClick={() => startOAuthSignupPrefill('facebook')}
+              onClick={() => startOAuth('facebook')}
               onMouseEnter={(e) => {
                 e.currentTarget.style.background = '#1558c0';
                 e.currentTarget.style.boxShadow = '0 4px 14px rgba(22,87,209,0.45)';
@@ -525,7 +517,7 @@ export default function SignUpPage() {
 
             <button
               type="submit"
-              disabled={loading || (showPasswordRules && !isPasswordValid)}
+              disabled={loading || !isPasswordValid}
               style={{ width: '100%', padding: '13px 18px', marginTop: 16, borderRadius: 12, border: 'none', background: 'linear-gradient(135deg,#2563eb,#0ea5e9)', color: '#fff', fontSize: 14, fontWeight: 700, cursor: loading ? 'wait' : 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 8, boxShadow: '0 16px 26px rgba(37,99,235,0.22)', opacity: loading ? 0.72 : 1 }}
             >
               {loading ? (
