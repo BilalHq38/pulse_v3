@@ -79,6 +79,8 @@ pandas==3.0.2
 passlib==1.7.4
 pathspec==1.0.4
 pg0-embedded==0.12.3
+# Review ~every 6 months: metadata updates as numbering plans change (keep roughly aligned with node libphonenumber-js in whatsapp_bridge).
+phonenumbers==8.13.50
 pillow==12.2.0
 platformdirs==4.9.6
 pluggy==1.6.0

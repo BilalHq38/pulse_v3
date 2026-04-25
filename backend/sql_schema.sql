@@ -111,6 +111,8 @@ CREATE INDEX IF NOT EXISTS idx_company_settings_company_id ON company_settings(c
 CREATE INDEX IF NOT EXISTS idx_company_settings_created_at ON company_settings(company_id, created_at);
 
 ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS preferred_channels JSONB NOT NULL DEFAULT '[]'::jsonb;
+-- Per-tenant default region (ISO 3166-1 alpha-2) for parsing local phone numbers; empty = use env WHATSAPP_DEFAULT_COUNTRY only.
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_phone_region TEXT NOT NULL DEFAULT '';
 
 INSERT INTO company_settings(id, company_id, created_at, updated_at)
 VALUES (

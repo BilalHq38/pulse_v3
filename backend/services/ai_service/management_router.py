@@ -187,6 +187,18 @@ async def _fetch_scoped_mcp_server(
     )
 
 
+async def _fetch_scoped_ai_agent(
+    db,
+    agent_id: str,
+    *,
+    company_id: str,
+    is_super_admin: bool,
+):
+    if is_super_admin:
+        return r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1", agent_id))
+    return r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1 AND company_id=$2", agent_id, company_id))
+
+
 async def _load_agent_runtime_fields(db, agent: dict, company_id: str) -> dict:
     data = dict(agent or {})
     llm_id = str(data.get("llm_id") or "").strip()
@@ -222,7 +234,13 @@ async def ai_classify(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     body = await request.json()
-    return await classify_intent(body.get("text", ""), db=db, company_id=cu.get("company_id", ""))
+    return await classify_intent(
+        body.get("text", ""),
+        db=db,
+        company_id=cu.get("company_id", ""),
+        conversation_context=body.get("conversation_context", []),
+        previous_intent=body.get("previous_intent", ""),
+    )
 
 
 @router.get("/ai/llm-engines")
@@ -327,7 +345,7 @@ async def select_llm_engine(llm_id: str, request: Request):
     if not ready:
         raise HTTPException(400, reason)
     try:
-        validate_live_engine(engine, require_vision=True)
+        validate_live_engine(engine, require_vision=False)
     except Exception as exc:
         raise HTTPException(400, str(exc))
     settings = await ensure_company_settings_row(db, cid)
@@ -362,22 +380,28 @@ async def delete_llm_engine(llm_id: str, request: Request):
 async def list_ai_agents(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
-    cid = cu.get("company_id", "")
-    agents = rs(
-        await db.fetch(
+    cid = (cu.get("company_id", "") or "").strip()
+    requested_company_id = (request.query_params.get("company_id", "") or "").strip()
+    scoped_company_id = requested_company_id if _is_super_admin(cu) and requested_company_id else cid
+    rows = (
+        await db.fetch("SELECT * FROM ai_agents ORDER BY company_id, registered_at DESC")
+        if _is_super_admin(cu) and not scoped_company_id
+        else await db.fetch(
             "SELECT * FROM ai_agents WHERE company_id=$1 ORDER BY registered_at DESC",
-            cid,
+            scoped_company_id,
         )
     )
+    agents = rs(rows)
     for agent in agents:
-        agent.update(await _load_agent_runtime_fields(db, agent, cid))
-        agent["configuration"] = dict(
-            r
-            for r in await db.fetch(
+        agent_company_id = str(agent.get("company_id") or scoped_company_id or cid).strip()
+        agent.update(await _load_agent_runtime_fields(db, agent, agent_company_id))
+        agent["configuration"] = {
+            row["config_key"]: row["config_val"]
+            for row in await db.fetch(
                 "SELECT config_key,config_val FROM ai_agent_config WHERE agent_id=$1",
                 agent["id"],
             )
-        )
+        }
     return agents
 
 
@@ -386,7 +410,9 @@ async def create_ai_agent(request: Request):
     db = _db(request)
     cu = await require_roles(request, ["admin", "super_admin"])
     body = await request.json()
-    cid = cu.get("company_id", "")
+    cid = _tenant_resource_company_id(cu, body)
+    if not cid:
+        raise HTTPException(400, "company_id is required")
     llm_id = body.get("llm_id") or (await ensure_default_llm_engine(db)).get("id", "")
     if llm_id and not await _fetch_scoped_llm_engine(
         db,
@@ -425,6 +451,8 @@ async def create_ai_agent(request: Request):
             [(agent_id, k, str(v)) for k, v in cfg.items()],
         )
     agent = r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1", agent_id))
+    if agent:
+        agent["configuration"] = {k: str(v) for k, v in cfg.items()} if isinstance(cfg, dict) else {}
     return await _load_agent_runtime_fields(db, agent, cid)
 
 
@@ -432,7 +460,16 @@ async def create_ai_agent(request: Request):
 async def update_ai_agent(agent_id: str, request: Request):
     db = _db(request)
     cu = await require_roles(request, ["admin", "super_admin"])
-    cid = cu.get("company_id", "")
+    cid = (cu.get("company_id", "") or "").strip()
+    existing_agent = await _fetch_scoped_ai_agent(
+        db,
+        agent_id,
+        company_id=cid,
+        is_super_admin=_is_super_admin(cu),
+    )
+    if not existing_agent:
+        raise HTTPException(404, "AI agent not found")
+    agent_company_id = str(existing_agent.get("company_id") or cid).strip()
     body = await request.json()
     cfg = body.pop("configuration", None)
     body = _filter_update_fields(body, AI_AGENT_FIELDS)
@@ -442,7 +479,7 @@ async def update_ai_agent(agent_id: str, request: Request):
     if body.get("llm_id") and not await _fetch_scoped_llm_engine(
         db,
         body["llm_id"],
-        company_id=cid,
+        company_id=agent_company_id,
         is_super_admin=_is_super_admin(cu),
         allow_global=True,
     ):
@@ -450,7 +487,7 @@ async def update_ai_agent(agent_id: str, request: Request):
     if body.get("mcp_server_id") and not await _fetch_scoped_mcp_server(
         db,
         body["mcp_server_id"],
-        company_id=cid,
+        company_id=agent_company_id,
         is_super_admin=_is_super_admin(cu),
         allow_global=True,
     ):
@@ -458,13 +495,20 @@ async def update_ai_agent(agent_id: str, request: Request):
     if body:
         body["updated_at"] = now_ts()
         set_parts = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(body))
-        await db.execute(
-            f"UPDATE ai_agents SET {set_parts} WHERE id=$1 AND company_id=${len(body) + 2}",
-            agent_id,
-            *body.values(),
-            cid,
-        )
-        await _enable_company_ai_if_agent_active(db, cid, bool(body.get("is_active", False)))
+        if _is_super_admin(cu):
+            await db.execute(
+                f"UPDATE ai_agents SET {set_parts} WHERE id=$1",
+                agent_id,
+                *body.values(),
+            )
+        else:
+            await db.execute(
+                f"UPDATE ai_agents SET {set_parts} WHERE id=$1 AND company_id=${len(body) + 2}",
+                agent_id,
+                *body.values(),
+                agent_company_id,
+            )
+        await _enable_company_ai_if_agent_active(db, agent_company_id, bool(body.get("is_active", False)))
     if cfg is not None:
         await db.execute("DELETE FROM ai_agent_config WHERE agent_id=$1", agent_id)
         if cfg:
@@ -472,7 +516,12 @@ async def update_ai_agent(agent_id: str, request: Request):
                 "INSERT INTO ai_agent_config(agent_id,config_key,config_val) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
                 [(agent_id, k, str(v)) for k, v in cfg.items()],
             )
-    agent = r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1 AND company_id=$2", agent_id, cid))
+    agent = await _fetch_scoped_ai_agent(
+        db,
+        agent_id,
+        company_id=agent_company_id,
+        is_super_admin=_is_super_admin(cu),
+    )
     if not agent:
         raise HTTPException(404, "AI agent not found")
     agent["configuration"] = {
@@ -482,15 +531,18 @@ async def update_ai_agent(agent_id: str, request: Request):
             agent_id,
         )
     }
-    return await _load_agent_runtime_fields(db, agent, cid)
+    return await _load_agent_runtime_fields(db, agent, agent_company_id)
 
 
 @router.delete("/ai/agents/{agent_id}")
 async def delete_ai_agent(agent_id: str, request: Request):
     db = _db(request)
     cu = await require_roles(request, ["admin", "super_admin"])
-    cid = cu.get("company_id", "")
-    res = await db.execute("DELETE FROM ai_agents WHERE id=$1 AND company_id=$2", agent_id, cid)
+    cid = (cu.get("company_id", "") or "").strip()
+    if _is_super_admin(cu):
+        res = await db.execute("DELETE FROM ai_agents WHERE id=$1", agent_id)
+    else:
+        res = await db.execute("DELETE FROM ai_agents WHERE id=$1 AND company_id=$2", agent_id, cid)
     if res == "DELETE 0":
         raise HTTPException(404, "AI agent not found")
     return {"ok": True}
@@ -782,13 +834,13 @@ async def list_mcp_clients(request: Request):
         )
     )
     for c in clients:
-        c["configuration"] = dict(
-            r
-            for r in await db.fetch(
+        c["configuration"] = {
+            row["config_key"]: row["config_val"]
+            for row in await db.fetch(
                 "SELECT config_key,config_val FROM mcp_client_config WHERE client_id=$1",
                 c["id"],
             )
-        )
+        }
     return clients
 
 

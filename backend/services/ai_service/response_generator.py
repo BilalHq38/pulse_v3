@@ -20,6 +20,7 @@ from services.ai_service.common import (
 from services.ai_service.intent import classify_intent
 from services.ai_service.llm_client import (
     _resolve_engine_for_request,
+    call_with_engines,
     call_model_json,
     call_model_text,
     validate_live_engine,
@@ -194,18 +195,50 @@ def _build_generation_config(
     observed_sentiment: dict,
     recent_ai_replies: list[str],
 ) -> dict:
-    base_temperature = 0.72
+    try:
+        base_temperature = float(os.getenv("AI_RESPONSE_TEMPERATURE_BASE", "0.72") or 0.72)
+    except Exception:
+        base_temperature = 0.72
+    try:
+        min_temperature = float(os.getenv("AI_RESPONSE_TEMPERATURE_MIN", "0.55") or 0.55)
+    except Exception:
+        min_temperature = 0.55
+    try:
+        max_temperature = float(os.getenv("AI_RESPONSE_TEMPERATURE_MAX", "1.05") or 1.05)
+    except Exception:
+        max_temperature = 1.05
+    try:
+        jitter_steps = max(0, int(os.getenv("AI_RESPONSE_TEMPERATURE_JITTER_STEPS", "6") or 6))
+    except Exception:
+        jitter_steps = 6
+    try:
+        product_delta = float(os.getenv("AI_RESPONSE_TEMPERATURE_PRODUCT_DELTA", "0.08") or 0.08)
+    except Exception:
+        product_delta = 0.08
+    try:
+        negative_delta = float(os.getenv("AI_RESPONSE_TEMPERATURE_NEGATIVE_DELTA", "-0.10") or -0.10)
+    except Exception:
+        negative_delta = -0.10
+    try:
+        repetition_delta = float(os.getenv("AI_RESPONSE_TEMPERATURE_REPETITION_DELTA", "0.06") or 0.06)
+    except Exception:
+        repetition_delta = 0.06
     intent_name = str((observed_intent or {}).get("intent") or "").strip().lower()
     sentiment_label = _sentiment_label(observed_sentiment)
     if intent_name in {"product_recommendation", "purchase_inquiry"}:
-        base_temperature += 0.08
+        base_temperature += product_delta
     if sentiment_label == "negative":
-        base_temperature -= 0.1
+        base_temperature += negative_delta
     if len(recent_ai_replies) >= 2:
-        base_temperature += 0.06
-    jitter = random.randint(0, 6) / 100.0
-    temperature = max(0.55, min(1.05, base_temperature + jitter))
+        base_temperature += repetition_delta
+    jitter = random.randint(0, jitter_steps) / 100.0
+    temperature = max(min_temperature, min(max_temperature, base_temperature + jitter))
     return {"temperature": round(temperature, 2)}
+
+
+def _agent_configuration(agent: dict | None) -> dict[str, str]:
+    config = (agent or {}).get("configuration")
+    return dict(config or {}) if isinstance(config, dict) else {}
 
 
 def _normalize_ai_attachments(attachments: list[dict]) -> list[dict]:
@@ -634,11 +667,34 @@ def _select_response_style(
 def _agent_runtime_profile(agent: dict | None) -> dict[str, str]:
     agent_type = str((agent or {}).get("agent_type") or "generic").strip().lower() or "generic"
     profile = AGENT_RUNTIME_PROFILES.get(agent_type) or AGENT_RUNTIME_PROFILES["generic"]
+    configuration = _agent_configuration(agent)
+    configured_label = str(configuration.get("label") or "").strip()
+    configured_instruction = str(
+        configuration.get("instruction") or configuration.get("system_prompt") or ""
+    ).strip()
     return {
         "agent_type": agent_type,
-        "label": profile["label"],
-        "instruction": profile["instruction"],
+        "label": configured_label or profile["label"],
+        "instruction": configured_instruction or profile["instruction"],
     }
+
+
+def _apply_agent_engine_overrides(engine: dict, agent: dict | None) -> dict:
+    resolved = dict(engine or {})
+    configuration = _agent_configuration(agent)
+    if not configuration:
+        return resolved
+    if configuration.get("temperature") not in {None, ""}:
+        try:
+            resolved["temperature"] = float(configuration["temperature"])
+        except Exception:
+            pass
+    if configuration.get("max_tokens") not in {None, ""}:
+        try:
+            resolved["max_tokens"] = int(configuration["max_tokens"])
+        except Exception:
+            pass
+    return resolved
 
 
 async def _generate_response_text(
@@ -822,9 +878,29 @@ async def generate_ai_response(
             )
         except Exception as exc:
             logger.debug("Active AI agent resolution skipped: %s", exc)
+    if db and selected_agent and selected_agent.get("id"):
+        try:
+            selected_agent["configuration"] = {
+                row["config_key"]: row["config_val"]
+                for row in await db.fetch(
+                    "SELECT config_key,config_val FROM ai_agent_config WHERE agent_id=$1",
+                    selected_agent["id"],
+                )
+            }
+        except Exception as exc:
+            logger.debug("AI agent configuration load skipped: %s", exc)
     agent_profile = _agent_runtime_profile(selected_agent)
     selected_agent_id = str((selected_agent or {}).get("id") or "").strip()
     selected_agent_type = str((selected_agent or {}).get("agent_type") or "").strip().lower() or "generic"
+    logger.info(
+        "ai_agent_selected company_id=%s agent_id=%s agent_type=%s intent=%s channel=%s llm_id=%s",
+        company_id or "",
+        selected_agent_id or "-",
+        selected_agent_type,
+        str(observed_intent.get("intent") or "general_question"),
+        channel_name or "unknown",
+        str((selected_agent or {}).get("llm_id") or ""),
+    )
     style_profile = _select_response_style(
         query,
         observed_sentiment,
@@ -908,6 +984,13 @@ async def generate_ai_response(
         quick_response.setdefault("agent_id", selected_agent_id)
         quick_response.setdefault("agent_type", selected_agent_type)
         quick_response.setdefault("intent_name", str(observed_intent.get("intent") or ""))
+        logger.info(
+            "ai_rule_response company_id=%s intent=%s channel=%s provider=%s",
+            company_id or "",
+            str(observed_intent.get("intent") or ""),
+            channel_name or "unknown",
+            str(quick_response.get("provider") or "rule"),
+        )
         await _persist_response_memory(
             db=db,
             company_id=company_id,
@@ -984,6 +1067,13 @@ async def generate_ai_response(
         product_rule_response.setdefault("agent_id", selected_agent_id)
         product_rule_response.setdefault("agent_type", selected_agent_type)
         product_rule_response.setdefault("intent_name", str(observed_intent.get("intent") or ""))
+        logger.info(
+            "ai_rule_response company_id=%s intent=%s channel=%s provider=%s",
+            company_id or "",
+            str(observed_intent.get("intent") or ""),
+            channel_name or "unknown",
+            str(product_rule_response.get("provider") or "rule"),
+        )
         response_product_ids = [
             str(item).strip()
             for item in product_rule_response.get("product_ids", ai_context.get("product_ids", []))
@@ -1155,6 +1245,7 @@ async def generate_ai_response(
             engine = dict(engine_row)
     if not engine:
         engine = await _resolve_engine_for_request(db=db, company_id=company_id or "", use_pro=False)
+    engine = _apply_agent_engine_overrides(engine, selected_agent)
     generation_config = _build_generation_config(
         query=query,
         observed_intent=observed_intent,
@@ -1177,8 +1268,16 @@ async def generate_ai_response(
         )
         if max_similarity >= 0.88:
             retry_generation_config = dict(generation_config)
+            try:
+                retry_delta = float(os.getenv("AI_RESPONSE_RETRY_TEMPERATURE_DELTA", "0.14") or 0.14)
+            except Exception:
+                retry_delta = 0.14
+            try:
+                retry_max = float(os.getenv("AI_RESPONSE_RETRY_TEMPERATURE_MAX", "1.1") or 1.1)
+            except Exception:
+                retry_max = 1.1
             retry_generation_config["temperature"] = round(
-                min(1.1, float(generation_config.get("temperature", 0.72)) + 0.14),
+                min(retry_max, float(generation_config.get("temperature", os.getenv("AI_RESPONSE_TEMPERATURE_BASE", "0.72"))) + retry_delta),
                 2,
             )
             retry_prompt = (
@@ -1333,6 +1432,13 @@ async def generate_ai_response(
             conversation_state=conversation_state,
         )
         fallback_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
+        logger.warning(
+            "ai_response_fallback company_id=%s intent=%s channel=%s provider=%s",
+            company_id or "",
+            str(observed_intent.get("intent") or ""),
+            channel_name or "unknown",
+            str(fallback_response.get("provider") or "fallback"),
+        )
         _record_outcome("success", "fallback", "rule-recovery")
         return fallback_response
 
@@ -1406,9 +1512,12 @@ async def generate_product_description(
         + ([f"Category: {category}"] if category and category != "general" else [])
         + ([f"Price: {price_currency or 'USD'} {price}"] if price else [])
     )
-    selected_engine = dict((engines or [None])[0] or await _resolve_engine_for_request())
+    ordered_engines = [dict(engine) for engine in (engines or []) if isinstance(engine, dict)]
+    ordered_engines.sort(key=lambda engine: 0 if engine.get("is_selected") else 1)
+    if not ordered_engines:
+        ordered_engines = [await _resolve_engine_for_request()]
     return (
-        await call_model_text(
+        await call_with_engines(
             "You are an ecommerce product copywriter.\n"
             "Task: write one concise product description for a catalog or CRM card.\n"
             "Input format:\n"
@@ -1420,8 +1529,8 @@ async def generate_product_description(
             "- Do NOT mention price.\n"
             "- Do NOT invent specs that are not present in the metadata or clearly visible in the images.\n"
             f"\nproduct_metadata:\n{chr(10).join(lines)}",
-            engine=selected_engine,
-            image_urls=[url for url in (images or [])[:2] if is_data_url_image(str(url))] or None,
+            engines=ordered_engines,
+            image_parts=[url for url in (images or [])[:2] if is_data_url_image(str(url))] or None,
         )
     ).strip()
 

@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import re
 from typing import Any
 
 from services.ai_service.common import SentimentResult
 from services.ai_service.llm_client import (
     _default_engine,
+    _provider_default_model,
     _resolve_engine_for_request,
     call_model_json,
     get_provider_runtime_info,
@@ -16,13 +18,27 @@ from services.ai_service.llm_client import (
 
 logger = logging.getLogger(__name__)
 
-_GEMINI_FLASH_LITE_ENGINE = {
-    "provider": "gemini",
-    "model_name": "gemini-2.5-flash-lite",
-    "temperature": 0.25,
-    "max_tokens": 1024,
-    "supports_vision": False,
-}
+
+def _sentiment_fallback_engine() -> dict[str, Any]:
+    provider = (os.getenv("AI_SENTIMENT_FALLBACK_PROVIDER", "gemini") or "gemini").strip().lower()
+    model_name = (
+        os.getenv("AI_SENTIMENT_FALLBACK_MODEL") or _provider_default_model(provider, use_pro=False)
+    ).strip()
+    try:
+        temperature = float(os.getenv("AI_SENTIMENT_FALLBACK_TEMPERATURE", "0.25") or 0.25)
+    except Exception:
+        temperature = 0.25
+    try:
+        max_tokens = int(os.getenv("AI_SENTIMENT_FALLBACK_MAX_TOKENS", "1024") or 1024)
+    except Exception:
+        max_tokens = 1024
+    return {
+        "provider": provider,
+        "model_name": model_name,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "supports_vision": False,
+    }
 
 _SUPPORTED_EMOTIONS = {
     "angry",
@@ -373,7 +389,7 @@ async def _call_sentiment_api(
     selected_engine = await _resolve_engine_for_request(db=db, company_id=company_id)
     candidates = [
         selected_engine,
-        _GEMINI_FLASH_LITE_ENGINE,
+        _sentiment_fallback_engine(),
         _default_engine(use_pro=False),
         _default_engine(use_pro=True),
     ]

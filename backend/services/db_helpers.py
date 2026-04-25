@@ -28,6 +28,7 @@ from core.config import (
     VERIFICATION_RESEND_MAX_ATTEMPTS,
 )
 from core.request_helpers import get_client_ip, resolve_frontend_base_url
+from core.phone_normalization import normalize_to_e164_digits, phone_lookup_candidates
 from core.utils import make_id, parse_dt
 from models.reference_data import ensure_company_reference_data, resolve_role_id
 from services.email_service import render_platform_email_html, send_email_async
@@ -1642,21 +1643,13 @@ async def refresh_conversation_rollup(db, convo_id: str):
     )
 
 
-def _normalize_phone_digits(value: str | None) -> str | None:
-    """Normalize phone to last-10-digit form for cross-format CRM matching."""
-    if not value:
-        return None
-    digits = re.sub(r"\D", "", value)
-    return digits[-10:] if len(digits) >= 10 else (digits or None)
-
-
 async def get_or_create_customer_from_contact(db, name: str, phone: str, current_user: dict) -> dict:
     raw = (phone or "").strip()
-    normalized = _normalize_phone_digits(raw) or raw
+    e164 = normalize_to_e164_digits(raw) if raw else ""
+    stored = e164 or (re.sub(r"\D", "", raw) if raw else "")
     cid = current_user.get("company_id", "")
     if raw:
-        # Try exact raw match first, then normalized form.
-        for phone_candidate in dict.fromkeys([raw, normalized]):
+        for phone_candidate in phone_lookup_candidates(raw):
             if not phone_candidate:
                 continue
             row = await db.fetchrow(
@@ -1684,7 +1677,7 @@ async def get_or_create_customer_from_contact(db, name: str, phone: str, current
         nid,
         cid,
         name or "Unknown",
-        normalized,
+        stored,
     )
     cust = dict(await db.fetchrow("SELECT * FROM customers WHERE id=$1", nid))
     await db.execute(
@@ -1729,7 +1722,8 @@ async def get_or_create_contact_conversation(db, customer: dict, channel: str, s
 
 async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> dict:
     email = (lead.get("email") or "").strip().lower()
-    phone = (lead.get("phone") or "").strip()
+    _raw_phone = (lead.get("phone") or "").strip()
+    phone = normalize_to_e164_digits(_raw_phone) if _raw_phone else ""
     name = (lead.get("name") or "").strip() or "Unknown"
     cid = current_user.get("company_id", "")
     wp, args = [], [cid]

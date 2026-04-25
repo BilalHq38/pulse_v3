@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from shared.config import is_production
+from shared.config import gateway_allowed_origins, is_production
 
 from services.identity_service.app.db.database import close_db_engine, get_db, init_db_schema
 from services.identity_service.app.db.models import IdentityMapping, UnifiedCustomer
@@ -91,17 +91,14 @@ logger = logging.getLogger(__name__)
 
 
 def _identity_allowed_origins() -> list[str]:
-    configured = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "").split(",") if origin.strip()]
-    defaults = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://app.pulse-engine.example",
-    ]
-    origins = configured or defaults
-    origins = [origin for origin in origins if origin and origin != "*"]
-    if not origins:
-        origins = defaults[:2]
-    return list(dict.fromkeys(origins))
+    configured: list[str] = []
+    for raw in (
+        os.environ.get("CORS_ORIGINS", ""),
+        os.environ.get("GATEWAY_ALLOWED_ORIGINS", ""),
+    ):
+        configured.extend(origin.strip() for origin in raw.split(",") if origin.strip())
+    origins = [origin for origin in (configured or gateway_allowed_origins()) if origin and origin != "*"]
+    return list(dict.fromkeys(origins or gateway_allowed_origins()))
 
 
 def _validate_identity_cors_settings() -> None:

@@ -304,13 +304,17 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
     if _prefer_local_impl():
         return await _local_classify_intent(text, db=db, company_id=company_id, **kwargs)
     try:
-        result = await _call_remote_ai(
+        return await _call_remote_ai(
             "POST",
-            "/api/ai/analyze",
+            "/api/ai/classify",
             company_id=company_id,
-            json_body={"text": text, "company_id": company_id},
+            json_body={
+                "text": text,
+                "company_id": company_id,
+                "conversation_context": kwargs.get("conversation_context", []),
+                "previous_intent": kwargs.get("previous_intent", ""),
+            },
         )
-        return result.get("intent", {})
     except Exception as exc:
         logger.warning(
             "ai_service intent remote failed company_id=%s error=%s",
@@ -365,6 +369,7 @@ async def generate_ai_response(
                 "historical_sentiment": historical_sentiment,
                 "actor_user_id": actor_user_id,
                 "conversation_id": kwargs.get("conversation_id", ""),
+                "channel": kwargs.get("channel", "web_chat"),
             },
         )
         return {
@@ -375,6 +380,13 @@ async def generate_ai_response(
             "provider": response.get("engine", "").split(":", 1)[0] if response.get("engine") else "",
             "model_name": response.get("engine", "").split(":", 1)[1] if ":" in response.get("engine", "") else "",
             "confidence": float(response.get("confidence", 0.9) or 0.0),
+            "llm_id": str(response.get("llm_id", "") or ""),
+            "agent_id": str(response.get("agent_id", "") or ""),
+            "agent_type": str(response.get("agent_type", "") or ""),
+            "conversation_stage": str(response.get("conversation_stage", "") or ""),
+            "next_action": str(response.get("next_action", "") or ""),
+            "intent_shift": bool(response.get("intent_shift")),
+            "conversation_sentiment": dict(response.get("conversation_sentiment") or {}),
         }
     except Exception as exc:
         logger.warning(
@@ -434,6 +446,7 @@ async def generate_combined_ai_analysis(
                 "historical_sentiment": historical_sentiment,
                 "actor_user_id": kwargs.get("actor_user_id", ""),
                 "conversation_id": kwargs.get("conversation_id", ""),
+                "channel": kwargs.get("channel", "web_chat"),
             },
         )
     except Exception as exc:
@@ -670,6 +683,7 @@ async def generate_product_description(
     price_currency: str = "USD",
     images: list | None = None,
     engines: Optional[list[dict]] = None,
+    company_id: str = "",
 ) -> str:
     if _prefer_local_impl():
         return await _local_generate_product_description(
@@ -686,6 +700,7 @@ async def generate_product_description(
         result = await _call_remote_ai(
             "POST",
             "/api/ai/product-description",
+            company_id=company_id,
             json_body={
                 "name": name,
                 "product_title": product_title,
@@ -694,6 +709,7 @@ async def generate_product_description(
                 "price": price,
                 "price_currency": price_currency,
                 "images": images or [],
+                "company_id": company_id,
             },
         )
         return str(result.get("description") or "")

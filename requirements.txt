@@ -36,3 +36,6 @@ openpyxl>=3.1.0
 
 # Environment variables
 python-dotenv>=1.0.0
+
+# Phone E.164 validation (must match backend/core/phone_normalization.py; keep in sync with backend/requirements.txt)
+phonenumbers>=8.13.0,<9

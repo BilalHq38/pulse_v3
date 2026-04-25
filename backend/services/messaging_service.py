@@ -10,6 +10,7 @@ import httpx
 from fastapi import HTTPException
 
 from core.config import WHATSAPP_PHONE_ID, WHATSAPP_TOKEN
+from core.phone_normalization import normalize_to_e164_digits, strict_normalize_to_e164_digits
 from services.ai_service.common import _extract_data_url_payload
 from services.meta_service import get_meta_config, meta_api_request
 
@@ -97,6 +98,62 @@ def _extract_bridge_error(payload: Any, fallback_text: str = "") -> str:
     return str(fallback_text or "").strip()
 
 
+def _normalize_region_code(value: str | None) -> str:
+    candidate = str(value or "").strip().upper()
+    if len(candidate) == 2 and candidate.isalpha():
+        return candidate
+    return ""
+
+
+async def _company_default_phone_region(db, company_id: str) -> str:
+    scoped_company_id = (company_id or "").strip()
+    if not db or not scoped_company_id:
+        return ""
+    try:
+        row = await db.fetchrow(
+            "SELECT default_phone_region FROM company_settings WHERE company_id=$1 LIMIT 1",
+            scoped_company_id,
+        )
+    except Exception as exc:
+        logger.debug("Failed to load company phone region company_id=%s: %s", scoped_company_id, exc)
+        return ""
+    if not row:
+        return ""
+    return _normalize_region_code(dict(row).get("default_phone_region"))
+
+
+async def _normalize_outbound_whatsapp_phone(
+    to_phone: str,
+    *,
+    db=None,
+    company_id: str = "",
+) -> tuple[str, str]:
+    raw_phone = str(to_phone or "").strip()
+    if not raw_phone:
+        return "", "Phone number is required"
+
+    fallback_region = await _company_default_phone_region(db, company_id)
+    normalized = strict_normalize_to_e164_digits(raw_phone, fallback_region=fallback_region)
+    if normalized:
+        return normalized, ""
+
+    fallback_digits = normalize_to_e164_digits(raw_phone, fallback_region=fallback_region)
+    if fallback_digits and fallback_region:
+        logger.warning(
+            "Strict WhatsApp phone normalization failed, keeping digit fallback company_id=%s region=%s raw=%s",
+            (company_id or "").strip(),
+            fallback_region,
+            raw_phone,
+        )
+        return fallback_digits, ""
+
+    return (
+        "",
+        "Invalid WhatsApp phone number. Save the contact number in full international format "
+        "or set the tenant default phone region in Company Settings.",
+    )
+
+
 async def _persist_outbound_message_state(
     db,
     *,
@@ -144,13 +201,18 @@ async def _send_via_bridge(
     message_text: str,
     attachments: list | None = None,
     *,
+    db=None,
     company_id: str = "",
     user_id: str = "",
 ) -> tuple[bool, str, str]:
-    phone = to_phone.strip().replace("+", "").replace(" ", "").replace("-", "")
+    phone, phone_error = await _normalize_outbound_whatsapp_phone(
+        to_phone,
+        db=db,
+        company_id=company_id,
+    )
     if not phone:
-        logger.warning("send_whatsapp_message: empty phone number")
-        return False, "Phone number is required", ""
+        logger.warning("send_whatsapp_message: invalid bridge phone company_id=%s error=%s", company_id, phone_error)
+        return False, phone_error or "Phone number is required", ""
     if not _BRIDGE_SECRET:
         return False, "WHATSAPP_BRIDGE_SECRET is not configured", ""
     try:
@@ -196,10 +258,10 @@ async def _send_via_meta(
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
         logger.warning("Meta WhatsApp not configured")
         return False, "Meta WhatsApp is not configured", ""
-    phone = to_phone.strip().replace("+", "").replace(" ", "").replace("-", "")
+    phone, phone_error = await _normalize_outbound_whatsapp_phone(to_phone)
     if not phone:
-        logger.warning("send_whatsapp_message: empty phone number")
-        return False, "Phone number is required", ""
+        logger.warning("send_whatsapp_message: invalid meta phone error=%s", phone_error)
+        return False, phone_error or "Phone number is required", ""
     url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload: dict[str, Any] = {
@@ -259,9 +321,13 @@ async def _send_via_tenant_meta(
     phone_number_id = (config.get("phone_number_id") or "").strip()
     if not phone_number_id:
         return False, "phone_number_id is not configured for this tenant", ""
-    phone = to_phone.strip().replace("+", "").replace(" ", "").replace("-", "")
+    phone, phone_error = await _normalize_outbound_whatsapp_phone(
+        to_phone,
+        db=db,
+        company_id=company_id,
+    )
     if not phone:
-        return False, "Phone number is required", ""
+        return False, phone_error or "Phone number is required", ""
     try:
         if attachments:
             attachment = attachments[0] or {}
@@ -413,6 +479,7 @@ async def send_whatsapp_message(
             to_phone,
             message_text,
             attachments=attachments,
+            db=db,
             company_id=scoped_company_id,
             user_id=scoped_user_id,
         )

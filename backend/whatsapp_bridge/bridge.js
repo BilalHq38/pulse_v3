@@ -14,6 +14,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const util = require("util");
+const { parsePhoneNumberFromString } = require("libphonenumber-js");
 
 function loadEnvFile(filePath) {
   try {
@@ -172,8 +173,171 @@ function formatBridgeError(err) {
   };
 }
 
-function normalizePhoneNumber(value) {
-  return String(value || "").replace(/\D/g, "");
+function getFallbackRegion() {
+  const r = String(process.env.WHATSAPP_DEFAULT_COUNTRY || "")
+    .trim()
+    .toUpperCase();
+  if (r.length === 2 && /^[A-Z]{2}$/.test(r)) {
+    return r;
+  }
+  return undefined;
+}
+
+function normalizePhoneNumber(value, fallbackCountry) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const fb = fallbackCountry !== undefined ? fallbackCountry : getFallbackRegion();
+
+  try {
+    if (raw.startsWith("+")) {
+      const parsed = parsePhoneNumberFromString(raw);
+      if (parsed && typeof parsed.isValid === "function" && parsed.isValid()) {
+        return String(parsed.format("E.164")).replace(/^\+/, "");
+      }
+    }
+
+    const digits = raw.replace(/\D/g, "");
+    if (!raw.startsWith("+") && digits.length >= 8) {
+      const intl = parsePhoneNumberFromString(`+${digits}`);
+      if (intl && intl.isValid && intl.isValid()) {
+        return String(intl.format("E.164")).replace(/^\+/, "");
+      }
+    }
+
+    if (fb) {
+      const parsed = parsePhoneNumberFromString(raw, fb);
+      if (parsed && parsed.isValid && parsed.isValid()) {
+        return String(parsed.format("E.164")).replace(/^\+/, "");
+      }
+    }
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.warn(`[normalizePhoneNumber] Parse error for ${raw}: ${msg}`);
+  }
+
+  const loose = raw.replace(/\D/g, "");
+  console.warn(
+    `[normalizePhoneNumber] Could not parse ${raw} as valid international number, using raw digits`,
+  );
+  return loose;
+}
+
+function isNoLidErrorText(value) {
+  return /no lid for user/i.test(String(value || ""));
+}
+
+async function ensureRegisteredChatTarget(client, phoneDigits, directChatId, logContext = "") {
+  if (typeof client.isRegisteredUser !== "function") {
+    return { ok: true, chatId: directChatId, phoneDigits };
+  }
+  try {
+    const hasWhatsApp = await client.isRegisteredUser(directChatId);
+    if (hasWhatsApp) {
+      return { ok: true, chatId: directChatId, phoneDigits };
+    }
+    return {
+      ok: false,
+      statusCode: 404,
+      error: `Phone number ${phoneDigits} is not registered on WhatsApp.`,
+      phoneDigits,
+      logMessage: logContext,
+    };
+  } catch (err) {
+    const formatted = formatBridgeError(err);
+    return {
+      ok: false,
+      statusCode: 502,
+      error:
+        "WhatsApp could not resolve this recipient. Verify the full international phone number and retry.",
+      details: formatted.clientMessage,
+      phoneDigits,
+      logMessage: [logContext, formatted.logMessage].filter(Boolean).join(" | "),
+    };
+  }
+}
+
+function serializeMediaForBrowser(media) {
+  if (!media || typeof media !== "object") return null;
+  const mimetype = String(media.mimetype || media.mimeType || "").trim();
+  const data = String(media.data || "").trim();
+  if (!mimetype || !data) return null;
+  return {
+    mimetype,
+    data,
+    filename: String(media.filename || media.name || "").trim(),
+  };
+}
+
+async function sendMessageViaBrowserFallback(client, chatId, content, options = {}) {
+  const media = serializeMediaForBrowser(content);
+  return client.pupPage.evaluate(
+    async ({ chatId: targetChatId, content: targetContent, options: targetOptions, media: targetMedia }) => {
+      const chatWid = window.Store.WidFactory.createWid(targetChatId);
+      let chat = window.Store.Chat.get(chatWid) || null;
+
+      if (!chat && window.Store.Chat && typeof window.Store.Chat.find === "function") {
+        try {
+          chat = await window.Store.Chat.find(chatWid);
+        } catch {
+          chat = null;
+        }
+      }
+
+      if (
+        !chat &&
+        window.Store.FindOrCreateChat &&
+        typeof window.Store.FindOrCreateChat.findOrCreateLatestChat === "function"
+      ) {
+        try {
+          chat = (await window.Store.FindOrCreateChat.findOrCreateLatestChat(chatWid))?.chat || null;
+        } catch {
+          chat = null;
+        }
+      }
+
+      if (!chat) {
+        return null;
+      }
+
+      const sendOptions = { ...(targetOptions || {}) };
+      let sendContent = targetContent;
+
+      if (targetMedia) {
+        sendOptions.media = targetMedia;
+        sendContent = "";
+      }
+
+      const sent = await window.WWebJS.sendMessage(chat, sendContent, sendOptions);
+      return sent ? window.WWebJS.getMessageModel(sent) : null;
+    },
+    {
+      chatId,
+      content: typeof content === "string" ? content : String(content || ""),
+      options: { ...(options || {}) },
+      media,
+    },
+  );
+}
+
+async function sendMessageWithFallback(client, chatId, content, options = {}) {
+  try {
+    return await client.sendMessage(chatId, content, options);
+  } catch (err) {
+    const formatted = formatBridgeError(err);
+    if (!isNoLidErrorText(formatted.logMessage)) {
+      throw err;
+    }
+    console.warn(`[bridge] sendMessage hit No LID for user on ${chatId}; retrying with Chat.find fallback`);
+    const fallbackResult = await sendMessageViaBrowserFallback(client, chatId, content, options);
+    if (!fallbackResult) {
+      throw new Error(
+        "WhatsApp chat could not be resolved for this recipient. Verify the contact number includes country code.",
+      );
+    }
+    return fallbackResult;
+  }
 }
 
 async function resolveChatTarget(client, to) {
@@ -187,6 +351,8 @@ async function resolveChatTarget(client, to) {
     };
   }
 
+  const directChatId = `${phoneDigits}@c.us`;
+
   if (typeof client.getNumberId === "function") {
     try {
       const resolved = await client.getNumberId(phoneDigits);
@@ -196,45 +362,32 @@ async function resolveChatTarget(client, to) {
       if (typeof resolved === "string" && resolved.trim()) {
         return { ok: true, chatId: resolved.trim(), phoneDigits };
       }
-    } catch (err) {
-      const formatted = formatBridgeError(err);
-      return {
-        ok: false,
-        statusCode: 502,
-        error: `Could not resolve WhatsApp recipient ${phoneDigits}.`,
-        details: formatted.clientMessage,
-        logMessage: `getNumberId failed: ${formatted.logMessage}`,
+      return ensureRegisteredChatTarget(
+        client,
         phoneDigits,
-      };
-    }
-  }
-
-  const fallbackChatId = `${phoneDigits}@c.us`;
-  if (typeof client.isRegisteredUser === "function") {
-    try {
-      const hasWhatsApp = await client.isRegisteredUser(fallbackChatId);
-      if (!hasWhatsApp) {
-        return {
-          ok: false,
-          statusCode: 404,
-          error: `Phone number ${phoneDigits} is not registered on WhatsApp.`,
-          phoneDigits,
-        };
+        directChatId,
+        `[resolveChatTarget] getNumberId returned empty for ${phoneDigits}`,
+      );
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      const fallbackResult = await ensureRegisteredChatTarget(
+        client,
+        phoneDigits,
+        directChatId,
+        `[resolveChatTarget] getNumberId failed for ${phoneDigits}: ${msg}`,
+      );
+      if (fallbackResult.ok) {
+        return fallbackResult;
       }
-    } catch (err) {
-      const formatted = formatBridgeError(err);
-      return {
-        ok: false,
-        statusCode: 502,
-        error: `Could not verify WhatsApp recipient ${phoneDigits}.`,
-        details: formatted.clientMessage,
-        logMessage: `isRegisteredUser failed: ${formatted.logMessage}`,
-        phoneDigits,
-      };
+      if (isNoLidErrorText(msg)) {
+        fallbackResult.error =
+          "WhatsApp could not resolve this recipient. Save the number with its country code and retry.";
+      }
+      return fallbackResult;
     }
   }
 
-  return { ok: true, chatId: fallbackChatId, phoneDigits };
+  return ensureRegisteredChatTarget(client, phoneDigits, directChatId);
 }
 
 function requireBridgeSecret(req, res) {
@@ -681,14 +834,14 @@ app.post("/send", async (req, res) => {
       for (let index = 0; index < mediaItems.length; index += 1) {
         const media = mediaItems[index];
         const options = index === 0 && String(message || "").trim() ? { caption: message } : {};
-        const result = await session.client.sendMessage(chatId, media, options);
+        const result = await sendMessageWithFallback(session.client, chatId, media, options);
         sentIds.push(result.id.id);
         if (index === 0 && options.caption) captionUsed = true;
       }
     }
 
     if (String(message || "").trim() && !captionUsed) {
-      const textResult = await session.client.sendMessage(chatId, message);
+      const textResult = await sendMessageWithFallback(session.client, chatId, message);
       sentIds.push(textResult.id.id);
     }
 
@@ -725,9 +878,11 @@ app.get("/check/:phone", async (req, res) => {
     });
   }
   try {
-    const hasWhatsApp = await session.client.isRegisteredUser(
-      `${String(req.params.phone || "").replace(/\D/g, "")}@c.us`,
-    );
+    const checkDigits = normalizePhoneNumber(req.params.phone || "");
+    if (!checkDigits) {
+      return res.status(400).json({ error: "Phone number is missing or invalid.", scope: session.scopeKey });
+    }
+    const hasWhatsApp = await session.client.isRegisteredUser(`${checkDigits}@c.us`);
     res.json({ phone: req.params.phone, has_whatsapp: hasWhatsApp, scope: session.scopeKey });
   } catch (err) {
     res.status(500).json({ error: err.message, scope: session.scopeKey });

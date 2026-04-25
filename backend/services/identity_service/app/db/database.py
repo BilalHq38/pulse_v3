@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -8,26 +10,23 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import declarative_base
 
 from shared.config import (
+    database_url as shared_database_url,
+    db_startup_retries,
+    db_startup_retry_backoff_seconds,
     identity_default_tenant_id,
     identity_public_tenant_id,
     is_production,
     is_truthy,
 )
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 DATABASE_URL = (
     os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or os.environ.get("POSTGRES_DSN") or ""
-).strip()
-if not DATABASE_URL:
-    host = (os.environ.get("POSTGRES_HOST") or os.environ.get("PGHOST") or "").strip()
-    port = (os.environ.get("POSTGRES_PORT") or os.environ.get("PGPORT") or "5432").strip()
-    user = (os.environ.get("POSTGRES_USER") or os.environ.get("PGUSER") or "").strip()
-    password = (os.environ.get("POSTGRES_PASSWORD") or os.environ.get("PGPASSWORD") or "").strip()
-    database = (os.environ.get("POSTGRES_DB") or os.environ.get("PGDATABASE") or "").strip()
-    if host and user and password and database:
-        DATABASE_URL = f"postgresql://{user}:{password}@{host}:{port}/{database}"
+).strip() or shared_database_url()
 
 if not DATABASE_URL:
     raise RuntimeError("Identity service DATABASE_URL (or POSTGRES_* settings) is required")
@@ -187,38 +186,55 @@ async def init_db_schema() -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_event_outbox_tenant_idempotency ON event_outbox(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL",  # noqa: E501
     ]
 
-    async with engine.begin() as conn:
-        await _assert_database_role_security(conn)
-        if _vector_enabled():
-            await conn.execute(
-                text(
-                    """
-                    DO $$
-                    BEGIN
-                        BEGIN
-                            CREATE EXTENSION IF NOT EXISTS vector;
-                        EXCEPTION
-                            WHEN undefined_file THEN
-                                RAISE NOTICE 'pgvector not installed, IDENTITY_USE_VECTOR cannot be enabled.';
-                            WHEN feature_not_supported THEN
-                                RAISE NOTICE 'pgvector not supported on this PostgreSQL instance.';
-                            WHEN insufficient_privilege THEN
-                                RAISE NOTICE 'insufficient privilege to create pgvector extension.';
-                        END;
-                    END
-                    $$;
-                    """
-                )
-            )
-            extension_available = await conn.scalar(
-                text("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')")
-            )
-            if not bool(extension_available):
-                raise RuntimeError(
-                    "IDENTITY_USE_VECTOR is enabled but pgvector extension is unavailable. "
-                    "Disable IDENTITY_USE_VECTOR or install pgvector."
-                )
+    attempts = db_startup_retries()
+    base_delay = db_startup_retry_backoff_seconds()
+    for attempt in range(1, attempts + 1):
+        try:
+            async with engine.begin() as conn:
+                await _assert_database_role_security(conn)
+                if _vector_enabled():
+                    await conn.execute(
+                        text(
+                            """
+                            DO $$
+                            BEGIN
+                                BEGIN
+                                    CREATE EXTENSION IF NOT EXISTS vector;
+                                EXCEPTION
+                                    WHEN undefined_file THEN
+                                        RAISE NOTICE 'pgvector not installed, IDENTITY_USE_VECTOR cannot be enabled.';
+                                    WHEN feature_not_supported THEN
+                                        RAISE NOTICE 'pgvector not supported on this PostgreSQL instance.';
+                                    WHEN insufficient_privilege THEN
+                                        RAISE NOTICE 'insufficient privilege to create pgvector extension.';
+                                END;
+                            END
+                            $$;
+                            """
+                        )
+                    )
+                    extension_available = await conn.scalar(
+                        text("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')")
+                    )
+                    if not bool(extension_available):
+                        raise RuntimeError(
+                            "IDENTITY_USE_VECTOR is enabled but pgvector extension is unavailable. "
+                            "Disable IDENTITY_USE_VECTOR or install pgvector."
+                        )
 
-        await conn.run_sync(Base.metadata.create_all)
-        for statement in compatibility_patches:
-            await conn.execute(text(statement))
+                await conn.run_sync(Base.metadata.create_all)
+                for statement in compatibility_patches:
+                    await conn.execute(text(statement))
+            return
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            delay_seconds = round(base_delay * attempt, 2)
+            logger.warning(
+                "Identity DB init retry attempt=%s/%s delay_seconds=%s error=%s",
+                attempt,
+                attempts,
+                delay_seconds,
+                exc,
+            )
+            await asyncio.sleep(delay_seconds)

@@ -14,9 +14,13 @@ import asyncpg
 from shared.background_queue import get_background_queue
 from shared.config import (
     database_url,
+    db_command_timeout_seconds,
+    db_connect_timeout_seconds,
     db_pool_max_size,
     db_pool_min_size,
     db_schema,
+    db_startup_retries,
+    db_startup_retry_backoff_seconds,
     is_production,
     is_truthy,
     service_name,
@@ -305,6 +309,8 @@ class Database:
         self._application_name = (application_name or service_name()).strip()
         self._min_size = min_size or db_pool_min_size()
         self._max_size = max_size or db_pool_max_size()
+        self._connect_timeout = db_connect_timeout_seconds()
+        self._command_timeout = db_command_timeout_seconds()
         self._pool: asyncpg.Pool | None = None
         self._lock = asyncio.Lock()
         self._init_connection = _build_init_connection(self._schema, self._application_name)
@@ -322,16 +328,47 @@ class Database:
                     self._application_name,
                     self._schema,
                 )
-                self._pool = await asyncpg.create_pool(
-                    dsn=self._url,
-                    min_size=self._min_size,
-                    max_size=self._max_size,
-                    command_timeout=60,
-                    init=self._init_connection,
-                )
-                async with self._pool.acquire() as conn:
-                    await _validate_database_role_security(conn, app_name=self._application_name)
-                    await _ensure_platform_admin_rls_policies(conn)
+                attempts = db_startup_retries()
+                base_delay = db_startup_retry_backoff_seconds()
+                last_exc: Exception | None = None
+                for attempt in range(1, attempts + 1):
+                    try:
+                        self._pool = await asyncpg.create_pool(
+                            dsn=self._url,
+                            min_size=self._min_size,
+                            max_size=self._max_size,
+                            timeout=self._connect_timeout,
+                            command_timeout=self._command_timeout,
+                            init=self._init_connection,
+                        )
+                        async with self._pool.acquire() as conn:
+                            await _validate_database_role_security(conn, app_name=self._application_name)
+                            await _ensure_platform_admin_rls_policies(conn)
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if self._pool is not None:
+                            try:
+                                await self._pool.close()
+                            except Exception:
+                                logger.debug("Failed to close partially initialized DB pool", exc_info=True)
+                            finally:
+                                self._pool = None
+                        if attempt >= attempts:
+                            raise
+                        delay_seconds = round(base_delay * attempt, 2)
+                        logger.warning(
+                            "PostgreSQL connect retry service=%s schema=%s attempt=%s/%s delay_seconds=%s error=%s",
+                            self._application_name,
+                            self._schema,
+                            attempt,
+                            attempts,
+                            delay_seconds,
+                            exc,
+                        )
+                        await asyncio.sleep(delay_seconds)
+                if self._pool is None and last_exc is not None:
+                    raise last_exc
         return self._pool
 
     async def close(self) -> None:

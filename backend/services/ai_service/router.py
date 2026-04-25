@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import time
 
@@ -67,7 +68,12 @@ async def analyze_message(
     db = request.app.state.db
     company_id = current_user.get("company_id", "") or payload.company_id
     sentiment = await analyze_sentiment(payload.text, db=db, company_id=company_id)
-    intent = await classify_intent(payload.text, db=db, company_id=company_id)
+    intent = await classify_intent(
+        payload.text,
+        db=db,
+        company_id=company_id,
+        conversation_context=payload.conversation_context,
+    )
     gate = build_sentiment_gate(payload.text, sentiment)
     return AnalyzeResponse(
         sentiment=sentiment,
@@ -107,7 +113,12 @@ async def respond_to_customer(
         except Exception:
             pass
     sentiment = await analyze_sentiment(payload.message, db=db, company_id=company_id)
-    intent = await classify_intent(payload.message, db=db, company_id=company_id)
+    intent = await classify_intent(
+        payload.message,
+        db=db,
+        company_id=company_id,
+        conversation_context=context[-12:],
+    )
     result = await generate_ai_response(
         conversation_context=context,
         customer_info=customer_info,
@@ -118,15 +129,20 @@ async def respond_to_customer(
         historical_sentiment=payload.historical_sentiment,
         actor_user_id=payload.actor_user_id or current_user.get("sub", ""),
         conversation_id=payload.conversation_id,
+        channel=payload.channel,
         observed_sentiment=sentiment,
         observed_intent=intent,
     )
     return RespondResponse(
         reply=result.get("response", ""),
+        confidence=float(result.get("confidence", 0.0) or 0.0),
         sentiment=sentiment,
         intent=intent,
         conversation_sentiment=result.get("conversation_sentiment") or {},
         engine=f"{result.get('provider', '')}:{result.get('model_name', '')}".strip(":"),
+        llm_id=str(result.get("llm_id", "") or ""),
+        agent_id=str(result.get("agent_id", "") or ""),
+        agent_type=str(result.get("agent_type", "") or ""),
         attachments=result.get("attachments", []),
         product_images=result.get("product_images", []),
         product_ids=result.get("product_ids", []),
@@ -155,6 +171,7 @@ async def combined_ai_analysis(
         historical_sentiment=payload.historical_sentiment,
         actor_user_id=payload.actor_user_id or current_user.get("sub", ""),
         conversation_id=payload.conversation_id,
+        channel=payload.channel,
     )
     return CombinedResponse(**result)
 
@@ -335,7 +352,7 @@ async def ai_runtime(
 _VALIDATE_RESPONSE_MAX_CHARS = 16_000
 
 _MODEL_HEALTH_CACHE: dict = {}
-_MODEL_HEALTH_CACHE_TTL = 30.0
+_MODEL_HEALTH_CACHE_TTL = max(5.0, float(os.getenv("AI_MODEL_HEALTH_CACHE_TTL_SECONDS", "30") or 30))
 
 _SAFETY_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)

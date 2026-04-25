@@ -53,10 +53,14 @@ class RespondRequest(BaseModel):
 
 class RespondResponse(BaseModel):
     reply: str
+    confidence: float = 0.0
     sentiment: dict[str, Any] | None = None
     intent: dict[str, Any] | None = None
     conversation_sentiment: dict[str, Any] | None = None
     engine: str = ""
+    llm_id: str = ""
+    agent_id: str = ""
+    agent_type: str = ""
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     product_images: list[dict[str, Any]] = Field(default_factory=list)
     product_ids: list[str] = Field(default_factory=list)
@@ -82,6 +86,7 @@ class LeadScoreResponse(BaseModel):
 class CombinedRequest(BaseModel):
     customer_message: str
     company_id: str = ""
+    channel: str = "web_chat"
     conversation_context: list[dict[str, Any]] = Field(default_factory=list)
     customer: dict[str, Any] = Field(default_factory=dict)
     knowledge_context: str = ""

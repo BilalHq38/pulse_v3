@@ -50,9 +50,24 @@ async def get_latest_context_memory(
         convo_id,
     )
     if not row:
+        logger.debug(
+            "context_memory_read company_id=%s entity_id=%s memory_type=%s convo_id=%s hit=false",
+            company_id,
+            entity_id,
+            memory_type,
+            convo_id or "-",
+        )
         return {}
     payload = dict(row)
     payload["memory_data"] = _safe_json_loads(payload.get("memory_content", ""))
+    logger.debug(
+        "context_memory_read company_id=%s entity_id=%s memory_type=%s convo_id=%s hit=true memory_id=%s",
+        company_id,
+        entity_id,
+        memory_type,
+        convo_id or "-",
+        str(payload.get("id") or ""),
+    )
     return payload
 
 
@@ -89,6 +104,15 @@ async def store_context_memory(
         payload,
         memory_type,
         relevance_score,
+    )
+    logger.debug(
+        "context_memory_write company_id=%s entity_id=%s entity_type=%s memory_type=%s convo_id=%s memory_id=%s",
+        company_id,
+        entity_id,
+        entity_type,
+        memory_type,
+        convo_id or "-",
+        str(result_id or memory_id),
     )
     return str(result_id) if result_id else memory_id
 
@@ -263,6 +287,13 @@ async def update_customer_memory(
                     memory_type="customer_profile",
                     content=payload,
                 )
+            logger.info(
+                "customer_memory_updated company_id=%s customer_id=%s summary_chars=%s key_fact_count=%s",
+                company_id or "",
+                customer_id,
+                len(payload["summary"] or ""),
+                len(payload.get("key_facts", []) or []),
+            )
         except Exception as exc:
             logger.warning("Failed to persist customer memory: %s", exc)
     return payload

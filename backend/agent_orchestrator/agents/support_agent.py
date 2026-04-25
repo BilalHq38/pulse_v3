@@ -122,6 +122,7 @@ class SupportAgent(BaseAgent):
             knowledge_context=knowledge_context,
             actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
             conversation_id=str(getattr(request, "conversation_id", "") or ""),
+            channel=str(getattr(request, "channel", "") or "web_chat"),
             observed_sentiment=sentiment,
             observed_intent=intent,
         )

@@ -113,6 +113,7 @@ async def _message_workflow_fallback(
         knowledge_context=payload.knowledge_context,
         conversation_id=payload.conversation_id,
         actor_user_id=payload.actor_user_id,
+        channel=payload.channel,
     )
     sentiment = dict(combined.get("sentiment") or {})
     conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
@@ -129,6 +130,7 @@ async def _message_workflow_fallback(
             knowledge_context=payload.knowledge_context,
             actor_user_id=payload.actor_user_id,
             conversation_id=payload.conversation_id,
+            channel=payload.channel,
             observed_sentiment=sentiment,
             observed_intent=intent,
         )

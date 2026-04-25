@@ -395,6 +395,7 @@ async def generate_product_desc_endpoint(request: Request):
         price_currency=body.get("price_currency", "USD"),
         images=body.get("images", []),
         engines=active_engines,
+        company_id=cid,
     )
     return {"description": desc}
 

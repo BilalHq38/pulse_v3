@@ -4,6 +4,7 @@ import functools
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 
@@ -197,7 +198,24 @@ def database_url() -> str:
         auth_segment = f"{user}:{password}@"
     elif user:
         auth_segment = f"{user}@"
-    return f"postgresql://{auth_segment}{host}:{port}/{database}"
+    query: dict[str, str] = {}
+    sslmode = (
+        os.environ.get("POSTGRES_SSLMODE")
+        or os.environ.get("PGSSLMODE")
+        or os.environ.get("DATABASE_SSLMODE")
+        or ""
+    ).strip()
+    connect_timeout = (
+        os.environ.get("POSTGRES_CONNECT_TIMEOUT")
+        or os.environ.get("PGCONNECT_TIMEOUT")
+        or ""
+    ).strip()
+    if sslmode:
+        query["sslmode"] = sslmode
+    if connect_timeout:
+        query["connect_timeout"] = connect_timeout
+    query_string = f"?{urlencode(query)}" if query else ""
+    return f"postgresql://{auth_segment}{host}:{port}/{database}{query_string}"
 
 
 def db_schema(default: str = "public") -> str:
@@ -214,6 +232,34 @@ def db_pool_min_size(default: int = 5) -> int:
 def db_pool_max_size(default: int = 20) -> int:
     try:
         return int(os.environ.get("DB_POOL_MAX_SIZE", str(default)))
+    except ValueError:
+        return default
+
+
+def db_connect_timeout_seconds(default: float = 10.0) -> float:
+    try:
+        return float(os.environ.get("POSTGRES_CONNECT_TIMEOUT", str(default)))
+    except ValueError:
+        return default
+
+
+def db_command_timeout_seconds(default: float = 60.0) -> float:
+    try:
+        return float(os.environ.get("DB_COMMAND_TIMEOUT_SECONDS", str(default)))
+    except ValueError:
+        return default
+
+
+def db_startup_retries(default: int = 10) -> int:
+    try:
+        return max(1, int(os.environ.get("DB_STARTUP_RETRIES", str(default))))
+    except ValueError:
+        return default
+
+
+def db_startup_retry_backoff_seconds(default: float = 2.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("DB_STARTUP_RETRY_BACKOFF_SECONDS", str(default))))
     except ValueError:
         return default
 

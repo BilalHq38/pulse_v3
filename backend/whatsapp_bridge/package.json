@@ -8,6 +8,7 @@
     "dev": "nodemon bridge.js"
   },
   "dependencies": {
+    "libphonenumber-js": "^1.11.0",
     "whatsapp-web.js": "^1.23.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",

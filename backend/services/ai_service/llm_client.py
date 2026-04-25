@@ -4,11 +4,12 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from services.ai_service.common import _extract_data_url_payload, _sanitize_schema
+from services.ai_service.common import _extract_data_url_payload, _sanitize_schema, estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,28 @@ except Exception:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except Exception:
+        return default
+
+
 OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 ANTHROPIC_DEFAULT_MODEL = (
     os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip() or "claude-3-5-sonnet-20241022"
 )
-FLASH_MODEL = "gemini-2.5-flash"
-PRO_MODEL = "gemini-2.5-pro"
+FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+PRO_MODEL = os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
 GEMINI_FALLBACK_MODELS = tuple(
     model.strip()
     for model in os.getenv(
@@ -47,7 +64,15 @@ GEMINI_FALLBACK_MODELS = tuple(
     ).split(",")
     if model.strip()
 )
-EMBEDDING_MODEL = "models/text-embedding-004"
+GEMINI_EMBEDDING_MODEL = (
+    os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004").strip() or "models/text-embedding-004"
+)
+OPENAI_EMBEDDING_MODEL = (
+    os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
+)
+EMBEDDING_MODEL = GEMINI_EMBEDDING_MODEL
+DEFAULT_TEMPERATURE = _float_env("AI_TEMPERATURE", 0.7)
+DEFAULT_MAX_TOKENS = _int_env("AI_MAX_TOKENS", 2048)
 
 _gemini_client = None
 if genai and GEMINI_API_KEY:
@@ -72,8 +97,8 @@ def _default_engine(use_pro: bool = False) -> dict:
     return {
         "provider": provider,
         "model_name": (os.getenv("AI_MODEL_NAME") or provider_defaults[provider]).strip() or provider_defaults[provider],
-        "temperature": 0.65,
-        "max_tokens": 2048,
+        "temperature": DEFAULT_TEMPERATURE,
+        "max_tokens": DEFAULT_MAX_TOKENS,
         "supports_vision": provider in {"gemini", "openai"},
     }
 
@@ -156,12 +181,73 @@ def _image_data_url_to_part(data_url: str) -> Optional[Any]:
     return genai_types.Part.from_bytes(data=raw, mime_type=mime)
 
 
+def _normalize_usage_dict(
+    prompt_tokens: Any = None,
+    completion_tokens: Any = None,
+    *,
+    prompt: str = "",
+    response_text: str = "",
+) -> dict[str, int]:
+    prompt_count = int(prompt_tokens) if prompt_tokens is not None else estimate_tokens(prompt)
+    completion_count = int(completion_tokens) if completion_tokens is not None else estimate_tokens(response_text)
+    return {
+        "prompt_tokens": max(0, prompt_count),
+        "completion_tokens": max(0, completion_count),
+        "total_tokens": max(0, prompt_count) + max(0, completion_count),
+    }
+
+
+def _log_llm_call(
+    *,
+    outcome: str,
+    provider: str,
+    model: str,
+    prompt: str,
+    response_text: str = "",
+    latency_ms: float,
+    usage: dict[str, int] | None = None,
+    error: Exception | None = None,
+    fallback_from: str = "",
+) -> None:
+    usage_payload = usage or _normalize_usage_dict(prompt=prompt, response_text=response_text)
+    message = (
+        "llm_call outcome=%s provider=%s model=%s latency_ms=%.2f "
+        "prompt_tokens=%s completion_tokens=%s total_tokens=%s fallback_from=%s"
+    )
+    if error is None:
+        logger.info(
+            message,
+            outcome,
+            provider,
+            model,
+            latency_ms,
+            usage_payload.get("prompt_tokens", 0),
+            usage_payload.get("completion_tokens", 0),
+            usage_payload.get("total_tokens", 0),
+            fallback_from or "-",
+        )
+        return
+    logger.warning(
+        message + " error_type=%s error=%s",
+        outcome,
+        provider,
+        model,
+        latency_ms,
+        usage_payload.get("prompt_tokens", 0),
+        usage_payload.get("completion_tokens", 0),
+        usage_payload.get("total_tokens", 0),
+        fallback_from or "-",
+        error.__class__.__name__,
+        str(error).splitlines()[0][:240],
+    )
+
+
 async def _call_gemini(
     prompt: str,
     engine: dict,
     generation_config: Any = None,
     image_urls: Optional[list[str]] = None,
-) -> str:
+) -> tuple[str, str, dict[str, int]]:
     if not _gemini_client:
         raise RuntimeError(get_provider_runtime_info("gemini")[1])
     config = generation_config
@@ -183,7 +269,15 @@ async def _call_gemini(
                 contents=contents,
                 config=config,
             )
-            return (getattr(response, "text", "") or "").strip()
+            text = (getattr(response, "text", "") or "").strip()
+            usage_meta = getattr(response, "usage_metadata", None)
+            usage = _normalize_usage_dict(
+                getattr(usage_meta, "prompt_token_count", None),
+                getattr(usage_meta, "candidates_token_count", None),
+                prompt=prompt,
+                response_text=text,
+            )
+            return text, model_name, usage
         except Exception as exc:
             errors.append(f"{model_name}:{exc.__class__.__name__}:{exc}")
             continue
@@ -199,7 +293,7 @@ async def _call_openai(
     engine: dict,
     generation_config: Any = None,
     image_urls: Optional[list[str]] = None,
-) -> str:
+) -> tuple[str, str, dict[str, int]]:
     if not _openai_client:
         raise RuntimeError(get_provider_runtime_info("openai")[1])
     content = [{"type": "text", "text": prompt}] + [
@@ -217,7 +311,15 @@ async def _call_openai(
     if isinstance(generation_config, dict) and generation_config.get("response_format") == "json_object":
         kwargs["response_format"] = {"type": "json_object"}
     response = await _openai_client.chat.completions.create(**kwargs)
-    return (response.choices[0].message.content or "").strip()
+    text = (response.choices[0].message.content or "").strip()
+    usage_meta = getattr(response, "usage", None)
+    usage = _normalize_usage_dict(
+        getattr(usage_meta, "prompt_tokens", None),
+        getattr(usage_meta, "completion_tokens", None),
+        prompt=prompt,
+        response_text=text,
+    )
+    return text, str(kwargs["model"]), usage
 
 
 async def _call_anthropic(
@@ -225,7 +327,7 @@ async def _call_anthropic(
     engine: dict,
     generation_config: Any = None,
     image_urls: Optional[list[str]] = None,
-) -> str:
+) -> tuple[str, str, dict[str, int]]:
     if not _anthropic_client:
         raise RuntimeError(get_provider_runtime_info("anthropic")[1])
     temperature, max_tokens = _generation_opts(engine, generation_config)
@@ -243,14 +345,22 @@ async def _call_anthropic(
     kwargs: dict[str, Any] = {
         "model": engine.get("model_name") or ANTHROPIC_DEFAULT_MODEL,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": max_tokens or 2048,
+        "max_tokens": max_tokens or DEFAULT_MAX_TOKENS,
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
     response = await _anthropic_client.messages.create(**kwargs)
-    return "\n".join(
+    text = "\n".join(
         [getattr(block, "text", "") for block in getattr(response, "content", []) or [] if getattr(block, "text", "")]
     ).strip()
+    usage_meta = getattr(response, "usage", None)
+    usage = _normalize_usage_dict(
+        getattr(usage_meta, "input_tokens", None),
+        getattr(usage_meta, "output_tokens", None),
+        prompt=prompt,
+        response_text=text,
+    )
+    return text, str(kwargs["model"]), usage
 
 
 def _get_fallback_provider_order(primary_provider: str) -> list[str]:
@@ -270,6 +380,38 @@ def _engine_for_provider(base_engine: dict, provider: str, *, use_pro: bool = Fa
     return engine
 
 
+async def _call_provider_once(
+    provider: str,
+    prompt: str,
+    engine: dict,
+    *,
+    generation_config: Any = None,
+    image_urls: Optional[list[str]] = None,
+) -> tuple[str, str, dict[str, int]]:
+    if provider == "gemini":
+        return await _call_gemini(
+            prompt,
+            engine,
+            generation_config=generation_config,
+            image_urls=image_urls,
+        )
+    if provider == "openai":
+        return await _call_openai(
+            prompt,
+            engine,
+            generation_config=generation_config,
+            image_urls=image_urls,
+        )
+    if provider == "anthropic":
+        return await _call_anthropic(
+            prompt,
+            engine,
+            generation_config=generation_config,
+            image_urls=image_urls,
+        )
+    raise RuntimeError(f"Unsupported provider: {provider or 'unknown'}")
+
+
 async def call_model_text(
     prompt: str,
     engine: Optional[dict] = None,
@@ -284,36 +426,36 @@ async def call_model_text(
     last_exc: Exception | None = None
     for provider in provider_order:
         provider_engine = _engine_for_provider(selected, provider, use_pro=use_pro)
+        started = time.perf_counter()
         try:
-            if provider == "gemini":
-                return await _call_gemini(
-                    prompt,
-                    provider_engine,
-                    generation_config=generation_config,
-                    image_urls=image_urls,
-                )
-            if provider == "openai":
-                return await _call_openai(
-                    prompt,
-                    provider_engine,
-                    generation_config=generation_config,
-                    image_urls=image_urls,
-                )
-            if provider == "anthropic":
-                return await _call_anthropic(
-                    prompt,
-                    provider_engine,
-                    generation_config=generation_config,
-                    image_urls=image_urls,
-                )
+            text, resolved_model, usage = await _call_provider_once(
+                provider,
+                prompt,
+                provider_engine,
+                generation_config=generation_config,
+                image_urls=image_urls,
+            )
+            _log_llm_call(
+                outcome="success",
+                provider=provider,
+                model=resolved_model or str(provider_engine.get("model_name") or ""),
+                prompt=prompt,
+                response_text=text,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                usage=usage,
+                fallback_from=primary_provider if provider != primary_provider else "",
+            )
+            return text
         except Exception as exc:
-            if provider != primary_provider:
-                logger.warning(
-                    "AI provider fallback: %s failed, tried %s: %s",
-                    primary_provider,
-                    provider,
-                    exc,
-                )
+            _log_llm_call(
+                outcome="error",
+                provider=provider,
+                model=str(provider_engine.get("model_name") or ""),
+                prompt=prompt,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                error=exc,
+                fallback_from=primary_provider if provider != primary_provider else "",
+            )
             last_exc = exc
             continue
 
@@ -440,7 +582,15 @@ async def _resolve_engine_for_request(db=None, company_id: str = "", use_pro: bo
         try:
             from services.db_helpers import resolve_active_llm_engine
 
-            return await resolve_active_llm_engine(db, company_id or "")
+            engine = await resolve_active_llm_engine(db, company_id or "")
+            logger.debug(
+                "llm_engine_resolved company_id=%s provider=%s model=%s selected_id=%s",
+                company_id or "<global>",
+                str((engine or {}).get("provider") or ""),
+                str((engine or {}).get("model_name") or ""),
+                str((engine or {}).get("id") or ""),
+            )
+            return engine
         except Exception as exc:
             logger.warning(
                 "Engine resolution failed for company %s: %s",
@@ -458,19 +608,72 @@ async def call_with_engines(
     image_parts: Optional[list] = None,
 ) -> str:
     image_urls = [item for item in (image_parts or []) if isinstance(item, str) and item.startswith("data:")]
-    return await call_model_text(
-        prompt,
-        engine=dict((engines or [None])[0] or _default_engine(use_pro=use_pro)),
-        generation_config=generation_config,
-        image_urls=image_urls,
-    )
+    ordered_engines: list[dict] = []
+    seen: set[str] = set()
+    for engine in engines or []:
+        candidate = dict(engine or {})
+        provider = str(candidate.get("provider") or "").strip().lower()
+        model_name = str(candidate.get("model_name") or "").strip()
+        if not provider:
+            continue
+        signature = f"{provider}:{model_name}:{candidate.get('id', '')}"
+        if signature in seen:
+            continue
+        seen.add(signature)
+        ordered_engines.append(candidate)
+    if not ordered_engines:
+        return await call_model_text(
+            prompt,
+            engine=_default_engine(use_pro=use_pro),
+            generation_config=generation_config,
+            image_urls=image_urls,
+        )
+
+    last_exc: Exception | None = None
+    for engine in ordered_engines:
+        provider = str(engine.get("provider") or "").strip().lower()
+        started = time.perf_counter()
+        try:
+            text, resolved_model, usage = await _call_provider_once(
+                provider,
+                prompt,
+                engine,
+                generation_config=generation_config,
+                image_urls=image_urls,
+            )
+            _log_llm_call(
+                outcome="success",
+                provider=provider,
+                model=resolved_model or str(engine.get("model_name") or ""),
+                prompt=prompt,
+                response_text=text,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                usage=usage,
+            )
+            return text
+        except Exception as exc:
+            _log_llm_call(
+                outcome="error",
+                provider=provider,
+                model=str(engine.get("model_name") or ""),
+                prompt=prompt,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                error=exc,
+            )
+            last_exc = exc
+            continue
+    raise RuntimeError(f"All configured engines failed. Last error: {last_exc}") from last_exc
 
 
 __all__ = [
     "EMBEDDING_MODEL",
     "FLASH_MODEL",
+    "GEMINI_EMBEDDING_MODEL",
     "PRO_MODEL",
+    "OPENAI_EMBEDDING_MODEL",
     "_default_engine",
+    "_engine_for_provider",
+    "_provider_default_model",
     "_resolve_engine_for_request",
     "call_gemini",
     "call_gemini_json",

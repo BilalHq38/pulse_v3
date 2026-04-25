@@ -149,6 +149,7 @@ ALLOWED_COMPANY_SETTINGS_FIELDS = {
     "description",
     "logo_url",
     "phone",
+    "default_phone_region",
     "support_email",
     "website_address",
     "address_line1",
@@ -282,6 +283,7 @@ class CompanySettingsUpdate(BaseModel):
     description: Optional[str] = Field(default=None, max_length=5000)
     logo_url: Optional[str] = Field(default=None, max_length=5000)
     phone: Optional[str] = Field(default=None, max_length=64)
+    default_phone_region: Optional[str] = Field(default=None, min_length=2, max_length=2)
     support_email: Optional[str] = Field(default=None, max_length=255)
     website_address: Optional[str] = Field(default=None, max_length=500)
     address_line1: Optional[str] = Field(default=None, max_length=500)

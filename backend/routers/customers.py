@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from services.ai_service.facade import calculate_churn_risk
+from core.phone_normalization import strict_normalize_to_e164_digits
 from core.utils import make_id, now_ts
 from shared.database import create_detached_task
 from services.db_helpers import (
@@ -124,7 +125,16 @@ async def create_customer(request: Request):
     if "company" in body and "customer_company_name" not in body:
         body["customer_company_name"] = body.pop("company")
     email = (body.get("email", "") or "").strip().lower()
-    phone = (body.get("phone", "") or "").strip()
+    _raw = (body.get("phone", "") or "").strip()
+    phone = ""
+    if _raw:
+        phone = strict_normalize_to_e164_digits(_raw) or ""
+        if not phone:
+            raise HTTPException(
+                400,
+                "Invalid phone number. Use a valid number in E.164 or international form (e.g. +92… or +44…), "
+                "or a valid local number for WHATSAPP_DEFAULT_COUNTRY.",
+            )
     name = (body.get("name", "") or "").strip()
     if not any([name, email, phone]):
         raise HTTPException(400, "Customer name, email, or phone is required")
@@ -194,6 +204,16 @@ async def update_customer(customer_id: str, request: Request):
     safe_body = {k: v for k, v in body.items() if k in CUSTOMER_UPDATE_FIELDS}
     if body and not safe_body:
         raise HTTPException(400, "No valid fields provided")
+    if "phone" in safe_body and (safe_body.get("phone") or "").strip():
+        _up = str(safe_body["phone"] or "").strip()
+        out = strict_normalize_to_e164_digits(_up) or ""
+        if not out:
+            raise HTTPException(
+                400,
+                "Invalid phone number. Use a valid number in E.164 or international form (e.g. +92… or +44…), "
+                "or a valid local number for WHATSAPP_DEFAULT_COUNTRY.",
+            )
+        safe_body["phone"] = out
     safe_body["updated_at"] = now_ts()
     if safe_body:
         columns = list(safe_body.keys())
