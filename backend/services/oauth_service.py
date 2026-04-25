@@ -58,6 +58,22 @@ OAUTH_LINK_ACCOUNT_NEXT_PATH = "/__oauth_link__"
 OAUTH_ACCOUNT_LINK_REQUIRED = "OAUTH_ACCOUNT_LINK_REQUIRED"
 
 
+def _oauth_provider_error(provider: str, response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else {}
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("error_description") or "").strip()
+        code = str(error.get("code") or error.get("type") or "").strip()
+        return f"{provider} OAuth error status={response.status_code} code={code} message={message[:240]}"
+    if isinstance(payload, dict):
+        message = str(payload.get("error_description") or payload.get("error") or "").strip()
+        return f"{provider} OAuth error status={response.status_code} message={message[:240]}"
+    return f"{provider} OAuth error status={response.status_code}"
+
+
 async def resolve_oauth_login_user(
     db,
     provider: str,
@@ -379,6 +395,11 @@ async def exchange_google_code(code: str, request: Request) -> dict:
     client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
+        logger.error(
+            "oauth config_missing provider=google client_id_present=%s client_secret_present=%s",
+            bool(client_id),
+            bool(client_secret),
+        )
         raise HTTPException(501, "Google OAuth is not configured.")
 
     redirect_uri = build_google_redirect_uri(request)
@@ -396,10 +417,7 @@ async def exchange_google_code(code: str, request: Request) -> dict:
         timeout=20,
     )
     if token_resp.status_code >= 400:
-        logger.error(
-            "oauth exchange_failed provider=google status=%s",
-            token_resp.status_code,
-        )
+        logger.error("oauth exchange_failed provider=google %s", _oauth_provider_error("google", token_resp))
         raise HTTPException(401, AUTHENTICATION_FAILED_ERROR)
 
     access_token = token_resp.json().get("access_token", "")
@@ -412,10 +430,7 @@ async def exchange_google_code(code: str, request: Request) -> dict:
         timeout=20,
     )
     if profile_resp.status_code >= 400:
-        logger.error(
-            "oauth profile_failed provider=google status=%s",
-            profile_resp.status_code,
-        )
+        logger.error("oauth profile_failed provider=google %s", _oauth_provider_error("google", profile_resp))
         raise HTTPException(401, AUTHENTICATION_FAILED_ERROR)
 
     profile = profile_resp.json()
@@ -436,6 +451,11 @@ async def exchange_facebook_code(code: str, request: Request) -> dict:
     app_id = os.environ.get("FACEBOOK_APP_ID", "").strip()
     app_secret = os.environ.get("FACEBOOK_APP_SECRET", "").strip()
     if not app_id or not app_secret:
+        logger.error(
+            "oauth config_missing provider=facebook app_id_present=%s app_secret_present=%s",
+            bool(app_id),
+            bool(app_secret),
+        )
         raise HTTPException(501, "Facebook OAuth is not configured.")
 
     redirect_uri = build_facebook_redirect_uri(request)
@@ -453,13 +473,20 @@ async def exchange_facebook_code(code: str, request: Request) -> dict:
     )
     if token_resp.status_code >= 400:
         logger.error(
-            "oauth exchange_failed provider=facebook status=%s",
-            token_resp.status_code,
+            "oauth exchange_failed provider=facebook redirect_uri=%s %s",
+            redirect_uri,
+            _oauth_provider_error("facebook", token_resp),
         )
         raise HTTPException(401, AUTHENTICATION_FAILED_ERROR)
 
-    access_token = token_resp.json().get("access_token", "")
+    try:
+        token_payload = token_resp.json()
+    except Exception as exc:
+        logger.error("oauth exchange_failed provider=facebook reason=invalid_json error=%s", exc)
+        raise HTTPException(401, AUTHENTICATION_FAILED_ERROR) from exc
+    access_token = token_payload.get("access_token", "")
     if not access_token:
+        logger.error("oauth exchange_failed provider=facebook reason=missing_access_token")
         raise HTTPException(401, AUTHENTICATION_FAILED_ERROR)
 
     profile_resp = await _HTTP_CLIENT.get(
@@ -471,10 +498,7 @@ async def exchange_facebook_code(code: str, request: Request) -> dict:
         timeout=20,
     )
     if profile_resp.status_code >= 400:
-        logger.error(
-            "oauth profile_failed provider=facebook status=%s",
-            profile_resp.status_code,
-        )
+        logger.error("oauth profile_failed provider=facebook %s", _oauth_provider_error("facebook", profile_resp))
         raise HTTPException(401, AUTHENTICATION_FAILED_ERROR)
 
     profile = profile_resp.json()

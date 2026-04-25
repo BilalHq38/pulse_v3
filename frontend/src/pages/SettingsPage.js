@@ -263,6 +263,7 @@ export default function SettingsPage() {
   const [waQrImageSrc, setWaQrImageSrc] = useState('');
   const [waQrStatus, setWaQrStatus] = useState('');
   const [waQrError, setWaQrError] = useState('');
+  const [waDisconnecting, setWaDisconnecting] = useState(false);
   const waQrPollRef = useRef(null);
   const waStatusPollRef = useRef(null);
 
@@ -272,9 +273,9 @@ export default function SettingsPage() {
   const [editingAgentId, setEditingAgentId] = useState(null);
   const [agentDraft, setAgentDraft] = useState({});
   const [showAddLlmForm, setShowAddLlmForm] = useState(false);
-  const [addLlmForm, setAddLlmForm] = useState({ model_name: '', provider: 'gemini', temperature: 0.7, max_tokens: 2048 });
+  const [addLlmForm, setAddLlmForm] = useState({ model_name: '', provider: 'openai', temperature: 0.7, max_tokens: 2048 });
   const [showAddAgentForm, setShowAddAgentForm] = useState(false);
-  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', provider: 'gemini', model_name: '', is_active: true, mcp_server_id: '' });
+  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', provider: 'openai', model_name: '', is_active: true, mcp_server_id: '' });
 
   // Integrations interactive state
   const [editingMcpId, setEditingMcpId] = useState(null);
@@ -1084,6 +1085,28 @@ export default function SettingsPage() {
     }
   }, []);
 
+  const disconnectWaWeb = useCallback(async () => {
+    if (waDisconnecting) return;
+    setWaDisconnecting(true);
+    setWaQrError('');
+    try {
+      await api.post('/settings/channels/whatsapp/bridge-disconnect', {});
+      setWaQrStatus('disconnected');
+      setWaQrImageSrc('');
+      setWaQrPanelOpen(false);
+      if (waQrPollRef.current) {
+        clearInterval(waQrPollRef.current);
+        waQrPollRef.current = null;
+      }
+      setTimeout(() => { void fetchWaBridgeQr({ silent: true }); }, 1200);
+    } catch (err) {
+      const raw = err.response?.data?.detail || err.response?.data?.error;
+      setWaQrError(typeof raw === 'string' ? raw : 'Failed to disconnect WhatsApp Web.');
+    } finally {
+      setWaDisconnecting(false);
+    }
+  }, [fetchWaBridgeQr, waDisconnecting]);
+
   const expandWaWebPanel = () => {
     if (waMetaBlocksQr) return;
     setWaQrPanelOpen(true);
@@ -1340,7 +1363,21 @@ export default function SettingsPage() {
                                   <span>Meta API fields are set. Remove Phone number ID and Access token and save, then you can use QR here.</span>
                                 </div>
                               )}
-                              {!waQrPanelOpen ? (
+                              {waQrStatus === 'ready' ? (
+                                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2">
+                                  <span className="inline-flex items-center gap-2 text-sm font-medium text-emerald-800">
+                                    <CheckCircle size={16} className="text-emerald-600" /> Connected
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={disconnectWaWeb}
+                                    disabled={waDisconnecting}
+                                    className="ml-auto px-3 py-1.5 text-xs font-medium text-red-600 bg-white border border-red-200 rounded-lg hover:bg-red-50 disabled:opacity-50"
+                                  >
+                                    {waDisconnecting ? 'Disconnecting...' : 'Disconnect'}
+                                  </button>
+                                </div>
+                              ) : !waQrPanelOpen ? (
                                 <button
                                   type="button"
                                   onClick={expandWaWebPanel}
@@ -1353,12 +1390,6 @@ export default function SettingsPage() {
                                 <div className="space-y-3">
                                   {waQrError && (
                                     <div className="flex items-start gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900">{waQrError}</div>
-                                  )}
-                                  {waQrStatus === 'ready' && !waQrError && (
-                                    <div className="flex items-center gap-2 px-3 py-2 bg-emerald-100 border border-emerald-200 rounded-lg text-sm text-emerald-900 font-medium">
-                                      <CheckCircle size={16} className="text-emerald-600 flex-shrink-0" />
-                                      Connected. You can close this panel and use WhatsApp in the inbox.
-                                    </div>
                                   )}
                                   {waQrStatus && waQrStatus !== 'ready' && (
                                     <p className="text-xs font-medium text-slate-600">
@@ -1386,7 +1417,7 @@ export default function SettingsPage() {
                                       disabled={waMetaBlocksQr}
                                       className="px-3 py-2 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 rounded-lg hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
-                                      Refresh QR
+                                      Connect / Refresh QR
                                     </button>
                                     <button
                                       type="button"
@@ -2375,7 +2406,7 @@ export default function SettingsPage() {
                   {products.length === 0 && <p className="col-span-3 text-center text-slate-400 text-sm py-8">No products added yet.</p>}
                 </div>
               </div>
-              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4"><div className="flex items-start gap-3"><Bot size={16} className="text-blue-600 mt-0.5" /><div><h4 className="text-sm font-medium text-blue-800">How this works</h4><p className="text-xs text-blue-600 mt-1 leading-relaxed">Products and FAQs are automatically used by AI (Gemini 2.5 Flash/Pro) when responding to messages and scoring leads.</p></div></div></div>
+              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4"><div className="flex items-start gap-3"><Bot size={16} className="text-blue-600 mt-0.5" /><div><h4 className="text-sm font-medium text-blue-800">How this works</h4><p className="text-xs text-blue-600 mt-1 leading-relaxed">Products and FAQs are automatically used by the selected AI engine when responding to messages and scoring leads.</p></div></div></div>
               {showProductForm && (
                 <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4">
                   <div className="bg-white rounded-2xl w-full max-w-2xl p-6">

@@ -617,6 +617,30 @@ async def get_whatsapp_bridge_qr(request: Request):
     return out
 
 
+@router.post("/settings/channels/whatsapp/bridge-disconnect")
+async def disconnect_whatsapp_bridge(request: Request):
+    """Disconnect the linked WhatsApp Web session through the bridge."""
+    await get_current_user_flexible(request)
+    bridge_url = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3001").rstrip("/")
+    secret = (os.environ.get("WHATSAPP_BRIDGE_SECRET") or os.environ.get("BRIDGE_SECRET") or "").strip()
+    if not secret:
+        raise HTTPException(400, "WhatsApp bridge secret is not configured.")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=3.0)) as client:
+            resp = await client.post(f"{bridge_url}/disconnect", headers={"X-Bridge-Secret": secret})
+    except httpx.ConnectError as exc:
+        logger.warning("WhatsApp bridge disconnect unreachable at %s: %s", bridge_url, exc)
+        raise HTTPException(503, "WhatsApp bridge is not reachable.") from exc
+    except httpx.HTTPError as exc:
+        logger.warning("WhatsApp bridge disconnect HTTP error: %s", exc)
+        raise HTTPException(502, "WhatsApp bridge disconnect failed.") from exc
+    data = resp.json() if resp.content else {}
+    if resp.status_code >= 400:
+        detail = data.get("error") if isinstance(data, dict) else resp.text
+        raise HTTPException(resp.status_code, str(detail or "WhatsApp bridge disconnect failed."))
+    return {"bridge_status": str(data.get("status") or "disconnected"), "success": True}
+
+
 @router.put("/settings/channels/{channel}")
 async def update_channel_settings(channel: str, body: ChannelSettingsUpdate, request: Request):
     db = _db(request)

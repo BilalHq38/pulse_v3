@@ -35,7 +35,7 @@ const DEFAULT_DATA = {
     recent_lead_activity: [],
   },
   alerts: [],
-  system_health: { gemini_api: 'unknown', channels: [], bulk_upload_status: 'unknown', server_time: '' },
+  system_health: { channels: [], server_time: '' },
   micro_visuals: { messages_last_24h: [], sentiment_distribution: { positive: 0, neutral: 0, negative: 0 }, response_rate_gauge: 0 },
   insights: [],
 };
@@ -326,10 +326,6 @@ export default function DashboardPage() {
             <h2 className="text-sm font-semibold text-slate-900">System Health</h2>
           </div>
           <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-sm text-slate-700">Gemini API</span>
-              <span className={`text-xs px-2 py-1 rounded-full ${data.system_health.gemini_api === 'online' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>{data.system_health.gemini_api}</span>
-            </div>
             {(data.system_health.channels || []).map((channel) => (
               <div key={channel.channel} className="flex items-center justify-between">
                 <span className="text-sm text-slate-700">{channelMeta[channel.channel]?.label || channel.channel}</span>
@@ -338,10 +334,9 @@ export default function DashboardPage() {
                 </span>
               </div>
             ))}
-            <div className="flex items-center justify-between pt-2 border-t border-slate-100">
-              <span className="text-sm text-slate-700">Bulk upload</span>
-              <span className={`text-xs px-2 py-1 rounded-full ${data.system_health.bulk_upload_status === 'failed' ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-700'}`}>{data.system_health.bulk_upload_status}</span>
-            </div>
+            {!loading && (data.system_health.channels || []).length === 0 && (
+              <p className="text-sm text-slate-400">No channel health data yet.</p>
+            )}
           </div>
         </div>
       </div>

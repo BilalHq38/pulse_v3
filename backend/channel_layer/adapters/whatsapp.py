@@ -235,13 +235,17 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 elif msg_type in ("image", "video", "audio", "document", "sticker"):
                     media_data = msg.get(msg_type) or {}
                     result["content"] = str(media_data.get("caption") or "").strip()
-                    if media_data.get("id"):
+                    data_url = str(media_data.get("data_url") or "").strip()
+                    media_id = str(media_data.get("id") or "").strip()
+                    if data_url or media_id:
                         result["attachments"].append(
                             UnifiedAttachment(
                                 type=msg_type,
-                                url="",  # Media ID needs separate download
+                                url="",
+                                data_url=data_url,
                                 mime_type=str(media_data.get("mime_type") or "").strip(),
                                 name=str(media_data.get("filename") or "").strip(),
+                                size=int(media_data.get("size") or 0),
                             )
                         )
                 elif msg_type == "location":

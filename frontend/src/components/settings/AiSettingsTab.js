@@ -5,17 +5,14 @@ import {
 } from 'lucide-react';
 
 const LLM_MODELS = {
-  gemini: ['gemini-3-pro-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-pro', 'gemini-1.5-flash'],
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o3-mini'],
   anthropic: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
   custom: [],
 };
+const DEFAULT_LLM_PROVIDER = 'openai';
+const DEFAULT_LLM_MODEL = LLM_MODELS[DEFAULT_LLM_PROVIDER][0];
 
 const MODEL_MAX_TOKENS = {
-  'gemini-3-pro-preview': 65536,
-  'gemini-2.5-pro': 65536, 'gemini-2.5-flash': 65536, 'gemini-2.5-flash-lite': 65536,
-  'gemini-2.0-flash': 8192, 'gemini-2.0-flash-lite': 8192,
-  'gemini-1.5-pro': 8192, 'gemini-1.5-flash': 8192,
   'gpt-4o': 16384, 'gpt-4o-mini': 16384,
   'gpt-4-turbo': 4096, 'gpt-4': 8192, 'gpt-3.5-turbo': 4096,
   'o1': 32768, 'o1-mini': 65536, 'o3-mini': 100000,
@@ -340,7 +337,7 @@ export default function AiSettingsTab({
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Wand2 size={14} className="text-violet-500" /> LLM Engines ({llmEngines.length})</h3>
           {isAdmin && (
-            <button onClick={() => { const m = LLM_MODELS.gemini[0]; setShowAddLlmForm(true); setAddLlmForm({ model_name: m, provider: 'gemini', temperature: 0.7, max_tokens: MODEL_MAX_TOKENS[m] || 2048 }); }}
+            <button onClick={() => { const m = DEFAULT_LLM_MODEL; setShowAddLlmForm(true); setAddLlmForm({ model_name: m, provider: DEFAULT_LLM_PROVIDER, temperature: 0.7, max_tokens: MODEL_MAX_TOKENS[m] || 2048 }); }}
               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
               <Plus size={12} /> Add Engine
             </button>
@@ -374,7 +371,7 @@ export default function AiSettingsTab({
                       </button>
                     )}
                     {isAdmin && (
-                      <button onClick={() => { setEditingLlmId(editingLlmId === e.id ? null : e.id); setLlmDraft({ model_name: e.model_name || '', provider: e.provider || 'gemini', temperature: e.temperature ?? 0.7, max_tokens: e.max_tokens ?? 2048 }); }}
+                      <button onClick={() => { setEditingLlmId(editingLlmId === e.id ? null : e.id); setLlmDraft({ model_name: e.model_name || DEFAULT_LLM_MODEL, provider: e.provider || DEFAULT_LLM_PROVIDER, temperature: e.temperature ?? 0.7, max_tokens: e.max_tokens ?? 2048 }); }}
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
@@ -391,7 +388,7 @@ export default function AiSettingsTab({
                         <select value={llmDraft.provider}
                           onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setLlmDraft(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
+                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
                         </select>
                       </div>
                       <div>
@@ -433,7 +430,7 @@ export default function AiSettingsTab({
                 <select value={addLlmForm.provider}
                   onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
                   className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
+                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
                 </select>
               </div>
               <div>
@@ -457,7 +454,7 @@ export default function AiSettingsTab({
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Bot size={14} className="text-blue-500" /> AI Agents ({aiAgents.length})</h3>
           {isAdmin && (
-            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', provider: 'gemini', model_name: LLM_MODELS.gemini[0], is_active: true, mcp_server_id: '' }); }}
+            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', provider: DEFAULT_LLM_PROVIDER, model_name: DEFAULT_LLM_MODEL, is_active: true, mcp_server_id: '' }); }}
               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
               <Plus size={12} /> Add Agent
             </button>
@@ -481,7 +478,7 @@ export default function AiSettingsTab({
                       <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${a.is_active ? 'translate-x-4' : ''}`} />
                     </button>
                     {isAdmin && (
-                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', provider: a.provider || 'gemini', model_name: a.model_name || '', mcp_server_id: a.mcp_server_id || '' }); }}
+                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', provider: a.provider || DEFAULT_LLM_PROVIDER, model_name: a.model_name || DEFAULT_LLM_MODEL, mcp_server_id: a.mcp_server_id || '' }); }}
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
@@ -502,7 +499,7 @@ export default function AiSettingsTab({
                       <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
                         <select value={agentDraft.provider} onChange={ev => setAgentDraft(p => ({ ...p, provider: ev.target.value, model_name: (LLM_MODELS[ev.target.value] || [])[0] || '' }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
                         </select>
                       </div>
                       <div>
@@ -544,7 +541,7 @@ export default function AiSettingsTab({
               <div>
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
                 <select value={addAgentForm.provider} onChange={ev => setAddAgentForm(p => ({ ...p, provider: ev.target.value, model_name: (LLM_MODELS[ev.target.value] || [])[0] || '' }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  <option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
                 </select>
               </div>
               <div>

@@ -10,7 +10,7 @@ app = create_service_app(
     service_name="email-campaign-service",
     title="Pulse Engine Email Campaign Service",
     routers=routers,
-    db_schema="lead_service",
+    db_schema="email_campaign_service",
 )
 
 

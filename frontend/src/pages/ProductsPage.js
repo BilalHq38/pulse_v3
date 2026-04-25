@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from 'react';
-import * as XLSX from 'xlsx';
 import api from '@/lib/api';
 import {
   Package,
@@ -14,11 +13,6 @@ import {
   Wand2,
   Lock,
   Check,
-  FileSpreadsheet,
-  AlertCircle,
-  CheckCircle,
-  Info,
-  ChevronDown,
   LayoutGrid,
   List,
   Eye,
@@ -28,15 +22,6 @@ const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_PRODUCT_IMAGES = 3;
 const MAX_PRODUCT_IMAGE_SIZE_MB = 5;
 const DEFAULT_CATEGORIES = ['general','software','service','hardware','subscription','consulting','support','training','integration'];
-
-function downloadBulkTemplate() {
-  const headers = ['product_id','name','product_title','description','price','price_currency','category','product_type','features','image_1','image_2','image_3'];
-  const ws = XLSX.utils.aoa_to_sheet([headers]);
-  ws['!cols'] = headers.map(h => ({ wch: Math.max(h.length + 4, 18) }));
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Products');
-  XLSX.writeFile(wb, 'products_bulk_upload_template.xlsx');
-}
 
 const EMPTY_FORM = {
   name: '', product_title: '', description: '', price: '', price_currency: 'USD',
@@ -87,10 +72,6 @@ export default function ProductsPage() {
   const [generatingDesc, setGeneratingDesc] = useState(false);
   const [genDescNudge, setGenDescNudge] = useState(false);
 
-  // Bulk upload state
-  const [bulkUploading, setBulkUploading] = useState(false);
-  const [bulkResult, setBulkResult] = useState(null); // { created_count, error_count, errors }
-  const [showBulkGuide, setShowBulkGuide] = useState(false);
   const [viewMode, setViewMode] = useState('list'); // 'grid' | 'list'
 
   // Delete confirm dialog
@@ -306,36 +287,6 @@ export default function ProductsPage() {
       : new Set(filtered.map(p => p.id)));
   };
 
-  // ── Bulk Excel Upload ──────────────────────────────────────
-  const handleBulkUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    e.target.value = ''; // reset input so same file can be re-selected
-
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (ext !== 'xlsx') {
-      setBulkResult({ created_count: 0, error_count: 1, warning_count: 0, errors: [{ row: 0, error: 'Only .xlsx files are accepted' }], warnings: [] });
-      return;
-    }
-
-    setBulkUploading(true);
-    setBulkResult(null);
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const res = await api.post('/company-data/products/bulk-upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      setBulkResult(res.data);
-      await loadProducts();
-    } catch (err) {
-      const msg = err.response?.data?.detail || 'Upload failed';
-      setBulkResult({ created_count: 0, error_count: 1, warning_count: 0, errors: [{ row: 0, error: msg }], warnings: [] });
-    } finally {
-      setBulkUploading(false);
-    }
-  };
-
   // ── Filter ──────────────────────────────────────────────────
   const filtered = products.filter(p => {
     if (!search) return true;
@@ -356,22 +307,6 @@ export default function ProductsPage() {
           <p className="text-slate-400 text-sm mt-1">{products.length} product{products.length !== 1 ? 's' : ''} in catalog</p>
         </div>
         <div className="flex items-center gap-2">
-          <label
-            className={`flex items-center gap-2 px-4 py-2.5 border border-slate-200 text-slate-700 rounded-xl text-sm font-medium hover:bg-slate-50 transition-all cursor-pointer ${bulkUploading ? 'opacity-60 pointer-events-none' : ''}`}
-          >
-            {bulkUploading ? (
-              <><div className="w-4 h-4 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" /> Uploading...</>
-            ) : (
-              <><FileSpreadsheet size={16} /> Bulk Upload Products</>
-            )}
-            <input
-              type="file"
-              accept=".xlsx"
-              className="hidden"
-              onChange={handleBulkUpload}
-              disabled={bulkUploading}
-            />
-          </label>
           {selectedIds.size > 0 && (
             <button
               onClick={bulkDeleteClick}
@@ -388,129 +323,6 @@ export default function ProductsPage() {
           </button>
         </div>
       </div>
-
-      {/* Bulk Upload Format Guide */}
-      <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <button
-          onClick={() => setShowBulkGuide(prev => !prev)}
-          className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-slate-50 transition-colors"
-        >
-          <div className="flex items-center gap-2">
-            <Info size={16} className="text-blue-500" />
-            <span className="text-sm font-medium text-slate-700">Bulk Upload — Excel File Format Guide</span>
-          </div>
-          <ChevronDown size={16} className={`text-slate-400 transition-transform duration-200 ${showBulkGuide ? 'rotate-180' : ''}`} />
-        </button>
-        {showBulkGuide && (
-          <div className="px-4 pb-4 border-t border-slate-100">
-            <p className="text-xs text-slate-500 mt-3 mb-3">Your .xlsx file must have a <strong>header row</strong> with column names. Imported products are also used as AI context. Below are all supported columns:</p>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs border-collapse">
-                <thead>
-                  <tr className="bg-slate-50">
-                    <th className="text-left px-3 py-2 border border-slate-200 font-semibold text-slate-700">Column Name</th>
-                    <th className="text-left px-3 py-2 border border-slate-200 font-semibold text-slate-700">Required</th>
-                    <th className="text-left px-3 py-2 border border-slate-200 font-semibold text-slate-700">Description</th>
-                    <th className="text-left px-3 py-2 border border-slate-200 font-semibold text-slate-700">Example</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[
-                    ['product_id', 'No', 'Internal tracking ID — use your own reference (e.g. ERP/CRM ID). Not auto-generated on import.', 'PROD-001'],
-                    ['name', 'Yes', 'Product name (also accepts "product_name")', 'Premium Widget'],
-                    ['product_title', 'No', 'Product ID / code / SKU (also accepts "title", "code", "product_code", "product_id", "sku")', 'WDG-001'],
-                    ['description', 'No', 'Product description (also accepts "desc")', 'High-quality premium widget...'],
-                    ['price', 'No', 'Product price as text or number', '29.99'],
-                    ['price_currency', 'No', 'ISO currency code (defaults to USD, also accepts "currency")', 'USD'],
-                    ['category', 'No', 'Product category (defaults to "general")', 'software'],
-                    ['product_type', 'No', 'Type or variety (defaults to "standard", also accepts "type")', 'subscription'],
-                    ['features', 'No', 'Semicolon-separated list of features', 'Fast shipping; 2-year warranty; Eco-friendly'],
-                    ['image_1', 'No', 'First product image URL (also accepts "image1", "photo_1")', 'https://cdn.example.com/products/widget-front.jpg'],
-                    ['image_2', 'No', 'Second product image URL (also accepts "image2", "photo_2")', 'https://cdn.example.com/products/widget-side.jpg'],
-                    ['image_3', 'No', 'Third product image URL (also accepts "image3", "photo_3")', 'https://cdn.example.com/products/widget-box.jpg'],
-                    ['images', 'No', 'Legacy: semicolon-separated public image URLs in one cell (also accepts "image", "image_urls", "photos")', 'https://cdn.example.com/a.jpg; https://cdn.example.com/b.jpg'],
-                  ].map(([col, req, desc, example]) => (
-                    <tr key={col} className="hover:bg-blue-50/40">
-                      <td className="px-3 py-2 border border-slate-200 font-mono text-blue-700 font-medium">{col}</td>
-                      <td className="px-3 py-2 border border-slate-200">
-                        {req === 'Yes'
-                          ? <span className="text-red-600 font-semibold">Required</span>
-                          : <span className="text-slate-400">Optional</span>}
-                      </td>
-                      <td className="px-3 py-2 border border-slate-200 text-slate-600">{desc}</td>
-                      <td className="px-3 py-2 border border-slate-200 font-mono text-slate-500">{example}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="mt-3 p-3 bg-blue-50 border border-blue-100 rounded-lg">
-              <p className="text-xs text-blue-800 font-medium mb-1">Tips:</p>
-              <ul className="text-xs text-blue-700 space-y-1 list-disc list-inside">
-                <li>Column headers are <strong>case-insensitive</strong> — "Name", "NAME", or "name" all work</li>
-                <li>Only the <strong>name</strong> column is required — all other columns are optional</li>
-                <li>Rows with an empty name will be skipped and reported as errors</li>
-                <li>Use <strong>semicolons (;)</strong> to separate multiple features in the features column</li>
-                <li><strong>Images — three methods:</strong> (1) Use <strong>image_1</strong>, <strong>image_2</strong>, <strong>image_3</strong> columns for one image each (recommended), (2) use a single <strong>images</strong> column with semicolon-separated values, or (3) insert images directly into Excel cells — they will be automatically extracted and matched to the row</li>
-                <li>Maximum <strong>3 images</strong> per product. Supported formats: JPEG, PNG, WebP, GIF</li>
-                <li>Accepted file format: <strong>.xlsx</strong> only</li>
-                <li>Valid imported products become part of the AI context used in responses</li>
-              </ul>
-            </div>
-            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-              Bulk-upload image support is limited to embedded Excel images, full public image URLs, and existing data URLs. Plain filenames are not imported on their own.
-            </div>
-            <div className="mt-4 flex justify-end">
-              <button
-                type="button"
-                onClick={downloadBulkTemplate}
-                className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
-              >
-                Download Template
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Bulk Upload Result Banner */}
-      {bulkResult && (
-        <div className={`flex items-start gap-3 p-4 rounded-xl border ${bulkResult.created_count > 0 && bulkResult.error_count === 0 ? 'bg-green-50 border-green-200' : bulkResult.error_count > 0 && bulkResult.created_count === 0 ? 'bg-red-50 border-red-200' : 'bg-amber-50 border-amber-200'}`}>
-          {bulkResult.created_count > 0 && bulkResult.error_count === 0 ? (
-            <CheckCircle size={18} className="text-green-600 mt-0.5 flex-shrink-0" />
-          ) : (
-            <AlertCircle size={18} className={`mt-0.5 flex-shrink-0 ${bulkResult.created_count === 0 ? 'text-red-600' : 'text-amber-600'}`} />
-          )}
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium text-slate-800">
-              {bulkResult.created_count > 0 && `${bulkResult.created_count} product${bulkResult.created_count !== 1 ? 's' : ''} imported successfully.`}
-              {bulkResult.error_count > 0 && ` ${bulkResult.error_count} error${bulkResult.error_count !== 1 ? 's' : ''}.`}
-              {bulkResult.warning_count > 0 && ` ${bulkResult.warning_count} warning${bulkResult.warning_count !== 1 ? 's' : ''}.`}
-            </p>
-            {bulkResult.warnings?.length > 0 && (
-              <ul className="mt-1 space-y-0.5">
-                {bulkResult.warnings.slice(0, 5).map((item, i) => (
-                  <li key={`warning-${i}`} className="text-xs text-amber-700">
-                    {item.row > 0 ? `Row ${item.row}: ` : ''}{item.warning}
-                  </li>
-                ))}
-                {bulkResult.warnings.length > 5 && <li className="text-xs text-slate-500">...and {bulkResult.warnings.length - 5} more warnings</li>}
-              </ul>
-            )}
-            {bulkResult.errors?.length > 0 && (
-              <ul className="mt-1 space-y-0.5">
-                {bulkResult.errors.slice(0, 5).map((err, i) => (
-                  <li key={i} className="text-xs text-red-600">
-                    {err.row > 0 ? `Row ${err.row}: ` : ''}{err.error}
-                  </li>
-                ))}
-                {bulkResult.errors.length > 5 && <li className="text-xs text-slate-500">...and {bulkResult.errors.length - 5} more</li>}
-              </ul>
-            )}
-          </div>
-          <button onClick={() => setBulkResult(null)} className="text-slate-400 hover:text-slate-600 flex-shrink-0"><X size={16} /></button>
-        </div>
-      )}
 
       {/* Search + View Toggle */}
       <div className="flex items-center gap-3">

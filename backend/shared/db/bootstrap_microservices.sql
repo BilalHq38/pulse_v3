@@ -2,6 +2,7 @@ CREATE SCHEMA IF NOT EXISTS auth_service;
 CREATE SCHEMA IF NOT EXISTS user_service;
 CREATE SCHEMA IF NOT EXISTS customer_service;
 CREATE SCHEMA IF NOT EXISTS lead_service;
+CREATE SCHEMA IF NOT EXISTS email_campaign_service;
 CREATE SCHEMA IF NOT EXISTS ai_service;
 CREATE SCHEMA IF NOT EXISTS agent_orchestrator;
 CREATE SCHEMA IF NOT EXISTS product_service;
@@ -14,6 +15,7 @@ COMMENT ON SCHEMA auth_service IS 'Auth, sessions, OAuth, and verification flows
 COMMENT ON SCHEMA user_service IS 'Users, roles, and permissions.';
 COMMENT ON SCHEMA customer_service IS 'Customers, conversations, tickets, and support workflows.';
 COMMENT ON SCHEMA lead_service IS 'Lead capture, qualification, and sales automation.';
+COMMENT ON SCHEMA email_campaign_service IS 'Outbound email campaign orchestration and recipients.';
 COMMENT ON SCHEMA ai_service IS 'AI engines, embeddings, MCP, social AI, and model runtime data.';
 COMMENT ON SCHEMA agent_orchestrator IS 'Multi-agent orchestration, workflow state, and agent memory.';
 COMMENT ON SCHEMA product_service IS 'Products, FAQs, onboarding documents, and catalog metadata.';

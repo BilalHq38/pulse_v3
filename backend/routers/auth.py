@@ -158,6 +158,13 @@ def _auth_failed(status_code: int = 401) -> HTTPException:
     return HTTPException(status_code, AUTHENTICATION_FAILED_ERROR)
 
 
+async def _record_auth_event_safe(db, user_id: str, event_type: str, request: Request, success: bool, email: str = "") -> None:
+    try:
+        await record_auth_event(db, user_id, event_type, request, success, email)
+    except Exception as exc:
+        logger.warning("auth event logging skipped event=%s user_id=%s success=%s error=%s", event_type, user_id, success, exc)
+
+
 def _refresh_cookie_secure(request: Request) -> bool:
     forwarded_proto = (request.headers.get("x-forwarded-proto", "") or request.url.scheme).split(",")[0].strip().lower()
     return forwarded_proto == "https"
@@ -327,22 +334,31 @@ async def login(request: Request):
     db = _db(request)
     body = await _json_body(request)
     email = (body.get("email", "") or "").strip().lower()
+    password = body.get("password", "")
     workspace = _workspace_hint_from_body(body)
     if not email:
         raise HTTPException(400, "Email is required")
-    await set_public_auth_context(db, email=email)
-    users = await _list_users_by_email(db, email, workspace=workspace)
+    if not isinstance(password, str) or not password:
+        raise HTTPException(400, "Password is required")
+    try:
+        await set_public_auth_context(db, email=email)
+        users = await _list_users_by_email(db, email, workspace=workspace)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("auth login_failed method=email reason=db_lookup_error email=%s", email)
+        raise HTTPException(500, "Unable to sign in right now. Please try again.") from exc
     if not users:
-        await record_auth_event(db, "", "login", request, False, email)
+        await _record_auth_event_safe(db, "", "login", request, False, email)
         logger.warning("auth login_failed method=email reason=user_not_found")
         raise _auth_failed()
     password_matches = [
         user
         for user in users
-        if user.get("password_hash") and verify_password(body.get("password", ""), user["password_hash"])
+        if user.get("password_hash") and verify_password(password, user["password_hash"])
     ]
     if not password_matches:
-        await record_auth_event(
+        await _record_auth_event_safe(
             db,
             users[0].get("id", ""),
             "login",
@@ -353,7 +369,7 @@ async def login(request: Request):
         logger.warning("auth login_failed method=email reason=password_auth_unavailable")
         raise _auth_failed()
     if len(password_matches) > 1:
-        await record_auth_event(
+        await _record_auth_event_safe(
             db,
             password_matches[0].get("id", ""),
             "login",
@@ -381,22 +397,37 @@ async def login(request: Request):
                 "detail": "Super admins must sign in through /admin/login",
             },
         )
-    if (
-        (user.get("auth_provider") or "email").lower() == "email"
-        and not user.get("email_verified", False)
-        and not relaxed_billing_env()
-    ):
-        logger.warning("auth login_failed method=email reason=email_unverified")
-        raise _auth_failed(403)
-    await db.execute("UPDATE users SET last_login=NOW(),updated_at=NOW() WHERE id=$1", user["id"])
-    await create_user_session(db, user["id"], request)
-    await record_auth_event(db, user["id"], "login", request, True, user["email"])
-    logger.info(
-        "auth login_success method=email user_id=%s company_id=%s",
-        user["id"],
-        user.get("company_id", ""),
-    )
-    return _auth_response(await build_auth_payload(db, user, request), request)
+    try:
+        await db.execute("UPDATE users SET last_login=NOW(),updated_at=NOW() WHERE id=$1", user["id"])
+        await create_user_session(db, user["id"], request)
+        await _record_auth_event_safe(db, user["id"], "login", request, True, user["email"])
+        logger.info(
+            "auth login_success method=email user_id=%s company_id=%s email_verified=%s",
+            user["id"],
+            user.get("company_id", ""),
+            bool(user.get("email_verified")),
+        )
+        payload = await build_auth_payload(db, user, request)
+        if (
+            not payload.get("user", {}).get("email_verified", False)
+            and not relaxed_billing_env()
+            and payload.get("user", {}).get("role") != "super_admin"
+        ):
+            payload["email_verification"] = {
+                "required": True,
+                "email": payload.get("user", {}).get("email", email),
+                "message": "Email verification is required before using the workspace.",
+            }
+        return _auth_response(payload, request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "auth login_failed method=email reason=session_or_payload_error user_id=%s company_id=%s",
+            user.get("id", ""),
+            user.get("company_id", ""),
+        )
+        raise HTTPException(500, "Unable to complete sign in right now. Please try again.") from exc
 
 
 @router.post("/auth/logout")
@@ -591,8 +622,6 @@ async def resend_verification(request: Request):
     if workspace or len(users) == 1:
         user = await ensure_user_company_assignment(db, users[0])
         await set_company_context(db, user.get("company_id", ""))
-        if (user.get("auth_provider") or "email").lower() in ("google", "facebook"):
-            return {"message": "This account uses external sign-in."}
         if user.get("email_verified", False):
             return {"message": "This email address is already verified."}
         ctrl = await get_email_verification_resend_control(db, user)
@@ -638,8 +667,6 @@ async def resend_verification(request: Request):
     for user in users:
         user = await ensure_user_company_assignment(db, user)
         await set_company_context(db, user.get("company_id", ""))
-        if (user.get("auth_provider") or "email").lower() in ("google", "facebook"):
-            continue
         if user.get("email_verified", False):
             continue
         ctrl = await get_email_verification_resend_control(db, user)

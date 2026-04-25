@@ -319,6 +319,26 @@ app.get("/qr", (req, res) => {
   });
 });
 
+app.post("/disconnect", async (req, res) => {
+  if (!requireBridgeSecret(req, res)) return;
+  try {
+    isClientReady = false;
+    lastQrString = "";
+    await client.logout();
+    setTimeout(() => {
+      try {
+        clientInitPromise = client.initialize();
+      } catch (err) {
+        console.error("Reinitialize after disconnect failed:", err.message || err);
+      }
+    }, 1000);
+    res.json({ success: true, status: "disconnected" });
+  } catch (err) {
+    console.error("Disconnect failed:", err.message || err);
+    res.status(500).json({ success: false, error: err.message || "Disconnect failed" });
+  }
+});
+
 // Send message — called by Python messaging_service.py
 app.post("/send", async (req, res) => {
   if (!BRIDGE_SECRET)

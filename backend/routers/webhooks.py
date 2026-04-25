@@ -1113,133 +1113,132 @@ async def _handle_whatsapp_webhook_payload(
 ) -> bool:
     resolved_company_id = ""
     try:
-        entry = payload.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
-        value_metadata = value.get("metadata", {}) or {}
-        inbound_metadata = {
-            "phone_number_id": value_metadata.get("phone_number_id", ""),
-            "recipient_phone_number": value_metadata.get("display_phone_number", ""),
-            "business_account_id": (value.get("business_account_id", "") or entry.get("id", "")),
-            "company_id": value_metadata.get("company_id", ""),
-        }
+        registry = get_channel_registry()
+        adapter = registry.get_or_none(ChannelType.WHATSAPP)
+        if adapter is None:
+            raise RuntimeError("WhatsApp adapter is not registered")
 
-        resolved_company_id = await _resolve_inbound_company_id(
-            db,
-            "whatsapp",
-            inbound_metadata,
-            allow_direct_company_id=allow_direct_company_id,
-        )
-        if not resolved_company_id:
-            logger.warning(
-                "Unknown tenant for signed Meta webhook channel=whatsapp event_id=%s metadata=%s",
-                event_id,
-                {k: v for k, v in inbound_metadata.items() if v},
-            )
+        processed_any = False
+        unresolved_metadata: dict = {}
+        for entry in payload.get("entry", []) or []:
+            for change in (entry or {}).get("changes", []) or []:
+                value = (change or {}).get("value", {}) or {}
+                value_metadata = value.get("metadata", {}) or {}
+                inbound_metadata = {
+                    "phone_number_id": value_metadata.get("phone_number_id", ""),
+                    "recipient_phone_number": value_metadata.get("display_phone_number", ""),
+                    "business_account_id": (value.get("business_account_id", "") or (entry or {}).get("id", "")),
+                    "company_id": value_metadata.get("company_id", ""),
+                }
+                unresolved_metadata = {k: v for k, v in inbound_metadata.items() if v}
+                resolved_company_id = await _resolve_inbound_company_id(
+                    db,
+                    "whatsapp",
+                    inbound_metadata,
+                    allow_direct_company_id=allow_direct_company_id,
+                )
+                if not resolved_company_id:
+                    logger.warning(
+                        "Unknown tenant for signed Meta webhook channel=whatsapp event_id=%s metadata=%s",
+                        event_id,
+                        unresolved_metadata,
+                    )
+                    continue
+
+                await _record_webhook_event_safe(
+                    db,
+                    "whatsapp",
+                    payload,
+                    metadata=inbound_metadata,
+                    resolved_company_id=resolved_company_id,
+                    allow_direct_company_id=False,
+                )
+                messages = value.get("messages", []) or []
+                contacts = value.get("contacts", []) or []
+
+                raw_statuses = value.get("statuses", []) or []
+                if raw_statuses:
+                    await process_delivery_status_webhook(
+                        db,
+                        company_id=resolved_company_id,
+                        channel="whatsapp",
+                        statuses=raw_statuses,
+                    )
+                    processed_any = True
+                    if not messages:
+                        continue
+
+                for i, msg in enumerate(messages):
+                    sender_phone = str((msg or {}).get("from") or "").strip()
+                    if not sender_phone:
+                        continue
+
+                    contact = contacts[i] if i < len(contacts) else {}
+                    single_payload = {
+                        "entry": [
+                            {
+                                "id": (entry or {}).get("id", ""),
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "metadata": value_metadata,
+                                            "messages": [msg],
+                                            "contacts": [contact] if contact else [],
+                                        }
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+
+                    unified_message = await adapter.receive_message(
+                        single_payload,
+                        db,
+                        resolved_company_id,
+                    )
+                    unified_message.trace_id = _trace_id_from_context(
+                        str((unified_message.metadata or {}).get("trace_id") or "")
+                    )
+                    unified_message.metadata.update(
+                        {
+                            **inbound_metadata,
+                            "company_id": resolved_company_id,
+                            "source": "whatsapp_webhook",
+                            "message_type": str((msg or {}).get("type") or "text"),
+                            "event_id": event_id,
+                            "trace_id": unified_message.trace_id,
+                        }
+                    )
+                    unified_message = await _CHANNEL_NORMALIZER.normalize(unified_message, db)
+
+                    sender_name = (
+                        str(((contact or {}).get("profile") or {}).get("name") or "").strip()
+                        or str((unified_message.metadata or {}).get("profile_name") or "").strip()
+                        or f"WhatsApp {sender_phone}"
+                    )
+                    if not (str(unified_message.content or "").strip() or unified_message.attachments):
+                        continue
+
+                    await _process_unified_incoming_message(
+                        db,
+                        unified_message,
+                        sender_name=sender_name,
+                        sender_contact=sender_phone,
+                    )
+                    processed_any = True
+
+        if not processed_any:
             if store_unresolved and event_id:
                 await _store_unprocessed_event(
                     db,
                     channel="whatsapp",
                     event_id=event_id,
                     payload=payload,
-                    metadata=inbound_metadata,
+                    metadata=unresolved_metadata,
                     reason="tenant_unresolved",
                 )
                 _schedule_unprocessed_retry(db, "whatsapp")
             return False
-
-        await _record_webhook_event_safe(
-            db,
-            "whatsapp",
-            payload,
-            metadata=inbound_metadata,
-            resolved_company_id=resolved_company_id,
-            allow_direct_company_id=False,
-        )
-        messages = value.get("messages", [])
-        contacts = value.get("contacts", [])
-
-        raw_statuses = value.get("statuses", [])
-        if raw_statuses:
-            await process_delivery_status_webhook(
-                db,
-                company_id=resolved_company_id,
-                channel="whatsapp",
-                statuses=raw_statuses,
-            )
-            if not messages:
-                if event_id:
-                    await _mark_unprocessed_event_resolved(
-                        db,
-                        channel="whatsapp",
-                        event_id=event_id,
-                        company_id=resolved_company_id,
-                    )
-                _schedule_unprocessed_retry(db, "whatsapp")
-                return True
-
-        registry = get_channel_registry()
-        adapter = registry.get_or_none(ChannelType.WHATSAPP)
-        if adapter is None:
-            raise RuntimeError("WhatsApp adapter is not registered")
-
-        for i, msg in enumerate(messages):
-            sender_phone = str((msg or {}).get("from") or "").strip()
-            if not sender_phone:
-                continue
-
-            contact = contacts[i] if i < len(contacts) else {}
-            single_payload = {
-                "entry": [
-                    {
-                        "id": entry.get("id", ""),
-                        "changes": [
-                            {
-                                "value": {
-                                    "metadata": value_metadata,
-                                    "messages": [msg],
-                                    "contacts": [contact] if contact else [],
-                                }
-                            }
-                        ],
-                    }
-                ]
-            }
-
-            unified_message = await adapter.receive_message(
-                single_payload,
-                db,
-                resolved_company_id,
-            )
-            unified_message.trace_id = _trace_id_from_context(
-                str((unified_message.metadata or {}).get("trace_id") or "")
-            )
-            unified_message.metadata.update(
-                {
-                    **inbound_metadata,
-                    "company_id": resolved_company_id,
-                    "source": "whatsapp_webhook",
-                    "message_type": str((msg or {}).get("type") or "text"),
-                    "event_id": event_id,
-                    "trace_id": unified_message.trace_id,
-                }
-            )
-            unified_message = await _CHANNEL_NORMALIZER.normalize(unified_message, db)
-
-            sender_name = (
-                str(((contact or {}).get("profile") or {}).get("name") or "").strip()
-                or str((unified_message.metadata or {}).get("profile_name") or "").strip()
-                or f"WhatsApp {sender_phone}"
-            )
-            if not (str(unified_message.content or "").strip() or unified_message.attachments):
-                continue
-
-            await _process_unified_incoming_message(
-                db,
-                unified_message,
-                sender_name=sender_name,
-                sender_contact=sender_phone,
-            )
 
         if event_id:
             await _mark_unprocessed_event_resolved(

@@ -68,6 +68,7 @@ class ServiceUrls:
     user: str
     customer: str
     lead: str
+    email_campaign: str
     ai: str
     orchestrator: str
     product: str
@@ -83,6 +84,7 @@ class ServiceUrls:
             "user": self.user,
             "customer": self.customer,
             "lead": self.lead,
+            "email_campaign": self.email_campaign,
             "ai": self.ai,
             "orchestrator": self.orchestrator,
             "product": self.product,
@@ -100,6 +102,7 @@ def service_urls() -> ServiceUrls:
         user=os.environ.get("USER_SERVICE_URL", "http://user:8002").rstrip("/"),
         customer=os.environ.get("CUSTOMER_SERVICE_URL", "http://customer:8003").rstrip("/"),
         lead=os.environ.get("LEAD_SERVICE_URL", "http://lead:8004").rstrip("/"),
+        email_campaign=os.environ.get("EMAIL_CAMPAIGN_SERVICE_URL", "http://email-campaign:8013").rstrip("/"),
         ai=os.environ.get("AI_SERVICE_URL", "http://ai:8005").rstrip("/"),
         orchestrator=os.environ.get("ORCHESTRATOR_SERVICE_URL", "http://agent-orchestrator:8009").rstrip("/"),
         analytics=os.environ.get("ANALYTICS_SERVICE_URL", "http://analytics:8006").rstrip("/"),

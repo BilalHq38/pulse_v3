@@ -17,6 +17,7 @@ x-common-env: &common-env
   USER_SERVICE_URL: http://user:8002
   CUSTOMER_SERVICE_URL: http://customer:8003
   LEAD_SERVICE_URL: http://lead:8004
+  EMAIL_CAMPAIGN_SERVICE_URL: http://email-campaign:8013
   AI_SERVICE_URL: http://ai:8005
   ORCHESTRATOR_SERVICE_URL: http://agent-orchestrator:8009
   ANALYTICS_SERVICE_URL: http://analytics:8006
@@ -217,6 +218,29 @@ services:
       retries: 10
     expose:
       - "8004"
+
+  email-campaign:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: backend/services/email_campaign_service/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: email-campaign-service
+      PORT: 8013
+      DB_SCHEMA: email_campaign_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "8013"
 
   ai:
     <<: *service-defaults
@@ -423,6 +447,8 @@ services:
       customer:
         condition: service_healthy
       lead:
+        condition: service_healthy
+      email-campaign:
         condition: service_healthy
       ai:
         condition: service_healthy
