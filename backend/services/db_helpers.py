@@ -607,8 +607,15 @@ async def record_system_log(
 
 
 async def ensure_default_llm_engine(db) -> dict:
-    provider = (os.environ.get("AI_PROVIDER", "gemini") or "gemini").strip().lower()
-    model_name = (os.environ.get("AI_MODEL_NAME", "gemini-2.5-flash") or "gemini-2.5-flash").strip()
+    provider = (os.environ.get("AI_PROVIDER", "openai") or "openai").strip().lower()
+    model_defaults = {
+        "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+        "gemini": "gemini-2.5-flash",
+    }
+    if provider not in model_defaults:
+        provider = "openai"
+    model_name = (os.environ.get("AI_MODEL_NAME") or model_defaults[provider] or "gpt-4o-mini").strip()
     row = await db.fetchrow(
         "SELECT * FROM llm_engines WHERE provider=$1 AND model_name=$2 AND company_id='' LIMIT 1",
         provider,
@@ -1701,7 +1708,7 @@ async def get_or_create_contact_conversation(db, customer: dict, channel: str, s
         return dict(row)
     nid = make_id()
     await db.execute(
-        "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,TRUE,NULL,'',0,'',NOW(),0,NOW(),NOW())",  # noqa: E501
+        "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,TRUE,0,'neutral',0,'',NOW(),0,NOW(),NOW())",  # noqa: E501
         nid,
         cid,
         customer["id"],

@@ -193,8 +193,9 @@ function CompanyStep({ user, onNext, onSkip }) {
 const CHANNEL_OPTIONS = [
   { id: 'whatsapp', label: 'WhatsApp' },
   { id: 'email', label: 'Email' },
-  { id: 'sms', label: 'SMS' },
-  { id: 'web_chat', label: 'Web chat' },
+  { id: 'facebook', label: 'Facebook' },
+  { id: 'instagram', label: 'Instagram' },
+  { id: 'web_chat', label: 'Website chat' },
 ];
 
 // ─── Step 2: Preferred channels ─────────────────────────────────────────────

@@ -91,22 +91,42 @@ def _filter_update_fields(body: dict, allowed: set[str]) -> dict:
     return {k: v for k, v in body.items() if k in allowed}
 
 
+async def _load_agent_runtime_fields(db, agent: dict, company_id: str) -> dict:
+    data = dict(agent or {})
+    llm_id = str(data.get("llm_id") or "").strip()
+    if llm_id:
+        engine = r(
+            await db.fetchrow(
+                "SELECT provider,model_name,temperature,max_tokens FROM llm_engines "
+                "WHERE id=$1 AND (company_id='' OR company_id=$2) LIMIT 1",
+                llm_id,
+                company_id,
+            )
+        )
+        if engine:
+            data["provider"] = data.get("provider") or engine.get("provider", "")
+            data["model_name"] = engine.get("model_name", "")
+            data["llm_temperature"] = engine.get("temperature")
+            data["llm_max_tokens"] = engine.get("max_tokens")
+    return data
+
+
 @router.post("/ai/sentiment")
 async def ai_sentiment(request: Request):
     db = _db(request)
-    await get_current_user_flexible(request)
+    cu = await get_current_user_flexible(request)
     body = await request.json()
     text = body.get("text", "")
-    sentiment = await analyze_sentiment(text, db=db)
+    sentiment = await analyze_sentiment(text, db=db, company_id=cu.get("company_id", ""))
     return build_sentiment_gate(text, sentiment)
 
 
 @router.post("/ai/classify")
 async def ai_classify(request: Request):
     db = _db(request)
-    await get_current_user_flexible(request)
+    cu = await get_current_user_flexible(request)
     body = await request.json()
-    return await classify_intent(body.get("text", ""), db=db)
+    return await classify_intent(body.get("text", ""), db=db, company_id=cu.get("company_id", ""))
 
 
 @router.get("/ai/llm-engines")
@@ -156,6 +176,8 @@ async def update_llm_engine(llm_id: str, request: Request):
     body.pop("_id", None)
     if "provider" in body:
         body["provider"] = normalize_reference_key(body["provider"])
+        if body["provider"] not in {"openai", "anthropic", "gemini"}:
+            raise HTTPException(400, "provider must be openai, anthropic, or gemini")
     if not body:
         raise HTTPException(400, "No valid fields provided")
     body["updated_at"] = now_ts()
@@ -211,6 +233,7 @@ async def list_ai_agents(request: Request):
         )
     )
     for agent in agents:
+        agent.update(await _load_agent_runtime_fields(db, agent, cid))
         agent["configuration"] = dict(
             r
             for r in await db.fetch(
@@ -230,6 +253,12 @@ async def create_ai_agent(request: Request):
         raise HTTPException(400, "Provide at least one AI agent field")
     cid = cu.get("company_id", "")
     llm_id = body.get("llm_id") or (await ensure_default_llm_engine(db)).get("id", "")
+    if llm_id and not await db.fetchrow(
+        "SELECT id FROM llm_engines WHERE id=$1 AND (company_id='' OR company_id=$2) LIMIT 1",
+        llm_id,
+        cid,
+    ):
+        raise HTTPException(404, "LLM engine not found")
     agent_id = make_id()
     await db.execute(
         "INSERT INTO ai_agents(id,company_id,llm_id,mcp_server_id,agent_type,api_key_ref,provider,version,is_active,registered_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),NOW())",  # noqa: E501
@@ -250,7 +279,8 @@ async def create_ai_agent(request: Request):
             "INSERT INTO ai_agent_config(agent_id,config_key,config_val) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
             [(agent_id, k, str(v)) for k, v in cfg.items()],
         )
-    return r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1", agent_id))
+    agent = r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1", agent_id))
+    return await _load_agent_runtime_fields(db, agent, cid)
 
 
 @router.put("/ai/agents/{agent_id}")
@@ -264,6 +294,12 @@ async def update_ai_agent(agent_id: str, request: Request):
     body.pop("_id", None)
     if not body and cfg is None:
         raise HTTPException(400, "No valid fields provided")
+    if body.get("llm_id") and not await db.fetchrow(
+        "SELECT id FROM llm_engines WHERE id=$1 AND (company_id='' OR company_id=$2) LIMIT 1",
+        body["llm_id"],
+        cid,
+    ):
+        raise HTTPException(404, "LLM engine not found")
     if body:
         body["updated_at"] = now_ts()
         set_parts = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(body))
@@ -291,7 +327,7 @@ async def update_ai_agent(agent_id: str, request: Request):
             agent_id,
         )
     }
-    return agent
+    return await _load_agent_runtime_fields(db, agent, cid)
 
 
 @router.delete("/ai/agents/{agent_id}")

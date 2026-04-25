@@ -424,7 +424,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "8011:8011"
+      - "${SUPER_ADMIN_HOST_PORT:-8011}:8011"
     expose:
       - "8011"
 
@@ -472,7 +472,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "8000:8000"
+      - "${GATEWAY_HOST_PORT:-8000}:8000"
 
   frontend:
     <<: *service-defaults
@@ -486,7 +486,7 @@ services:
       gateway:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "${FRONTEND_HOST_PORT:-3000}:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 >/dev/null 2>&1 || exit 1"]
       interval: 20s

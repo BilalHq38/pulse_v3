@@ -1118,7 +1118,7 @@ async def generate_ai_response(
     )
     if prompt_context and getattr(prompt_context, "conversation_history", ""):
         conversation_text = prompt_context.conversation_history
-    budget = int(os.getenv("GEMINI_INPUT_TOKEN_BUDGET", "12000"))
+    budget = int(os.getenv("AI_INPUT_TOKEN_BUDGET", os.getenv("GEMINI_INPUT_TOKEN_BUDGET", "12000")))
     prompt = (
         f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
         f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.35))}\n\n"  # noqa: E501

@@ -319,7 +319,8 @@ async def ai_runtime(
     current_user: dict = Depends(get_current_user),
 ):
     db = request.app.state.db
-    engine = await get_active_llm_engine(db)
+    company_id = current_user.get("company_id", "")
+    engine = await get_active_llm_engine(db, company_id=company_id)
     engine = dict(engine or {})
     ready, reason = get_provider_runtime_info(engine.get("provider", ""))
     try:
@@ -366,19 +367,21 @@ async def model_health(
     Result is cached for 30 seconds to avoid hammering the LLM on every probe.
     """
     now = time.monotonic()
-    cached = _MODEL_HEALTH_CACHE.get("result")
-    cached_at = _MODEL_HEALTH_CACHE.get("at", 0.0)
+    company_id = current_user.get("company_id", "")
+    cache_key = company_id or "_global"
+    cached = _MODEL_HEALTH_CACHE.get(cache_key)
+    cached_at = _MODEL_HEALTH_CACHE.get(f"{cache_key}:at", 0.0)
     if cached is not None and (now - cached_at) < _MODEL_HEALTH_CACHE_TTL:
         return cached
 
     db = request.app.state.db
-    engine = await get_active_llm_engine(db)
+    engine = await get_active_llm_engine(db, company_id=company_id)
     engine = dict(engine or {})
     ready, reason = get_provider_runtime_info(engine.get("provider", ""))
     if not ready:
         result = {"healthy": False, "reason": reason, "engine": engine}
-        _MODEL_HEALTH_CACHE["result"] = result
-        _MODEL_HEALTH_CACHE["at"] = now
+        _MODEL_HEALTH_CACHE[cache_key] = result
+        _MODEL_HEALTH_CACHE[f"{cache_key}:at"] = now
         return result
     try:
         validate_live_engine(engine, require_vision=False)
@@ -394,8 +397,8 @@ async def model_health(
         }
     except Exception as exc:
         result = {"healthy": False, "reason": str(exc), "engine": engine}
-    _MODEL_HEALTH_CACHE["result"] = result
-    _MODEL_HEALTH_CACHE["at"] = now
+    _MODEL_HEALTH_CACHE[cache_key] = result
+    _MODEL_HEALTH_CACHE[f"{cache_key}:at"] = now
     return result
 
 

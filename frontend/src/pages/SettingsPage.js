@@ -275,7 +275,7 @@ export default function SettingsPage() {
   const [showAddLlmForm, setShowAddLlmForm] = useState(false);
   const [addLlmForm, setAddLlmForm] = useState({ model_name: '', provider: 'openai', temperature: 0.7, max_tokens: 2048 });
   const [showAddAgentForm, setShowAddAgentForm] = useState(false);
-  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', provider: 'openai', model_name: '', is_active: true, mcp_server_id: '' });
+  const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', llm_id: '', is_active: true, mcp_server_id: '' });
 
   // Integrations interactive state
   const [editingMcpId, setEditingMcpId] = useState(null);

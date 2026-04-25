@@ -1,5 +1,6 @@
 """routers/auth.py — Auth endpoints using PostgreSQL."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -25,13 +26,21 @@ from core.request_helpers import (
 from core.utils import make_id, validate_password, seconds_until
 from models.reference_data import resolve_role_id
 from services.billing_helpers import (
+    PLAN_CATALOG,
+    assert_stripe_ready,
     assert_workspace_seat_available,
     count_pending_invitations,
     count_workspace_seats_used,
     effective_max_users,
+    get_or_create_billing_customer,
     relaxed_billing_env,
+    stripe_configured,
     stripe_enabled_for_app,
+    stripe_price_id,
     trial_period_days,
+    update_billing_customer_status,
+    upsert_subscription,
+    uses_local_billing_customer_id,
 )
 from services.db_helpers import (
     bump_user_token_version,
@@ -88,6 +97,11 @@ router = APIRouter()
 AUTHENTICATION_FAILED_ERROR = "Authentication failed"
 REFRESH_COOKIE_NAME = "pe_refresh"
 INVITATION_TTL_HOURS = max(1, int(os.environ.get("INVITATION_TTL_HOURS", "72") or 72))
+
+try:
+    import stripe
+except Exception:  # pragma: no cover
+    stripe = None
 
 
 def _signup_prefill_frontend_base(request: Request, sd: dict) -> str:
@@ -1355,11 +1369,44 @@ async def patch_onboarding_profile(request: Request):
         ch = body.get("preferred_channels")
         if not isinstance(ch, list):
             raise HTTPException(400, "preferred_channels must be a list")
+        channel_display_names = {
+            "whatsapp": "WhatsApp",
+            "facebook": "Facebook Messenger",
+            "instagram": "Instagram",
+            "email": "Email",
+            "web_chat": "Web Chat Widget",
+        }
+        normalized_channels: list[str] = []
+        seen_channels: set[str] = set()
+        for raw_channel in ch:
+            normalized = str(raw_channel or "").strip().lower()
+            if normalized not in channel_display_names or normalized in seen_channels:
+                continue
+            seen_channels.add(normalized)
+            normalized_channels.append(normalized)
+
         await db.execute(
-            "UPDATE company_settings SET preferred_channels=$1::jsonb, updated_at=NOW() WHERE company_id=$2",
-            json.dumps([str(x).strip() for x in ch if str(x).strip()]),
+            "INSERT INTO company_settings(id,company_id,preferred_channels,created_at,updated_at) "
+            "VALUES($1,$2,$3::jsonb,NOW(),NOW()) "
+            "ON CONFLICT (company_id) DO UPDATE SET preferred_channels=EXCLUDED.preferred_channels, updated_at=NOW()",
+            make_id(),
             company_id,
+            json.dumps(normalized_channels),
         )
+
+        for channel_key, display_name in channel_display_names.items():
+            enabled = channel_key in seen_channels
+            await db.execute(
+                "INSERT INTO channel_settings(id,company_id,channel,display_name,enabled,created_at,updated_at) "
+                "VALUES($1,$2,$3,$4,$5,NOW(),NOW()) "
+                "ON CONFLICT (company_id, channel) DO UPDATE "
+                "SET display_name=EXCLUDED.display_name, enabled=EXCLUDED.enabled, updated_at=NOW()",
+                make_id(),
+                company_id,
+                channel_key,
+                display_name,
+                enabled,
+            )
     return {"status": "ok"}
 
 
@@ -1380,7 +1427,7 @@ async def complete_onboarding(request: Request):
 
 @router.post("/auth/billing/plan")
 async def select_billing_plan(request: Request):
-    """After onboarding, user selects trial or acknowledges paid (mock) plan."""
+    """After onboarding, user selects a real free-trial or paid billing path."""
     db = _db(request)
     cu = await get_current_user_flexible(request)
     uid = str(cu.get("sub") or "").strip()
@@ -1390,22 +1437,146 @@ async def select_billing_plan(request: Request):
         return {"status": "ok", "message": "Super admin bypass"}
     body = await _json_body(request)
     mode = str(body.get("mode") or "").strip().lower()
-    if mode not in ("free_trial", "paid_mock"):
-        raise HTTPException(400, "mode must be free_trial or paid_mock")
-    row = r(await db.fetchrow("SELECT onboarding_completed FROM users WHERE id=$1", uid))
-    if not row or not row.get("onboarding_completed"):
-        raise HTTPException(400, "Complete onboarding before selecting a plan")
-    billing = "trial" if mode == "free_trial" else "active"
-    await db.execute(
-        "UPDATE users SET plan_selected=TRUE, billing_status=$1, updated_at=NOW() WHERE id=$2",
-        billing,
-        uid,
-    )
+    if mode not in ("free_trial", "paid"):
+        raise HTTPException(400, "mode must be free_trial or paid")
     user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", uid))
     if not user:
         raise HTTPException(404, "User not found")
     user = await ensure_user_company_assignment(db, user)
-    return _auth_response(await build_auth_payload(db, user, request), request)
+    if not user.get("onboarding_completed"):
+        raise HTTPException(400, "Complete onboarding before selecting a plan")
+    company_id = str(user.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "Company context is required before selecting a plan")
+
+    subscription = r(await db.fetchrow("SELECT * FROM subscriptions WHERE company_id=$1 LIMIT 1", company_id))
+    plan_code = str((subscription or {}).get("plan_code") or "pro").strip().lower()
+    if plan_code not in PLAN_CATALOG or plan_code == "free":
+        plan_code = "pro"
+
+    if mode == "free_trial":
+        now = datetime.now(timezone.utc)
+        existing_start = (subscription or {}).get("current_period_start")
+        existing_end = (subscription or {}).get("current_period_end")
+        existing_status = str((subscription or {}).get("status") or "").strip().lower()
+        reset_trial_window = (
+            not isinstance(existing_end, datetime)
+            or existing_end <= now
+            or existing_status not in {"trialing", "active"}
+        )
+        period_start = now if reset_trial_window or not isinstance(existing_start, datetime) else existing_start
+        period_end = now + timedelta(days=trial_period_days()) if reset_trial_window else existing_end
+        billing_customer = await update_billing_customer_status(
+            db,
+            company_id=company_id,
+            payment_status="inactive",
+            billing_email=(user.get("email") or "").strip().lower(),
+            billing_name=(user.get("name") or "").strip(),
+        )
+        await upsert_subscription(
+            db,
+            company_id,
+            billing_customer_id=billing_customer["id"],
+            plan_code=plan_code,
+            status="trialing",
+            current_period_start=period_start,
+            current_period_end=period_end,
+        )
+        await db.execute(
+            "UPDATE users SET plan_selected=TRUE,billing_status='trial',updated_at=NOW() WHERE company_id=$1",
+            company_id,
+        )
+        refreshed_user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", uid))
+        if not refreshed_user:
+            raise HTTPException(404, "User not found")
+        refreshed_user = await ensure_user_company_assignment(db, refreshed_user)
+        return _auth_response(await build_auth_payload(db, refreshed_user, request), request)
+
+    if not stripe_configured() or not stripe_enabled_for_app():
+        raise HTTPException(
+            422,
+            "Paid checkout requires Stripe (STRIPE_SECRET_KEY and STRIPE_PRICE_*). "
+            "Use the free trial, set STRIPE_ENABLED=auto (default), or enable Stripe in your environment.",
+        )
+    assert_stripe_ready()
+    if not stripe:
+        raise HTTPException(501, "Stripe SDK is not installed")
+
+    price_id = stripe_price_id(plan_code)
+    if not price_id:
+        raise HTTPException(501, f"Stripe price is not configured for plan {plan_code}")
+
+    billing_customer = await get_or_create_billing_customer(
+        db,
+        company_id,
+        billing_email=(user.get("email") or "").strip().lower(),
+        billing_name=(user.get("name") or "").strip(),
+        payment_status="inactive",
+    )
+    stripe_customer_id = str(billing_customer.get("stripe_customer_id") or "").strip()
+    if not stripe_customer_id or uses_local_billing_customer_id(stripe_customer_id):
+        try:
+            customer = await asyncio.to_thread(
+                stripe.Customer.create,
+                email=(billing_customer.get("billing_email") or "").strip().lower(),
+                name=(billing_customer.get("billing_name") or "").strip(),
+                metadata={"billing_customer_id": billing_customer["id"], "company_id": company_id},
+            )
+        except Exception as exc:
+            logger.exception(
+                "billing checkout customer_create_failed company_id=%s user_id=%s",
+                company_id,
+                uid,
+            )
+            raise HTTPException(502, "Could not prepare Stripe checkout. Verify your Stripe configuration.") from exc
+        stripe_customer_id = str(customer.get("id") or "").strip()
+        await db.execute(
+            "UPDATE billing_customers SET stripe_customer_id=$1,updated_at=NOW() WHERE id=$2",
+            stripe_customer_id,
+            billing_customer["id"],
+        )
+        billing_customer["stripe_customer_id"] = stripe_customer_id
+
+    frontend_base = resolve_frontend_base_url(request).rstrip("/")
+    try:
+        session = await asyncio.to_thread(
+            stripe.checkout.Session.create,
+            mode="subscription",
+            customer=billing_customer["stripe_customer_id"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{frontend_base}/billing?checkout=success",
+            cancel_url=f"{frontend_base}/billing?checkout=cancelled",
+            metadata={"company_id": company_id, "plan_code": plan_code, "source": "onboarding_plan_selection"},
+            subscription_data={
+                "metadata": {"company_id": company_id, "plan_code": plan_code, "source": "onboarding_plan_selection"}
+            },
+            allow_promotion_codes=True,
+        )
+    except Exception as exc:
+        logger.exception(
+            "billing checkout session_create_failed company_id=%s user_id=%s plan_code=%s",
+            company_id,
+            uid,
+            plan_code,
+        )
+        raise HTTPException(502, "Could not open Stripe checkout. Verify your Stripe keys and price IDs.") from exc
+
+    await update_billing_customer_status(
+        db,
+        company_id=company_id,
+        stripe_customer_id=billing_customer["stripe_customer_id"],
+        payment_status="inactive",
+        billing_email=(user.get("email") or "").strip().lower(),
+        billing_name=(user.get("name") or "").strip(),
+    )
+    await upsert_subscription(
+        db,
+        company_id,
+        billing_customer_id=billing_customer["id"],
+        plan_code=plan_code,
+        status="pending",
+    )
+    return {"ok": True, "checkout_url": session.url, "session_id": session.id}
 
 
 @router.post("/auth/onboarding/invite")

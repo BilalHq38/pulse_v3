@@ -80,14 +80,27 @@ def _channel_type_from_name(channel: str) -> Optional[ChannelType]:
 
 def _resolve_lead_recipient(channel: str, customer: dict, lead: dict) -> str:
     normalized = str(channel or "").strip().lower()
+    lead_social_profiles = lead.get("social_profiles") if isinstance(lead.get("social_profiles"), dict) else {}
+    customer_social_profiles = (
+        customer.get("social_profiles") if isinstance(customer.get("social_profiles"), dict) else {}
+    )
     if normalized == "whatsapp":
         return str(customer.get("phone") or lead.get("phone") or "").strip()
     if normalized in {"facebook", "instagram"}:
         return str(
-            customer.get("phone") or customer.get("email") or lead.get("phone") or lead.get("email") or ""
+            lead.get("channel_recipient_id")
+            or lead.get("external_recipient_id")
+            or lead.get("channel_user_id")
+            or customer.get("channel_recipient_id")
+            or customer.get("external_recipient_id")
+            or customer_social_profiles.get(normalized)
+            or lead_social_profiles.get(normalized)
+            or ""
         ).strip()
     if normalized == "web_chat":
-        return str(customer.get("email") or customer.get("id") or "").strip()
+        return str(customer.get("email") or customer.get("id") or lead.get("email") or "").strip()
+    if normalized == "email":
+        return str(customer.get("email") or lead.get("email") or "").strip().lower()
     return ""
 
 
@@ -101,6 +114,7 @@ async def _send_outbound_via_channel_layer(
     conversation_id: str,
     db_message_id: str,
     metadata: dict | None = None,
+    subject: str = "",
 ) -> tuple[bool, str]:
     channel_type = _channel_type_from_name(channel)
     if not channel_type:
@@ -119,6 +133,7 @@ async def _send_outbound_via_channel_layer(
         channel_type=channel_type,
         external_user_id=recipient,
         content=content,
+        subject=str(subject or "").strip(),
         db=db,
         metadata=message_metadata,
         conversation_id=conversation_id,
@@ -165,17 +180,42 @@ def _serialize_lead(lead: dict | None) -> dict | None:
 
 def _normalize_lead_channel(lead: dict) -> str:
     preferred = str(lead.get("source") or "").strip().lower()
-    if preferred in {"whatsapp", "facebook", "instagram", "web_chat"}:
+    if preferred in {"whatsapp", "facebook", "instagram", "web_chat", "email"}:
         return preferred
     channels = lead.get("channels") or []
     for channel in channels:
         key = str(channel if isinstance(channel, str) else channel.get("channel", "")).strip().lower()
-        if key in {"whatsapp", "facebook", "instagram", "web_chat"}:
+        if key in {"whatsapp", "facebook", "instagram", "web_chat", "email"}:
             return key
+    if lead.get("email"):
+        return "email"
     return "whatsapp" if lead.get("phone") else "web_chat"
 
 
-async def _resolve_lead_customer(db, lead: dict, current_user: dict) -> dict:
+async def _create_email_only_customer(db, lead: dict, current_user: dict) -> dict:
+    cid = get_company_id(current_user)
+    customer_id = make_id()
+    email = (lead.get("email") or "").strip().lower()
+    await db.execute(
+        "INSERT INTO customers(id,company_id,lead_id,name,email,phone,customer_company_name,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "  # noqa: E501
+        "VALUES($1,$2,$3,$4,$5,'',$6,'general','','lead',0,0,0,0,0,0,NOW(),NOW())",
+        customer_id,
+        cid,
+        lead.get("id", ""),
+        (lead.get("name") or "").strip() or "Unknown",
+        email,
+        lead.get("customer_company_name", "") or lead.get("company", ""),
+    )
+    return r(
+        await db.fetchrow(
+            "SELECT * FROM customers WHERE id=$1 AND company_id=$2 LIMIT 1",
+            customer_id,
+            cid,
+        )
+    )
+
+
+async def _resolve_lead_customer(db, lead: dict, current_user: dict, *, channel: str = "") -> dict:
     cid = get_company_id(current_user)
     phone = (lead.get("phone") or "").strip()
     email = (lead.get("email") or "").strip().lower()
@@ -229,23 +269,54 @@ async def _resolve_lead_customer(db, lead: dict, current_user: dict) -> dict:
         return customer
     if phone:
         return await get_or_create_customer_from_contact(db, lead.get("name", ""), phone, current_user)
-    raise HTTPException(400, "Lead needs a phone number to open or send a chat message.")
+    normalized_channel = str(channel or "").strip().lower()
+    if normalized_channel == "email" and email:
+        return await _create_email_only_customer(db, lead, current_user)
+    raise HTTPException(
+        400,
+        "Lead needs a phone number to open or send a chat message."
+        if normalized_channel != "email"
+        else "Email address is required to send an email message.",
+    )
 
 
-async def _resolve_lead_conversation(db, lead: dict, current_user: dict) -> tuple[dict, dict]:
-    customer = await _resolve_lead_customer(db, lead, current_user)
-    channel = _normalize_lead_channel(lead)
-    conversation = await get_or_create_contact_conversation(db, customer, channel, "lead_profile", current_user)
+async def _resolve_lead_conversation(
+    db,
+    lead: dict,
+    current_user: dict,
+    *,
+    channel: str | None = None,
+) -> tuple[dict, dict]:
+    resolved_channel = str(channel or _normalize_lead_channel(lead)).strip().lower()
+    customer = await _resolve_lead_customer(db, lead, current_user, channel=resolved_channel)
+    conversation = await get_or_create_contact_conversation(
+        db,
+        customer,
+        resolved_channel,
+        "lead_profile",
+        current_user,
+    )
     return customer, conversation
 
 
-async def _send_lead_nurture_message(db, lead: dict, nurture_message: dict, current_user: dict) -> dict:
-    customer, conversation = await _resolve_lead_conversation(db, lead, current_user)
+async def _send_lead_nurture_message(
+    db,
+    lead: dict,
+    nurture_message: dict,
+    current_user: dict,
+    *,
+    requested_channel: str = "",
+) -> dict:
+    channel = str(requested_channel or _normalize_lead_channel(lead)).strip().lower()
+    if channel not in {"whatsapp", "facebook", "instagram", "web_chat", "email"}:
+        raise HTTPException(400, "Unsupported nurture channel")
+
+    customer, conversation = await _resolve_lead_conversation(db, lead, current_user, channel=channel)
     content = (nurture_message.get("message") or "").strip()
     if not content:
         raise HTTPException(400, "Nurture message is empty.")
 
-    channel = conversation.get("channel") or _normalize_lead_channel(lead)
+    channel = str(conversation.get("channel") or channel).strip().lower()
     recipient_id = _resolve_lead_recipient(channel, customer, lead)
     msg_id = make_id()
     await db.execute(
@@ -258,7 +329,7 @@ async def _send_lead_nurture_message(db, lead: dict, nurture_message: dict, curr
         current_user.get("sub", ""),
         current_user.get("name", ""),
     )
-    if channel in {"whatsapp", "facebook", "instagram"}:
+    if channel in {"whatsapp", "facebook", "instagram", "email"}:
         if not recipient_id:
             await db.execute(
                 "DELETE FROM messages WHERE id=$1 AND company_id=$2",
@@ -267,6 +338,8 @@ async def _send_lead_nurture_message(db, lead: dict, nurture_message: dict, curr
             )
             if channel == "whatsapp":
                 raise HTTPException(400, "Phone number is required to send a WhatsApp message.")
+            if channel == "email":
+                raise HTTPException(400, "Email address is required to send an email message.")
             raise HTTPException(
                 400,
                 f"{channel.capitalize()} recipient ID is required to send this message.",
@@ -286,6 +359,11 @@ async def _send_lead_nurture_message(db, lead: dict, nurture_message: dict, curr
                 "actor_user_role": current_user.get("role", ""),
                 "trace_id": _trace_id_from_context(),
             },
+            subject=(
+                f"Pulse Engine follow up for {lead.get('name') or customer.get('name') or 'lead'}"
+                if channel == "email"
+                else ""
+            ),
         )
         if not sent:
             await db.execute(
@@ -326,7 +404,7 @@ async def _send_lead_nurture_message(db, lead: dict, nurture_message: dict, curr
     )
     message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", msg_id))
     await emit_new_message(conversation["id"], message)
-    return {"conversation_id": conversation["id"], "message": message}
+    return {"conversation_id": conversation["id"], "message": message, "channel": channel}
 
 
 @router.get("/leads")
@@ -739,7 +817,18 @@ async def send_lead_nurture_message(lead_id: str, message_id: str, request: Requ
     )
     if not nurture_message:
         raise HTTPException(404, "Nurture message not found")
-    result = await _send_lead_nurture_message(db, lead, nurture_message, cu)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    requested_channel = str(body.get("channel") or "").strip().lower()
+    result = await _send_lead_nurture_message(
+        db,
+        lead,
+        nurture_message,
+        cu,
+        requested_channel=requested_channel,
+    )
     refreshed = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid))
     if refreshed:
         refreshed["activities"] = rs(
@@ -761,6 +850,7 @@ async def send_lead_nurture_message(lead_id: str, message_id: str, request: Requ
     return {
         "status": "sent",
         "conversation_id": result["conversation_id"],
+        "channel": result.get("channel", requested_channel),
         "lead": refreshed,
     }
 

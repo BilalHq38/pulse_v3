@@ -556,7 +556,7 @@ async def get_whatsapp_bridge_qr(request: Request):
     Proxy QR / session state from the Node whatsapp-web.js bridge.
     Uses WHATSAPP_BRIDGE_URL + WHATSAPP_BRIDGE_SECRET server-side only.
     """
-    await get_current_user_flexible(request)
+    cu = await get_current_user_flexible(request)
     bridge_url = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3001").rstrip("/")
     secret = (os.environ.get("WHATSAPP_BRIDGE_SECRET") or os.environ.get("BRIDGE_SECRET") or "").strip()
     if not secret:
@@ -566,7 +566,11 @@ async def get_whatsapp_bridge_qr(request: Request):
             "qr_png_base64": "",
             "detail": "WhatsApp bridge secret is not configured (WHATSAPP_BRIDGE_SECRET).",
         }
-    headers = {"X-Bridge-Secret": secret}
+    headers = {
+        "X-Bridge-Secret": secret,
+        "X-Bridge-Company-Id": (get_company_id(cu) or "").strip(),
+        "X-Bridge-User-Id": str(cu.get("sub") or "").strip(),
+    }
     timeout = httpx.Timeout(12.0, connect=3.0)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -620,14 +624,21 @@ async def get_whatsapp_bridge_qr(request: Request):
 @router.post("/settings/channels/whatsapp/bridge-disconnect")
 async def disconnect_whatsapp_bridge(request: Request):
     """Disconnect the linked WhatsApp Web session through the bridge."""
-    await get_current_user_flexible(request)
+    cu = await get_current_user_flexible(request)
     bridge_url = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3001").rstrip("/")
     secret = (os.environ.get("WHATSAPP_BRIDGE_SECRET") or os.environ.get("BRIDGE_SECRET") or "").strip()
     if not secret:
         raise HTTPException(400, "WhatsApp bridge secret is not configured.")
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=3.0)) as client:
-            resp = await client.post(f"{bridge_url}/disconnect", headers={"X-Bridge-Secret": secret})
+            resp = await client.post(
+                f"{bridge_url}/disconnect",
+                headers={
+                    "X-Bridge-Secret": secret,
+                    "X-Bridge-Company-Id": (get_company_id(cu) or "").strip(),
+                    "X-Bridge-User-Id": str(cu.get("sub") or "").strip(),
+                },
+            )
     except httpx.ConnectError as exc:
         logger.warning("WhatsApp bridge disconnect unreachable at %s: %s", bridge_url, exc)
         raise HTTPException(503, "WhatsApp bridge is not reachable.") from exc

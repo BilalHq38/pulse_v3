@@ -29,8 +29,8 @@ async def ensure_subscriptions_limit_columns(db) -> None:
 
 
 def trial_period_days() -> int:
-    """Length of self-serve offline trial when Stripe checkout is disabled (default 90)."""
-    return max(1, int(os.environ.get("TRIAL_PERIOD_DAYS", "90") or 90))
+    """Length of self-serve trial periods (default 30 days)."""
+    return max(1, int(os.environ.get("TRIAL_PERIOD_DAYS", "30") or 30))
 
 
 try:
@@ -248,6 +248,10 @@ def stripe_price_id(plan_code: str) -> str:
     return (os.environ.get(env_name, "") or "").strip()
 
 
+def uses_local_billing_customer_id(stripe_customer_id: str) -> bool:
+    return (stripe_customer_id or "").strip().startswith("cus_local_")
+
+
 def normalize_plan_code_from_lookup_key(value: str, default: str = "pro") -> str:
     candidate = (value or "").strip().lower()
     if candidate in PLAN_CATALOG:
@@ -271,10 +275,13 @@ async def get_or_create_billing_customer(
     )
     if row:
         return row
+    # Some DBs still enforce NOT NULL on stripe_customer_id; local/demo uses an internal id (see upsert_subscription).
+    hexco = (company_id or "").replace("-", "")
+    local_cus = f"cus_local_{hexco[:32]}"
     customer = {
         "id": make_id(),
         "company_id": company_id,
-        "stripe_customer_id": None,
+        "stripe_customer_id": local_cus,
         "billing_email": (billing_email or "").strip().lower(),
         "billing_name": (billing_name or "").strip(),
         "payment_status": payment_status,
@@ -311,6 +318,8 @@ async def update_billing_customer_status(
     normalized_stripe_customer_id = (
         (stripe_customer_id or billing_customer.get("stripe_customer_id") or "").strip() or None
     )
+    if not normalized_stripe_customer_id:
+        normalized_stripe_customer_id = f"cus_local_{(company_id or '').replace('-', '')[:32]}"
     await db.execute(
         "UPDATE billing_customers SET stripe_customer_id=$1,billing_email=$2,billing_name=$3,payment_status=$4,updated_at=NOW() WHERE id=$5",  # noqa: E501
         normalized_stripe_customer_id,

@@ -206,8 +206,9 @@ async def prepare_public_registration(
 
     email = (payload.get("email") or "").strip().lower()
     name = (payload.get("name") or "").strip()
-    company_name = (payload.get("company_name") or "").strip() or "My Company"
-    company_industry = (payload.get("company_industry") or "").strip()
+    # Company profile details now belong to the later onboarding step, not manual signup.
+    company_name = "My Company"
+    company_industry = ""
     timezone_name = (payload.get("timezone") or "").strip() or "UTC"
     password = payload.get("password", "")
     plan = get_plan(payload.get("plan_code") or "pro")

@@ -748,11 +748,11 @@ async def get_company_knowledge(db, company_id: str | None = None, current_query
         return ""
 
 
-async def get_active_llm_engines(db) -> list[dict]:
+async def get_active_llm_engines(db, company_id: str = "") -> list[dict]:
     if _prefer_local_impl():
-        return await _local_get_active_llm_engines(db)
+        return await _local_get_active_llm_engines(db, company_id=company_id)
     try:
-        result = await _call_remote_ai("GET", "/api/ai/llm-engines")
+        result = await _call_remote_ai("GET", "/api/ai/llm-engines", company_id=company_id)
         if isinstance(result, list):
             return [dict(item) for item in result if isinstance(item, dict)]
         if isinstance(result, dict):
@@ -766,15 +766,15 @@ async def get_active_llm_engines(db) -> list[dict]:
             exc.__class__.__name__,
         )
         if _allow_local_fallback():
-            return await _local_get_active_llm_engines(db)
+            return await _local_get_active_llm_engines(db, company_id=company_id)
         return []
 
 
-async def get_active_llm_engine(db) -> Optional[dict]:
+async def get_active_llm_engine(db, company_id: str = "") -> Optional[dict]:
     if _prefer_local_impl():
-        return await _local_get_active_llm_engine(db)
+        return await _local_get_active_llm_engine(db, company_id=company_id)
     try:
-        runtime = await _call_remote_ai("GET", "/api/ai/runtime")
+        runtime = await _call_remote_ai("GET", "/api/ai/runtime", company_id=company_id)
         engine = runtime.get("engine", {}) if isinstance(runtime, dict) else {}
         return dict(engine) if engine else None
     except Exception as exc:
@@ -783,7 +783,7 @@ async def get_active_llm_engine(db) -> Optional[dict]:
             exc.__class__.__name__,
         )
         if _allow_local_fallback():
-            return await _local_get_active_llm_engine(db)
+            return await _local_get_active_llm_engine(db, company_id=company_id)
         return None
 
 

@@ -7,7 +7,6 @@ import {
 const LLM_MODELS = {
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o3-mini'],
   anthropic: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
-  custom: [],
 };
 const DEFAULT_LLM_PROVIDER = 'openai';
 const DEFAULT_LLM_MODEL = LLM_MODELS[DEFAULT_LLM_PROVIDER][0];
@@ -114,6 +113,15 @@ export default function AiSettingsTab({
     [mcpList],
   );
   const activeAgents = useMemo(() => aiAgents.filter((agent) => agent.is_active), [aiAgents]);
+  const engineOptions = useMemo(
+    () => llmEngines.map((engine) => ({
+      id: engine.id,
+      label: `${engine.provider ? engine.provider.charAt(0).toUpperCase() + engine.provider.slice(1) : 'Provider'} - ${engine.model_name || 'model'}`,
+      ready: Boolean(engine.provider_ready),
+    })),
+    [llmEngines],
+  );
+  const defaultAgentLlmId = selectedLlmEngine?.id || engineOptions[0]?.id || '';
   const latestSessionByAgent = useMemo(() => {
     const byAgent = {};
     for (const session of aiSessions) {
@@ -388,14 +396,12 @@ export default function AiSettingsTab({
                         <select value={llmDraft.provider}
                           onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setLlmDraft(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
+                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
                         </select>
                       </div>
                       <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
-                        {llmDraft.provider === 'custom'
-                          ? <input value={llmDraft.model_name} onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value }))} placeholder="custom-model-name" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" />
-                          : <select value={llmDraft.model_name} onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[llmDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>}
+                        <select value={llmDraft.model_name} onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[llmDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>
                       </div>
                       <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Temperature ({llmDraft.temperature})</label>
@@ -430,14 +436,12 @@ export default function AiSettingsTab({
                 <select value={addLlmForm.provider}
                   onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
                   className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option>
+                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
                 </select>
               </div>
               <div>
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model *</label>
-                {addLlmForm.provider === 'custom'
-                  ? <input value={addLlmForm.model_name} onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value }))} placeholder="custom-model-name" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm" />
-                  : <select value={addLlmForm.model_name} onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[addLlmForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>}
+                <select value={addLlmForm.model_name} onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[addLlmForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>
               </div>
             </div>
             <div className="flex gap-2">
@@ -454,7 +458,7 @@ export default function AiSettingsTab({
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Bot size={14} className="text-blue-500" /> AI Agents ({aiAgents.length})</h3>
           {isAdmin && (
-            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', provider: DEFAULT_LLM_PROVIDER, model_name: DEFAULT_LLM_MODEL, is_active: true, mcp_server_id: '' }); }}
+            <button onClick={() => { setShowAddAgentForm(true); setAddAgentForm({ agent_type: 'support', llm_id: defaultAgentLlmId, is_active: true, mcp_server_id: '' }); }}
               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
               <Plus size={12} /> Add Agent
             </button>
@@ -478,7 +482,7 @@ export default function AiSettingsTab({
                       <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${a.is_active ? 'translate-x-4' : ''}`} />
                     </button>
                     {isAdmin && (
-                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', provider: a.provider || DEFAULT_LLM_PROVIDER, model_name: a.model_name || DEFAULT_LLM_MODEL, mcp_server_id: a.mcp_server_id || '' }); }}
+                      <button onClick={() => { setEditingAgentId(editingAgentId === a.id ? null : a.id); setAgentDraft({ agent_type: a.agent_type || 'support', llm_id: a.llm_id || defaultAgentLlmId, mcp_server_id: a.mcp_server_id || '' }); }}
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
@@ -489,7 +493,7 @@ export default function AiSettingsTab({
                 </div>
                 {editingAgentId === a.id && (
                   <div className="p-4 bg-white border-t border-slate-100 space-y-3">
-                    <div className="grid grid-cols-3 gap-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                       <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Agent Type</label>
                         <select value={agentDraft.agent_type} onChange={ev => setAgentDraft(p => ({ ...p, agent_type: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
@@ -497,18 +501,13 @@ export default function AiSettingsTab({
                         </select>
                       </div>
                       <div>
-                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
-                        <select value={agentDraft.provider} onChange={ev => setAgentDraft(p => ({ ...p, provider: ev.target.value, model_name: (LLM_MODELS[ev.target.value] || [])[0] || '' }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">LLM Engine</label>
+                        <select value={agentDraft.llm_id || ''} onChange={ev => setAgentDraft(p => ({ ...p, llm_id: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          <option value="">Use workspace default</option>
+                          {engineOptions.map(engine => <option key={engine.id} value={engine.id}>{engine.label}{engine.ready ? '' : ' (missing key)'}</option>)}
                         </select>
                       </div>
-                      <div>
-                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
-                        <select value={agentDraft.model_name} onChange={ev => setAgentDraft(p => ({ ...p, model_name: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          {(LLM_MODELS[agentDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
-                      </div>
-                      <div className="col-span-3">
+                      <div className="md:col-span-2">
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">MCP server (optional)</label>
                         <select value={agentDraft.mcp_server_id || ''} onChange={ev => setAgentDraft(p => ({ ...p, mcp_server_id: ev.target.value }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
                           <option value="">None</option>
@@ -531,7 +530,7 @@ export default function AiSettingsTab({
         {showAddAgentForm && (
           <div className="mt-4 border border-blue-200 bg-blue-50/40 rounded-xl p-4 space-y-3">
             <p className="text-xs font-semibold text-blue-700">New AI Agent</p>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div>
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">Agent Type</label>
                 <select value={addAgentForm.agent_type} onChange={ev => setAddAgentForm(p => ({ ...p, agent_type: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
@@ -539,18 +538,13 @@ export default function AiSettingsTab({
                 </select>
               </div>
               <div>
-                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
-                <select value={addAgentForm.provider} onChange={ev => setAddAgentForm(p => ({ ...p, provider: ev.target.value, model_name: (LLM_MODELS[ev.target.value] || [])[0] || '' }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">LLM Engine</label>
+                <select value={addAgentForm.llm_id || ''} onChange={ev => setAddAgentForm(p => ({ ...p, llm_id: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  <option value="">Use workspace default</option>
+                  {engineOptions.map(engine => <option key={engine.id} value={engine.id}>{engine.label}{engine.ready ? '' : ' (missing key)'}</option>)}
                 </select>
               </div>
-              <div>
-                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
-                <select value={addAgentForm.model_name} onChange={ev => setAddAgentForm(p => ({ ...p, model_name: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  {(LLM_MODELS[addAgentForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}
-                </select>
-              </div>
-              <div className="col-span-3">
+              <div className="md:col-span-2">
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">MCP server (optional)</label>
                 <select value={addAgentForm.mcp_server_id || ''} onChange={ev => setAddAgentForm(p => ({ ...p, mcp_server_id: ev.target.value }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
                   <option value="">None</option>

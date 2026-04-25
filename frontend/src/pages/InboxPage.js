@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api from '@/lib/api';
+import { toast } from '@/hooks/use-toast';
 import { useSocket } from '@/lib/useSocket';
 import {
   Send,
@@ -401,23 +402,43 @@ export default function InboxPage() {
     const message = outboundMessage.trim();
 
     if (!name) {
-      alert('Name is required.');
+      toast({
+        variant: 'destructive',
+        title: 'Name required',
+        description: 'Name is required.',
+      });
       return;
     }
     if (channel === 'whatsapp' && !phone) {
-      alert('Phone number is required for WhatsApp.');
+      toast({
+        variant: 'destructive',
+        title: 'Phone required',
+        description: 'Phone number is required for WhatsApp.',
+      });
       return;
     }
     if ((channel === 'facebook' || channel === 'instagram') && !recipientId) {
-      alert(channel === 'facebook' ? 'Facebook recipient ID is required.' : 'Instagram recipient ID is required.');
+      toast({
+        variant: 'destructive',
+        title: 'Recipient required',
+        description: channel === 'facebook' ? 'Facebook recipient ID is required.' : 'Instagram recipient ID is required.',
+      });
       return;
     }
     if (channel === 'email' && !recipientId) {
-      alert('Recipient email is required.');
+      toast({
+        variant: 'destructive',
+        title: 'Recipient required',
+        description: 'Recipient email is required.',
+      });
       return;
     }
     if (!message) {
-      alert('Initial outbound message is required.');
+      toast({
+        variant: 'destructive',
+        title: 'Message required',
+        description: 'Initial outbound message is required.',
+      });
       return;
     }
 
@@ -441,10 +462,18 @@ export default function InboxPage() {
       setOutboundComposerOpen(false);
       await loadConversations();
       if (convo?.id) await loadMessages(convo.id);
+      toast({
+        title: 'Message sent',
+        description: `Outbound ${channel} conversation started successfully.`,
+      });
     } catch (err) {
       console.error('Failed to start outbound conversation', err);
       const detail = err?.response?.data?.detail;
-      alert(detail || 'Failed to start outbound conversation');
+      toast({
+        variant: 'destructive',
+        title: 'Message failed',
+        description: detail || 'Failed to start outbound conversation',
+      });
     } finally {
       setOutboundSubmitting(false);
     }
@@ -685,9 +714,17 @@ export default function InboxPage() {
       setComposerError('');
       if (composerFileRef.current) composerFileRef.current.value = '';
       loadConversations();
+      toast({
+        title: 'Message sent',
+        description: `Message sent via ${selectedConvo.channel?.replace('_', ' ') || 'the active channel'}.`,
+      });
     } catch (err) {
       console.error('Send message error:', err);
-      alert(err?.response?.data?.detail || 'Failed to send message. Please try again.');
+      toast({
+        variant: 'destructive',
+        title: 'Message failed',
+        description: err?.response?.data?.detail || 'Failed to send message. Please try again.',
+      });
     }
     finally { setSending(false); }
   };

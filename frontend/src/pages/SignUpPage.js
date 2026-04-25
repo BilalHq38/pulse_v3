@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowRight,
-  Building2,
   CheckCircle,
   CreditCard,
   Eye,
@@ -76,8 +75,6 @@ export default function SignUpPage() {
     name: '',
     email: '',
     password: '',
-    company_name: '',
-    company_industry: '',
     plan_code: 'pro',
   });
 
@@ -168,17 +165,13 @@ export default function SignUpPage() {
   const offlineTrialSignup =
     billingInfo?.billing_mode === 'trial_no_payment' || billingInfo?.billing_mode === 'trial_relaxed';
   const planOptions = offlineTrialSignup ? getSignupTrialPlanOptions() : PLAN_OPTIONS_STRIPE;
-  const trialDays = billingInfo?.trial_days ?? 90;
+  const trialDays = billingInfo?.trial_days ?? 30;
 
   const handleSubmit = async (event) => {
     event.preventDefault();
     event.stopPropagation();
     if (!form.name.trim()) {
       setError('Please enter your full name.');
-      return;
-    }
-    if (!form.company_name.trim()) {
-      setError('Please enter your company name.');
       return;
     }
     if (!form.email.trim()) {
@@ -285,8 +278,8 @@ export default function SignUpPage() {
           </h1>
           <p style={{ fontSize: 16, lineHeight: 1.75, color: '#475569', maxWidth: 680 }}>
             {offlineTrialSignup
-              ? `We collect your workspace details and create your company admin account immediately. You get a ${trialDays}-day trial on the plan you choose (no card required in this environment), then sign in and use the product.`
-              : 'We collect your workspace details here, then complete secure checkout. After payment succeeds, your workspace is provisioned and we guide you through admin activation.'}
+              ? `We create your admin account immediately. You get a ${trialDays}-day trial on the plan you choose, then sign in and complete onboarding.`
+              : 'Enter your admin details here, then complete secure checkout. After payment succeeds, your workspace is provisioned and we guide you through admin activation.'}
           </p>
           {offlineTrialSignup && billingInfo?.trial_mode_message && (
             <p style={{ fontSize: 14, lineHeight: 1.65, color: '#2563eb', maxWidth: 680, marginTop: 4 }}>
@@ -435,8 +428,8 @@ export default function SignUpPage() {
             <h2 style={{ fontSize: 26, fontWeight: 800, color: '#0f172a', marginBottom: 8 }}>Start Secure Signup</h2>
             <p style={{ fontSize: 14, lineHeight: 1.65, color: '#64748b', marginBottom: 20 }}>
               {offlineTrialSignup
-                ? 'Enter your admin profile and workspace details. We create the workspace first, then continue with verification and onboarding.'
-                : 'Enter your admin profile and workspace details. Payment is required before the account becomes active.'}
+                ? 'Enter your admin profile. We create the workspace first, then continue with verification and onboarding.'
+                : 'Enter your admin profile. Payment is required before the account becomes active.'}
             </p>
 
             <div style={{ display: 'grid', gap: 16 }}>
@@ -453,22 +446,6 @@ export default function SignUpPage() {
                 <div style={{ position: 'relative' }}>
                   <Mail size={15} color="#94a3b8" style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)' }} />
                   <input type="email" value={form.email} onChange={(e) => set('email', e.target.value)} placeholder="you@company.com" style={inputStyle} onFocus={focusIn} onBlur={focusOut} required />
-                </div>
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: '#475569', display: 'block', marginBottom: 6 }}>Company Name *</label>
-                <div style={{ position: 'relative' }}>
-                  <Building2 size={15} color="#94a3b8" style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)' }} />
-                  <input value={form.company_name} onChange={(e) => set('company_name', e.target.value)} placeholder="Acme Inc." style={inputStyle} onFocus={focusIn} onBlur={focusOut} required />
-                </div>
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: '#475569', display: 'block', marginBottom: 6 }}>Industry</label>
-                <div style={{ position: 'relative' }}>
-                  <Building2 size={15} color="#94a3b8" style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)' }} />
-                  <input value={form.company_industry} onChange={(e) => set('company_industry', e.target.value)} placeholder="SaaS, Retail, Healthcare..." style={inputStyle} onFocus={focusIn} onBlur={focusOut} />
                 </div>
               </div>
 

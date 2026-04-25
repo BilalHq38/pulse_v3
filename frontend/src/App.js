@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation, useSearchParams } 
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { postAuthDestination } from '@/lib/auth-gates';
 import Layout from '@/components/Layout';
+import { Toaster } from '@/components/ui/toaster';
 import '@/App.css';
 
 const LandingPage = lazy(() => import('@/pages/LandingPage'));
@@ -152,6 +153,7 @@ function App() {
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
         </Suspense>
+        <Toaster />
       </BrowserRouter>
     </AuthProvider>
   );

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
+import { toast } from '@/hooks/use-toast';
 import {
   Search,
   Plus,
@@ -57,6 +58,15 @@ export default function CustomersPage() {
 
   const [contactPrompt, setContactPrompt] = useState({ open: false, mode: 'message', customer: null, method: null });
   const [contactForm, setContactForm] = useState({ phone: '', email: '' });
+  const [emailComposer, setEmailComposer] = useState({
+    open: false,
+    customer: null,
+    subject: '',
+    body: '',
+    originalSubject: '',
+    originalBody: '',
+    sending: false,
+  });
   const [deletingCustomerId, setDeletingCustomerId] = useState(null);
   const [showEditCustomer, setShowEditCustomer] = useState(false);
   const [editCustomerForm, setEditCustomerForm] = useState({ name: '', email: '', phone: '', company: '', segment: 'general', tags: '' });
@@ -171,12 +181,97 @@ export default function CustomersPage() {
   const openMessagePicker = (customer) => {
     const methods = buildCustomerMethods(customer);
     if (methods.length === 0) {
-      alert('No messaging channels available for this customer.');
+      toast({
+        variant: 'destructive',
+        title: 'No messaging channels',
+        description: 'No messaging channels are available for this customer yet.',
+      });
       return;
     }
     setActiveCustomerForMethods(customer);
     setMessageMethods(methods);
     setShowMethodPicker(true);
+  };
+
+  const buildCustomerEmailDraft = (customer) => ({
+    subject: `Pulse Engine follow up for ${customer?.name || 'customer'}`,
+    body: `Hi ${customer?.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
+  });
+
+  const closeEmailComposer = () => {
+    setEmailComposer({
+      open: false,
+      customer: null,
+      subject: '',
+      body: '',
+      originalSubject: '',
+      originalBody: '',
+      sending: false,
+    });
+  };
+
+  const openEmailComposer = (customer) => {
+    if (!customer?.email) {
+      askForContacts(customer, 'email');
+      return;
+    }
+    const draft = buildCustomerEmailDraft(customer);
+    setEmailComposer({
+      open: true,
+      customer,
+      subject: draft.subject,
+      body: draft.body,
+      originalSubject: draft.subject,
+      originalBody: draft.body,
+      sending: false,
+    });
+  };
+
+  const submitCustomerEmail = async (mode = 'direct') => {
+    const customer = emailComposer.customer;
+    if (!customer?.email || emailComposer.sending) return;
+
+    const subject = mode === 'direct' ? emailComposer.originalSubject : emailComposer.subject.trim();
+    const body = mode === 'direct' ? emailComposer.originalBody : emailComposer.body.trim();
+
+    if (!subject) {
+      toast({
+        variant: 'destructive',
+        title: 'Subject required',
+        description: 'Email subject is required before sending.',
+      });
+      return;
+    }
+    if (!body) {
+      toast({
+        variant: 'destructive',
+        title: 'Body required',
+        description: 'Email body is required before sending.',
+      });
+      return;
+    }
+
+    setEmailComposer((prev) => ({ ...prev, sending: true }));
+    try {
+      await api.post('/communications/email/send', {
+        to_email: customer.email,
+        subject,
+        body,
+      });
+      closeEmailComposer();
+      toast({
+        title: 'Message sent',
+        description: `Email sent to ${customer.email}.`,
+      });
+    } catch (err) {
+      console.error(err);
+      setEmailComposer((prev) => ({ ...prev, sending: false }));
+      toast({
+        variant: 'destructive',
+        title: 'Message failed',
+        description: err?.response?.data?.detail || 'Failed to send email from Pulse Engine.',
+      });
+    }
   };
 
   const handlePickMethod = (method) => {
@@ -195,20 +290,7 @@ export default function CustomersPage() {
   };
 
   const handleEmailCustomer = (customer) => {
-    if (!customer?.email) {
-      askForContacts(customer, 'email');
-      return;
-    }
-    api.post('/communications/email/send', {
-      to_email: customer.email,
-      subject: `Pulse Engine follow up for ${customer.name || 'customer'}`,
-      body: `Hi ${customer.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
-    }).then(() => {
-      alert('Email sent from Pulse Engine.');
-    }).catch((err) => {
-      console.error(err);
-      alert(err?.response?.data?.detail || 'Failed to send email from Pulse Engine.');
-    });
+    openEmailComposer(customer);
   };
 
   const submitContacts = async () => {
@@ -219,12 +301,20 @@ export default function CustomersPage() {
     const email = contactForm.email.trim();
 
     if (contactPrompt.mode === 'message' && !phone) {
-      alert('Phone is required to start a chat conversation.');
+      toast({
+        variant: 'destructive',
+        title: 'Phone required',
+        description: 'Phone is required to start a chat conversation.',
+      });
       return;
     }
 
     if (contactPrompt.mode === 'email' && !email) {
-      alert('Email is required to send an email.');
+      toast({
+        variant: 'destructive',
+        title: 'Email required',
+        description: 'Email is required to send an email.',
+      });
       return;
     }
 
@@ -243,12 +333,7 @@ export default function CustomersPage() {
       setContactPrompt({ open: false, mode: 'message', customer: null, method: null });
 
       if (contactPrompt.mode === 'email') {
-        await api.post('/communications/email/send', {
-          to_email: updatedCustomer.email,
-          subject: `Pulse Engine follow up for ${updatedCustomer.name || 'customer'}`,
-          body: `Hi ${updatedCustomer.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
-        });
-        alert('Email sent from Pulse Engine.');
+        openEmailComposer(updatedCustomer);
         return;
       }
 
@@ -258,7 +343,11 @@ export default function CustomersPage() {
       openInboxForCustomer(updatedCustomer, contactPrompt.method || { channel: 'web_chat', source: 'customer_profile' });
     } catch (err) {
       console.error(err);
-      alert(err?.response?.data?.detail || 'Failed to save contact details.');
+      toast({
+        variant: 'destructive',
+        title: 'Contact update failed',
+        description: err?.response?.data?.detail || 'Failed to save contact details.',
+      });
     }
   };
 
@@ -702,6 +791,73 @@ export default function CustomersPage() {
                   className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm"
                 />
                 <button onClick={submitContacts} className="w-full py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">Save and Continue</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {emailComposer.open && emailComposer.customer && (
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="customer-email-composer-modal" onClick={closeEmailComposer}>
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900">Send Email</h3>
+                  <p className="text-sm text-slate-500">Send the prepared draft as-is, or edit it first.</p>
+                </div>
+                <button onClick={closeEmailComposer} className="text-slate-400 hover:text-slate-600">
+                  <X size={18} />
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">To</label>
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-700">
+                    {emailComposer.customer.email}
+                  </div>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">Subject</label>
+                  <input
+                    value={emailComposer.subject}
+                    onChange={(e) => setEmailComposer((prev) => ({ ...prev, subject: e.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-700"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-500">Body</label>
+                  <textarea
+                    value={emailComposer.body}
+                    onChange={(e) => setEmailComposer((prev) => ({ ...prev, body: e.target.value }))}
+                    rows={7}
+                    className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 resize-none"
+                  />
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-400">
+                “Send As Is” uses the original generated draft. “Send Edited Email” uses the subject and body shown above.
+              </p>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => { void submitCustomerEmail('direct'); }}
+                  disabled={emailComposer.sending}
+                  className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                >
+                  {emailComposer.sending ? 'Sending...' : 'Send As Is'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { void submitCustomerEmail('edited'); }}
+                  disabled={emailComposer.sending}
+                  className="rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+                >
+                  {emailComposer.sending ? 'Sending...' : 'Send Edited Email'}
+                </button>
               </div>
             </div>
           </div>

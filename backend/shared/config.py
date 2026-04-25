@@ -371,6 +371,7 @@ def gateway_allowed_origins() -> list[str]:
         for raw in (
             os.environ.get("FRONTEND_URL", ""),
             os.environ.get("APP_URL", ""),
+            os.environ.get("GATEWAY_ALLOWED_ORIGINS", ""),
         )
         for origin in raw.split(",")
         if origin.strip()
@@ -385,10 +386,19 @@ def gateway_allowed_origins() -> list[str]:
 
 
 def gateway_allowed_methods() -> list[str]:
+    configured = os.environ.get("GATEWAY_ALLOWED_METHODS", "").strip()
+    if configured:
+        methods = [method.strip().upper() for method in configured.split(",") if method.strip()]
+        return methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
     return ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 
 def gateway_allowed_headers() -> list[str]:
+    configured = os.environ.get("GATEWAY_ALLOWED_HEADERS", "").strip()
+    if configured:
+        headers = [header.strip() for header in configured.split(",") if header.strip()]
+        if headers:
+            return headers
     return [
         "Authorization",
         "Content-Type",

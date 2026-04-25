@@ -20,13 +20,11 @@ ENV DISABLE_ESLINT_PLUGIN=true
 RUN --mount=type=cache,target=/app/node_modules/.cache \
     npm run build
 
-FROM node:20-alpine
+FROM nginx:1.27-alpine
 
-WORKDIR /app
-RUN npm install -g serve@14
-
-COPY --from=build /app/build ./build
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/build /usr/share/nginx/html
 
 EXPOSE 3000
 
-CMD ["serve", "-s", "build", "-l", "3000"]
+CMD ["nginx", "-g", "daemon off;"]

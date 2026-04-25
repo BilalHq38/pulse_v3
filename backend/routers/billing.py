@@ -23,6 +23,7 @@ from services.billing_helpers import (
     stripe_price_id,
     stripe_webhook_configured,
     upsert_subscription,
+    uses_local_billing_customer_id,
 )
 from services.db_helpers import get_current_user_flexible, require_roles, r
 from services.public_signup_service import finalize_public_registration_from_checkout
@@ -94,7 +95,8 @@ def _stripe_price_id(plan_code: str) -> str:
 
 async def _create_stripe_customer_record(billing_customer: dict) -> dict:
     assert_stripe_ready()
-    if billing_customer.get("stripe_customer_id"):
+    stripe_customer_id = str(billing_customer.get("stripe_customer_id") or "").strip()
+    if stripe_customer_id and not uses_local_billing_customer_id(stripe_customer_id):
         return billing_customer
     customer = await asyncio.to_thread(
         stripe.Customer.create,
@@ -320,6 +322,10 @@ async def stripe_webhook(request: Request):
                     plan_code=plan_code,
                     status="active",
                     stripe_subscription_id=subscription_id,
+                )
+                await db.execute(
+                    "UPDATE users SET plan_selected=TRUE,billing_status='active',updated_at=NOW() WHERE company_id=$1",
+                    company_id,
                 )
 
     if event_type.startswith("customer.subscription."):

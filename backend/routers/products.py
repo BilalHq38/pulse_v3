@@ -379,12 +379,13 @@ async def create_product(request: Request):
 @router.post("/company-data/products/generate-description")
 async def generate_product_desc_endpoint(request: Request):
     db = _db(request)
-    await get_current_user_flexible(request)
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
     body = await request.json()
     name = str(body.get("name", "") or "").strip()
     if not name:
         raise HTTPException(400, "name is required")
-    active_engines = await get_active_llm_engines(db)
+    active_engines = await get_active_llm_engines(db, company_id=cid)
     desc = await generate_product_description(
         name=name,
         product_title=body.get("product_title", ""),
@@ -440,182 +441,6 @@ async def delete_product(product_id: str, request: Request):
     cid = cu.get("company_id", "")
     await db.execute("DELETE FROM company_products WHERE id=$1 AND company_id=$2", product_id, cid)
     return {"status": "deleted"}
-
-
-@router.post("/company-data/products/bulk-upload")
-async def bulk_upload_products(request: Request, file: UploadFile = File(...)):
-    db = _db(request)
-    cu = await get_current_user_flexible(request)
-    cid = cu.get("company_id", "")
-    if not file.filename:
-        raise HTTPException(400, "No file provided.")
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext != "xlsx":
-        raise HTTPException(400, "Only .xlsx files are supported for bulk upload.")
-    content_type = (file.content_type or "").lower()
-    valid_types = {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/octet-stream",
-    }
-    if content_type and content_type not in valid_types:
-        raise HTTPException(400, "Invalid Content-Type. Use multipart/form-data with an .xlsx file.")
-
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(400, "Uploaded file is empty.")
-
-    try:
-        workbook = load_workbook(filename=BytesIO(raw), data_only=True)
-    except Exception:
-        raise HTTPException(400, "Invalid Excel file. Please use the provided .xlsx template.")
-
-    sheet = workbook.active
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows:
-        raise HTTPException(400, "The Excel file has no rows.")
-    embedded_images_by_row = _extract_sheet_row_images(sheet)
-    richvalue_images_by_row = _extract_richvalue_row_images(raw)
-    for row_number, row_images in richvalue_images_by_row.items():
-        if not row_images:
-            continue
-        embedded_images_by_row.setdefault(row_number, []).extend(row_images)
-
-    headers = [_normalize_header(cell) for cell in rows[0]]
-    if not headers or "name" not in headers:
-        raise HTTPException(400, "Invalid template. The header row must include a 'name' column.")
-
-    created_count = 0
-    errors = []
-    warnings = []
-    alias_map = {
-        "product_name": "name",
-        "title": "product_title",
-        "product_code": "product_title",
-        "code": "product_title",
-        "sku": "product_title",
-        "type": "product_type",
-        "currency": "price_currency",
-        "desc": "description",
-        "image": "images",
-        "image_urls": "images",
-        "photos": "images",
-        "image1": "image_1",
-        "image2": "image_2",
-        "image3": "image_3",
-        "photo_1": "image_1",
-        "photo_2": "image_2",
-        "photo_3": "image_3",
-    }
-
-    for idx, row in enumerate(rows[1:], start=2):
-        values = {headers[i]: row[i] for i in range(min(len(headers), len(row))) if headers[i]}
-        normalized = {}
-        for key, value in values.items():
-            normalized[alias_map.get(key, key)] = value
-        name = str(normalized.get("name") or "").strip()
-        if not name:
-            errors.append({"row": idx, "error": "Product name is required."})
-            continue
-
-        price = normalized.get("price", "")
-        price_text = "" if price is None else str(price).strip()
-        images = []
-        declared_image_inputs = []
-        for image_key in ["image_1", "image_2", "image_3"]:
-            value = normalized.get(image_key)
-            if value:
-                cleaned = str(value).strip()
-                images.append(cleaned)
-                declared_image_inputs.append(cleaned)
-        legacy_images = str(normalized.get("images") or "").strip()
-        if legacy_images:
-            split_images = [item.strip() for item in legacy_images.split(";") if item.strip()]
-            images.extend(split_images)
-            declared_image_inputs.extend(split_images)
-        embedded_row_images = embedded_images_by_row.get(idx) or []
-        if embedded_row_images:
-            images.extend(embedded_row_images)
-        clean_images = normalize_product_images(images, limit=3)
-        if embedded_row_images and not clean_images:
-            warnings.append(
-                {
-                    "row": idx,
-                    "warning": "Embedded images were detected but could not be converted into valid product images.",
-                }
-            )
-        elif _has_non_empty_image_input(declared_image_inputs) and not clean_images:
-            warnings.append(
-                {
-                    "row": idx,
-                    "warning": "Image values were provided, but only embedded Excel images or full public image URLs are supported.",  # noqa: E501
-                }
-            )
-        elif not clean_images:
-            warnings.append(
-                {
-                    "row": idx,
-                    "warning": "Product imported without images. Use embedded workbook images or full public image URLs.",  # noqa: E501
-                }
-            )
-        features_raw = str(normalized.get("features") or "").strip()
-        features = [item.strip() for item in features_raw.split(";") if item.strip()]
-        pid = make_id()
-        try:
-            await db.execute(
-                "INSERT INTO company_products(id,company_id,name,product_title,description,price,price_currency,category,product_type,created_at,updated_at) "  # noqa: E501
-                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())",
-                pid,
-                cid,
-                name,
-                str(normalized.get("product_title") or "").strip(),
-                str(normalized.get("description") or "").strip(),
-                price_text,
-                str(normalized.get("price_currency") or "USD").strip() or "USD",
-                str(normalized.get("category") or "general").strip() or "general",
-                str(normalized.get("product_type") or "standard").strip() or "standard",
-            )
-            if clean_images:
-                await db.executemany(
-                    "INSERT INTO product_images(id,product_id,image_url,sort_order,created_at) VALUES($1,$2,$3,$4,NOW())",  # noqa: E501
-                    [(make_id(), pid, url, image_index) for image_index, url in enumerate(clean_images)],
-                )
-            if features:
-                await db.executemany(
-                    "INSERT INTO product_features(id,product_id,feature,sort_order) VALUES($1,$2,$3,$4)",
-                    [(make_id(), pid, feature, feature_index) for feature_index, feature in enumerate(features)],
-                )
-            created_count += 1
-        except Exception as exc:
-            logger.error(f"Bulk product import failed on row {idx}: {exc}")
-            errors.append({"row": idx, "error": "Failed to import this row."})
-
-    return {
-        "created_count": created_count,
-        "error_count": len(errors),
-        "errors": errors,
-        "warning_count": len(warnings),
-        "warnings": warnings,
-        "template_columns": [
-            "name",
-            "product_title",
-            "description",
-            "price",
-            "price_currency",
-            "category",
-            "product_type",
-            "features",
-            "image_1",
-            "image_2",
-            "image_3",
-        ],
-        "used_as_ai_context": True,
-        "image_input_support": [
-            "embedded_excel_images",
-            "http_urls",
-            "https_urls",
-            "data_urls",
-        ],
-    }
 
 
 @router.get("/company-data/faqs")

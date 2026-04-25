@@ -74,6 +74,12 @@ class WhatsAppAdapter(BaseChannelAdapter):
 
         to_phone = message.external_user_id or message.metadata.get("phone", "")
         db_message_id = str(message.metadata.get("db_message_id") or "").strip()
+        actor_user_id = str(
+            message.metadata.get("actor_user_id")
+            or message.metadata.get("owner_user_id")
+            or message.metadata.get("user_id")
+            or ""
+        ).strip()
         attachments = [
             {
                 "url": att.url,
@@ -92,6 +98,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
             db=db,
             company_id=message.tenant_id,
             db_message_id=db_message_id,
+            user_id=actor_user_id,
         )
 
         return SendResult(

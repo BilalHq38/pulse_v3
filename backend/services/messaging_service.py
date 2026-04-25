@@ -36,6 +36,39 @@ def _use_bridge() -> bool:
     return not (WHATSAPP_PHONE_ID and WHATSAPP_TOKEN)
 
 
+def _bridge_headers(*, company_id: str = "", user_id: str = "") -> dict[str, str]:
+    headers = {"X-Bridge-Secret": _BRIDGE_SECRET}
+    scoped_company_id = (company_id or "").strip()
+    scoped_user_id = (user_id or "").strip()
+    if scoped_company_id:
+        headers["X-Bridge-Company-Id"] = scoped_company_id
+    if scoped_user_id:
+        headers["X-Bridge-User-Id"] = scoped_user_id
+    return headers
+
+
+async def _bridge_session_status(*, company_id: str = "", user_id: str = "") -> str:
+    if not _BRIDGE_SECRET:
+        return "not_configured"
+    try:
+        resp = await _HTTP_CLIENT.get(
+            f"{_BRIDGE_URL}/session",
+            headers=_bridge_headers(company_id=company_id, user_id=user_id),
+            timeout=5.0,
+        )
+        if resp.status_code != 200 or not resp.content:
+            return "error"
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            return "error"
+        return str(payload.get("status") or "").strip().lower() or "unknown"
+    except httpx.ConnectError:
+        return "offline"
+    except Exception as exc:
+        logger.debug("[Bridge] Session status lookup failed: %s", exc)
+        return "error"
+
+
 def _extract_meta_message_id(payload: Any) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -47,6 +80,21 @@ def _extract_meta_message_id(payload: Any) -> str:
         first = messages[0] if isinstance(messages[0], dict) else {}
         return str(first.get("id") or "").strip()
     return ""
+
+
+def _extract_bridge_error(payload: Any, fallback_text: str = "") -> str:
+    if isinstance(payload, dict):
+        primary = str(payload.get("error") or payload.get("detail") or "").strip()
+        details = str(payload.get("details") or "").strip()
+        if details and (not primary or len(primary) <= 2 or details == primary):
+            return details
+        if primary and details and details != primary:
+            return f"{primary} ({details})"
+        if primary:
+            return primary
+        if details:
+            return details
+    return str(fallback_text or "").strip()
 
 
 async def _persist_outbound_message_state(
@@ -95,6 +143,9 @@ async def _send_via_bridge(
     to_phone: str,
     message_text: str,
     attachments: list | None = None,
+    *,
+    company_id: str = "",
+    user_id: str = "",
 ) -> tuple[bool, str, str]:
     phone = to_phone.strip().replace("+", "").replace(" ", "").replace("-", "")
     if not phone:
@@ -106,15 +157,21 @@ async def _send_via_bridge(
         resp = await _HTTP_CLIENT.post(
             f"{_BRIDGE_URL}/send",
             json={"to": phone, "message": message_text, "attachments": attachments or []},
-            headers={"X-Bridge-Secret": _BRIDGE_SECRET},
+            headers=_bridge_headers(company_id=company_id, user_id=user_id),
             timeout=20.0,
         )
-        data = resp.json() if resp.content else {}
+        data = {}
+        if resp.content:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
         if resp.status_code == 200 and isinstance(data, dict) and data.get("success"):
             logger.info("[Bridge] WhatsApp sent to %s", phone)
             return True, "", _extract_meta_message_id(data)
-        logger.error("[Bridge] Send failed [%s]: %s", resp.status_code, resp.text[:200])
-        return False, resp.text[:200], ""
+        error_text = _extract_bridge_error(data, resp.text[:300])
+        logger.error("[Bridge] Send failed [%s]: %s", resp.status_code, error_text or resp.text[:300])
+        return False, error_text or "WhatsApp bridge send failed", ""
     except httpx.ConnectError:
         logger.error("[Bridge] Cannot connect to WhatsApp bridge on %s", _BRIDGE_URL)
         return False, "WhatsApp bridge is not reachable", ""
@@ -302,13 +359,22 @@ async def send_whatsapp_message(
     db=None,
     company_id: str = "",
     db_message_id: str = "",
+    user_id: str = "",
 ) -> tuple[bool, str]:
     scoped_company_id = (company_id or "").strip()
     local_message_id = (db_message_id or "").strip()
+    scoped_user_id = (user_id or "").strip()
     sent = False
     error = ""
     external_message_id = ""
+    bridge_status = ""
+    bridge_preferred = False
     if db and scoped_company_id:
+        bridge_status = await _bridge_session_status(
+            company_id=scoped_company_id,
+            user_id=scoped_user_id,
+        )
+        bridge_preferred = bridge_status in {"ready", "initializing"}
         try:
             sent, error, external_message_id = await _send_via_tenant_meta(
                 db,
@@ -327,7 +393,7 @@ async def send_whatsapp_message(
                         external_message_id=external_message_id,
                     )
                 return sent, error
-            if not _use_bridge():
+            if not (bridge_preferred or _use_bridge()):
                 if local_message_id:
                     await _persist_outbound_message_state(
                         db,
@@ -342,11 +408,13 @@ async def send_whatsapp_message(
             logger.warning("[MetaTenant] falling back after config error: %s", exc.detail)
         except Exception as exc:
             logger.warning("[MetaTenant] fallback triggered: %s", exc)
-    if _use_bridge():
+    if bridge_preferred or _use_bridge():
         sent, error, external_message_id = await _send_via_bridge(
             to_phone,
             message_text,
             attachments=attachments,
+            company_id=scoped_company_id,
+            user_id=scoped_user_id,
         )
     else:
         sent, error, external_message_id = await _send_via_meta(

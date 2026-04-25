@@ -9,7 +9,7 @@ import {
   LayoutDashboard, MessageSquare, Users, Target, BarChart3,
   Ticket, BookOpen, Settings, LogOut, X, Bell, Search, Package,
   Link2, Mail,
-  ChevronDown, UserCircle, Filter, Save, Check, Plus, Menu
+  ChevronDown, ChevronRight, UserCircle, Filter, Save, Check, Plus, Menu
 } from 'lucide-react';
 
 const navItems = [
@@ -291,6 +291,18 @@ export default function Layout({ children }) {
   return (
     <div className="flex h-screen bg-transparent text-slate-900 overflow-hidden" data-testid="app-layout">
       {sidebarOpen && <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setSidebarOpen(false)} />}
+      {!sidebarOpen && (
+        <button
+          type="button"
+          onClick={() => setSidebarOpen(true)}
+          className="fixed left-3 top-1/2 z-40 inline-flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-r-xl rounded-l-lg border border-slate-200 bg-white text-slate-600 shadow-lg transition-colors hover:bg-blue-50 hover:text-blue-600 lg:hidden"
+          aria-label="Reopen navigation sidebar"
+          aria-controls="mobile-sidebar"
+          aria-expanded={sidebarOpen}
+        >
+          <ChevronRight size={18} />
+        </button>
+      )}
 
       <aside
         id="mobile-sidebar"

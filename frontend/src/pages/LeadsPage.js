@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
+import { toast } from '@/hooks/use-toast';
 import {
   Target,
   Search,
@@ -64,21 +65,24 @@ export default function LeadsPage() {
   const [contactForm, setContactForm] = useState({ phone: '', email: '' });
   const [showEditLead, setShowEditLead] = useState(false);
   const [editLeadForm, setEditLeadForm] = useState({ name: '', email: '', phone: '', company: '', source: 'web_chat', notes: '', status: 'new' });
+  const [nurtureComposer, setNurtureComposer] = useState({ open: false, lead: null, message: null, channel: '' });
   const [creatingLead, setCreatingLead] = useState(false);
   const [createLeadError, setCreateLeadError] = useState('');
   const [loadError, setLoadError] = useState('');
+  const dismissedLeadIdRef = useRef('');
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const closeLeadDetail = useCallback(() => {
+    dismissedLeadIdRef.current = selectedLead?.id || searchParams.get('lead') || '';
     setSelectedLead(null);
     if (searchParams.get('lead')) {
       const nextParams = new URLSearchParams(searchParams);
       nextParams.delete('lead');
       setSearchParams(nextParams, { replace: true });
     }
-  }, [searchParams, setSearchParams]);
+  }, [searchParams, selectedLead?.id, setSearchParams]);
 
   const loadLeads = useCallback(async () => {
     setLoadError('');
@@ -138,6 +142,7 @@ export default function LeadsPage() {
 
   const openLeadDetail = useCallback(async (lead) => {
     if (!lead?.id) return;
+    dismissedLeadIdRef.current = '';
     const nextParams = new URLSearchParams(searchParams);
     nextParams.set('lead', lead.id);
     setSearchParams(nextParams, { replace: true });
@@ -152,7 +157,11 @@ export default function LeadsPage() {
 
   useEffect(() => {
     const requestedLeadId = searchParams.get('lead');
-    if (!requestedLeadId || loading || selectedLead?.id === requestedLeadId) return;
+    if (!requestedLeadId) {
+      dismissedLeadIdRef.current = '';
+      return;
+    }
+    if (loading || selectedLead?.id === requestedLeadId || dismissedLeadIdRef.current === requestedLeadId) return;
     const lead = leads.find((item) => item.id === requestedLeadId);
     if (lead) {
       openLeadDetail(lead);
@@ -284,6 +293,87 @@ export default function LeadsPage() {
     return [...messages].reverse().find((item) => !item?.sent) || null;
   };
 
+  const buildLeadEmailDraft = (lead) => ({
+    subject: `Pulse Engine follow up for ${lead?.name || 'lead'}`,
+    body: `Hi ${lead?.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
+  });
+
+  const sendLeadEmail = async (lead) => {
+    if (!lead?.email) {
+      askForContacts(lead, 'email');
+      return;
+    }
+    const draft = buildLeadEmailDraft(lead);
+    try {
+      await api.post('/communications/email/send', {
+        to_email: lead.email,
+        subject: draft.subject,
+        body: draft.body,
+      });
+      toast({
+        title: 'Message sent',
+        description: `Email sent to ${lead.email}.`,
+      });
+    } catch (err) {
+      console.error(err);
+      toast({
+        variant: 'destructive',
+        title: 'Message failed',
+        description: err?.response?.data?.detail || 'Failed to send email from Pulse Engine.',
+      });
+    }
+  };
+
+  const getLeadSendChannels = useCallback((lead) => {
+    const methods = buildLeadMethods(lead);
+    const available = new Map();
+
+    methods.forEach((method) => {
+      const channel = String(method?.channel || '').trim().toLowerCase();
+      if (!['whatsapp', 'email', 'facebook', 'instagram'].includes(channel) || available.has(channel)) {
+        return;
+      }
+      if (channel === 'whatsapp' && !String(lead?.phone || '').trim()) return;
+      if (channel === 'email' && !String(lead?.email || '').trim()) return;
+      if ((channel === 'facebook' || channel === 'instagram')
+        && !String(
+          lead?.channel_recipient_id
+          || lead?.external_recipient_id
+          || lead?.channel_user_id
+          || lead?.social_profiles?.[channel]
+          || ''
+        ).trim()) {
+        return;
+      }
+      available.set(channel, method);
+    });
+
+    return Array.from(available.values());
+  }, []);
+
+  const closeNurtureComposer = () => {
+    setNurtureComposer({ open: false, lead: null, message: null, channel: '' });
+  };
+
+  const openNurtureComposer = (lead, nurtureMessage, event) => {
+    if (event) event.stopPropagation();
+    const channels = getLeadSendChannels(lead);
+    if (!channels.length) {
+      toast({
+        variant: 'destructive',
+        title: 'No sendable channels',
+        description: 'Add an email address or WhatsApp number before sending this nurture message.',
+      });
+      return;
+    }
+    setNurtureComposer({
+      open: true,
+      lead,
+      message: nurtureMessage,
+      channel: channels[0].channel,
+    });
+  };
+
   const openInboxForLead = async (lead) => {
     try {
       const res = await api.post(`/leads/${lead.id}/conversation`);
@@ -292,14 +382,22 @@ export default function LeadsPage() {
       navigate(`/inbox?conversation=${encodeURIComponent(conversationId)}`);
     } catch (err) {
       console.error(err);
-      alert(err?.response?.data?.detail || 'Failed to open the lead chat.');
+      toast({
+        variant: 'destructive',
+        title: 'Chat unavailable',
+        description: err?.response?.data?.detail || 'Failed to open the lead chat.',
+      });
     }
   };
 
   const openMessagePicker = (lead) => {
     const methods = buildLeadMethods(lead);
     if (methods.length === 0) {
-      alert('No messaging channels available for this lead.');
+      toast({
+        variant: 'destructive',
+        title: 'No messaging channels',
+        description: 'No messaging channels are available for this lead yet.',
+      });
       return;
     }
     setMessageMethods(methods);
@@ -327,20 +425,7 @@ export default function LeadsPage() {
   };
 
   const handleEmailLead = (lead) => {
-    if (!lead?.email) {
-      askForContacts(lead, 'email');
-      return;
-    }
-    api.post('/communications/email/send', {
-      to_email: lead.email,
-      subject: `Pulse Engine follow up for ${lead.name || 'lead'}`,
-      body: `Hi ${lead.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
-    }).then(() => {
-      alert('Email sent from Pulse Engine.');
-    }).catch((err) => {
-      console.error(err);
-      alert(err?.response?.data?.detail || 'Failed to send email from Pulse Engine.');
-    });
+    void sendLeadEmail(lead);
   };
 
   const submitContacts = async () => {
@@ -351,12 +436,20 @@ export default function LeadsPage() {
     const email = contactForm.email.trim();
 
     if (contactPrompt.mode === 'message' && !phone) {
-      alert('Phone is required to start a chat conversation.');
+      toast({
+        variant: 'destructive',
+        title: 'Phone required',
+        description: 'Phone is required to start a chat conversation.',
+      });
       return;
     }
 
     if (contactPrompt.mode === 'email' && !email) {
-      alert('Email is required to send an email.');
+      toast({
+        variant: 'destructive',
+        title: 'Email required',
+        description: 'Email is required to send an email.',
+      });
       return;
     }
 
@@ -376,12 +469,7 @@ export default function LeadsPage() {
       setContactPrompt({ open: false, mode: 'message', lead: null, method: null });
 
       if (contactPrompt.mode === 'email') {
-        await api.post('/communications/email/send', {
-          to_email: updatedLead.email,
-          subject: `Pulse Engine follow up for ${updatedLead.name || 'lead'}`,
-          body: `Hi ${updatedLead.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
-        });
-        alert('Email sent from Pulse Engine.');
+        await sendLeadEmail(updatedLead);
         return;
       }
 
@@ -391,23 +479,40 @@ export default function LeadsPage() {
       await openInboxForLead(updatedLead);
     } catch (err) {
       console.error(err);
-      alert(err?.response?.data?.detail || 'Failed to save contact details.');
+      toast({
+        variant: 'destructive',
+        title: 'Contact update failed',
+        description: err?.response?.data?.detail || 'Failed to save contact details.',
+      });
     }
   };
 
-  const sendNurtureMessage = async (lead, nurtureMessage, event) => {
-    if (event) event.stopPropagation();
-    if (!lead?.id || !nurtureMessage?.id || sendingNurtureId) return;
+  const submitNurtureMessageSend = async () => {
+    const lead = nurtureComposer.lead;
+    const nurtureMessage = nurtureComposer.message;
+    const selectedChannel = nurtureComposer.channel;
+    if (!lead?.id || !nurtureMessage?.id || !selectedChannel || sendingNurtureId) return;
     setSendingNurtureId(nurtureMessage.id);
     try {
-      const res = await api.post(`/leads/${lead.id}/nurture-messages/${nurtureMessage.id}/send`);
+      const res = await api.post(`/leads/${lead.id}/nurture-messages/${nurtureMessage.id}/send`, {
+        channel: selectedChannel,
+      });
       const updatedLead = res.data?.lead;
       if (updatedLead) upsertLeadState(updatedLead);
       await loadLeads();
+      closeNurtureComposer();
+      toast({
+        title: 'Message sent',
+        description: `Nurture message sent via ${(CHANNEL_META[selectedChannel] || {}).label || selectedChannel}.`,
+      });
       if (res.data?.conversation_id) navigate(`/inbox?conversation=${encodeURIComponent(res.data.conversation_id)}`);
     } catch (err) {
       console.error(err);
-      alert(err?.response?.data?.detail || 'Failed to send nurture message.');
+      toast({
+        variant: 'destructive',
+        title: 'Message failed',
+        description: err?.response?.data?.detail || 'Failed to send nurture message.',
+      });
     } finally {
       setSendingNurtureId('');
     }
@@ -555,7 +660,7 @@ export default function LeadsPage() {
                   {getLatestDraft(lead) && (
                     <div className="mb-3 flex justify-end">
                       <button
-                        onClick={(e) => sendNurtureMessage(lead, getLatestDraft(lead), e)}
+                        onClick={(e) => openNurtureComposer(lead, getLatestDraft(lead), e)}
                         disabled={sendingNurtureId === getLatestDraft(lead)?.id}
                         className="px-2.5 py-1 text-[11px] font-medium rounded-lg bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 disabled:opacity-60"
                         data-testid={`send-nurture-${lead.id}`}
@@ -693,7 +798,7 @@ export default function LeadsPage() {
                           </div>
                           {!nm.sent && (
                             <button
-                              onClick={(e) => sendNurtureMessage(selectedLead, nm, e)}
+                              onClick={(e) => openNurtureComposer(selectedLead, nm, e)}
                               disabled={sendingNurtureId === nm.id}
                               className="px-2 py-1 text-[10px] font-medium rounded-md bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 disabled:opacity-60"
                               data-testid={`send-nurture-detail-${nm.id}`}
@@ -856,6 +961,59 @@ export default function LeadsPage() {
                 />
                 <button onClick={submitContacts} className="w-full py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">Save and Continue</button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {nurtureComposer.open && nurtureComposer.lead && nurtureComposer.message && (
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="lead-nurture-send-modal" onClick={closeNurtureComposer}>
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg" onClick={(e) => e.stopPropagation()}>
+            <div className="p-5 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900">Send Nurture Message</h3>
+                  <p className="text-sm text-slate-500">Choose the channel for this saved draft.</p>
+                </div>
+                <button onClick={closeNurtureComposer} className="text-slate-400 hover:text-slate-600">
+                  <X size={18} />
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {getLeadSendChannels(nurtureComposer.lead).map((method) => {
+                  const meta = CHANNEL_META[method.channel] || CHANNEL_META.whatsapp;
+                  const Icon = meta.icon;
+                  const active = nurtureComposer.channel === method.channel;
+                  return (
+                    <button
+                      key={method.channel}
+                      type="button"
+                      onClick={() => setNurtureComposer((prev) => ({ ...prev, channel: method.channel }))}
+                      className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${active ? `${meta.bg} ${meta.border} ${meta.color}` : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}
+                    >
+                      <Icon size={14} />
+                      {meta.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Draft</p>
+                <p className="mt-2 text-sm leading-6 text-slate-700">{nurtureComposer.message.message}</p>
+              </div>
+
+              <button
+                type="button"
+                onClick={submitNurtureMessageSend}
+                disabled={sendingNurtureId === nurtureComposer.message.id}
+                className="w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+              >
+                {sendingNurtureId === nurtureComposer.message.id
+                  ? 'Sending...'
+                  : `Send via ${(CHANNEL_META[nurtureComposer.channel] || {}).label || nurtureComposer.channel}`}
+              </button>
             </div>
           </div>
         </div>

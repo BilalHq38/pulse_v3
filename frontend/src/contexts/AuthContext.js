@@ -125,7 +125,9 @@ export function AuthProvider({ children }) {
         setUser(data.user);
         saveAvatar(data.user.avatar || '');
       }
+      return data.user || null;
     } catch {
+      return null;
       /* ignore */
     }
   }, [saveAvatar]);

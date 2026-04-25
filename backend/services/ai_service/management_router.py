@@ -104,7 +104,7 @@ def _tenant_resource_company_id(current_user: dict, body: dict) -> str:
 async def ai_architecture(request: Request):
     await get_current_user_flexible(request)
     require_mcp = os.environ.get("REQUIRE_MCP", "false").lower() == "true"
-    provider = os.environ.get("AI_PROVIDER", "gemini")
+    provider = os.environ.get("AI_PROVIDER", "openai")
     return {
         "provider": provider,
         "mcp_required": require_mcp,
@@ -187,6 +187,26 @@ async def _fetch_scoped_mcp_server(
     )
 
 
+async def _load_agent_runtime_fields(db, agent: dict, company_id: str) -> dict:
+    data = dict(agent or {})
+    llm_id = str(data.get("llm_id") or "").strip()
+    if llm_id:
+        engine = r(
+            await db.fetchrow(
+                "SELECT provider,model_name,temperature,max_tokens FROM llm_engines "
+                "WHERE id=$1 AND (company_id='' OR company_id=$2) LIMIT 1",
+                llm_id,
+                company_id,
+            )
+        )
+        if engine:
+            data["provider"] = data.get("provider") or engine.get("provider", "")
+            data["model_name"] = engine.get("model_name", "")
+            data["llm_temperature"] = engine.get("temperature")
+            data["llm_max_tokens"] = engine.get("max_tokens")
+    return data
+
+
 @router.post("/ai/sentiment")
 async def ai_sentiment(request: Request):
     db = _db(request)
@@ -236,13 +256,19 @@ async def create_llm_engine(request: Request):
     current_user = await require_roles(request, ["admin", "super_admin"])
     body = await request.json()
     engine_company_id = _tenant_resource_company_id(current_user, body)
+    model_name = (body.get("model_name", "") or "").strip()
+    provider = normalize_reference_key(body.get("provider", ""))
+    if not model_name:
+        raise HTTPException(400, "model_name is required")
+    if provider not in {"openai", "anthropic", "gemini"}:
+        raise HTTPException(400, "provider must be openai, anthropic, or gemini")
     eid = make_id()
     await db.execute(
         "INSERT INTO llm_engines(id,company_id,model_name,provider,api_endpoint,temperature,max_tokens,is_active,version,last_updated,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),NOW())",  # noqa: E501
         eid,
         engine_company_id,
-        (body.get("model_name", "") or "").strip(),
-        normalize_reference_key(body.get("provider", "")),
+        model_name,
+        provider,
         (body.get("api_endpoint", "") or "").strip(),
         float(body.get("temperature", 0.7)),
         int(body.get("max_tokens", 2048)),
@@ -261,6 +287,8 @@ async def update_llm_engine(llm_id: str, request: Request):
     body.pop("_id", None)
     if "provider" in body:
         body["provider"] = normalize_reference_key(body["provider"])
+        if body["provider"] not in {"openai", "anthropic", "gemini"}:
+            raise HTTPException(400, "provider must be openai, anthropic, or gemini")
     if not body:
         raise HTTPException(400, "No valid fields provided")
     engine = await _fetch_scoped_llm_engine(
@@ -342,6 +370,7 @@ async def list_ai_agents(request: Request):
         )
     )
     for agent in agents:
+        agent.update(await _load_agent_runtime_fields(db, agent, cid))
         agent["configuration"] = dict(
             r
             for r in await db.fetch(
@@ -395,7 +424,8 @@ async def create_ai_agent(request: Request):
             "INSERT INTO ai_agent_config(agent_id,config_key,config_val) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
             [(agent_id, k, str(v)) for k, v in cfg.items()],
         )
-    return r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1", agent_id))
+    agent = r(await db.fetchrow("SELECT * FROM ai_agents WHERE id=$1", agent_id))
+    return await _load_agent_runtime_fields(db, agent, cid)
 
 
 @router.put("/ai/agents/{agent_id}")
@@ -452,7 +482,7 @@ async def update_ai_agent(agent_id: str, request: Request):
             agent_id,
         )
     }
-    return agent
+    return await _load_agent_runtime_fields(db, agent, cid)
 
 
 @router.delete("/ai/agents/{agent_id}")

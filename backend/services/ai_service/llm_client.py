@@ -33,6 +33,10 @@ except Exception:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+ANTHROPIC_DEFAULT_MODEL = (
+    os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip() or "claude-3-5-sonnet-20241022"
+)
 FLASH_MODEL = "gemini-2.5-flash"
 PRO_MODEL = "gemini-2.5-pro"
 GEMINI_FALLBACK_MODELS = tuple(
@@ -57,13 +61,32 @@ _anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if AsyncAnthropic 
 
 
 def _default_engine(use_pro: bool = False) -> dict:
+    provider = (os.getenv("AI_PROVIDER", "openai") or "openai").strip().lower()
+    provider_defaults = {
+        "openai": OPENAI_DEFAULT_MODEL,
+        "anthropic": ANTHROPIC_DEFAULT_MODEL,
+        "gemini": PRO_MODEL if use_pro else FLASH_MODEL,
+    }
+    if provider not in provider_defaults:
+        provider = "openai"
     return {
-        "provider": "gemini",
-        "model_name": PRO_MODEL if use_pro else FLASH_MODEL,
+        "provider": provider,
+        "model_name": (os.getenv("AI_MODEL_NAME") or provider_defaults[provider]).strip() or provider_defaults[provider],
         "temperature": 0.65,
         "max_tokens": 2048,
-        "supports_vision": True,
+        "supports_vision": provider in {"gemini", "openai"},
     }
+
+
+def _provider_default_model(provider: str, use_pro: bool = False) -> str:
+    provider = (provider or "").strip().lower()
+    if provider == "openai":
+        return OPENAI_DEFAULT_MODEL
+    if provider == "anthropic":
+        return ANTHROPIC_DEFAULT_MODEL
+    if provider == "gemini":
+        return PRO_MODEL if use_pro else FLASH_MODEL
+    return ""
 
 
 def get_provider_runtime_info(provider: str) -> tuple[bool, str]:
@@ -184,7 +207,7 @@ async def _call_openai(
     ]
     temperature, max_tokens = _generation_opts(engine, generation_config)
     kwargs: dict[str, Any] = {
-        "model": engine.get("model_name") or "gpt-4o-mini",
+        "model": engine.get("model_name") or OPENAI_DEFAULT_MODEL,
         "messages": [{"role": "user", "content": content}],
     }
     if temperature is not None:
@@ -218,7 +241,7 @@ async def _call_anthropic(
                 }
             )
     kwargs: dict[str, Any] = {
-        "model": engine.get("model_name") or "claude-3-5-sonnet-20241022",
+        "model": engine.get("model_name") or ANTHROPIC_DEFAULT_MODEL,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": max_tokens or 2048,
     }
@@ -232,10 +255,19 @@ async def _call_anthropic(
 
 def _get_fallback_provider_order(primary_provider: str) -> list[str]:
     """Return provider fallback order, starting with the primary."""
-    all_providers = ["gemini", "openai", "anthropic"]
-    primary = (primary_provider or "gemini").strip().lower()
+    all_providers = ["openai", "anthropic", "gemini"]
+    primary = (primary_provider or "openai").strip().lower()
     ordered = [primary] + [p for p in all_providers if p != primary]
     return [p for p in ordered if get_provider_runtime_info(p)[0]]
+
+
+def _engine_for_provider(base_engine: dict, provider: str, *, use_pro: bool = False) -> dict:
+    provider = (provider or "").strip().lower()
+    engine = dict(base_engine or {})
+    engine["provider"] = provider
+    if provider != str((base_engine or {}).get("provider") or "").strip().lower():
+        engine["model_name"] = _provider_default_model(provider, use_pro=use_pro)
+    return engine
 
 
 async def call_model_text(
@@ -246,30 +278,31 @@ async def call_model_text(
     image_urls: Optional[list[str]] = None,
 ) -> str:
     selected = dict(engine or _default_engine(use_pro=use_pro))
-    primary_provider = (selected.get("provider") or "gemini").strip().lower()
+    primary_provider = (selected.get("provider") or "openai").strip().lower()
     provider_order = _get_fallback_provider_order(primary_provider)
 
     last_exc: Exception | None = None
     for provider in provider_order:
+        provider_engine = _engine_for_provider(selected, provider, use_pro=use_pro)
         try:
             if provider == "gemini":
                 return await _call_gemini(
                     prompt,
-                    selected,
+                    provider_engine,
                     generation_config=generation_config,
                     image_urls=image_urls,
                 )
             if provider == "openai":
                 return await _call_openai(
                     prompt,
-                    selected,
+                    provider_engine,
                     generation_config=generation_config,
                     image_urls=image_urls,
                 )
             if provider == "anthropic":
                 return await _call_anthropic(
                     prompt,
-                    selected,
+                    provider_engine,
                     generation_config=generation_config,
                     image_urls=image_urls,
                 )
@@ -311,7 +344,7 @@ async def call_model_json(
     image_urls: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     selected = dict(engine or _default_engine(use_pro=use_pro))
-    provider = (selected.get("provider") or "gemini").strip().lower()
+    provider = (selected.get("provider") or "openai").strip().lower()
     if provider == "gemini" and genai_types:
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
