@@ -188,7 +188,7 @@ def _assert_meta_payload_timestamp_fresh(request: Request, payload: dict, channe
             "Meta webhook timestamp rejected channel=%s ts=%s now=%s ip=%s",
             channel,
             ts,
-            now_ts,
+            current_ts,
             _client_ip_from_request(request),
         )
         raise HTTPException(401, "Webhook timestamp is outside accepted window")
@@ -430,34 +430,50 @@ async def _check_replay(channel: str, replay_fingerprint: str) -> None:
     await _channel_check_replay(channel, replay_fingerprint)
 
 
+def _is_trusted_whatsapp_web_bridge_request(request: Request) -> bool:
+    """Node WhatsApp Web.js bridge is internal. It signs with the app webhook secret; tenant DB secrets
+    may not match. When X-Bridge-Secret matches env, skip Meta multi-secret HMAC.
+    """
+    expected = (os.environ.get("WHATSAPP_BRIDGE_SECRET") or os.environ.get("BRIDGE_SECRET") or "").strip()
+    provided = (request.headers.get("X-Bridge-Secret") or "").strip()
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
 async def _verify_meta_webhook_request(
     request: Request,
     db,
     channel: str,
     raw_body: bytes,
 ) -> str:
+    bridge_trusted = channel == "whatsapp" and _is_trusted_whatsapp_web_bridge_request(request)
     await _enforce_meta_webhook_rate_limit(request, channel)
-    _enforce_meta_webhook_ip_allowlist(request, channel)
+    if not bridge_trusted:
+        _enforce_meta_webhook_ip_allowlist(request, channel)
 
     signature_header = request.headers.get("X-Hub-Signature-256", "")
     provided_signature = _extract_hex_signature(signature_header)
-    if not provided_signature:
-        logger.warning(
-            "Meta webhook missing signature channel=%s ip=%s",
-            channel,
-            _client_ip_from_request(request),
-        )
-        raise HTTPException(401, "Missing webhook signature")
-    candidate_secrets = await _candidate_meta_webhook_secrets(db, channel, raw_body)
-    if not candidate_secrets:
-        raise HTTPException(503, "Webhook signing secret is not configured")
-    if not any(_verify_hmac_sha256(secret, raw_body, provided_signature) for secret in candidate_secrets):
-        logger.warning(
-            "Meta webhook invalid signature channel=%s ip=%s",
-            channel,
-            _client_ip_from_request(request),
-        )
-        raise HTTPException(401, "Invalid webhook signature")
+    if not bridge_trusted:
+        if not provided_signature:
+            logger.warning(
+                "Meta webhook missing signature channel=%s ip=%s",
+                channel,
+                _client_ip_from_request(request),
+            )
+            raise HTTPException(401, "Missing webhook signature")
+        candidate_secrets = await _candidate_meta_webhook_secrets(db, channel, raw_body)
+        if not candidate_secrets:
+            raise HTTPException(503, "Webhook signing secret is not configured")
+        if not any(_verify_hmac_sha256(secret, raw_body, provided_signature) for secret in candidate_secrets):
+            logger.warning(
+                "Meta webhook invalid signature channel=%s ip=%s",
+                channel,
+                _client_ip_from_request(request),
+            )
+            raise HTTPException(401, "Invalid webhook signature")
+    elif not provided_signature:
+        provided_signature = hashlib.sha256(raw_body).hexdigest()
 
     payload = _decode_webhook_json(raw_body)
     event_timestamp = _assert_meta_payload_timestamp_fresh(request, payload, channel)
@@ -2230,6 +2246,19 @@ async def _auto_capture_lead(
                     company_id,
                 )
             )
+        social_profile_id = str(metadata_payload.get("social_profile_id") or "").strip()
+        if social_profile_id and not existing and channel in {"facebook", "instagram"}:
+            existing = r(
+                await db.fetchrow(
+                    "SELECT c.* FROM customers c "
+                    "JOIN customer_social_profiles csp ON csp.customer_id=c.id "
+                    "WHERE c.company_id=$1 AND csp.platform=$2 AND csp.profile_id=$3 "
+                    "ORDER BY c.updated_at DESC LIMIT 1",
+                    company_id,
+                    channel,
+                    social_profile_id,
+                )
+            )
         if sender_contact and not existing:
             # Exact match first (cheap, indexed).
             existing = r(
@@ -2325,9 +2354,19 @@ async def _auto_capture_lead(
                 "company_id": company_id,
             }
 
+        existing_lead = None
+        existing_customer_lead_id = str(existing.get("lead_id") or "").strip()
+        if existing_customer_lead_id:
+            existing_lead = r(
+                await db.fetchrow(
+                    "SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1",
+                    existing_customer_lead_id,
+                    company_id,
+                )
+            )
         lookup_value = existing.get("email") or existing.get("phone") or ""
-        existing_lead = (
-            r(
+        if not existing_lead and lookup_value:
+            existing_lead = r(
                 await db.fetchrow(
                     "SELECT * FROM leads WHERE (email=$1 OR phone=$1) AND company_id=$2 "
                     "ORDER BY updated_at DESC LIMIT 1",
@@ -2335,9 +2374,6 @@ async def _auto_capture_lead(
                     company_id,
                 )
             )
-            if lookup_value
-            else None
-        )
         if not existing_lead:
             lid = make_id()
             await db.execute(
@@ -2355,6 +2391,12 @@ async def _auto_capture_lead(
                 "INSERT INTO lead_channels(lead_id,channel) VALUES($1,$2) ON CONFLICT DO NOTHING",
                 lid,
                 channel,
+            )
+            await db.execute(
+                "UPDATE customers SET lead_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                lid,
+                existing["id"],
+                company_id,
             )
             try:
                 lead_snapshot = await _run_lead_workflow_sync(
@@ -2378,6 +2420,7 @@ async def _auto_capture_lead(
                 source=channel,
                 action="lead_auto_captured",
             )
+            existing["lead_id"] = lid
             return {
                 "customer": existing,
                 "lead_id": lid,
@@ -2405,6 +2448,14 @@ async def _auto_capture_lead(
             existing_lead["id"],
             channel,
         )
+        if existing_customer_lead_id != existing_lead["id"]:
+            await db.execute(
+                "UPDATE customers SET lead_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                existing_lead["id"],
+                existing["id"],
+                company_id,
+            )
+            existing["lead_id"] = existing_lead["id"]
         await db.execute(
             "INSERT INTO lead_activities(id,lead_id,company_id,type,content,stage,created_at) VALUES($1,$2,$3,'message',$4,'',NOW())",  # noqa: E501
             make_id(),
@@ -2616,6 +2667,14 @@ async def _process_unified_incoming_message(
     payload_metadata.update(dict(metadata or {}))
     if not payload_metadata.get("company_id"):
         payload_metadata["company_id"] = str(message.tenant_id or "").strip()
+    if message.resolved_customer_id and not payload_metadata.get("customer_id"):
+        payload_metadata["customer_id"] = str(message.resolved_customer_id or "").strip()
+    if (
+        message.channel_type in (ChannelType.INSTAGRAM, ChannelType.FACEBOOK)
+        and message.external_user_id
+        and not payload_metadata.get("social_profile_id")
+    ):
+        payload_metadata["social_profile_id"] = str(message.external_user_id or "").strip()
     if not payload_metadata.get("inbound_external_message_id"):
         payload_metadata["inbound_external_message_id"] = str(message.message_id or "").strip()
     if not payload_metadata.get("adapter"):
@@ -3045,6 +3104,9 @@ async def _process_incoming_message(
                             "confidence": float(support_result.get("confidence", 0.0) or 0.0),
                             "source": f"webhook_{channel}",
                             "llm_id": support_result.get("llm_id", ""),
+                            "agent_id": support_result.get("agent_id", ""),
+                            "intent_name": support_result.get("intent_name", ""),
+                            "channel": channel,
                         },
                     )
                 )
@@ -3627,6 +3689,9 @@ async def web_chat_webhook(request: Request):
                                 "confidence": float(support_result.get("confidence", 0.0) or 0.0),
                                 "source": "webhook_web_chat",
                                 "llm_id": support_result.get("llm_id", ""),
+                                "agent_id": support_result.get("agent_id", ""),
+                                "intent_name": support_result.get("intent_name", ""),
+                                "channel": "web_chat",
                             },
                         )
                     )

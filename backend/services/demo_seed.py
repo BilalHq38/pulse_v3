@@ -31,6 +31,60 @@ DEMO_PASSWORD = (os.environ.get("DEMO_ACCOUNTS_PASSWORD") or "DemoPulse2026!").s
 _PLATFORM_COMPANY_ID = (
     os.environ.get("SUPER_ADMIN_COMPANY_ID") or ""
 ).strip() or "00000000-0000-0000-0000-000000000001"
+_DEMO_DUPLICATE_AVATAR = (
+    "data:image/svg+xml;utf8,"
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'>"
+    "<rect width='128' height='128' rx='28' fill='%230f172a'/>"
+    "<circle cx='64' cy='44' r='22' fill='%23f8fafc'/>"
+    "<path d='M26 110c6-23 27-36 38-36s32 13 38 36' fill='%2322c55e'/>"
+    "</svg>"
+)
+
+
+async def _ensure_duplicate_demo_customers(db, company_id: str) -> None:
+    sample_rows = (
+        {
+            "email": "jordan.blake.duplicate.1@pulseengine.local",
+            "phone": "+15550001101",
+            "name": "Jordan Blake",
+            "segment": "enterprise",
+        },
+        {
+            "email": "jordan.blake.duplicate.2@pulseengine.local",
+            "phone": "+15550001102",
+            "name": "Jordan Blake",
+            "segment": "enterprise",
+        },
+    )
+    for sample in sample_rows:
+        existing = await db.fetchrow(
+            "SELECT id FROM customers WHERE company_id=$1 AND email=$2 LIMIT 1",
+            company_id,
+            sample["email"],
+        )
+        if existing:
+            await db.execute(
+                "UPDATE customers SET name=$1,phone=$2,segment=$3,avatar=$4,lifecycle_stage='lead',updated_at=NOW() "
+                "WHERE id=$5 AND company_id=$6",
+                sample["name"],
+                sample["phone"],
+                sample["segment"],
+                _DEMO_DUPLICATE_AVATAR,
+                existing["id"],
+                company_id,
+            )
+            continue
+        await db.execute(
+            "INSERT INTO customers(id,company_id,lead_id,name,email,phone,customer_company_name,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "  # noqa: E501
+            "VALUES($1,$2,'',$3,$4,$5,'Duplicate Test Co',$6,$7,'lead',0,0,0,0,0,0,NOW(),NOW())",
+            make_id(),
+            company_id,
+            sample["name"],
+            sample["email"],
+            sample["phone"],
+            sample["segment"],
+            _DEMO_DUPLICATE_AVATAR,
+        )
 
 
 async def ensure_demo_accounts(db) -> None:
@@ -109,6 +163,7 @@ async def ensure_demo_accounts(db) -> None:
         current_period_end=period_end,
     )
     await invalidate_billing_cache(DEMO_TENANT_ID)
+    await _ensure_duplicate_demo_customers(db, DEMO_TENANT_ID)
 
     # ── Platform super_admin (same company row as env bootstrap) ────────────
     await db.execute(

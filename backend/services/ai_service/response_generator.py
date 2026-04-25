@@ -34,7 +34,7 @@ from services.ai_service.memory_service import (
 )
 from services.ai_service.rag import build_ai_context, recent_customer_image_urls, understand_product_query
 from services.ai_service.sentiment import analyze_conversation_sentiment, analyze_sentiment
-from services.db_helpers import is_data_url_image
+from services.db_helpers import is_data_url_image, resolve_active_ai_agent
 from core.utils import is_valid_image_url
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,25 @@ RESPONSE_STYLE_PROFILES = (
         "instruction": "Focus on concrete actions, specific options, and the fastest path to value.",
     },
 )
+
+AGENT_RUNTIME_PROFILES = {
+    "support": {
+        "label": "Support Agent",
+        "instruction": "Operate like a hands-on support specialist who resolves issues quickly and reduces customer effort.",
+    },
+    "sales": {
+        "label": "Sales Agent",
+        "instruction": "Operate like a live sales advisor who qualifies intent, recommends the best-fit product, and moves toward a concrete buying step.",
+    },
+    "onboarding": {
+        "label": "Onboarding Agent",
+        "instruction": "Operate like an onboarding specialist who explains setup clearly, removes friction, and keeps activation moving forward.",
+    },
+    "generic": {
+        "label": "General Assistant",
+        "instruction": "Operate like a fast, reliable CRM assistant who adapts to the request without sounding robotic.",
+    },
+}
 
 
 def _allow_rule_based_recovery() -> bool:
@@ -585,11 +604,17 @@ def _select_response_style(
     sentiment: dict | None,
     intent: dict | None,
     customer_info: dict,
+    preferred_agent_type: str = "",
 ) -> dict[str, str]:
     emotion = str((sentiment or {}).get("emotion", "neutral") or "neutral").lower()
     intent_name = str((intent or {}).get("intent", "general_question") or "general_question").lower()
     urgency = str((intent or {}).get("urgency", "medium") or "medium").lower()
-    if emotion in {"angry", "frustrated"} or intent_name in {"complaint", "refund", "cancel_request"}:
+    preferred = str(preferred_agent_type or "").strip().lower()
+    if preferred == "sales":
+        base_profile = RESPONSE_STYLE_PROFILES[1]
+    elif preferred == "onboarding":
+        base_profile = RESPONSE_STYLE_PROFILES[3]
+    elif emotion in {"angry", "frustrated"} or intent_name in {"complaint", "refund", "cancel_request"}:
         base_profile = RESPONSE_STYLE_PROFILES[0]
     elif intent_name in {"product_recommendation", "purchase_inquiry"}:
         base_profile = RESPONSE_STYLE_PROFILES[1]
@@ -603,6 +628,16 @@ def _select_response_style(
     return {
         "name": base_profile["name"],
         "instruction": base_profile["instruction"],
+    }
+
+
+def _agent_runtime_profile(agent: dict | None) -> dict[str, str]:
+    agent_type = str((agent or {}).get("agent_type") or "generic").strip().lower() or "generic"
+    profile = AGENT_RUNTIME_PROFILES.get(agent_type) or AGENT_RUNTIME_PROFILES["generic"]
+    return {
+        "agent_type": agent_type,
+        "label": profile["label"],
+        "instruction": profile["instruction"],
     }
 
 
@@ -775,13 +810,28 @@ async def generate_ai_response(
             company_id=company_id or "",
             conversation_context=conversation_context[-12:],
         )
+    channel_name = str(kwargs.get("channel") or "").strip()
+    selected_agent = None
+    if db and company_id:
+        try:
+            selected_agent = await resolve_active_ai_agent(
+                db,
+                company_id,
+                intent_name=str(observed_intent.get("intent") or ""),
+                channel=channel_name,
+            )
+        except Exception as exc:
+            logger.debug("Active AI agent resolution skipped: %s", exc)
+    agent_profile = _agent_runtime_profile(selected_agent)
+    selected_agent_id = str((selected_agent or {}).get("id") or "").strip()
+    selected_agent_type = str((selected_agent or {}).get("agent_type") or "").strip().lower() or "generic"
     style_profile = _select_response_style(
         query,
         observed_sentiment,
         observed_intent,
         customer_info,
+        preferred_agent_type=agent_profile["agent_type"],
     )
-    channel_name = str(kwargs.get("channel") or "").strip()
 
     memory_entity_id = str(customer_info.get("id") or "").strip() or str(actor_user_id or "").strip() or conversation_id
 
@@ -855,6 +905,9 @@ async def generate_ai_response(
             conversation_state=conversation_state,
         )
     if quick_response:
+        quick_response.setdefault("agent_id", selected_agent_id)
+        quick_response.setdefault("agent_type", selected_agent_type)
+        quick_response.setdefault("intent_name", str(observed_intent.get("intent") or ""))
         await _persist_response_memory(
             db=db,
             company_id=company_id,
@@ -928,6 +981,9 @@ async def generate_ai_response(
         else None
     )
     if product_rule_response:
+        product_rule_response.setdefault("agent_id", selected_agent_id)
+        product_rule_response.setdefault("agent_type", selected_agent_type)
+        product_rule_response.setdefault("intent_name", str(observed_intent.get("intent") or ""))
         response_product_ids = [
             str(item).strip()
             for item in product_rule_response.get("product_ids", ai_context.get("product_ids", []))
@@ -997,6 +1053,8 @@ async def generate_ai_response(
         "- If products are relevant, recommend at most 3 and explain why each fits.\n"
         "- If the customer seems frustrated, acknowledge it and focus on resolution before any upsell.\n"
         "- Do not invent policies, inventory, prices, shipping times, or account details that are not in context.\n"
+        f"- Active agent mode: {agent_profile['label']}.\n"
+        f"- Agent operating instruction: {agent_profile['instruction']}\n"
         f"- Response style: {style_profile['instruction']}\n"
         f"- Observed intent: {observed_intent.get('intent', 'general_question')}"
         f" (urgency: {observed_intent.get('urgency', 'medium')}).\n"
@@ -1085,7 +1143,18 @@ async def generate_ai_response(
     if product_images:
         prompt += f"\n\n[{len(product_images)} product image(s) are attached for reference.]"
 
-    engine = await _resolve_engine_for_request(db=db, company_id=company_id or "", use_pro=False)
+    engine = None
+    selected_llm_id = str((selected_agent or {}).get("llm_id") or "").strip()
+    if db and company_id and selected_llm_id:
+        engine_row = await db.fetchrow(
+            "SELECT * FROM llm_engines WHERE id=$1 AND (company_id='' OR company_id=$2) LIMIT 1",
+            selected_llm_id,
+            company_id,
+        )
+        if engine_row:
+            engine = dict(engine_row)
+    if not engine:
+        engine = await _resolve_engine_for_request(db=db, company_id=company_id or "", use_pro=False)
     generation_config = _build_generation_config(
         query=query,
         observed_intent=observed_intent,
@@ -1165,6 +1234,9 @@ async def generate_ai_response(
             "product_images": response_attachments,
             "product_ids": response_product_ids,
             "llm_id": engine.get("id", ""),
+            "agent_id": selected_agent_id,
+            "agent_type": selected_agent_type,
+            "intent_name": str(observed_intent.get("intent") or ""),
             "provider": engine.get("provider", ""),
             "model_name": engine.get("model_name", ""),
             "conversation_stage": conversation_state.get("stage", "discovery"),
@@ -1211,6 +1283,9 @@ async def generate_ai_response(
                 "product_images": [],
                 "product_ids": [],
                 "llm_id": "",
+                "agent_id": selected_agent_id,
+                "agent_type": selected_agent_type,
+                "intent_name": str(observed_intent.get("intent") or ""),
                 "provider": "fallback",
                 "model_name": "rule-recovery",
                 "api_error": False,
@@ -1222,6 +1297,9 @@ async def generate_ai_response(
         else:
             fallback_response["confidence"] = max(float(fallback_response.get("confidence", 0) or 0), 0.82)
             fallback_response.setdefault("llm_id", "")
+            fallback_response.setdefault("agent_id", selected_agent_id)
+            fallback_response.setdefault("agent_type", selected_agent_type)
+            fallback_response.setdefault("intent_name", str(observed_intent.get("intent") or ""))
             fallback_response.setdefault("provider", "fallback")
             fallback_response.setdefault("model_name", "rule-recovery")
             fallback_response["api_error"] = False

@@ -23,6 +23,34 @@ const MODEL_MAX_TOKENS = {
   'claude-3-5-haiku-20241022': 8192, 'claude-3-opus-20240229': 4096, 'claude-3-haiku-20240307': 4096,
 };
 
+const AGENT_RUNTIME_PROFILES = {
+  support: {
+    title: 'Support responder',
+    route: 'Handles complaints, support questions, refunds, and escalation-prone messages.',
+    behavior: 'Replies in the inbox and connected channels, then hands off if confidence or safety drops.',
+  },
+  sales: {
+    title: 'Sales assistant',
+    route: 'Handles product, pricing, availability, and purchase-intent conversations.',
+    behavior: 'Qualifies the customer, recommends relevant products, and moves toward a clear next step.',
+  },
+  onboarding: {
+    title: 'Onboarding guide',
+    route: 'Handles setup, activation, implementation, and first-run questions.',
+    behavior: 'Breaks work into simple steps and keeps the user moving without waiting for a human.',
+  },
+  generic: {
+    title: 'General assistant',
+    route: 'Covers messages that do not match a specialized active agent.',
+    behavior: 'Responds with a flexible assistant style and uses the selected live model.',
+  },
+};
+
+function agentRuntimeProfile(type) {
+  const key = String(type || 'generic').toLowerCase();
+  return AGENT_RUNTIME_PROFILES[key] || AGENT_RUNTIME_PROFILES.generic;
+}
+
 export default function AiSettingsTab({
   company, setCompany, saveCompany,
   saving, setSaving,
@@ -38,6 +66,7 @@ export default function AiSettingsTab({
   const [orchLoading, setOrchLoading] = useState(true);
   const [orchErr, setOrchErr] = useState('');
   const [mcpList, setMcpList] = useState([]);
+  const [aiSessions, setAiSessions] = useState([]);
 
   const loadExecutions = useCallback(async () => {
     try {
@@ -53,11 +82,24 @@ export default function AiSettingsTab({
     }
   }, []);
 
+  const loadAiSessions = useCallback(async () => {
+    try {
+      const res = await api.get('/ai/sessions?limit=50');
+      setAiSessions(Array.isArray(res.data) ? res.data : []);
+    } catch {
+      setAiSessions([]);
+    }
+  }, []);
+
   useEffect(() => {
     loadExecutions();
-    const id = setInterval(loadExecutions, 20000);
+    loadAiSessions();
+    const id = setInterval(() => {
+      loadExecutions();
+      loadAiSessions();
+    }, 10000);
     return () => clearInterval(id);
-  }, [loadExecutions]);
+  }, [loadAiSessions, loadExecutions]);
 
   useEffect(() => {
     (async () => {
@@ -74,6 +116,16 @@ export default function AiSettingsTab({
     () => mcpList.map((s) => ({ id: s.id, label: `${(s.endpoint || s.id).slice(0, 64)}${s.status && s.status !== 'active' ? ` (${s.status})` : ''}` })),
     [mcpList],
   );
+  const activeAgents = useMemo(() => aiAgents.filter((agent) => agent.is_active), [aiAgents]);
+  const latestSessionByAgent = useMemo(() => {
+    const byAgent = {};
+    for (const session of aiSessions) {
+      const agentId = String(session.agent_id || '');
+      if (!agentId || byAgent[agentId]) continue;
+      byAgent[agentId] = session;
+    }
+    return byAgent;
+  }, [aiSessions]);
 
   return (
     <div className="space-y-6">
@@ -162,6 +214,67 @@ export default function AiSettingsTab({
             <span className="text-slate-600"> ({a.provider || '?'} / {a.model_name || 'default'})</span>
           </p>
         ))}
+      </div>
+
+      <div className="bg-white border border-slate-100 rounded-xl p-6">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+              <Bot size={14} className="text-emerald-500" /> Live agent behavior
+            </h3>
+            <p className="text-[10px] text-slate-400 mt-0.5">
+              Active agents are used for real-time replies in inbox and channel webhooks. This panel refreshes with the latest AI response sessions.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={loadAiSessions}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200"
+          >
+            <RefreshCw size={12} /> Refresh replies
+          </button>
+        </div>
+        {!company.ai_enabled && activeAgents.length > 0 && (
+          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            Active agents are configured. Enabling an agent turns AI responses on server-side, but save or refresh this page if this switch still appears off locally.
+          </div>
+        )}
+        {activeAgents.length === 0 ? (
+          <p className="text-xs text-slate-400 py-3">No active AI agents yet. Turn one on and incoming customer messages will route to it automatically.</p>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            {activeAgents.map((agent) => {
+              const profile = agentRuntimeProfile(agent.agent_type);
+              const session = latestSessionByAgent[agent.id];
+              return (
+                <div key={agent.id} className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-800 capitalize">{agent.agent_type || 'generic'} Agent</p>
+                      <p className="text-[11px] text-emerald-700 font-medium mt-0.5">{profile.title}</p>
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-medium">Live</span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-3">{profile.route}</p>
+                  <p className="text-xs text-slate-500 mt-1">{profile.behavior}</p>
+                  <div className="mt-3 rounded-lg bg-white border border-slate-100 p-3">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Latest live response</p>
+                    {session ? (
+                      <>
+                        <p className="text-xs text-slate-700 mt-1 line-clamp-3">{session.response || 'Response saved without body preview.'}</p>
+                        <p className="text-[10px] text-slate-400 mt-1">
+                          {session.source || 'ai'} | {session.confidence != null ? `${Math.round(Number(session.confidence) * 100)}% confidence` : 'confidence n/a'} | {(session.created_at || '').replace('T', ' ').slice(0, 19)}
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-xs text-slate-400 mt-1">Waiting for the next incoming message to show this agent responding live.</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Orchestrator: rule-based agent / workflow activity */}
@@ -363,7 +476,7 @@ export default function AiSettingsTab({
                     <p className="text-[10px] text-slate-400">Provider: {a.provider || '—'} | Model: {a.model_name || 'default'} | LLM: {a.llm_id?.substring(0, 8) || 'default'}…</p>
                   </div>
                   <div className="flex items-center gap-2 ml-3 flex-shrink-0">
-                    <button onClick={async () => { const r = await api.put(`/ai/agents/${a.id}`, { is_active: !a.is_active }).catch(() => null); if (r) setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, is_active: !x.is_active } : x)); }}
+                    <button onClick={async () => { const nextActive = !a.is_active; const r = await api.put(`/ai/agents/${a.id}`, { is_active: nextActive }).catch(() => null); if (r) { setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, is_active: nextActive } : x)); if (nextActive) setCompany(prev => ({ ...prev, ai_enabled: true })); } }}
                       className={`relative w-9 h-5 rounded-full transition-colors ${a.is_active ? 'bg-green-500' : 'bg-gray-300'}`}>
                       <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${a.is_active ? 'translate-x-4' : ''}`} />
                     </button>
@@ -407,7 +520,7 @@ export default function AiSettingsTab({
                       </div>
                     </div>
                     <div className="flex gap-2">
-                      <button onClick={async () => { const r = await api.put(`/ai/agents/${a.id}`, agentDraft).catch(() => null); if (r) { setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, ...r.data } : x)); setEditingAgentId(null); } }}
+                      <button onClick={async () => { const r = await api.put(`/ai/agents/${a.id}`, agentDraft).catch(() => null); if (r) { setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, ...r.data } : x)); if (r.data?.is_active) setCompany(prev => ({ ...prev, ai_enabled: true })); setEditingAgentId(null); } }}
                         className="px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">Save Changes</button>
                       <button onClick={() => setEditingAgentId(null)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
                     </div>
@@ -449,7 +562,7 @@ export default function AiSettingsTab({
               </div>
             </div>
             <div className="flex gap-2">
-              <button onClick={async () => { const r = await api.post('/ai/agents', addAgentForm).catch(() => null); if (r?.data) { setAiAgents(prev => [r.data, ...prev]); setShowAddAgentForm(false); } }}
+              <button onClick={async () => { const r = await api.post('/ai/agents', addAgentForm).catch(() => null); if (r?.data) { setAiAgents(prev => [r.data, ...prev]); if (r.data.is_active) setCompany(prev => ({ ...prev, ai_enabled: true })); setShowAddAgentForm(false); } }}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">Add AI Agent</button>
               <button onClick={() => setShowAddAgentForm(false)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
             </div>

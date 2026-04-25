@@ -183,12 +183,15 @@ class KBDocCreate(BaseModel):
 class ChannelSettingsUpdate(BaseModel):
     channel: str
     enabled: bool = False
+    display_name: str = ""
     api_key: str = ""
     api_secret: str = ""
+    phone_number: str = ""
     webhook_url: str = ""
     page_id: str = ""
     phone_number_id: str = ""
     access_token: str = ""
+    verify_token: str = ""
     extra_config: dict = {}
 
 

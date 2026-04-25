@@ -57,6 +57,42 @@ for (const candidate of [
   loadEnvFile(candidate);
 }
 
+const WWEBJS_AUTH_DIR = path.join(__dirname, ".wwebjs_auth");
+
+/** Stale lock files in the named volume (after crash/container replace) make Chromium refuse to start. */
+const CHROMIUM_STALE_LOCK_NAMES = new Set([
+  "SingletonLock",
+  "SingletonSocket",
+  "SingletonCookie",
+  "lockfile",
+]);
+
+function removeChromiumSingletonLocks(rootDir) {
+  if (!fs.existsSync(rootDir)) return;
+  const walk = (dir) => {
+    let names;
+    try {
+      names = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of names) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        walk(full);
+      } else if (CHROMIUM_STALE_LOCK_NAMES.has(ent.name)) {
+        try {
+          fs.unlinkSync(full);
+          console.log(`🧹  Cleared stale Chromium lock: ${path.relative(rootDir, full)}`);
+        } catch (err) {
+          console.warn(`⚠️  Could not remove ${full}: ${err.message}`);
+        }
+      }
+    }
+  };
+  walk(rootDir);
+}
+
 // ── Config ─────────────────────────────────────────────────────────
 const BRIDGE_PORT    = process.env.BRIDGE_PORT    || 3001;
 const PYTHON_BACKEND = process.env.PYTHON_BACKEND || "http://localhost:8000";
@@ -99,9 +135,9 @@ function attachmentToMedia(attachment) {
 
 // ── WhatsApp client ────────────────────────────────────────────────
 const client = new Client({
-  authStrategy: new LocalAuth({ 
-    dataPath: "./.wwebjs_auth",
-    clientId: "pulse_bridge"
+  authStrategy: new LocalAuth({
+    dataPath: WWEBJS_AUTH_DIR,
+    clientId: "pulse_bridge",
   }),
   puppeteer: {
     headless: true,
@@ -372,4 +408,5 @@ bridgeServer.on("error", (err) => {
 
 // ── Start ──────────────────────────────────────────────────────────
 console.log("\n🚀  Starting WhatsApp bridge (first run takes 10-30 seconds)...\n");
+removeChromiumSingletonLocks(WWEBJS_AUTH_DIR);
 clientInitPromise = client.initialize();

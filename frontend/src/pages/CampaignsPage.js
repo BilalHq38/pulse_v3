@@ -4,10 +4,13 @@ import {
   AlertCircle,
   CheckCircle2,
   Mail,
+  Package,
   Plus,
   RefreshCw,
   Send,
   Trash2,
+  Users,
+  Wand2,
   X,
 } from 'lucide-react';
 
@@ -28,23 +31,42 @@ const DEFAULT_FILTERS = {
   channel: '',
 };
 
-function toFiltersPayload(f) {
+function toFiltersPayload(f, selectedLeadIds = [], selectedCustomerIds = [], productId = '') {
   const out = {};
   if (f.audience && f.audience !== 'both') out.audience = f.audience;
   if (f.lifecycle_stage) out.lifecycle_stage = f.lifecycle_stage.split(',').map((s) => s.trim()).filter(Boolean);
   if (f.tags) out.tags = f.tags.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (f.source) out.source = f.source.split(',').map((s) => s.trim()).filter(Boolean);
   if (f.channel) out.channel = f.channel.split(',').map((s) => s.trim()).filter(Boolean);
+  if (selectedLeadIds.length) out.selected_lead_ids = selectedLeadIds;
+  if (selectedCustomerIds.length) out.selected_customer_ids = selectedCustomerIds;
+  if (productId) out.product_id = productId;
   return out;
 }
+
+const EMPTY_AI_DETAILS = {
+  campaign_goal: '',
+  audience_description: '',
+  tone: 'friendly',
+  call_to_action: '',
+  offer_details: '',
+  extra_context: '',
+};
 
 export default function CampaignsPage() {
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: '', subject: '', body: '', html_body: '' });
+  const [form, setForm] = useState({ name: '', subject: '', body: '', html_body: '', product_id: '' });
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [products, setProducts] = useState([]);
+  const [leads, setLeads] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [selectedLeadIds, setSelectedLeadIds] = useState([]);
+  const [selectedCustomerIds, setSelectedCustomerIds] = useState([]);
+  const [aiDetails, setAiDetails] = useState(EMPTY_AI_DETAILS);
+  const [generatingCopy, setGeneratingCopy] = useState(false);
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -65,6 +87,20 @@ export default function CampaignsPage() {
   }, []);
 
   useEffect(() => { loadCampaigns(); }, [loadCampaigns]);
+
+  const loadCampaignResources = useCallback(async () => {
+    const [productRes, leadRes, customerRes] = await Promise.all([
+      api.get('/company-data/products').catch(() => ({ data: [] })),
+      api.get('/leads', { params: { limit: 100 } }).catch(() => ({ data: [] })),
+      api.get('/customers').catch(() => ({ data: [] })),
+    ]);
+    setProducts(Array.isArray(productRes.data) ? productRes.data : []);
+    setLeads(Array.isArray(leadRes.data) ? leadRes.data.filter((lead) => lead.email) : []);
+    setCustomers(Array.isArray(customerRes.data) ? customerRes.data.filter((customer) => customer.email) : []);
+  }, []);
+
+  useEffect(() => { loadCampaignResources(); }, [loadCampaignResources]);
+
   useEffect(() => {
     // Light polling so sending/queued campaigns show progress.
     const t = setInterval(() => {
@@ -77,7 +113,9 @@ export default function CampaignsPage() {
   const runPreview = useCallback(async () => {
     setPreviewLoading(true);
     try {
-      const res = await api.post('/campaigns/preview', { filters: toFiltersPayload(filters) });
+      const res = await api.post('/campaigns/preview', {
+        filters: toFiltersPayload(filters, selectedLeadIds, selectedCustomerIds, form.product_id),
+      });
       setPreview(res.data);
     } catch (err) {
       const detail = err?.response?.data?.detail;
@@ -85,7 +123,50 @@ export default function CampaignsPage() {
     } finally {
       setPreviewLoading(false);
     }
-  }, [filters]);
+  }, [filters, form.product_id, selectedCustomerIds, selectedLeadIds]);
+
+  const toggleLead = (id) => {
+    setSelectedLeadIds((prev) => (prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]));
+  };
+
+  const toggleCustomer = (id) => {
+    setSelectedCustomerIds((prev) => (prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]));
+  };
+
+  const aiGenerationReady = Boolean(
+    form.product_id
+    && aiDetails.campaign_goal.trim()
+    && aiDetails.audience_description.trim()
+    && aiDetails.tone.trim()
+    && aiDetails.call_to_action.trim(),
+  );
+
+  const generateCampaignCopy = async () => {
+    if (!aiGenerationReady) {
+      setNotice('Select a product and complete the required AI campaign details first.');
+      return;
+    }
+    setGeneratingCopy(true);
+    setNotice('');
+    try {
+      const res = await api.post('/campaigns/generate', {
+        product_id: form.product_id,
+        ...aiDetails,
+      });
+      setForm((prev) => ({
+        ...prev,
+        subject: res.data?.subject || prev.subject,
+        body: res.data?.body || prev.body,
+        html_body: res.data?.html_body || prev.html_body,
+      }));
+      setNotice('AI campaign copy generated. You can edit it before sending.');
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      setNotice(detail || 'Failed to generate campaign copy');
+    } finally {
+      setGeneratingCopy(false);
+    }
+  };
 
   const submit = async (e) => {
     e?.preventDefault?.();
@@ -101,13 +182,16 @@ export default function CampaignsPage() {
         subject: form.subject,
         body: form.body,
         html_body: form.html_body,
-        filters: toFiltersPayload(filters),
+        filters: toFiltersPayload(filters, selectedLeadIds, selectedCustomerIds, form.product_id),
         send_now: sendNow,
       };
       await api.post('/campaigns', payload);
       setShowForm(false);
-      setForm({ name: '', subject: '', body: '', html_body: '' });
+      setForm({ name: '', subject: '', body: '', html_body: '', product_id: '' });
       setFilters(DEFAULT_FILTERS);
+      setSelectedLeadIds([]);
+      setSelectedCustomerIds([]);
+      setAiDetails(EMPTY_AI_DETAILS);
       setPreview(null);
       setNotice('Campaign created' + (sendNow ? ' and queued for delivery.' : '.'));
       loadCampaigns();
@@ -211,7 +295,7 @@ export default function CampaignsPage() {
           ) : campaigns.length === 0 ? (
             <div className="px-4 py-14 text-center">
               <Mail size={28} className="mx-auto text-slate-300 mb-2" />
-              <p className="text-sm text-slate-500">No campaigns yet.</p>
+              <p className="text-sm text-slate-500">No campaign is currently running.</p>
               <p className="text-xs text-slate-400 mt-1">Click <span className="font-medium">New campaign</span> to compose your first email blast.</p>
             </div>
           ) : (
@@ -296,6 +380,115 @@ export default function CampaignsPage() {
                 </Field>
               </div>
 
+              <div className="rounded-xl border border-sky-100 bg-sky-50/50 p-4 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-700 flex items-center gap-2">
+                      <Package size={14} className="text-sky-600" /> Product and AI copy
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      Pick a product, then either write manually below or generate copy from campaign details.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={loadCampaignResources}
+                    className="text-[11px] px-2 py-1 rounded-lg border border-sky-200 bg-white text-sky-700 hover:bg-sky-50"
+                  >
+                    Refresh data
+                  </button>
+                </div>
+                <Field label="Product from database">
+                  <select
+                    value={form.product_id}
+                    onChange={(e) => setForm({ ...form, product_id: e.target.value })}
+                    className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                    data-testid="campaign-product"
+                  >
+                    <option value="">Select a product</option>
+                    {products.map((product) => (
+                      <option key={product.id} value={product.id}>
+                        {product.name || product.product_title || 'Untitled product'}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <Field label="Campaign goal *">
+                    <input
+                      value={aiDetails.campaign_goal}
+                      onChange={(e) => setAiDetails({ ...aiDetails, campaign_goal: e.target.value })}
+                      placeholder="Reactivate inactive customers"
+                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                      data-testid="ai-campaign-goal"
+                    />
+                  </Field>
+                  <Field label="Audience description *">
+                    <input
+                      value={aiDetails.audience_description}
+                      onChange={(e) => setAiDetails({ ...aiDetails, audience_description: e.target.value })}
+                      placeholder="Warm leads interested in support automation"
+                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                      data-testid="ai-audience-description"
+                    />
+                  </Field>
+                  <Field label="Tone *">
+                    <select
+                      value={aiDetails.tone}
+                      onChange={(e) => setAiDetails({ ...aiDetails, tone: e.target.value })}
+                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                      data-testid="ai-tone"
+                    >
+                      <option value="friendly">Friendly</option>
+                      <option value="professional">Professional</option>
+                      <option value="urgent">Urgent</option>
+                      <option value="premium">Premium</option>
+                    </select>
+                  </Field>
+                  <Field label="Call to action *">
+                    <input
+                      value={aiDetails.call_to_action}
+                      onChange={(e) => setAiDetails({ ...aiDetails, call_to_action: e.target.value })}
+                      placeholder="Book a demo this week"
+                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                      data-testid="ai-call-to-action"
+                    />
+                  </Field>
+                  <Field label="Offer details (optional)">
+                    <input
+                      value={aiDetails.offer_details}
+                      onChange={(e) => setAiDetails({ ...aiDetails, offer_details: e.target.value })}
+                      placeholder="Free migration assessment"
+                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                    />
+                  </Field>
+                  <Field label="Extra context (optional)">
+                    <input
+                      value={aiDetails.extra_context}
+                      onChange={(e) => setAiDetails({ ...aiDetails, extra_context: e.target.value })}
+                      placeholder="Mention quick setup and real-time inbox replies"
+                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
+                    />
+                  </Field>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[11px] text-slate-500">
+                    Generate unlocks after product, goal, audience, tone, and CTA are filled.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={generateCampaignCopy}
+                    disabled={!aiGenerationReady || generatingCopy}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-sky-600 text-white text-xs font-medium hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    data-testid="campaign-generate-ai"
+                  >
+                    <Wand2 size={13} /> {generatingCopy ? 'Generating...' : 'Generate with AI'}
+                  </button>
+                </div>
+              </div>
+
               <Field label="Plain-text body *">
                 <textarea
                   value={form.body}
@@ -376,6 +569,27 @@ export default function CampaignsPage() {
                   </Field>
                 </div>
 
+                <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-3">
+                  <RecipientPicker
+                    title="Select leads"
+                    icon={<Users size={13} className="text-blue-500" />}
+                    items={leads}
+                    selectedIds={selectedLeadIds}
+                    onToggle={toggleLead}
+                    emptyText="No email-ready leads found."
+                    testIdPrefix="lead-recipient"
+                  />
+                  <RecipientPicker
+                    title="Select customers"
+                    icon={<Users size={13} className="text-emerald-500" />}
+                    items={customers}
+                    selectedIds={selectedCustomerIds}
+                    onToggle={toggleCustomer}
+                    emptyText="No email-ready customers found."
+                    testIdPrefix="customer-recipient"
+                  />
+                </div>
+
                 <div className="mt-3 flex items-center justify-between">
                   <button
                     type="button"
@@ -406,8 +620,8 @@ export default function CampaignsPage() {
                 Start sending immediately after save
               </label>
 
-              {notice && !showForm && (
-                <div className="text-xs text-red-500">{notice}</div>
+              {notice && (
+                <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">{notice}</div>
               )}
 
               <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
@@ -446,6 +660,48 @@ function Field({ label, children }) {
       <span className="block mb-1 font-medium">{label}</span>
       {children}
     </label>
+  );
+}
+
+function RecipientPicker({ title, icon, items, selectedIds, onToggle, emptyText, testIdPrefix }) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-3">
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
+          {icon} {title}
+        </p>
+        <span className="text-[10px] text-slate-400">{selectedIds.length} selected</span>
+      </div>
+      {items.length === 0 ? (
+        <p className="text-xs text-slate-400 py-2">{emptyText}</p>
+      ) : (
+        <div className="max-h-40 overflow-y-auto space-y-1 pr-1">
+          {items.slice(0, 80).map((item) => {
+            const selected = selectedIds.includes(item.id);
+            return (
+              <label
+                key={item.id}
+                className={`flex items-start gap-2 rounded-md px-2 py-1.5 text-xs cursor-pointer border ${
+                  selected ? 'bg-blue-50 border-blue-100 text-blue-800' : 'bg-slate-50/80 border-transparent text-slate-600 hover:bg-slate-100'
+                }`}
+                data-testid={`${testIdPrefix}-${item.id}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected}
+                  onChange={() => onToggle(item.id)}
+                  className="mt-0.5"
+                />
+                <span className="min-w-0">
+                  <span className="block font-medium truncate">{item.name || item.email}</span>
+                  <span className="block text-[10px] opacity-70 truncate">{item.email}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 

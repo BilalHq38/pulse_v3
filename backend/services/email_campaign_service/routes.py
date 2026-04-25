@@ -26,6 +26,7 @@ from services.db_helpers import (
 )
 from services.email_campaign_service.service import (
     create_campaign,
+    generate_campaign_copy,
     resolve_recipients,
     schedule_campaign_send,
 )
@@ -120,6 +121,34 @@ async def create_campaign_route(request: Request):
         campaign["status"] = "queued"
 
     return campaign
+
+
+@router.post("/campaigns/generate")
+async def generate_campaign_route(request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    payload = await request.json()
+    try:
+        return await generate_campaign_copy(
+            db,
+            company_id=cid,
+            product_id=str(payload.get("product_id") or "").strip(),
+            campaign_goal=str(payload.get("campaign_goal") or "").strip(),
+            audience_description=str(payload.get("audience_description") or "").strip(),
+            tone=str(payload.get("tone") or "").strip(),
+            call_to_action=str(payload.get("call_to_action") or "").strip(),
+            offer_details=str(payload.get("offer_details") or "").strip(),
+            extra_context=str(payload.get("extra_context") or "").strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Campaign copy generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate campaign copy")
 
 
 @router.get("/campaigns/{campaign_id}")

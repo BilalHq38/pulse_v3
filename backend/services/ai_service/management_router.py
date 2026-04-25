@@ -80,6 +80,16 @@ def _filter_update_fields(body: dict, allowed: set[str]) -> dict:
     return {k: v for k, v in body.items() if k in allowed}
 
 
+async def _enable_company_ai_if_agent_active(db, company_id: str, should_enable: bool) -> None:
+    if not should_enable or not str(company_id or "").strip():
+        return
+    settings = await ensure_company_settings_row(db, company_id)
+    await db.execute(
+        "UPDATE company_settings SET ai_enabled=TRUE,updated_at=NOW() WHERE id=$1",
+        settings["id"],
+    )
+
+
 def _is_super_admin(current_user: dict) -> bool:
     return (current_user.get("role") or "").strip().lower() == "super_admin"
 
@@ -378,6 +388,7 @@ async def create_ai_agent(request: Request):
         body.get("version", "current"),
         bool(body.get("is_active", True)),
     )
+    await _enable_company_ai_if_agent_active(db, cid, bool(body.get("is_active", True)))
     cfg = body.get("configuration", {})
     if cfg:
         await db.executemany(
@@ -423,6 +434,7 @@ async def update_ai_agent(agent_id: str, request: Request):
             *body.values(),
             cid,
         )
+        await _enable_company_ai_if_agent_active(db, cid, bool(body.get("is_active", False)))
     if cfg is not None:
         await db.execute("DELETE FROM ai_agent_config WHERE agent_id=$1", agent_id)
         if cfg:

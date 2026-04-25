@@ -15,10 +15,14 @@ Design goals:
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from core.utils import make_id
+from services.ai_service.llm_client import call_model_json, get_active_llm_engine
 from services.email_service import send_email_async
 from shared.database import create_detached_task
 
@@ -28,6 +32,12 @@ logger = logging.getLogger(__name__)
 # with the rest of the API. Override via CAMPAIGN_SEND_CONCURRENCY env if needed.
 DEFAULT_BATCH_CONCURRENCY = 10
 RECIPIENT_HARD_CAP = 50_000
+
+
+class CampaignCopyDraft(BaseModel):
+    subject: str = Field(min_length=1, max_length=220)
+    body: str = Field(min_length=1, max_length=6000)
+    html_body: str = Field(default="", max_length=12000)
 
 
 # --------------------------------------------------------------------------- #
@@ -43,6 +53,13 @@ def _coerce_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(v).strip() for v in value if str(v).strip()]
     return []
+
+
+def _body_to_html(body: str) -> str:
+    paragraphs = [segment.strip() for segment in str(body or "").split("\n\n") if segment.strip()]
+    if not paragraphs:
+        return ""
+    return "".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
 
 
 async def resolve_recipients(
@@ -70,96 +87,272 @@ async def resolve_recipients(
     tags = [t.lower() for t in _coerce_list(filters.get("tags"))]
     sources = _coerce_list(filters.get("source"))
     channels = _coerce_list(filters.get("channel"))
+    customer_ids = _coerce_list(filters.get("customer_ids") or filters.get("selected_customer_ids"))
+    lead_ids = _coerce_list(filters.get("lead_ids") or filters.get("selected_lead_ids"))
     audience = str(filters.get("audience") or "both").lower()
     if audience not in {"customers", "leads", "both"}:
         audience = "both"
+    has_explicit_selection = bool(customer_ids or lead_ids)
+    has_filter_selection = bool(lifecycle or tags or sources or channels)
+    include_filter_matches = has_filter_selection or not has_explicit_selection
 
     rows: dict[str, dict] = {}
 
     # ---- customers side --------------------------------------------------- #
     if audience in {"customers", "both"}:
-        sql = (
-            "SELECT DISTINCT c.id, c.name, c.email FROM customers c "
-            "LEFT JOIN customer_tags ct ON ct.customer_id = c.id "
-            "LEFT JOIN customer_channels cc ON cc.customer_id = c.id "
-            "WHERE c.company_id=$1 AND c.email <> ''"
-        )
-        args: list = [company_id]
-        if lifecycle:
-            args.append(lifecycle)
-            sql += f" AND c.lifecycle_stage = ANY(${len(args)}::text[])"
-        if tags:
-            args.append(tags)
-            sql += f" AND LOWER(ct.tag) = ANY(${len(args)}::text[])"
-        if channels:
-            args.append(channels)
-            sql += f" AND cc.channel = ANY(${len(args)}::text[])"
-        args.append(int(limit))
-        sql += f" ORDER BY c.id LIMIT ${len(args)}"
-        try:
-            records = await db.fetch(sql, *args)
-        except Exception as exc:
-            logger.warning("Customer recipient query failed: %s", exc)
-            records = []
-        for rec in records:
-            email = str(rec.get("email") or "").strip().lower()
-            if not email or "@" not in email:
-                continue
-            rows.setdefault(
-                email,
-                {
-                    "email": email,
-                    "name": str(rec.get("name") or "").strip(),
-                    "customer_id": str(rec.get("id") or ""),
-                    "lead_id": "",
-                },
+        if customer_ids:
+            try:
+                selected_customers = await db.fetch(
+                    "SELECT id,name,email FROM customers "
+                    "WHERE company_id=$1 AND id = ANY($2::text[]) AND email <> '' "
+                    "ORDER BY created_at DESC LIMIT $3",
+                    company_id,
+                    customer_ids,
+                    int(limit),
+                )
+            except Exception as exc:
+                logger.warning("Selected customer recipient query failed: %s", exc)
+                selected_customers = []
+            for rec in selected_customers:
+                email = str(rec.get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                rows.setdefault(
+                    email,
+                    {
+                        "email": email,
+                        "name": str(rec.get("name") or "").strip(),
+                        "customer_id": str(rec.get("id") or ""),
+                        "lead_id": "",
+                    },
+                )
+        if include_filter_matches:
+            sql = (
+                "SELECT DISTINCT c.id, c.name, c.email FROM customers c "
+                "LEFT JOIN customer_tags ct ON ct.customer_id = c.id "
+                "LEFT JOIN customer_channels cc ON cc.customer_id = c.id "
+                "WHERE c.company_id=$1 AND c.email <> ''"
             )
+            args: list = [company_id]
+            if lifecycle:
+                args.append(lifecycle)
+                sql += f" AND c.lifecycle_stage = ANY(${len(args)}::text[])"
+            if tags:
+                args.append(tags)
+                sql += f" AND LOWER(ct.tag) = ANY(${len(args)}::text[])"
+            if channels:
+                args.append(channels)
+                sql += f" AND cc.channel = ANY(${len(args)}::text[])"
+            args.append(int(limit))
+            sql += f" ORDER BY c.id LIMIT ${len(args)}"
+            try:
+                records = await db.fetch(sql, *args)
+            except Exception as exc:
+                logger.warning("Customer recipient query failed: %s", exc)
+                records = []
+            for rec in records:
+                email = str(rec.get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                rows.setdefault(
+                    email,
+                    {
+                        "email": email,
+                        "name": str(rec.get("name") or "").strip(),
+                        "customer_id": str(rec.get("id") or ""),
+                        "lead_id": "",
+                    },
+                )
 
     # ---- leads side ------------------------------------------------------- #
     if audience in {"leads", "both"}:
-        sql = (
-            "SELECT DISTINCT l.id, l.name, l.email FROM leads l "
-            "LEFT JOIN lead_tags lt ON lt.lead_id = l.id "
-            "LEFT JOIN lead_channels lc ON lc.lead_id = l.id "
-            "WHERE l.company_id=$1 AND l.email <> ''"
-        )
-        args = [company_id]
-        if sources:
-            args.append(sources)
-            sql += f" AND l.source = ANY(${len(args)}::text[])"
-        if tags:
-            args.append(tags)
-            sql += f" AND LOWER(lt.tag) = ANY(${len(args)}::text[])"
-        if channels:
-            args.append(channels)
-            sql += f" AND lc.channel = ANY(${len(args)}::text[])"
-        args.append(int(limit))
-        sql += f" ORDER BY l.id LIMIT ${len(args)}"
-        try:
-            records = await db.fetch(sql, *args)
-        except Exception as exc:
-            logger.warning("Lead recipient query failed: %s", exc)
-            records = []
-        for rec in records:
-            email = str(rec.get("email") or "").strip().lower()
-            if not email or "@" not in email:
-                continue
-            existing = rows.get(email)
-            if existing:
-                if not existing.get("lead_id"):
-                    existing["lead_id"] = str(rec.get("id") or "")
-                if not existing.get("name"):
-                    existing["name"] = str(rec.get("name") or "").strip()
-            else:
-                rows[email] = {
-                    "email": email,
-                    "name": str(rec.get("name") or "").strip(),
-                    "customer_id": "",
-                    "lead_id": str(rec.get("id") or ""),
-                }
+        if lead_ids:
+            try:
+                selected_leads = await db.fetch(
+                    "SELECT id,name,email FROM leads "
+                    "WHERE company_id=$1 AND id = ANY($2::text[]) AND email <> '' "
+                    "ORDER BY created_at DESC LIMIT $3",
+                    company_id,
+                    lead_ids,
+                    int(limit),
+                )
+            except Exception as exc:
+                logger.warning("Selected lead recipient query failed: %s", exc)
+                selected_leads = []
+            for rec in selected_leads:
+                email = str(rec.get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                existing = rows.get(email)
+                if existing:
+                    if not existing.get("lead_id"):
+                        existing["lead_id"] = str(rec.get("id") or "")
+                    if not existing.get("name"):
+                        existing["name"] = str(rec.get("name") or "").strip()
+                else:
+                    rows[email] = {
+                        "email": email,
+                        "name": str(rec.get("name") or "").strip(),
+                        "customer_id": "",
+                        "lead_id": str(rec.get("id") or ""),
+                    }
+        if include_filter_matches:
+            sql = (
+                "SELECT DISTINCT l.id, l.name, l.email FROM leads l "
+                "LEFT JOIN lead_tags lt ON lt.lead_id = l.id "
+                "LEFT JOIN lead_channels lc ON lc.lead_id = l.id "
+                "WHERE l.company_id=$1 AND l.email <> ''"
+            )
+            args = [company_id]
+            if sources:
+                args.append(sources)
+                sql += f" AND l.source = ANY(${len(args)}::text[])"
+            if tags:
+                args.append(tags)
+                sql += f" AND LOWER(lt.tag) = ANY(${len(args)}::text[])"
+            if channels:
+                args.append(channels)
+                sql += f" AND lc.channel = ANY(${len(args)}::text[])"
+            args.append(int(limit))
+            sql += f" ORDER BY l.id LIMIT ${len(args)}"
+            try:
+                records = await db.fetch(sql, *args)
+            except Exception as exc:
+                logger.warning("Lead recipient query failed: %s", exc)
+                records = []
+            for rec in records:
+                email = str(rec.get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                existing = rows.get(email)
+                if existing:
+                    if not existing.get("lead_id"):
+                        existing["lead_id"] = str(rec.get("id") or "")
+                    if not existing.get("name"):
+                        existing["name"] = str(rec.get("name") or "").strip()
+                else:
+                    rows[email] = {
+                        "email": email,
+                        "name": str(rec.get("name") or "").strip(),
+                        "customer_id": "",
+                        "lead_id": str(rec.get("id") or ""),
+                    }
 
     resolved = list(rows.values())[:limit]
     return resolved
+
+
+async def _load_campaign_product(db, *, company_id: str, product_id: str) -> dict | None:
+    product_id = str(product_id or "").strip()
+    if not product_id:
+        return None
+    product = await db.fetchrow(
+        "SELECT * FROM company_products WHERE id=$1 AND company_id=$2 LIMIT 1",
+        product_id,
+        company_id,
+    )
+    if not product:
+        return None
+    result = dict(product)
+    result["features"] = [
+        str(row["feature"])
+        for row in await db.fetch(
+            "SELECT feature FROM product_features WHERE product_id=$1 ORDER BY sort_order",
+            product_id,
+        )
+        if row.get("feature")
+    ]
+    result["images"] = [
+        str(row["image_url"])
+        for row in await db.fetch(
+            "SELECT image_url FROM product_images WHERE product_id=$1 ORDER BY sort_order",
+            product_id,
+        )
+        if row.get("image_url")
+    ]
+    return result
+
+
+async def generate_campaign_copy(
+    db,
+    *,
+    company_id: str,
+    product_id: str,
+    campaign_goal: str,
+    audience_description: str,
+    tone: str,
+    call_to_action: str,
+    offer_details: str = "",
+    extra_context: str = "",
+) -> dict:
+    if not company_id:
+        raise ValueError("company_id is required")
+
+    product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
+    if not product:
+        raise ValueError("Selected product was not found")
+
+    required_fields = {
+        "campaign_goal": campaign_goal,
+        "audience_description": audience_description,
+        "tone": tone,
+        "call_to_action": call_to_action,
+    }
+    missing = [label.replace("_", " ") for label, value in required_fields.items() if not str(value or "").strip()]
+    if missing:
+        raise ValueError(f"Missing campaign details: {', '.join(missing)}")
+
+    feature_lines = "\n".join(f"- {feature}" for feature in product.get("features") or []) or "- No structured features stored"
+    image_lines = "\n".join(f"- {image}" for image in product.get("images") or []) or "- No product images stored"
+    prompt = (
+        "You are creating outbound CRM email campaign copy.\n"
+        "Return JSON with keys: subject, body, html_body.\n"
+        "Constraints:\n"
+        "- subject: 4-10 words, specific, non-spammy.\n"
+        "- body: 3 short paragraphs, plain text, warm but concise, with one clear CTA.\n"
+        "- html_body: clean HTML matching the body with simple <p> tags.\n"
+        "- Mention only product details provided below.\n"
+        "- Do not invent discounts, deadlines, or guarantees.\n\n"
+        f"Campaign goal: {campaign_goal.strip()}\n"
+        f"Audience: {audience_description.strip()}\n"
+        f"Tone: {tone.strip()}\n"
+        f"Call to action: {call_to_action.strip()}\n"
+        f"Offer details: {str(offer_details or '').strip() or 'None'}\n"
+        f"Extra context: {str(extra_context or '').strip() or 'None'}\n\n"
+        f"Product name: {product.get('name') or product.get('product_title') or 'Product'}\n"
+        f"Product title/code: {product.get('product_title') or 'N/A'}\n"
+        f"Product description: {product.get('description') or 'No description provided'}\n"
+        f"Product price: {product.get('price') or 'N/A'} {product.get('price_currency') or ''}\n"
+        f"Product category: {product.get('category') or 'general'}\n"
+        f"Product type: {product.get('product_type') or 'general'}\n"
+        f"Features:\n{feature_lines}\n"
+        f"Images:\n{image_lines}\n"
+    )
+
+    try:
+        engine = await get_active_llm_engine(db, company_id)
+        generated = CampaignCopyDraft.model_validate(
+            await call_model_json(prompt, CampaignCopyDraft, engine=engine)
+        ).model_dump()
+        if not generated.get("html_body"):
+            generated["html_body"] = _body_to_html(generated.get("body", ""))
+        return generated
+    except Exception as exc:
+        logger.warning("Campaign copy generation fell back to template mode: %s", exc)
+        product_name = str(product.get("name") or product.get("product_title") or "our product").strip()
+        subject = f"{product_name}: {campaign_goal.strip()}"[:220]
+        body = (
+            f"Hi there,\n\n"
+            f"We're reaching out about {product_name}. {str(product.get('description') or '').strip()}\n\n"
+            f"This campaign is focused on {campaign_goal.strip()} for {audience_description.strip()}. "
+            f"{str(offer_details or '').strip()}\n\n"
+            f"{call_to_action.strip()}"
+        ).strip()
+        return {
+            "subject": subject,
+            "body": body,
+            "html_body": _body_to_html(body),
+        }
 
 
 # --------------------------------------------------------------------------- #

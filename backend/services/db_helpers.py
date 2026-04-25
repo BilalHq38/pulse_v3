@@ -244,6 +244,8 @@ async def ensure_unique_company_role(db, current_user: dict, role: str, exclude_
 
 async def ensure_auth_security_primitives(db) -> None:
     global _auth_security_ready
+    # Older DBs predate this column; runs before the early return so it applies on every call (cheap if present).
+    await db.execute("ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS link_user_id TEXT")
     if _auth_security_ready:
         return
     async with _auth_security_lock:
@@ -758,9 +760,79 @@ async def resolve_active_llm_engine(db, company_id: str = "") -> dict:
     return enrich_llm_engine(default_engine, selected_id=selected_id)
 
 
+def _preferred_agent_types(intent_name: str = "", channel: str = "") -> list[str]:
+    intent = str(intent_name or "").strip().lower()
+    channel_key = str(channel or "").strip().lower()
+    if intent in {
+        "product_recommendation",
+        "purchase_inquiry",
+        "pricing",
+        "quote_request",
+        "availability_check",
+        "sales",
+    }:
+        return ["sales", "generic", "support"]
+    if intent in {
+        "onboarding",
+        "setup_help",
+        "implementation",
+        "activation",
+    }:
+        return ["onboarding", "support", "generic"]
+    if intent in {
+        "complaint",
+        "refund",
+        "cancel_request",
+        "billing_issue",
+        "technical_support",
+        "support",
+    }:
+        return ["support", "generic", "sales"]
+    if channel_key == "email":
+        return ["support", "sales", "generic"]
+    return ["generic", "support", "sales", "onboarding"]
+
+
+async def resolve_active_ai_agent(
+    db,
+    company_id: str = "",
+    *,
+    intent_name: str = "",
+    channel: str = "",
+) -> Optional[dict]:
+    scoped_company_id = str(company_id or "").strip()
+    if not (db and scoped_company_id):
+        return None
+
+    rows = await db.fetch(
+        "SELECT * FROM ai_agents WHERE company_id=$1 AND is_active=TRUE "
+        "ORDER BY registered_at DESC, created_at DESC",
+        scoped_company_id,
+    )
+    agents = [dict(row) for row in rows]
+    if not agents:
+        return None
+
+    preferred_types = _preferred_agent_types(intent_name=intent_name, channel=channel)
+    for agent_type in preferred_types:
+        for agent in agents:
+            if str(agent.get("agent_type") or "").strip().lower() == agent_type:
+                return agent
+    return agents[0]
+
+
 async def is_company_ai_enabled(db, company_id: str = "") -> bool:
     settings = await ensure_company_settings_row(db, company_id or "")
-    return bool(settings.get("ai_enabled", True))
+    if bool(settings.get("ai_enabled", True)):
+        return True
+    active_agent = await resolve_active_ai_agent(db, company_id or "")
+    if active_agent:
+        await db.execute(
+            "UPDATE company_settings SET ai_enabled=TRUE,updated_at=NOW() WHERE id=$1",
+            settings["id"],
+        )
+        return True
+    return False
 
 
 async def persist_ai_session_record(
@@ -784,10 +856,23 @@ async def persist_ai_session_record(
         )
     if not llm:
         llm = await resolve_active_llm_engine(db, company_id)
-    ag = await db.fetchrow(
-        "SELECT id FROM ai_agents WHERE company_id=$1 AND is_active=TRUE LIMIT 1",
-        company_id,
-    )
+    agent_id = str(meta.get("agent_id", "") or "").strip()
+    ag = None
+    if agent_id:
+        ag = await db.fetchrow(
+            "SELECT id FROM ai_agents WHERE id=$1 AND company_id=$2 AND is_active=TRUE LIMIT 1",
+            agent_id,
+            company_id,
+        )
+    if not ag:
+        agent = await resolve_active_ai_agent(
+            db,
+            company_id,
+            intent_name=str(meta.get("intent_name") or ""),
+            channel=str(meta.get("channel") or ""),
+        )
+        if agent:
+            ag = {"id": agent.get("id", "")}
     await db.execute(
         "INSERT INTO ai_sessions(id,company_id,convo_id,llm_id,agent_id,prompt,response,confidence,source,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())",  # noqa: E501
         make_id(),

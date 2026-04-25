@@ -9,7 +9,7 @@ import {
   LayoutDashboard, MessageSquare, Users, Target, BarChart3,
   Ticket, BookOpen, Settings, LogOut, X, Bell, Search, Package,
   Link2, Mail,
-  ChevronDown, UserCircle, Filter, Save, Check, Plus
+  ChevronDown, UserCircle, Filter, Save, Check, Plus, Menu
 } from 'lucide-react';
 
 const navItems = [
@@ -384,6 +384,16 @@ export default function Layout({ children }) {
       <div className="flex-1 flex flex-col min-w-0">
         <header className="h-14 flex items-center justify-between px-3 sm:px-5 border-b border-slate-100/80 pe-glass z-10 pe-elevated">
           <div className="flex items-center gap-2 sm:gap-3">
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+              className="lg:hidden inline-flex items-center justify-center w-9 h-9 rounded-xl border border-slate-200 bg-white text-slate-600 shadow-sm hover:bg-blue-50 hover:text-blue-600 transition-colors"
+              aria-label="Open navigation sidebar"
+              aria-controls="mobile-sidebar"
+              aria-expanded={sidebarOpen}
+            >
+              <Menu size={18} />
+            </button>
             <div className="relative hidden sm:flex items-center">
               <div className="relative flex items-center bg-white border border-slate-200 rounded-xl px-3 py-2 w-56 md:w-[26rem] shadow-sm">
                 <input

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import secrets
 from typing import Optional
 
 import httpx
@@ -16,12 +17,18 @@ router = APIRouter()
 
 # Default channel rows for every company (used to fill gaps for legacy tenants).
 _CHANNEL_DEFAULT_ROWS = (
-    ("whatsapp", False, "WhatsApp Business"),
+    ("whatsapp", False, "WhatsApp"),
     ("instagram", False, "Instagram"),
     ("facebook", False, "Facebook Messenger"),
     ("email", False, "Email"),
     ("web_chat", True, "Web Chat Widget"),
 )
+_META_VERIFY_CHANNELS = ("whatsapp", "instagram", "facebook")
+_CHANNEL_DISPLAY_NAMES = {
+    "whatsapp": "WhatsApp",
+    "instagram": "Instagram",
+    "facebook": "Facebook Messenger",
+}
 
 
 async def _ensure_default_channel_rows(db, company_id: str) -> None:
@@ -39,6 +46,51 @@ async def _ensure_default_channel_rows(db, company_id: str) -> None:
             display,
             enabled,
         )
+
+
+async def _ensure_meta_verify_tokens(db, company_id: str) -> str:
+    """Guarantee a stable verify token across Meta-backed channels."""
+    company_id = (company_id or "").strip()
+    if not company_id:
+        return ""
+
+    await _ensure_default_channel_rows(db, company_id)
+    rows = rs(
+        await db.fetch(
+            "SELECT id,channel,display_name,verify_token FROM channel_settings "
+            "WHERE company_id=$1 AND channel = ANY($2::text[])",
+            company_id,
+            list(_META_VERIFY_CHANNELS),
+        )
+    )
+    token = next(
+        (
+            str(row.get("verify_token") or "").strip()
+            for row in rows
+            if str(row.get("verify_token") or "").strip()
+        ),
+        "",
+    )
+    if not token:
+        token = f"pe-{secrets.token_urlsafe(18)}"
+
+    for row in rows:
+        updates: dict[str, str] = {}
+        channel_key = str(row.get("channel") or "").strip().lower()
+        expected_name = _CHANNEL_DISPLAY_NAMES.get(channel_key, "")
+        if expected_name and str(row.get("display_name") or "").strip() != expected_name:
+            updates["display_name"] = expected_name
+        if not str(row.get("verify_token") or "").strip():
+            updates["verify_token"] = token
+        if updates:
+            updates["updated_at"] = now_ts()
+            set_parts, values = _build_set(updates)
+            await db.execute(
+                f"UPDATE channel_settings SET {set_parts} WHERE id=$1",
+                row["id"],
+                *values,
+            )
+    return token
 
 
 def _db(req: Request):
@@ -480,6 +532,7 @@ async def get_channel_settings(request: Request):
     cid = cu.get("company_id", "")
 
     await _ensure_default_channel_rows(db, cid)
+    meta_verify_token = await _ensure_meta_verify_tokens(db, cid)
     rows = rs(await db.fetch("SELECT * FROM channel_settings WHERE company_id=$1", cid))
 
     normalized: list[dict] = []
@@ -489,6 +542,10 @@ async def get_channel_settings(request: Request):
         if ch == "twitter":
             continue
         d["channel"] = ch
+        if ch in _CHANNEL_DISPLAY_NAMES:
+            d["display_name"] = _CHANNEL_DISPLAY_NAMES[ch]
+        if ch in _META_VERIFY_CHANNELS and not str(d.get("verify_token") or "").strip():
+            d["verify_token"] = meta_verify_token
         normalized.append(d)
     return normalized
 
@@ -571,6 +628,14 @@ async def update_channel_settings(channel: str, body: ChannelSettingsUpdate, req
         raise HTTPException(400, "Channel is required")
 
     payload: dict = body.model_dump(exclude_none=True)
+    if channel_key in _META_VERIFY_CHANNELS:
+        payload["display_name"] = _CHANNEL_DISPLAY_NAMES.get(
+            channel_key,
+            str(payload.get("display_name") or "").strip(),
+        )
+        verify_token = str(payload.get("verify_token") or "").strip()
+        if not verify_token:
+            payload["verify_token"] = await _ensure_meta_verify_tokens(db, cid)
     payload["updated_at"] = now_ts()
 
     safe = _safe_fields(payload, ALLOWED_CHANNEL_FIELDS)

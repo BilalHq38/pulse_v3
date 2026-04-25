@@ -343,6 +343,9 @@ async def upsert_subscription(
     await ensure_subscriptions_limit_columns(db)
     plan = get_plan(plan_code)
     normalized_stripe_subscription_id = (stripe_subscription_id or "").strip() or None
+    # DB column is NOT NULL; non-Stripe (demo / local trial) uses an internal id.
+    if not normalized_stripe_subscription_id:
+        normalized_stripe_subscription_id = f"sub_local_{company_id.replace('-', '')[:16]}"
     existing = await db.fetchval(
         "SELECT id FROM subscriptions WHERE company_id=$1 LIMIT 1",
         company_id,

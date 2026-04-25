@@ -44,15 +44,60 @@ import {
 } from 'lucide-react';
 
 const CHANNEL_CONFIG = {
-  whatsapp: { label: 'WhatsApp Web', color: 'emerald', fields: [], bgClass: 'bg-emerald-50', textClass: 'text-emerald-500' },
+  whatsapp: { label: 'WhatsApp', color: 'emerald', fields: [], bgClass: 'bg-emerald-50', textClass: 'text-emerald-500' },
   instagram: { label: 'Instagram', color: 'pink', fields: ['page_id', 'access_token'], bgClass: 'bg-pink-50', textClass: 'text-pink-500' },
   facebook: { label: 'Facebook Messenger', color: 'blue', fields: ['page_id', 'access_token'], bgClass: 'bg-blue-50', textClass: 'text-blue-500' },
   email: { label: 'Email', color: 'sky', fields: ['email_address', 'email_provider', 'imap_host', 'smtp_host'], bgClass: 'bg-sky-50', textClass: 'text-sky-500' },
   web_chat: { label: 'Web Chat Widget', color: 'violet', fields: [], bgClass: 'bg-violet-50', textClass: 'text-violet-500' },
 };
+const META_CHANNELS = ['whatsapp', 'instagram', 'facebook'];
 
 /** Order shown in Settings → Channels; fills gaps if API omits a row (e.g. legacy DB). */
 const CHANNEL_LIST_ORDER = ['whatsapp', 'instagram', 'facebook', 'email', 'web_chat'];
+const MCP_PRESETS = [
+  {
+    id: 'claude-desktop',
+    name: 'Claude Desktop',
+    description: 'Local desktop bridge with a ready-to-use localhost endpoint and desktop-friendly defaults.',
+    endpoint: 'http://127.0.0.1:8811/mcp',
+    region: 'desktop-local',
+    status: 'active',
+    capabilities: {
+      platform: 'Claude Desktop',
+      transport: 'Local HTTP bridge',
+      auth: 'Local session',
+      connection_details: 'Use this when your MCP bridge runs locally on port 8811.',
+    },
+  },
+  {
+    id: 'cursor-ide',
+    name: 'Cursor / Codex IDE',
+    description: 'Preset for IDE-based local MCP servers with a loopback endpoint and low-friction connection details.',
+    endpoint: 'http://127.0.0.1:8812/mcp',
+    region: 'ide-local',
+    status: 'active',
+    capabilities: {
+      platform: 'Cursor / Codex IDE',
+      transport: 'Loopback HTTP',
+      auth: 'Workspace token',
+      connection_details: 'Use this when your editor exposes an MCP bridge on port 8812.',
+    },
+  },
+  {
+    id: 'https-gateway',
+    name: 'Hosted HTTPS Gateway',
+    description: 'Cloud-friendly preset for a remote MCP endpoint behind HTTPS with secure token auth.',
+    endpoint: 'https://mcp.your-company.com/connect',
+    region: 'global',
+    status: 'active',
+    capabilities: {
+      platform: 'Hosted MCP',
+      transport: 'HTTPS',
+      auth: 'Bearer token',
+      connection_details: 'Replace the hostname with your hosted MCP gateway if you connect through a cloud platform.',
+    },
+  },
+];
 
 function normalizeChannelsResponse(raw) {
   const rows = Array.isArray(raw) ? raw : [];
@@ -63,9 +108,9 @@ function normalizeChannelsResponse(raw) {
     byKey.set(k, { ...row, channel: k });
   }
   const defaults = {
-    whatsapp: { channel: 'whatsapp', display_name: 'WhatsApp Web', enabled: false, phone_number_id: '', access_token: '', webhook_url: '', verify_token: '' },
-    instagram: { channel: 'instagram', display_name: 'Instagram', enabled: false, page_id: '', access_token: '', webhook_url: '' },
-    facebook: { channel: 'facebook', display_name: 'Facebook Messenger', enabled: false, page_id: '', access_token: '', webhook_url: '' },
+    whatsapp: { channel: 'whatsapp', display_name: 'WhatsApp', enabled: false, phone_number_id: '', access_token: '', webhook_url: '', verify_token: '' },
+    instagram: { channel: 'instagram', display_name: 'Instagram', enabled: false, page_id: '', access_token: '', webhook_url: '', verify_token: '' },
+    facebook: { channel: 'facebook', display_name: 'Facebook Messenger', enabled: false, page_id: '', access_token: '', webhook_url: '', verify_token: '' },
     email: {
       channel: 'email',
       display_name: 'Email',
@@ -235,7 +280,8 @@ export default function SettingsPage() {
   const [editingMcpId, setEditingMcpId] = useState(null);
   const [mcpDraft, setMcpDraft] = useState({});
   const [showAddMcpForm, setShowAddMcpForm] = useState(false);
-  const [addMcpForm, setAddMcpForm] = useState({ endpoint: '', region: '', status: 'active' });
+  const [addMcpForm, setAddMcpForm] = useState({ endpoint: '', region: '', status: 'active', capabilities: {} });
+  const [mcpPresetSaving, setMcpPresetSaving] = useState('');
   const [editingSocialPlatform, setEditingSocialPlatform] = useState(null);
   const [socialDraft, setSocialDraft] = useState({});
 
@@ -473,16 +519,19 @@ export default function SettingsPage() {
 
   useEffect(() => {
     if (activeTab !== 'channels') return;
-    const suggested = (webhookInfo?.webhook_urls?.whatsapp || '').trim();
-    if (!suggested) return;
     setChannels((prev) =>
       prev.map((ch) => {
-        if (ch.channel !== 'whatsapp') return ch;
-        if ((ch.webhook_url || '').trim()) return ch;
-        return { ...ch, webhook_url: suggested };
+        if (!META_CHANNELS.includes(ch.channel)) return ch;
+        const fallbackWebhook = (webhookInfo?.webhook_urls?.[ch.channel] || '').trim();
+        const fallbackVerifyToken = (webhookInfo?.verify_token || '').trim();
+        return {
+          ...ch,
+          webhook_url: (ch.webhook_url || '').trim() || fallbackWebhook,
+          verify_token: (ch.verify_token || '').trim() || fallbackVerifyToken,
+        };
       }),
     );
-  }, [activeTab, webhookInfo?.webhook_urls?.whatsapp]);
+  }, [activeTab, webhookInfo]);
 
   const loadSecurity = async () => {
     try {
@@ -536,13 +585,83 @@ export default function SettingsPage() {
     setNotifSaving(false);
   };
 
+  const getMetaChannelValidationError = (channel) => {
+    if (!channel || !META_CHANNELS.includes(channel.channel) || !channel.enabled) return '';
+    const verifyToken = (channel.verify_token || '').trim();
+    if (channel.channel === 'whatsapp') {
+      const phoneNumberId = (channel.phone_number_id || '').trim();
+      const accessToken = (channel.access_token || '').trim();
+      const usingMeta = !!(phoneNumberId || accessToken);
+      if (!usingMeta) return '';
+      const missing = [];
+      if (!phoneNumberId) missing.push('Phone number ID');
+      if (!accessToken) missing.push('Access Token');
+      if (!verifyToken) missing.push('Verify Token');
+      return missing.length ? `WhatsApp Meta API requires: ${missing.join(', ')}` : '';
+    }
+    const pageId = (channel.page_id || '').trim();
+    const accessToken = (channel.access_token || '').trim();
+    const missing = [];
+    if (!pageId) missing.push('Page ID');
+    if (!accessToken) missing.push('Access Token');
+    if (!verifyToken) missing.push('Verify Token');
+    return missing.length ? `${CHANNEL_CONFIG[channel.channel]?.label || channel.channel} requires: ${missing.join(', ')}` : '';
+  };
+
   const saveChannel = async (channel) => {
+    const validationError = getMetaChannelValidationError(channel);
+    if (validationError) {
+      alert(validationError);
+      return;
+    }
+    const fallbackVerifyToken = (webhookInfo?.verify_token || '').trim();
+    const payload = META_CHANNELS.includes(channel.channel) && !(channel.verify_token || '').trim()
+      ? { ...channel, verify_token: fallbackVerifyToken }
+      : channel;
     setSaving(channel.channel);
-    try { await api.put(`/settings/channels/${channel.channel}`, channel); setSaving(''); } catch (err) { console.error(err); setSaving(''); }
+    try {
+      const res = await api.put(`/settings/channels/${channel.channel}`, payload);
+      if (res?.data) {
+        setChannels((prev) => prev.map((item) => (item.channel === channel.channel ? { ...item, ...res.data } : item)));
+      }
+      setSaving('');
+    } catch (err) {
+      console.error(err);
+      setSaving('');
+    }
   };
 
   const updateChannelField = (channelName, field, value) => {
     setChannels(prev => prev.map(ch => ch.channel === channelName ? { ...ch, [field]: value } : ch));
+  };
+
+  const connectMcpPreset = async (preset) => {
+    if (!preset?.endpoint || !isAdmin) return;
+    setMcpPresetSaving(preset.id);
+    const payload = {
+      endpoint: preset.endpoint,
+      region: preset.region,
+      status: preset.status || 'active',
+      capabilities: preset.capabilities || {},
+    };
+    try {
+      const existing = mcpServers.find((server) => server.endpoint === preset.endpoint);
+      const res = existing
+        ? await api.put(`/mcp/servers/${existing.id}`, payload)
+        : await api.post('/mcp/servers', payload);
+      if (res?.data) {
+        const serverData = { ...res.data, capabilities: res.data.capabilities || payload.capabilities };
+        setMcpServers((prev) => {
+          const withoutExisting = prev.filter((server) => server.id !== serverData.id && server.endpoint !== preset.endpoint);
+          return [serverData, ...withoutExisting];
+        });
+      }
+      setShowAddMcpForm(false);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setMcpPresetSaving('');
+    }
   };
 
   const saveCompany = async () => {
@@ -1131,6 +1250,7 @@ export default function SettingsPage() {
                         {channel.channel === 'whatsapp' && (
                           <div className="w-full space-y-3" data-testid="whatsapp-channel-settings">
                             <div id="settings-whatsapp-meta" className="space-y-3 w-full" data-testid="whatsapp-meta-api">
+                              <p className="text-[11px] font-medium text-slate-500">Meta API</p>
                               <p className="text-xs text-slate-500">
                                 Configure in Meta Business Manager → WhatsApp → API Setup, then save (same style as other Meta channels).
                               </p>
@@ -1199,11 +1319,11 @@ export default function SettingsPage() {
                                 </div>
                               </div>
                               <div>
-                                <label className="text-xs text-slate-400 mb-1 block">Verify token</label>
+                                <label className="text-xs text-slate-400 mb-1 block">Verify Token</label>
                                 <input
                                   value={channel.verify_token || ''}
                                   onChange={(e) => updateChannelField(channel.channel, 'verify_token', e.target.value)}
-                                  placeholder="Meta webhook verify token"
+                                  placeholder="Enter Verify Token"
                                   disabled={waQrBlocksMeta}
                                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono disabled:bg-slate-100 disabled:text-slate-500"
                                 />
@@ -1225,7 +1345,7 @@ export default function SettingsPage() {
                                   type="button"
                                   onClick={expandWaWebPanel}
                                   disabled={waMetaBlocksQr}
-                                  className="inline-flex items-center gap-2 px-3 py-2 bg-slate-800 text-white rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                  className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                   <QrCode size={16} /> Connect with WhatsApp Web (QR)
                                 </button>
@@ -1264,7 +1384,7 @@ export default function SettingsPage() {
                                         fetchWaBridgeQr();
                                       }}
                                       disabled={waMetaBlocksQr}
-                                      className="px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                                      className="px-3 py-2 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 rounded-lg hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                       Refresh QR
                                     </button>
@@ -1281,7 +1401,25 @@ export default function SettingsPage() {
                             </div>
                           </div>
                         )}
-                        {(channel.channel === 'instagram' || channel.channel === 'facebook') && (<><div><label className="text-xs text-slate-400 mb-1 block">Page ID</label><input value={channel.page_id || ''} onChange={(e) => updateChannelField(channel.channel, 'page_id', e.target.value)} placeholder={`Enter ${config.label} Page ID`} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div><div><label className="text-xs text-slate-400 mb-1 block">Access Token</label><div className="relative"><input type={showKeys ? 'text' : 'password'} value={channel.access_token || ''} onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)} placeholder="Enter Access Token" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" /><button type="button" onClick={() => setShowKeyMap({...showKeyMap, [channel.channel]: !showKeys})} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></div></>)}
+                        {(channel.channel === 'instagram' || channel.channel === 'facebook') && (
+                          <>
+                            <div>
+                              <label className="text-xs text-slate-400 mb-1 block">Page ID</label>
+                              <input value={channel.page_id || ''} onChange={(e) => updateChannelField(channel.channel, 'page_id', e.target.value)} placeholder={`Enter ${config.label} Page ID`} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" />
+                            </div>
+                            <div>
+                              <label className="text-xs text-slate-400 mb-1 block">Access Token</label>
+                              <div className="relative">
+                                <input type={showKeys ? 'text' : 'password'} value={channel.access_token || ''} onChange={(e) => updateChannelField(channel.channel, 'access_token', e.target.value)} placeholder="Enter Access Token" className="w-full px-3 py-2 pr-10 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" />
+                                <button type="button" onClick={() => setShowKeyMap({...showKeyMap, [channel.channel]: !showKeys})} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">{showKeys ? <EyeOff size={14} /> : <Eye size={14} />}</button>
+                              </div>
+                            </div>
+                            <div>
+                              <label className="text-xs text-slate-400 mb-1 block">Verify Token</label>
+                              <input value={channel.verify_token || ''} onChange={(e) => updateChannelField(channel.channel, 'verify_token', e.target.value)} placeholder="Enter Verify Token" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" />
+                            </div>
+                          </>
+                        )}
                         {channel.channel === 'email' && (
                           <>
                             <div><label className="text-xs text-slate-400 mb-1 block">Email address</label><input type="email" value={channel.email_address || ''} onChange={(e) => updateChannelField(channel.channel, 'email_address', e.target.value)} placeholder="you@yourdomain.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm" /></div>
@@ -1802,7 +1940,43 @@ export default function SettingsPage() {
                       Register tool/automation endpoints here. In AI Config you can link an agent to a server; strict MCP tool routing may require <span className="font-mono">AI_PROVIDER=mcp</span> in deployment.
                     </p>
                   </div>
-                  {isAdmin && <button onClick={() => { setShowAddMcpForm(true); setAddMcpForm({ endpoint: '', region: '', status: 'active' }); }} className="flex items-center gap-1 px-2.5 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500"><Plus size={12} /> Add Server</button>}
+                  {isAdmin && <button onClick={() => { setShowAddMcpForm(true); setAddMcpForm({ endpoint: '', region: '', status: 'active', capabilities: {} }); }} className="flex items-center gap-1 px-2.5 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500"><Plus size={12} /> Add Server</button>}
+                </div>
+                <div className="mb-5 grid grid-cols-1 lg:grid-cols-3 gap-3">
+                  {MCP_PRESETS.map((preset) => {
+                    const connected = mcpServers.some((server) => server.endpoint === preset.endpoint);
+                    return (
+                      <div key={preset.id} className="rounded-xl border border-emerald-100 bg-emerald-50/40 p-4 flex flex-col gap-3">
+                        <div>
+                          <p className="text-xs font-semibold text-emerald-800">{preset.name}</p>
+                          <p className="text-[11px] text-slate-500 mt-1">{preset.description}</p>
+                        </div>
+                        <div className="space-y-1 text-[10px] text-slate-500">
+                          <p><span className="font-semibold text-slate-600">Endpoint:</span> <span className="font-mono break-all">{preset.endpoint}</span></p>
+                          <p><span className="font-semibold text-slate-600">Region:</span> {preset.region}</p>
+                          <p><span className="font-semibold text-slate-600">Auth:</span> {preset.capabilities?.auth || 'Preset default'}</p>
+                          <p>{preset.capabilities?.connection_details}</p>
+                        </div>
+                        <div className="mt-auto flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => connectMcpPreset(preset)}
+                            disabled={!isAdmin || mcpPresetSaving === preset.id}
+                            className="px-3 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500 disabled:opacity-50"
+                          >
+                            {mcpPresetSaving === preset.id ? 'Connecting...' : connected ? 'Reconnect' : 'Connect preset'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => { setShowAddMcpForm(true); setAddMcpForm({ endpoint: preset.endpoint, region: preset.region, status: preset.status, capabilities: preset.capabilities }); }}
+                            className="px-3 py-2 bg-white text-emerald-700 border border-emerald-200 rounded-lg text-xs font-medium hover:bg-emerald-50"
+                          >
+                            Prefill form
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
                 {mcpServers.length === 0 ? (
                   <p className="text-xs text-slate-400 py-3">No MCP servers registered yet.</p>
@@ -1844,8 +2018,21 @@ export default function SettingsPage() {
                       <div><label className="text-[10px] text-slate-400 font-medium mb-1 block">Region</label><input value={addMcpForm.region} onChange={ev => setAddMcpForm(p => ({...p, region: ev.target.value}))} placeholder="us-east-1" className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm" /></div>
                       <div><label className="text-[10px] text-slate-400 font-medium mb-1 block">Status</label><select value={addMcpForm.status} onChange={ev => setAddMcpForm(p => ({...p, status: ev.target.value}))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"><option value="active">Active</option><option value="inactive">Inactive</option></select></div>
                     </div>
+                    {Object.keys(addMcpForm.capabilities || {}).length > 0 && (
+                      <div className="rounded-lg border border-emerald-100 bg-white p-3">
+                        <p className="text-[10px] uppercase tracking-wide text-emerald-700 font-semibold mb-2">Pre-filled connection details</p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {Object.entries(addMcpForm.capabilities || {}).map(([key, value]) => (
+                            <div key={key} className="text-[10px] text-slate-500">
+                              <span className="block font-semibold text-slate-600 capitalize">{key.replace(/_/g, ' ')}</span>
+                              <span className="break-words">{String(value || '')}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex gap-2">
-                      <button onClick={async () => { if (!addMcpForm.endpoint.trim()) return; const r = await api.post('/mcp/servers', addMcpForm).catch(() => null); if (r?.data) { setMcpServers(prev => [r.data, ...prev]); setShowAddMcpForm(false); } }} className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500">Register Server</button>
+                      <button onClick={async () => { if (!addMcpForm.endpoint.trim()) return; const r = await api.post('/mcp/servers', addMcpForm).catch(() => null); if (r?.data) { setMcpServers(prev => [{ ...r.data, capabilities: r.data.capabilities || addMcpForm.capabilities || {} }, ...prev]); setShowAddMcpForm(false); } }} className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500">Register Server</button>
                       <button onClick={() => setShowAddMcpForm(false)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
                     </div>
                   </div>

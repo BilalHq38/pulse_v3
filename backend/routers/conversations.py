@@ -863,6 +863,9 @@ async def send_message(convo_id: str, request: Request):
                             "confidence": float(result.get("confidence", 0.0) or 0.0),
                             "source": "send_message",
                             "llm_id": result.get("llm_id", ""),
+                            "agent_id": result.get("agent_id", ""),
+                            "intent_name": result.get("intent_name", ""),
+                            "channel": convo.get("channel", ""),
                         },
                     )
                 )
@@ -1106,6 +1109,9 @@ async def trigger_ai_response(convo_id: str, request: Request):
                 "confidence": float(result.get("confidence", 0.0) or 0.0),
                 "source": "ai_respond",
                 "llm_id": result.get("llm_id", ""),
+                "agent_id": result.get("agent_id", ""),
+                "intent_name": result.get("intent_name", ""),
+                "channel": convo.get("channel", ""),
             },
         )
     )

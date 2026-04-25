@@ -32,6 +32,70 @@ def _db(req):
     return req.app.state.db
 
 
+async def _ensure_meta_verify_token(db, company_id: str) -> str:
+    company_id = (company_id or "").strip()
+    if not company_id:
+        return ""
+
+    default_rows = (
+        ("whatsapp", False, "WhatsApp"),
+        ("instagram", False, "Instagram"),
+        ("facebook", False, "Facebook Messenger"),
+    )
+    for channel, enabled, display_name in default_rows:
+        await db.execute(
+            "INSERT INTO channel_settings(id,company_id,channel,display_name,enabled,created_at,updated_at) "
+            "VALUES($1,$2,$3,$4,$5,NOW(),NOW()) ON CONFLICT (company_id, channel) DO NOTHING",
+            make_id(),
+            company_id,
+            channel,
+            display_name,
+            enabled,
+        )
+
+    rows = rs(
+        await db.fetch(
+            "SELECT id,channel,display_name,verify_token FROM channel_settings "
+            "WHERE company_id=$1 AND channel = ANY($2::text[])",
+            company_id,
+            [row[0] for row in default_rows],
+        )
+    )
+    token = next(
+        (
+            str(row.get("verify_token") or "").strip()
+            for row in rows
+            if str(row.get("verify_token") or "").strip()
+        ),
+        "",
+    )
+    if not token:
+        token = f"pe-{secrets.token_urlsafe(18)}"
+
+    expected_names = {channel: display_name for channel, _, display_name in default_rows}
+    for row in rows:
+        updates = {}
+        channel_key = str(row.get("channel") or "").strip().lower()
+        expected_name = expected_names.get(channel_key, "")
+        if expected_name and str(row.get("display_name") or "").strip() != expected_name:
+            updates["display_name"] = expected_name
+        if not str(row.get("verify_token") or "").strip():
+            updates["verify_token"] = token
+        if updates:
+            assignments = []
+            values = [row["id"]]
+            for index, (key, value) in enumerate(updates.items(), start=2):
+                assignments.append(f"{key}=${index}")
+                values.append(value)
+            assignments.append(f"updated_at=${len(values) + 1}")
+            values.append(datetime.now(timezone.utc))
+            await db.execute(
+                f"UPDATE channel_settings SET {', '.join(assignments)} WHERE id=$1",
+                *values,
+            )
+    return token
+
+
 # Security
 @security_router.get("/security/sessions")
 async def list_sessions(request: Request):
@@ -837,8 +901,11 @@ async def dashboard_live_summary(request: Request):
 
 @misc_router.get("/webhooks/info")
 async def webhook_info(request: Request):
-    await get_current_user_flexible(request)
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
     app_url = os.environ.get("APP_URL", "")
+    verify_token = await _ensure_meta_verify_token(db, cid) if cid else ""
     return {
         "webhook_urls": {
             "whatsapp": f"{app_url}/api/webhooks/whatsapp",
@@ -847,6 +914,7 @@ async def webhook_info(request: Request):
             "lead_form": f"{app_url}/api/webhooks/lead-form",
             "external_purchases": f"{app_url}/api/webhooks/external/purchases",
         },
+        "verify_token": verify_token,
         "signature_headers": {"meta": "X-Hub-Signature-256", "signed": "X-Webhook-Timestamp + X-Webhook-Signature"},
     }
 
