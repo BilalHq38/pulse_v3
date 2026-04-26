@@ -1,31 +1,5 @@
 import api from '@/lib/api';
 
-const normalizeRole = (value) => String(value || '').trim().toLowerCase();
-
-const normalizeTenantContext = (tenantContext = {}) => {
-  const tenantId = String(tenantContext.tenantId || '').trim();
-  const apiKey = String(tenantContext.apiKey || '').trim();
-  const userRole = normalizeRole(tenantContext.userRole) || 'company_agent';
-
-  if (!tenantId) {
-    throw new Error('Tenant ID is required for identity unification requests.');
-  }
-  if (!apiKey) {
-    throw new Error('API key is required for identity unification requests.');
-  }
-
-  return { tenantId, apiKey, userRole };
-};
-
-const identityHeaders = (tenantContext = {}) => {
-  const { tenantId, apiKey, userRole } = normalizeTenantContext(tenantContext);
-  return {
-    'X-Tenant-ID': tenantId,
-    'X-API-Key': apiKey,
-    'X-User-Role': userRole,
-  };
-};
-
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
 const asObject = (value) => (value && typeof value === 'object' ? value : {});
@@ -90,22 +64,36 @@ const normalizeProfileDetail = (summary = {}, raw = {}) => {
   };
 };
 
+const normalizeSuggestion = (suggestion = {}) => {
+  const item = asObject(suggestion);
+  // Compat contract: the backend service resolves by `resolution_id`, while the
+  // UI historically addressed the same record as `suggestion_id`. We normalize
+  // both to the same value so either field name stays safe to use.
+  const resolutionId = String(
+    item.resolution_id || item.suggestion_id || item.id || '',
+  ).trim();
+  return {
+    ...item,
+    id: resolutionId,
+    suggestion_id: resolutionId,
+    resolution_id: resolutionId,
+    review_id: String(item.review_id || '').trim(),
+  };
+};
+
 export const identityUnificationApi = {
-  async listProfiles(tenantContext) {
-    const response = await api.get('/identity/profiles', {
-      headers: identityHeaders(tenantContext),
-    });
+  async listProfiles() {
+    const response = await api.get('/identity/profiles');
     return asArray(response.data).map((item) => normalizeProfileSummary(item));
   },
 
-  async getProfileDetail(profileId, tenantContext) {
+  async getProfileDetail(profileId) {
     const safeProfileId = String(profileId || '').trim();
     if (!safeProfileId) throw new Error('Profile ID is required.');
 
-    const headers = identityHeaders(tenantContext);
     const [summaryResult, rawResult] = await Promise.allSettled([
-      api.get(`/identity/profiles/${encodeURIComponent(safeProfileId)}`, { headers }),
-      api.get(`/v1/identity/${encodeURIComponent(safeProfileId)}`, { headers }),
+      api.get(`/identity/profiles/${encodeURIComponent(safeProfileId)}`),
+      api.get(`/v1/identity/${encodeURIComponent(safeProfileId)}`),
     ]);
 
     if (summaryResult.status === 'rejected') {
@@ -117,10 +105,8 @@ export const identityUnificationApi = {
     return normalizeProfileDetail(summary, raw);
   },
 
-  async resolve(payload, tenantContext) {
-    const response = await api.post('/identity/resolve', payload, {
-      headers: identityHeaders(tenantContext),
-    });
+  async resolve(payload) {
+    const response = await api.post('/identity/resolve', payload);
     const data = asObject(response.data);
     return {
       ...data,
@@ -128,10 +114,8 @@ export const identityUnificationApi = {
     };
   },
 
-  async unify(payload, tenantContext) {
-    const response = await api.post('/identity/unify', payload, {
-      headers: identityHeaders(tenantContext),
-    });
+  async unify(payload) {
+    const response = await api.post('/identity/unify', payload);
     const data = asObject(response.data);
     return {
       ...data,
@@ -139,32 +123,26 @@ export const identityUnificationApi = {
     };
   },
 
-  async merge(customerIds, tenantContext, mergeReason = 'manual_merge') {
+  async merge(customerIds, mergeReason = 'manual_merge') {
     const normalizedIds = asArray(customerIds)
       .map((item) => String(item || '').trim())
       .filter(Boolean);
 
-    const response = await api.post(
-      '/identity/merge',
-      {
-        customer_ids: normalizedIds,
-        merge_reason: mergeReason,
-      },
-      {
-        headers: identityHeaders(tenantContext),
-      },
-    );
+    const response = await api.post('/identity/merge', {
+      customer_ids: normalizedIds,
+      merge_reason: mergeReason,
+    });
 
     return normalizeProfileSummary(response.data || {});
   },
 
-  async split({ profileId, mappingIds = [], fingerprintIds = [], splitReason = 'manual_split' }, tenantContext) {
+  async split({ profileId, customerId = '', mappingIds = [], fingerprintIds = [], splitReason = 'manual_split' }) {
     const safeProfileId = String(profileId || '').trim();
     if (!safeProfileId) throw new Error('Profile ID is required for split.');
 
     const payload = {
       profile_id: safeProfileId,
-      customer_id: safeProfileId,
+      customer_id: String(customerId || safeProfileId).trim(),
       mapping_ids: asArray(mappingIds)
         .map((item) => String(item || '').trim())
         .filter(Boolean),
@@ -174,20 +152,15 @@ export const identityUnificationApi = {
       split_reason: String(splitReason || 'manual_split').trim() || 'manual_split',
     };
 
-    const response = await api.post('/identity/split', payload, {
-      headers: identityHeaders(tenantContext),
-    });
-
+    const response = await api.post('/identity/split', payload);
     return asObject(response.data);
   },
 
-  async getByCustomer(customerId, tenantContext) {
+  async getByCustomer(customerId) {
     const safeCustomerId = String(customerId || '').trim();
     if (!safeCustomerId) throw new Error('Customer ID is required.');
 
-    const response = await api.get(`/identity/customer/${encodeURIComponent(safeCustomerId)}`, {
-      headers: identityHeaders(tenantContext),
-    });
+    const response = await api.get(`/identity/customer/${encodeURIComponent(safeCustomerId)}`);
     const data = asObject(response.data);
     return {
       ...data,
@@ -195,34 +168,29 @@ export const identityUnificationApi = {
     };
   },
 
-  async listSuggestions(tenantContext) {
-    const response = await api.get('/identity/suggestions', {
-      headers: identityHeaders(tenantContext),
-    });
-    return asArray(response.data);
+  async listSuggestions() {
+    const response = await api.get('/identity/suggestions');
+    return asArray(response.data).map((item) => normalizeSuggestion(item));
   },
 
-  async resolveSuggestion(suggestionId, action, notes, tenantContext) {
+  async resolveSuggestion(suggestionId, action, notes) {
     const safeSuggestionId = String(suggestionId || '').trim();
     if (!safeSuggestionId) throw new Error('Suggestion ID is required.');
 
     const response = await api.post(
       `/identity/suggestions/${encodeURIComponent(safeSuggestionId)}/resolve`,
       {
+        suggestion_id: safeSuggestionId,
+        resolution_id: safeSuggestionId,
         action: String(action || 'accept').trim(),
         notes: notes ? String(notes) : null,
       },
-      {
-        headers: identityHeaders(tenantContext),
-      },
     );
-    return asObject(response.data);
+    return normalizeSuggestion(asObject(response.data));
   },
 
-  async autoDetect(tenantContext) {
-    const response = await api.post('/identity/auto-detect', {}, {
-      headers: identityHeaders(tenantContext),
-    });
+  async autoDetect() {
+    const response = await api.post('/identity/auto-detect', {});
     return asObject(response.data);
   },
 
@@ -233,7 +201,6 @@ export const identityUnificationApi = {
 };
 
 export {
-  identityHeaders,
   isTenantConfigUnavailableError,
   normalizeProfileSummary,
   normalizeProfileDetail,

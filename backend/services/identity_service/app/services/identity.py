@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
 
+import httpx
 from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +48,8 @@ from services.identity_service.app.services.cache import delete_keys, get_json, 
 from services.identity_service.app.services.events import emit_identity_event
 from services.identity_service.app.services.observability import increment_counter, observe_histogram
 from services.identity_service.app.core.embeddings import embedding_service
+from shared.config import service_urls
+from shared.service_client import build_internal_headers
 from services.identity_service.app.utils.utils import (
     build_embedding_text,
     build_fingerprint_hash,
@@ -68,6 +71,11 @@ from services.identity_service.app.utils.utils import (
 
 logger = logging.getLogger(__name__)
 PUBLIC_UNIFICATION_SOURCE = "public_unification"
+_CUSTOMER_SERVICE_BASE_URL = service_urls().customer.rstrip("/")
+_REALTIME_RELAY_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.environ.get("IDENTITY_REALTIME_RELAY_TIMEOUT_SECONDS", "5") or 5),
+)
 
 
 def _vector_enabled() -> bool:
@@ -111,6 +119,13 @@ async def _emit_event_safe(
             idempotency_key=idempotency_key,
             dispatch_now=True,
         )
+        await _emit_realtime_socket_event_safe(
+            tenant_id=tenant_id,
+            event_type=event_type,
+            payload=payload,
+            aggregate_customer_id=aggregate_customer_id,
+            idempotency_key=idempotency_key,
+        )
     except Exception as exc:
         increment_counter(
             "identity.events.emit_errors",
@@ -118,6 +133,70 @@ async def _emit_event_safe(
         )
         logger.warning(
             "identity event emission skipped tenant_id=%s event_type=%s error=%s",
+            tenant_id,
+            event_type,
+            exc,
+        )
+
+
+def _socket_event_name_for(event_type: str) -> str:
+    normalized = str(event_type or "").strip().lower()
+    if normalized == "identity.merged":
+        return "identity_merged"
+    if normalized == "identity.split":
+        return "identity_split"
+    if normalized == "identity.resolved":
+        return "identity_resolved"
+    return ""
+
+
+async def _emit_realtime_socket_event_safe(
+    *,
+    tenant_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    aggregate_customer_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> None:
+    socket_event_name = _socket_event_name_for(event_type)
+    if not socket_event_name or not _CUSTOMER_SERVICE_BASE_URL:
+        return
+    try:
+        headers = build_internal_headers(
+            company_id=tenant_id,
+            user_id="identity-service",
+            user_role="admin",
+        )
+        async with httpx.AsyncClient(timeout=_REALTIME_RELAY_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{_CUSTOMER_SERVICE_BASE_URL}/api/internal/socket/identity-event",
+                headers=headers,
+                json={
+                    "event_name": socket_event_name,
+                    "tenant_id": tenant_id,
+                    "aggregate_customer_id": aggregate_customer_id,
+                    "event_type": event_type,
+                    "idempotency_key": idempotency_key,
+                    "payload": payload,
+                },
+            )
+        if response.status_code >= 400:
+            logger.warning(
+                "identity realtime relay failed tenant_id=%s event_type=%s status=%s",
+                tenant_id,
+                event_type,
+                response.status_code,
+            )
+            return
+        logger.info(
+            "identity realtime relay delivered tenant_id=%s event_type=%s socket_event=%s",
+            tenant_id,
+            event_type,
+            socket_event_name,
+        )
+    except Exception as exc:
+        logger.warning(
+            "identity realtime relay skipped tenant_id=%s event_type=%s error=%s",
             tenant_id,
             event_type,
             exc,
@@ -508,8 +587,8 @@ async def get_identity_profile(db: AsyncSession, tenant_id: str, customer_id: st
         merge_history=[
             {
                 "merge_id": str(row.merge_id),
-                "source_customer_id": str(row.source_customer_id),
-                "target_customer_id": str(row.target_customer_id),
+                "source_customer_id": str(row.source_customer_id) if row.source_customer_id else None,
+                "target_customer_id": str(row.target_customer_id) if row.target_customer_id else None,
                 "merge_reason": row.merge_reason,
                 "merged_at": row.merged_at,
                 "merged_by": row.merged_by,
@@ -606,6 +685,42 @@ async def split_customer(db: AsyncSession, tenant_id: str, payload: SplitRequest
     if not payload.identity_mapping_ids and not payload.fingerprint_ids:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Nothing selected for split")
 
+    mapping_ids = {_to_uuid(item) for item in payload.identity_mapping_ids}
+    fingerprint_ids = {_to_uuid(item) for item in payload.fingerprint_ids}
+
+    matched_mapping_ids: set[uuid.UUID] = set()
+    matched_fingerprint_ids: set[uuid.UUID] = set()
+
+    if mapping_ids:
+        mapping_result = await db.execute(
+            select(IdentityMapping.mapping_id).where(
+                IdentityMapping.tenant_id == tenant_id,
+                IdentityMapping.customer_id == customer.customer_id,
+                IdentityMapping.mapping_id.in_(mapping_ids),
+            )
+        )
+        matched_mapping_ids = set(mapping_result.scalars().all())
+        if not matched_mapping_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selected identity mappings do not belong to the requested profile",
+            )
+
+    if fingerprint_ids:
+        fingerprint_result = await db.execute(
+            select(DeviceFingerprint.fingerprint_id).where(
+                DeviceFingerprint.tenant_id == tenant_id,
+                DeviceFingerprint.customer_id == customer.customer_id,
+                DeviceFingerprint.fingerprint_id.in_(fingerprint_ids),
+            )
+        )
+        matched_fingerprint_ids = set(fingerprint_result.scalars().all())
+        if not matched_fingerprint_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selected fingerprints do not belong to the requested profile",
+            )
+
     new_customer = UnifiedCustomer(
         tenant_id=tenant_id,
         profile_confidence=0.5,
@@ -616,20 +731,25 @@ async def split_customer(db: AsyncSession, tenant_id: str, payload: SplitRequest
     db.add(new_customer)
     await db.flush()
 
-    mapping_ids = {_to_uuid(item) for item in payload.identity_mapping_ids}
-    fingerprint_ids = {_to_uuid(item) for item in payload.fingerprint_ids}
-
-    if mapping_ids:
+    if matched_mapping_ids:
         await db.execute(
             update(IdentityMapping)
-            .where(IdentityMapping.tenant_id == tenant_id, IdentityMapping.mapping_id.in_(mapping_ids))
+            .where(IdentityMapping.tenant_id == tenant_id, IdentityMapping.mapping_id.in_(matched_mapping_ids))
             .values(customer_id=new_customer.customer_id)
         )
-    if fingerprint_ids:
+    if matched_fingerprint_ids:
         await db.execute(
             update(DeviceFingerprint)
-            .where(DeviceFingerprint.tenant_id == tenant_id, DeviceFingerprint.fingerprint_id.in_(fingerprint_ids))
+            .where(DeviceFingerprint.tenant_id == tenant_id, DeviceFingerprint.fingerprint_id.in_(matched_fingerprint_ids))
             .values(customer_id=new_customer.customer_id)
+        )
+
+    moved_mapping_count = len(matched_mapping_ids)
+    moved_fingerprint_count = len(matched_fingerprint_ids)
+    if moved_mapping_count + moved_fingerprint_count <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No identity signals were moved during split",
         )
 
     split_record = ProfileMergeHistory(
@@ -658,14 +778,22 @@ async def split_customer(db: AsyncSession, tenant_id: str, payload: SplitRequest
             "source_customer_id": str(customer.customer_id),
             "new_customer_id": str(new_customer.customer_id),
             "split_reason": payload.split_reason,
-            "mapping_ids": [str(item) for item in payload.identity_mapping_ids],
-            "fingerprint_ids": [str(item) for item in payload.fingerprint_ids],
+            "mapping_ids": [str(item) for item in matched_mapping_ids],
+            "fingerprint_ids": [str(item) for item in matched_fingerprint_ids],
             "split_at": split_record.merged_at.isoformat(),
         },
     )
 
     increment_counter("identity.split.completed", labels={"tenant_id": tenant_id})
-    return {"split": True, "source_customer_id": payload.customer_id, "new_customer_id": str(new_customer.customer_id)}
+    return {
+        "split": True,
+        "source_customer_id": payload.customer_id,
+        "new_customer_id": str(new_customer.customer_id),
+        "moved_mapping_count": moved_mapping_count,
+        "moved_fingerprint_count": moved_fingerprint_count,
+        "moved_mapping_ids": [str(item) for item in matched_mapping_ids],
+        "moved_fingerprint_ids": [str(item) for item in matched_fingerprint_ids],
+    }
 
 
 async def list_review_queue(db: AsyncSession, tenant_id: str) -> list[ReviewQueueItemResponse]:
@@ -677,7 +805,7 @@ async def list_review_queue(db: AsyncSession, tenant_id: str) -> list[ReviewQueu
         ReviewQueueItemResponse(
             review_id=str(row.review_id),
             resolution_id=str(row.resolution_id),
-            source_customer_id=str(row.source_customer_id),
+            source_customer_id=str(row.source_customer_id) if row.source_customer_id else None,
             candidate_customer_id=str(row.candidate_customer_id) if row.candidate_customer_id else None,
             status=row.status,
             source=str(row.source or "internal"),
@@ -715,6 +843,11 @@ async def resolve_review_item(
 
     merge_result = None
     if payload.action == "approve_merge" and review.candidate_customer_id:
+        if not review.source_customer_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Review item no longer has a source profile available for merge",
+            )
         merge_result = await merge_customers(
             db,
             tenant_id,

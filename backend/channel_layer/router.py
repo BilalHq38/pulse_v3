@@ -31,6 +31,7 @@ from channel_layer.validators import (
 )
 from shared.cache import get_cache_client
 from shared.metrics import increment_counter
+from shared.webhook_task_runner import create_safe_detached_task
 
 logger = logging.getLogger(__name__)
 
@@ -275,8 +276,6 @@ async def unified_channel_webhook(
     try:
         from agent_orchestrator.engine import build_orchestrator_engine
         from agent_orchestrator.schemas import MessageWorkflowRequest
-        from shared.database import create_detached_task
-
         engine = build_orchestrator_engine(db)
         workflow_request = MessageWorkflowRequest(
             company_id=message.tenant_id,
@@ -288,9 +287,15 @@ async def unified_channel_webhook(
             trace_id=message.trace_id or "",
             metadata=message.metadata,
         )
-        create_detached_task(
+        create_safe_detached_task(
+            db,
             engine.run_message_workflow(workflow_request),
             name=f"channel-webhook-orchestrator-{channel}",
+            company_id=message.tenant_id,
+            channel=message.channel_type.value,
+            trace_id=message.trace_id or "",
+            event_id=message.message_id,
+            payload=message.metadata,
         )
     except Exception as exc:
         logger.warning(

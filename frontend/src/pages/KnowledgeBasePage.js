@@ -1,8 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import api from '@/lib/api';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import { BookOpen, Search, Plus, X, Eye, Edit3, Trash2, Tag, User, Calendar, Upload, FileText, Download, Users } from 'lucide-react';
 
 export default function KnowledgeBasePage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   // ── Tab state ──────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState('articles'); // 'articles' | 'onboarding'
 
@@ -49,15 +52,47 @@ export default function KnowledgeBasePage() {
       setEditMode(false);
       setForm({ title: '', content: '', category: 'general', tags: '', key_points: '', ai_context_enabled: true });
       loadDocs();
-    } catch (err) { console.error(err); }
+      showToast({
+        type: 'success',
+        title: editMode ? 'Article Updated' : 'Article Added',
+        message: `${payload.title || 'The article'} is ready in the knowledge base.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: editMode ? 'Update Failed' : 'Create Failed',
+        message: getErrorMessage(err, 'We could not save that article.'),
+      });
+    }
   };
 
   const deleteDoc = async (docId) => {
-    try {
-      await api.delete(`/knowledge-base/${docId}`);
-      if (selected?.id === docId) setSelected(null);
-      loadDocs();
-    } catch (err) { console.error(err); }
+    const doc = docs.find((item) => item.id === docId);
+    requestConfirmation({
+      title: 'Delete Article',
+      description: `Delete ${doc?.title || 'this article'} from the knowledge base. This cannot be undone.`,
+      confirmLabel: 'Delete article',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/knowledge-base/${docId}`);
+          if (selected?.id === docId) setSelected(null);
+          loadDocs();
+          showToast({
+            type: 'success',
+            title: 'Article Deleted',
+            message: `${doc?.title || 'The article'} was removed.`,
+          });
+        } catch (err) {
+          console.error(err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that article.'),
+          });
+        }
+      },
+    });
   };
 
   const startEdit = (doc) => {
@@ -74,7 +109,11 @@ export default function KnowledgeBasePage() {
       loadDocs();
     } catch (err) {
       console.error(err);
-      alert('Failed to update article toggle.');
+      showToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: getErrorMessage(err, 'We could not update the AI context setting.'),
+      });
     }
   };
 
@@ -104,16 +143,47 @@ export default function KnowledgeBasePage() {
       setOnboardingEditMode(false);
       setOnboardingForm({ title: '', content: '', category: 'onboarding', tags: '' });
       loadOnboardingDocs();
-    } catch (err) { console.error(err); }
+      showToast({
+        type: 'success',
+        title: onboardingEditMode ? 'Doc Updated' : 'Doc Added',
+        message: `${payload.title || 'The onboarding document'} is ready for the team.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: onboardingEditMode ? 'Update Failed' : 'Create Failed',
+        message: getErrorMessage(err, 'We could not save that onboarding document.'),
+      });
+    }
   };
 
   const deleteOnboardingDoc = async (docId) => {
-    if (!window.confirm('Delete this onboarding document?')) return;
-    try {
-      await api.delete(`/onboarding-docs/${docId}`);
-      if (onboardingSelected?.id === docId) setOnboardingSelected(null);
-      loadOnboardingDocs();
-    } catch (err) { console.error(err); }
+    const doc = onboardingDocs.find((item) => item.id === docId);
+    requestConfirmation({
+      title: 'Delete Onboarding Doc',
+      description: `Delete ${doc?.title || 'this onboarding document'}. This action cannot be undone.`,
+      confirmLabel: 'Delete document',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/onboarding-docs/${docId}`);
+          if (onboardingSelected?.id === docId) setOnboardingSelected(null);
+          loadOnboardingDocs();
+          showToast({
+            type: 'success',
+            title: 'Doc Deleted',
+            message: `${doc?.title || 'The onboarding document'} was removed.`,
+          });
+        } catch (err) {
+          console.error(err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that onboarding document.'),
+          });
+        }
+      },
+    });
   };
 
   const startOnboardingEdit = (doc) => {
@@ -136,7 +206,11 @@ export default function KnowledgeBasePage() {
       });
       loadOnboardingDocs();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Upload failed');
+      showToast({
+        type: 'error',
+        title: 'Upload Failed',
+        message: getErrorMessage(err, 'We could not upload that onboarding document.'),
+      });
     } finally {
       setUploading(false);
     }
@@ -153,8 +227,17 @@ export default function KnowledgeBasePage() {
       link.click();
       link.remove();
       window.URL.revokeObjectURL(url);
+      showToast({
+        type: 'success',
+        title: 'Download Ready',
+        message: `${doc.file_name || doc.title || 'The document'} downloaded successfully.`,
+      });
     } catch (err) {
-      alert('Download failed');
+      showToast({
+        type: 'error',
+        title: 'Download Failed',
+        message: getErrorMessage(err, 'We could not download that document.'),
+      });
     }
   };
 
@@ -164,6 +247,7 @@ export default function KnowledgeBasePage() {
   const FILE_TYPE_ICONS = { pdf: '📄', doc: '📝', docx: '📝', pptx: '📊', xlsx: '📗', xls: '📗', csv: '📋', txt: '📃', md: '📑' };
 
   return (
+    <>
     <div className="p-6 lg:p-8 space-y-6" data-testid="knowledge-base-page">
       {/* Header */}
       <div>
@@ -459,5 +543,7 @@ export default function KnowledgeBasePage() {
         </div>
       )}
     </div>
+    {confirmDialog}
+    </>
   );
 }

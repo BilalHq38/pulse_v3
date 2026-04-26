@@ -20,8 +20,8 @@ from agent_orchestrator.schemas import (
 from agent_orchestrator.workflows.jobs import run_workflow_analytics
 from agent_orchestrator.workflows.state_store import WorkflowStateStore
 from core.utils import make_id
-from shared.database import create_detached_task
 from shared.metrics import increment_counter, timed_metric
+from shared.webhook_task_runner import create_safe_detached_task
 
 
 @dataclass(slots=True)
@@ -187,11 +187,17 @@ class WorkflowManager:
             next_agent = AgentName(route.next_agent)
             if next_agent == AgentName.ANALYTICS and getattr(request, "run_async_analytics", True):
                 job_id = f"agent-orchestrator:analytics:{workflow_id}"
-                create_detached_task(
+                create_safe_detached_task(
+                    context.db,
                     run_workflow_analytics(db=context.db, workflow_id=workflow_id),
                     name="agent-orchestrator-analytics",
                     job_id=job_id,
                     idempotency_key=job_id,
+                    company_id=request.company_id,
+                    channel=workflow_kind.value,
+                    trace_id=trace_id,
+                    event_id=workflow_id,
+                    source_queue="agent_orchestrator",
                 )
                 async_job = AsyncJobStatus(
                     name="analytics",

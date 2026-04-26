@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import api from '@/lib/api';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
   Save, Plus, Trash2, Edit, Bot, Wand2, RefreshCw, Activity,
 } from 'lucide-react';
@@ -58,6 +60,7 @@ export default function AiSettingsTab({
   showAddAgentForm, setShowAddAgentForm, addAgentForm, setAddAgentForm,
   isAdmin,
 }) {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [orchExecutions, setOrchExecutions] = useState([]);
   const [orchLoading, setOrchLoading] = useState(true);
   const [orchErr, setOrchErr] = useState('');
@@ -371,7 +374,25 @@ export default function AiSettingsTab({
                   <div className="flex items-center gap-2 ml-3 flex-shrink-0">
                     {isAdmin && (
                       <button
-                        onClick={async () => { setSaving(`llm-select-${e.id}`); const r = await api.post(`/ai/llm-engines/${e.id}/select`).catch(err => err); setSaving(''); if (r?.data?.ok) { await refreshAiConfig(); return; } alert(r?.response?.data?.detail || 'Failed to select live engine'); }}
+                        onClick={async () => {
+                          setSaving(`llm-select-${e.id}`);
+                          const r = await api.post(`/ai/llm-engines/${e.id}/select`).catch(err => err);
+                          setSaving('');
+                          if (r?.data?.ok) {
+                            await refreshAiConfig();
+                            showToast({
+                              type: 'success',
+                              title: 'Engine Selected',
+                              message: `${e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : 'The provider'} ${e.model_name || 'engine'} is now live.`,
+                            });
+                            return;
+                          }
+                          showToast({
+                            type: 'error',
+                            title: 'Select Failed',
+                            message: getErrorMessage(r, 'We could not switch the live engine.'),
+                          });
+                        }}
                         disabled={saving === `llm-select-${e.id}` || e.is_selected}
                         className={`px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors ${e.is_selected ? 'bg-emerald-100 text-emerald-700 cursor-default' : 'bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-50'}`}
                       >
@@ -383,7 +404,31 @@ export default function AiSettingsTab({
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
-                      <button onClick={async () => { if (!window.confirm('Delete this LLM engine?')) return; await api.delete(`/ai/llm-engines/${e.id}`).catch(() => null); await refreshAiConfig(); setEditingLlmId(null); }}
+                      <button onClick={() => {
+                        requestConfirmation({
+                          title: 'Delete LLM Engine',
+                          description: `Delete ${e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : 'this'} ${e.model_name || 'engine'}. This removes it from the workspace catalog.`,
+                          confirmLabel: 'Delete engine',
+                          onConfirm: async () => {
+                            try {
+                              await api.delete(`/ai/llm-engines/${e.id}`);
+                              await refreshAiConfig();
+                              setEditingLlmId(null);
+                              showToast({
+                                type: 'success',
+                                title: 'Engine Deleted',
+                                message: `${e.model_name || 'The engine'} was removed.`,
+                              });
+                            } catch (err) {
+                              showToast({
+                                type: 'error',
+                                title: 'Delete Failed',
+                                message: getErrorMessage(err, 'We could not delete that LLM engine.'),
+                              });
+                            }
+                          },
+                        });
+                      }}
                         className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>
                     )}
                   </div>
@@ -486,7 +531,31 @@ export default function AiSettingsTab({
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
-                      <button onClick={async () => { if (!window.confirm('Delete this AI agent?')) return; await api.delete(`/ai/agents/${a.id}`).catch(() => null); setAiAgents(prev => prev.filter(x => x.id !== a.id)); setEditingAgentId(null); }}
+                      <button onClick={() => {
+                        requestConfirmation({
+                          title: 'Delete AI Agent',
+                          description: `Delete the ${a.agent_type || 'AI'} agent${a.model_name ? ` using ${a.model_name}` : ''}. This removes ${a.agent_type || 'this'} agent from live routing.`,
+                          confirmLabel: 'Delete agent',
+                          onConfirm: async () => {
+                            try {
+                              await api.delete(`/ai/agents/${a.id}`);
+                              setAiAgents(prev => prev.filter(x => x.id !== a.id));
+                              setEditingAgentId(null);
+                              showToast({
+                                type: 'success',
+                                title: 'Agent Deleted',
+                                message: `${a.agent_type || 'The AI'} agent was removed.`,
+                              });
+                            } catch (err) {
+                              showToast({
+                                type: 'error',
+                                title: 'Delete Failed',
+                                message: getErrorMessage(err, 'We could not delete that AI agent.'),
+                              });
+                            }
+                          },
+                        });
+                      }}
                         className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>
                     )}
                   </div>
@@ -560,6 +629,7 @@ export default function AiSettingsTab({
           </div>
         )}
       </div>
+      {confirmDialog}
     </div>
   );
 }

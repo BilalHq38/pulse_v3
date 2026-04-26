@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import perf_counter
@@ -216,6 +217,8 @@ class InternalIdentitySplitRequest(BaseModel):
 class SuggestionResolveRequest(BaseModel):
     action: Literal["accept", "reject", "keep_separate"] = "accept"
     notes: str | None = None
+    suggestion_id: str | None = None
+    resolution_id: str | None = None
 
 
 def _normalize_platform(platform: str | None) -> str:
@@ -284,6 +287,8 @@ def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
         members.append(
             {
                 "customer_id": mapping.mapping_id,
+                "mapping_id": mapping.mapping_id,
+                "platform_user_id": mapping.platform_user_id,
                 "platform": mapping.platform,
                 "name": mapping.name or profile.primary_name or mapping.platform_username or mapping.platform_user_id,
                 "email": mapping.email or "",
@@ -308,6 +313,54 @@ def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
         "confidence_score": profile.profile_confidence,
         "profile_confidence": profile.profile_confidence,
     }
+
+
+async def _resolve_split_mapping_ids(
+    db: AsyncSession,
+    tenant_id: str,
+    *,
+    target_profile_id: str,
+    candidate_customer_id: str,
+) -> list[str]:
+    safe_profile_id = str(target_profile_id or "").strip()
+    safe_candidate = str(candidate_customer_id or "").strip()
+    if not safe_profile_id or not safe_candidate:
+        return []
+    try:
+        target_profile_uuid = uuid.UUID(safe_profile_id)
+    except ValueError:
+        return []
+
+    resolved_mapping_ids: list[str] = []
+
+    try:
+        direct_mapping_uuid = uuid.UUID(safe_candidate)
+    except ValueError:
+        direct_mapping_uuid = None
+
+    if direct_mapping_uuid is not None:
+        direct_mapping = await db.execute(
+            select(IdentityMapping.mapping_id).where(
+                IdentityMapping.tenant_id == tenant_id,
+                IdentityMapping.customer_id == target_profile_uuid,
+                IdentityMapping.mapping_id == direct_mapping_uuid,
+            )
+        )
+        resolved_mapping_ids.extend(str(item) for item in direct_mapping.scalars().all())
+
+    if resolved_mapping_ids:
+        return list(dict.fromkeys(resolved_mapping_ids))
+
+    candidate_rows = await db.execute(
+        select(IdentityMapping.mapping_id).where(
+            IdentityMapping.tenant_id == tenant_id,
+            IdentityMapping.customer_id == target_profile_uuid,
+            IdentityMapping.platform == "pulse_customer",
+            IdentityMapping.platform_user_id == safe_candidate,
+        )
+    )
+    resolved_mapping_ids.extend(str(item) for item in candidate_rows.scalars().all())
+    return list(dict.fromkeys(resolved_mapping_ids))
 
 
 async def _resolve_with_auto_consent(
@@ -563,7 +616,12 @@ async def identity_split_compat(
     if not mapping_ids and not fingerprint_ids:
         candidate = (payload.customer_id or "").strip()
         if payload.profile_id and candidate and candidate != payload.profile_id:
-            mapping_ids = [candidate]
+            mapping_ids = await _resolve_split_mapping_ids(
+                db,
+                tenant.tenant_id,
+                target_profile_id=target_profile_id,
+                candidate_customer_id=candidate,
+            )
 
     if not mapping_ids and not fingerprint_ids:
         raise HTTPException(status_code=400, detail="mapping_ids or fingerprint_ids required for split")
@@ -636,6 +694,8 @@ async def identity_suggestions_compat(
         output.append(
             {
                 "id": item.resolution_id,
+                "suggestion_id": item.resolution_id,
+                "resolution_id": item.resolution_id,
                 "review_id": item.review_id,
                 "source": item.source,
                 "customer_id_a": item.source_customer_id,
@@ -643,7 +703,7 @@ async def identity_suggestions_compat(
                 "name_a": (source.primary_name if source else "")
                 or (source_mapping.name if source_mapping else "")
                 or (source_mapping.platform_username if source_mapping else "")
-                or f"Customer {item.source_customer_id[:8]}",
+                or (f"Customer {str(item.source_customer_id)[:8]}" if item.source_customer_id else "Unknown"),
                 "email_a": (source_mapping.email if source_mapping else "") or "",
                 "phone_a": (source_mapping.phone if source_mapping else "") or "",
                 "company_a": "",
@@ -682,16 +742,29 @@ async def identity_resolve_suggestion_compat(
         "reject": "reject",
         "keep_separate": "keep_separate",
     }
+    # Compat contract: frontend callers may send `suggestion_id`, while the
+    # underlying identity service resolves review items by `resolution_id`.
+    # Accept both names and normalize them to the same target here.
+    target_resolution_id = (
+        str(payload.resolution_id or "").strip()
+        or str(payload.suggestion_id or "").strip()
+        or str(suggestion_id or "").strip()
+    )
     result = await resolve_review_item(
         db,
         tenant.tenant_id,
-        suggestion_id,
+        target_resolution_id,
         ReviewDecisionRequest(
             action=action_map[payload.action],
             notes=payload.notes,
         ),
     )
-    return {"status": "ok", **result}
+    return {
+        "status": "ok",
+        "suggestion_id": target_resolution_id,
+        "resolution_id": target_resolution_id,
+        **result,
+    }
 
 
 @app.post("/api/identity/auto-detect")

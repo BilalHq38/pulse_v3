@@ -132,7 +132,12 @@ class ResolutionAuditLog(Base):
 
     resolution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
-    customer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     input_signals: Mapped[dict] = mapped_column(JSONB, default=dict)
     score_breakdown: Mapped[dict] = mapped_column(JSONB, default=dict)
     match_type: Mapped[str] = mapped_column(String(32))
@@ -149,8 +154,18 @@ class ProfileMergeHistory(Base):
 
     merge_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
-    source_customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
-    target_customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    source_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    target_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     merge_reason: Mapped[str] = mapped_column(Text)
     merged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     merged_by: Mapped[str] = mapped_column(String(32), default="auto")
@@ -161,9 +176,23 @@ class ReviewQueue(Base):
 
     review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
-    resolution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
-    source_customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
-    candidate_customer_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    resolution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("resolution_audit_log.resolution_id", ondelete="CASCADE"),
+        index=True,
+    )
+    source_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    candidate_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     source: Mapped[str] = mapped_column(String(64), default="internal", index=True)
     reason: Mapped[str] = mapped_column(Text)

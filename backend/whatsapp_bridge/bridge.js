@@ -47,19 +47,84 @@ for (const candidate of [
   loadEnvFile(candidate);
 }
 
-const BRIDGE_PORT = process.env.BRIDGE_PORT || 3001;
-const PYTHON_BACKEND = process.env.PYTHON_BACKEND || "http://localhost:8000";
-const WHATSAPP_WEBHOOK_PATH = process.env.WHATSAPP_WEBHOOK_PATH || "/api/webhook/meta/whatsapp";
-const BRIDGE_SECRET = process.env.BRIDGE_SECRET || process.env.WHATSAPP_BRIDGE_SECRET || "";
+function readEnvValue(name, aliases = []) {
+  const names = [name, ...aliases];
+  for (const candidate of names) {
+    const value = String(process.env[candidate] || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function requiredEnv(name, aliases = []) {
+  const value = readEnvValue(name, aliases);
+  return { name, value, aliases };
+}
+
+function readEnvInt(name, defaultValue, aliases = []) {
+  const raw = readEnvValue(name, aliases);
+  const parsed = Number.parseInt(String(raw || defaultValue), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+function validateRequiredBridgeEnv() {
+  const requirements = [
+    requiredEnv("BRIDGE_PORT"),
+    requiredEnv("PYTHON_BACKEND"),
+    requiredEnv("WHATSAPP_WEBHOOK_PATH"),
+    requiredEnv("WHATSAPP_BRIDGE_SECRET", ["BRIDGE_SECRET"]),
+    requiredEnv("WHATSAPP_PHONE_NUMBER_ID", ["PHONE_NUMBER_ID"]),
+    requiredEnv("WHATSAPP_BUSINESS_ACCOUNT_ID"),
+    requiredEnv("WHATSAPP_WEBHOOK_SECRET", ["META_WEBHOOK_SECRET", "BRIDGE_WEBHOOK_SECRET"]),
+  ];
+  const missing = requirements.filter((item) => !item.value);
+  const errors = [];
+  if (missing.length > 0) {
+    for (const item of missing) {
+      const aliasText = item.aliases.length > 0 ? ` (aliases: ${item.aliases.join(", ")})` : "";
+      errors.push(`- ${item.name}${aliasText}`);
+    }
+  }
+  const bridgePort = Number.parseInt(String(readEnvValue("BRIDGE_PORT")), 10);
+  if (!Number.isFinite(bridgePort) || bridgePort <= 0) {
+    errors.push("- BRIDGE_PORT must be a positive integer");
+  }
+  try {
+    // eslint-disable-next-line no-new
+    new URL(readEnvValue("PYTHON_BACKEND"));
+  } catch {
+    errors.push("- PYTHON_BACKEND must be a valid absolute URL");
+  }
+  const webhookPath = readEnvValue("WHATSAPP_WEBHOOK_PATH");
+  if (webhookPath && !webhookPath.startsWith("/")) {
+    errors.push("- WHATSAPP_WEBHOOK_PATH must start with '/'");
+  }
+  if (errors.length > 0) {
+    console.error("Bridge startup validation failed. Missing or invalid environment variables:");
+    for (const error of errors) {
+      console.error(error);
+    }
+    process.exit(1);
+  }
+}
+
+validateRequiredBridgeEnv();
+
+const BRIDGE_PORT = readEnvValue("BRIDGE_PORT");
+const PYTHON_BACKEND = readEnvValue("PYTHON_BACKEND");
+const WHATSAPP_WEBHOOK_PATH = readEnvValue("WHATSAPP_WEBHOOK_PATH");
+const BRIDGE_SECRET = readEnvValue("WHATSAPP_BRIDGE_SECRET", ["BRIDGE_SECRET"]);
 const DEFAULT_BRIDGE_COMPANY_ID = (process.env.BRIDGE_COMPANY_ID || "").trim();
-const WHATSAPP_PHONE_NUMBER_ID = (process.env.WHATSAPP_PHONE_NUMBER_ID || process.env.PHONE_NUMBER_ID || "").trim();
-const WHATSAPP_BUSINESS_ACCOUNT_ID = (process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || "").trim();
-const WEBHOOK_SIGNING_SECRET =
-  process.env.WHATSAPP_WEBHOOK_SECRET ||
-  process.env.META_WEBHOOK_SECRET ||
-  process.env.BRIDGE_WEBHOOK_SECRET ||
-  "";
+const WHATSAPP_PHONE_NUMBER_ID = readEnvValue("WHATSAPP_PHONE_NUMBER_ID", ["PHONE_NUMBER_ID"]);
+const WHATSAPP_BUSINESS_ACCOUNT_ID = readEnvValue("WHATSAPP_BUSINESS_ACCOUNT_ID");
+const WEBHOOK_SIGNING_SECRET = readEnvValue("WHATSAPP_WEBHOOK_SECRET", ["META_WEBHOOK_SECRET", "BRIDGE_WEBHOOK_SECRET"]);
 const MY_NUMBER = process.env.MY_WHATSAPP_NUMBER || "";
+const BRIDGE_FORWARD_TIMEOUT_MS = readEnvInt("BRIDGE_FORWARD_TIMEOUT_MS", 10000);
+const BRIDGE_READY_TIMEOUT_MS = readEnvInt("BRIDGE_READY_TIMEOUT_MS", 12000);
+const BRIDGE_CHECK_READY_TIMEOUT_MS = readEnvInt("BRIDGE_CHECK_READY_TIMEOUT_MS", 8000);
+const BRIDGE_JSON_LIMIT = readEnvValue("BRIDGE_JSON_LIMIT") || "10mb";
 
 const WWEBJS_AUTH_DIR = path.join(__dirname, ".wwebjs_auth");
 const SESSION_METADATA_DIR = path.join(WWEBJS_AUTH_DIR, ".scope_meta");
@@ -74,6 +139,26 @@ const CHROMIUM_STALE_LOCK_NAMES = new Set([
 ]);
 
 const sessions = new Map();
+
+// #region agent log
+const _DEBUG_LOG = path.join(__dirname, "../../debug-bc3f0b.log");
+function _dbgLog(hypothesisId, location, message, data) {
+  try {
+    const line = JSON.stringify({
+      sessionId: "bc3f0b",
+      runId: process.env.DEBUG_RUN_ID || "pre",
+      hypothesisId,
+      location,
+      message,
+      data: data || {},
+      timestamp: Date.now(),
+    });
+    fs.appendFileSync(_DEBUG_LOG, `${line}\n`);
+  } catch (_e) {
+    /* ignore */
+  }
+}
+// #endregion
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -525,27 +610,39 @@ async function forwardInboundMessage(session, msg) {
   }
 
   try {
+    const metadata = {
+      phone_number_id: WHATSAPP_PHONE_NUMBER_ID,
+      bridge_scope: session.scopeKey,
+    };
+    if (session.phone || MY_NUMBER) {
+      metadata.display_phone_number = session.phone || MY_NUMBER;
+    }
+    if (session.companyId || DEFAULT_BRIDGE_COMPANY_ID) {
+      metadata.company_id = session.companyId || DEFAULT_BRIDGE_COMPANY_ID;
+    }
+    if (session.userId) {
+      metadata.bridge_user_id = session.userId;
+    }
+
+    const messagePayload = {
+      from: senderPhone,
+      type: imagePayload ? "image" : "text",
+      text: { body: msg.body || "" },
+      timestamp: Math.floor(Date.now() / 1000),
+      id: msg.id.id,
+    };
+    if (imagePayload) {
+      messagePayload.image = imagePayload;
+    }
+
     const payload = {
       entry: [{
-        id: WHATSAPP_BUSINESS_ACCOUNT_ID || undefined,
+        id: WHATSAPP_BUSINESS_ACCOUNT_ID,
         changes: [{
           value: {
-            business_account_id: WHATSAPP_BUSINESS_ACCOUNT_ID || undefined,
-            metadata: {
-              phone_number_id: WHATSAPP_PHONE_NUMBER_ID,
-              display_phone_number: session.phone || MY_NUMBER,
-              company_id: session.companyId || DEFAULT_BRIDGE_COMPANY_ID,
-              bridge_scope: session.scopeKey,
-              bridge_user_id: session.userId || "",
-            },
-            messages: [{
-              from: senderPhone,
-              type: imagePayload ? "image" : "text",
-              text: { body: msg.body || "" },
-              image: imagePayload || undefined,
-              timestamp: Math.floor(Date.now() / 1000),
-              id: msg.id.id,
-            }],
+            business_account_id: WHATSAPP_BUSINESS_ACCOUNT_ID,
+            metadata,
+            messages: [messagePayload],
             contacts: [{
               profile: { name: senderName },
               wa_id: senderPhone,
@@ -566,7 +663,7 @@ async function forwardInboundMessage(session, msg) {
         "X-Bridge-Company-Id": session.companyId || "",
         "X-Bridge-User-Id": session.userId || "",
       },
-      timeout: 10000,
+      timeout: BRIDGE_FORWARD_TIMEOUT_MS,
     });
     console.log(`[${session.scopeKey}] Forwarded inbound message to Python backend`);
   } catch (err) {
@@ -575,16 +672,31 @@ async function forwardInboundMessage(session, msg) {
 }
 
 function buildClient(session) {
+  const chromeExecutablePath = readEnvValue("CHROME_BIN", ["PUPPETEER_EXECUTABLE_PATH"]);
+  const puppeteerConfig = {
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+  };
+  if (chromeExecutablePath) {
+    puppeteerConfig.executablePath = chromeExecutablePath;
+  }
+  // #region agent log
+  _dbgLog("H1", "bridge.js:buildClient", "puppeteer config", {
+    scopeKey: session.scopeKey,
+    hasChromeBin: Boolean(chromeExecutablePath),
+    chromeBasename: chromeExecutablePath
+      ? path.basename(String(chromeExecutablePath).split("?")[0])
+      : "",
+    headless: puppeteerConfig.headless,
+    argCount: (puppeteerConfig.args && puppeteerConfig.args.length) || 0,
+  });
+  // #endregion
   return new Client({
     authStrategy: new LocalAuth({
       dataPath: WWEBJS_AUTH_DIR,
       clientId: session.scopeKey,
     }),
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.CHROME_BIN || process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-    },
+    puppeteer: puppeteerConfig,
   });
 }
 
@@ -619,6 +731,9 @@ function attachClientHandlers(session) {
       (client.info && client.info.wid && client.info.wid.user) || MY_NUMBER || "",
     ).trim();
     persistSessionMetadata(session);
+    // #region agent log
+    _dbgLog("H4", "bridge.js:ready", "client ready", { scopeKey: session.scopeKey });
+    // #endregion
     console.log(
       `[${session.scopeKey}] READY company=${session.companyId || "-"} user=${session.userId || "-"} phone=${session.phone || "-"}`,
     );
@@ -666,12 +781,43 @@ function createSession(scopeInput) {
 
 async function ensureSessionInitialized(session) {
   if (!session || session.isReady) return;
-  if (session.initPromise) return session.initPromise;
+  if (session.initPromise) {
+    // #region agent log
+    _dbgLog("H2", "bridge.js:ensureSessionInitialized", "awaiting existing initPromise", {
+      scopeKey: session.scopeKey,
+    });
+    // #endregion
+    return session.initPromise;
+  }
+
+  // #region agent log
+  _dbgLog("H2", "bridge.js:ensureSessionInitialized", "start init", {
+    scopeKey: session.scopeKey,
+    isReady: session.isReady,
+  });
+  // #endregion
 
   removeChromiumSingletonLocks(sessionAuthDir(session.scopeKey));
   session.initPromise = Promise.resolve()
     .then(() => session.client.initialize())
     .catch((err) => {
+      // #region agent log
+      _dbgLog("H1", "bridge.js:ensureSessionInitialized", "initialize error", {
+        scopeKey: session.scopeKey,
+        name: err && err.name,
+        message: err && err.message,
+        code: err && err.code,
+        cause:
+          err && err.cause && (err.cause.message || String(err.cause).slice(0, 200)),
+        stackLine:
+          err && err.stack && String(err.stack).split("\n").slice(0, 4).join(" | "),
+      });
+      _dbgLog("H4", "bridge.js:ensureSessionInitialized", "initialize error (cdp layer)", {
+        scopeKey: session.scopeKey,
+        name: err && err.name,
+        message: err && err.message,
+      });
+      // #endregion
       console.error(`[${session.scopeKey}] Initialize failed: ${err.message || err}`);
       throw err;
     })
@@ -681,7 +827,7 @@ async function ensureSessionInitialized(session) {
   return session.initPromise;
 }
 
-async function waitForReady(session, timeoutMs = 12000) {
+async function waitForReady(session, timeoutMs = BRIDGE_READY_TIMEOUT_MS) {
   if (!session) return false;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -694,6 +840,9 @@ async function waitForReady(session, timeoutMs = 12000) {
 
 async function destroySession(session) {
   if (!session) return;
+  // #region agent log
+  _dbgLog("H5", "bridge.js:destroySession", "destroy start", { scopeKey: session.scopeKey });
+  // #endregion
   try {
     if (session.client) await session.client.destroy();
   } catch (err) {
@@ -704,6 +853,11 @@ async function destroySession(session) {
 
 async function restoreSavedSessions() {
   const savedScopes = loadSavedScopes();
+  // #region agent log
+  _dbgLog("H2", "bridge.js:restoreSavedSessions", "scopes to restore", {
+    count: savedScopes.length,
+  });
+  // #endregion
   for (const scope of savedScopes) {
     const session = createSession(scope);
     ensureSessionInitialized(session).catch(() => {});
@@ -711,7 +865,7 @@ async function restoreSavedSessions() {
 }
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: BRIDGE_JSON_LIMIT }));
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -799,7 +953,7 @@ app.post("/send", async (req, res) => {
 
   const session = createSession(sessionFromRequest(req));
   ensureSessionInitialized(session).catch(() => {});
-  const ready = await waitForReady(session, 12000);
+  const ready = await waitForReady(session, BRIDGE_READY_TIMEOUT_MS);
   if (!ready) {
     return res.status(503).json({
       error: session.lastQrString
@@ -869,7 +1023,7 @@ app.get("/check/:phone", async (req, res) => {
   if (!requireBridgeSecret(req, res)) return;
   const session = createSession(sessionFromRequest(req));
   ensureSessionInitialized(session).catch(() => {});
-  const ready = await waitForReady(session, 8000);
+  const ready = await waitForReady(session, BRIDGE_CHECK_READY_TIMEOUT_MS);
   if (!ready) {
     return res.status(503).json({
       error: "WhatsApp session is not ready for this account.",
@@ -889,10 +1043,16 @@ app.get("/check/:phone", async (req, res) => {
   }
 });
 
-const bridgePortNumber = Number.parseInt(String(BRIDGE_PORT), 10);
-const bridgePort = Number.isFinite(bridgePortNumber) ? bridgePortNumber : 3001;
+const bridgePort = Number.parseInt(String(BRIDGE_PORT), 10);
 
 const bridgeServer = app.listen(bridgePort, () => {
+  // #region agent log
+  const mu = process.memoryUsage();
+  _dbgLog("H3", "bridge.js:listen", "bridge listening (heap/rss)", {
+    heapMb: Math.round(mu.heapUsed / 1024 / 1024),
+    rssMb: Math.round(mu.rss / 1024 / 1024),
+  });
+  // #endregion
   console.log(`WhatsApp bridge HTTP listening on port ${bridgePort}`);
 });
 

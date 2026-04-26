@@ -1,7 +1,10 @@
+import { useCallback } from 'react';
 import api from '@/lib/api';
 import {
   Search, AlertTriangle, Check, X, ChevronRight, MessageSquare, Users,
 } from 'lucide-react';
+import { showToast } from '@/hooks/use-toast';
+import { useSocket } from '@/lib/useSocket';
 
 export default function UnificationTab({
   isAdmin,
@@ -12,7 +15,16 @@ export default function UnificationTab({
   selectedUnifiedProfile, setSelectedUnifiedProfile,
   suggestionDetail, setSuggestionDetail,
   splitFromProfile,
+  onIdentityEvent,
 }) {
+  const handleSocketEvent = useCallback((eventName, data) => {
+    if (['identity_merged', 'identity_split', 'identity_resolved'].includes(eventName)) {
+      onIdentityEvent?.(eventName, data);
+    }
+  }, [onIdentityEvent]);
+
+  useSocket(handleSocketEvent);
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -85,13 +97,21 @@ export default function UnificationTab({
                       </div>
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
-                      <button onClick={() => acceptSuggestion(s.id)}
-                        className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500 transition-colors">
-                        <Check size={13} /> Accept
+                      <button
+                        onClick={() => acceptSuggestion(s.id)}
+                        disabled={unificationLoading}
+                        className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-500 transition-colors disabled:opacity-50"
+                      >
+                        {unificationLoading ? <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Check size={13} />}
+                        {unificationLoading ? 'Working...' : 'Accept'}
                       </button>
-                      <button onClick={() => rejectSuggestion(s.id)}
-                        className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-200 transition-colors">
-                        <X size={13} /> Reject
+                      <button
+                        onClick={() => rejectSuggestion(s.id)}
+                        disabled={unificationLoading}
+                        className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-200 transition-colors disabled:opacity-50"
+                      >
+                        {unificationLoading ? <div className="w-3.5 h-3.5 border-2 border-slate-500 border-t-transparent rounded-full animate-spin" /> : <X size={13} />}
+                        {unificationLoading ? 'Working...' : 'Reject'}
                       </button>
                       <button onClick={() => setSuggestionDetail(s)} className="p-2 hover:bg-slate-100 rounded-lg text-slate-400 hover:text-slate-600">
                         <ChevronRight size={14} />
@@ -116,7 +136,13 @@ export default function UnificationTab({
             <span className="text-slate-400 text-xs">+</span>
             <input value={manualMergeIds[1]} onChange={e => setManualMergeIds([manualMergeIds[0], e.target.value])}
               placeholder="Customer ID 2" className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono" />
-            <button onClick={manualMerge} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs font-medium hover:bg-indigo-500">Merge</button>
+            <button
+              onClick={manualMerge}
+              disabled={unificationLoading}
+              className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs font-medium hover:bg-indigo-500 disabled:opacity-50"
+            >
+              {unificationLoading ? 'Merging...' : 'Merge'}
+            </button>
           </div>
         </div>
       )}
@@ -136,7 +162,16 @@ export default function UnificationTab({
           <div className="divide-y divide-slate-100">
             {unifiedProfiles.map((p) => (
               <button key={p.id} onClick={async () => {
-                try { const r = await api.get(`/identity/profiles/${p.id}`); setSelectedUnifiedProfile(r.data); } catch {}
+                try {
+                  const r = await api.get(`/identity/profiles/${p.id}`);
+                  setSelectedUnifiedProfile(r.data);
+                } catch {
+                  showToast({
+                    type: 'error',
+                    title: 'Profile Unavailable',
+                    message: 'That unified profile could not be loaded right now.',
+                  });
+                }
               }} className="w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors">
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
@@ -185,7 +220,13 @@ export default function UnificationTab({
                       {m.is_primary && <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full">PRIMARY</span>}
                       <span className="text-[9px] text-slate-400">{m.match_method}</span>
                       {isAdmin && (
-                        <button onClick={() => splitFromProfile(selectedUnifiedProfile.id, m.customer_id)} className="text-[10px] text-red-500 hover:text-red-700">Remove</button>
+                        <button
+                          onClick={() => splitFromProfile(selectedUnifiedProfile.id, m.mapping_id || m.customer_id)}
+                          disabled={unificationLoading}
+                          className="text-[10px] text-red-500 hover:text-red-700 disabled:opacity-50"
+                        >
+                          {unificationLoading ? 'Removing...' : 'Remove'}
+                        </button>
                       )}
                     </div>
                   ))}
@@ -247,13 +288,21 @@ export default function UnificationTab({
                 </div>
               </div>
               <div className="flex gap-3">
-                <button onClick={() => { acceptSuggestion(suggestionDetail.id); setSuggestionDetail(null); }}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 text-white rounded-xl text-sm font-semibold hover:bg-emerald-500">
-                  <Check size={16} /> Confirm — Same Person
+                <button
+                  onClick={() => { acceptSuggestion(suggestionDetail.id); setSuggestionDetail(null); }}
+                  disabled={unificationLoading}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 text-white rounded-xl text-sm font-semibold hover:bg-emerald-500 disabled:opacity-50"
+                >
+                  {unificationLoading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Check size={16} />}
+                  {unificationLoading ? 'Working...' : 'Confirm - Same Person'}
                 </button>
-                <button onClick={() => { rejectSuggestion(suggestionDetail.id); setSuggestionDetail(null); }}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-slate-100 text-slate-600 rounded-xl text-sm font-semibold hover:bg-slate-200">
-                  <X size={16} /> Reject — Different People
+                <button
+                  onClick={() => { rejectSuggestion(suggestionDetail.id); setSuggestionDetail(null); }}
+                  disabled={unificationLoading}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-slate-100 text-slate-600 rounded-xl text-sm font-semibold hover:bg-slate-200 disabled:opacity-50"
+                >
+                  {unificationLoading ? <div className="w-4 h-4 border-2 border-slate-500 border-t-transparent rounded-full animate-spin" /> : <X size={16} />}
+                  {unificationLoading ? 'Working...' : 'Reject - Different People'}
                 </button>
               </div>
             </div>

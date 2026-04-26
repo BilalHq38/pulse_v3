@@ -239,7 +239,7 @@ class IdentityProfileResponse(BaseModel):
 class ReviewQueueItemResponse(BaseModel):
     review_id: str
     resolution_id: str
-    source_customer_id: str
+    source_customer_id: str | None = None
     candidate_customer_id: str | None = None
     status: str
     source: str = "internal"

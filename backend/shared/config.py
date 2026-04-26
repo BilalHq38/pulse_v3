@@ -301,6 +301,194 @@ def ai_service_retry_attempts(default: int = 3) -> int:
         return default
 
 
+def orchestrator_request_timeout_seconds(default: float = 30.0) -> float:
+    try:
+        return float(os.environ.get("ORCHESTRATOR_REQUEST_TIMEOUT_SECONDS", str(default)))
+    except ValueError:
+        return default
+
+
+def ai_fallback_timeout_seconds(default: float = 15.0) -> float:
+    try:
+        return float(os.environ.get("AI_FALLBACK_TIMEOUT_SECONDS", str(default)))
+    except ValueError:
+        return default
+
+
+def ai_input_token_budget(default: int = 12000) -> int:
+    try:
+        raw = os.environ.get("AI_INPUT_TOKEN_BUDGET", os.environ.get("GEMINI_INPUT_TOKEN_BUDGET", str(default)))
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def ai_enable_rule_based_recovery() -> bool:
+    return os.environ.get("AI_ENABLE_RULE_BASED_RECOVERY", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def ai_temperature(default: float = 0.7) -> float:
+    try:
+        return float(os.environ.get("AI_TEMPERATURE", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_max_tokens(default: int = 2048) -> int:
+    try:
+        return int(os.environ.get("AI_MAX_TOKENS", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_provider_name(default: str = "openai") -> str:
+    return (os.environ.get("AI_PROVIDER", default) or default).strip().lower()
+
+
+def ai_model_name(default: str = "") -> str:
+    return (os.environ.get("AI_MODEL_NAME", default) or default).strip()
+
+
+def openai_api_key() -> str:
+    return (os.environ.get("OPENAI_API_KEY") or "").strip()
+
+
+def anthropic_api_key() -> str:
+    return (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+
+
+def gemini_api_key() -> str:
+    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+
+def openai_model_name(default: str = "gpt-4o-mini") -> str:
+    return (os.environ.get("OPENAI_MODEL", default) or default).strip()
+
+
+def anthropic_model_name(default: str = "claude-3-5-sonnet-20241022") -> str:
+    return (os.environ.get("ANTHROPIC_MODEL", default) or default).strip()
+
+
+def gemini_flash_model_name(default: str = "gemini-2.5-flash") -> str:
+    return (os.environ.get("GEMINI_FLASH_MODEL", default) or default).strip()
+
+
+def gemini_pro_model_name(default: str = "gemini-2.5-pro") -> str:
+    return (os.environ.get("GEMINI_PRO_MODEL", default) or default).strip()
+
+
+def gemini_fallback_models(default: str = "gemini-2.5-flash-lite,gemini-2.5-flash") -> list[str]:
+    return [
+        model.strip()
+        for model in (os.environ.get("GEMINI_FALLBACK_MODELS", default) or default).split(",")
+        if model.strip()
+    ]
+
+
+def gemini_embedding_model_name(default: str = "models/text-embedding-004") -> str:
+    return (os.environ.get("GEMINI_EMBEDDING_MODEL", default) or default).strip()
+
+
+def openai_embedding_model_name(default: str = "text-embedding-3-small") -> str:
+    return (os.environ.get("OPENAI_EMBEDDING_MODEL", default) or default).strip()
+
+
+def ai_response_recent_ai_message_limit(default: int = 3) -> int:
+    try:
+        return max(1, int(os.environ.get("AI_RESPONSE_RECENT_MESSAGE_LIMIT", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_base(default: float = 0.72) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_TEMPERATURE_BASE", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_min(default: float = 0.55) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_TEMPERATURE_MIN", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_max(default: float = 1.05) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_TEMPERATURE_MAX", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_jitter_steps(default: int = 6) -> int:
+    try:
+        return max(0, int(os.environ.get("AI_RESPONSE_TEMPERATURE_JITTER_STEPS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_product_delta(default: float = 0.08) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_TEMPERATURE_PRODUCT_DELTA", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_negative_delta(default: float = -0.10) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_TEMPERATURE_NEGATIVE_DELTA", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_temperature_repetition_delta(default: float = 0.06) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_TEMPERATURE_REPETITION_DELTA", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_retry_temperature_delta(default: float = 0.14) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_RETRY_TEMPERATURE_DELTA", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def ai_response_retry_temperature_max(default: float = 1.1) -> float:
+    try:
+        return float(os.environ.get("AI_RESPONSE_RETRY_TEMPERATURE_MAX", str(default)) or default)
+    except ValueError:
+        return default
+
+
+def outbound_retry_base_delay_seconds(default: float = 1.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("OUTBOUND_RETRY_BASE_DELAY_SECONDS", str(default))))
+    except ValueError:
+        return default
+
+
+def ai_response_cooldown_seconds(default: int = 300) -> int:
+    try:
+        return max(0, int(os.environ.get("AI_RESPONSE_COOLDOWN_SECONDS", str(default))))
+    except ValueError:
+        return default
+
+
+def dedup_cache_ttl_seconds(default: int = 300) -> int:
+    try:
+        return max(30, int(os.environ.get("DEDUP_CACHE_TTL_SECONDS", str(default))))
+    except ValueError:
+        return default
+
+
 def ai_service_retry_backoff_seconds(default: float = 0.5) -> float:
     try:
         return float(os.environ.get("AI_SERVICE_RETRY_BACKOFF_SECONDS", str(default)))
@@ -492,3 +680,149 @@ def socket_rate_limit_window_seconds(default: int = 60) -> int:
         return int(os.environ.get("SOCKET_RATE_LIMIT_WINDOW_SECONDS", str(default)))
     except ValueError:
         return default
+
+
+def webhook_replay_ttl_seconds(default: int = 300) -> int:
+    try:
+        return max(60, int(os.environ.get("WEBHOOK_REPLAY_TTL_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def webhook_signature_max_skew_seconds(default: int = 300) -> int:
+    try:
+        return max(30, int(os.environ.get("WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def meta_webhook_rate_limit_per_minute(default: int = 120) -> int:
+    try:
+        return max(10, int(os.environ.get("META_WEBHOOK_RATE_LIMIT_PER_MINUTE", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def meta_webhook_event_replay_ttl_seconds(default: int = 86400) -> int:
+    try:
+        return max(300, int(os.environ.get("META_WEBHOOK_EVENT_REPLAY_TTL_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def unprocessed_event_max_retries(default: int = 8) -> int:
+    try:
+        return max(1, int(os.environ.get("UNPROCESSED_EVENT_MAX_RETRIES", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def unprocessed_event_retry_base_seconds(default: int = 60) -> int:
+    try:
+        return max(15, int(os.environ.get("UNPROCESSED_EVENT_RETRY_BASE_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def webhook_identity_resolve_timeout_seconds(default: float = 10.0) -> float:
+    try:
+        return max(1.0, float(os.environ.get("IDENTITY_RESOLVE_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def webhook_message_history_fetch_limit(default: int = 20) -> int:
+    try:
+        return max(1, int(os.environ.get("WEBHOOK_MESSAGE_HISTORY_FETCH_LIMIT", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def whatsapp_mode(default: str = "bridge") -> str:
+    return (os.environ.get("WHATSAPP_MODE", default) or default).strip().lower()
+
+
+def whatsapp_bridge_url(default: str = "http://localhost:3001") -> str:
+    return (os.environ.get("WHATSAPP_BRIDGE_URL", default) or default).rstrip("/")
+
+
+def whatsapp_bridge_secret() -> str:
+    return (
+        os.environ.get("WHATSAPP_BRIDGE_SECRET")
+        or os.environ.get("BRIDGE_SECRET")
+        or ""
+    ).strip()
+
+
+def messaging_http_timeout_seconds(default: float = 20.0) -> float:
+    try:
+        return max(1.0, float(os.environ.get("MESSAGING_HTTP_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def messaging_http_connect_timeout_seconds(default: float = 5.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("MESSAGING_HTTP_CONNECT_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def messaging_http_pool_timeout_seconds(default: float = 5.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("MESSAGING_HTTP_POOL_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def messaging_http_max_keepalive_connections(default: int = 10) -> int:
+    try:
+        return max(1, int(os.environ.get("MESSAGING_HTTP_MAX_KEEPALIVE_CONNECTIONS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def messaging_http_max_connections(default: int = 20) -> int:
+    try:
+        return max(1, int(os.environ.get("MESSAGING_HTTP_MAX_CONNECTIONS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def messaging_http_keepalive_expiry_seconds(default: float = 60.0) -> float:
+    try:
+        return max(1.0, float(os.environ.get("MESSAGING_HTTP_KEEPALIVE_EXPIRY_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def whatsapp_bridge_session_timeout_seconds(default: float = 5.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("WHATSAPP_BRIDGE_SESSION_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def whatsapp_bridge_send_timeout_seconds(default: float = 20.0) -> float:
+    try:
+        return max(1.0, float(os.environ.get("WHATSAPP_BRIDGE_SEND_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def whatsapp_bridge_health_timeout_seconds(default: float = 5.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("WHATSAPP_BRIDGE_HEALTH_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def meta_message_send_timeout_seconds(default: float = 15.0) -> float:
+    try:
+        return max(1.0, float(os.environ.get("META_MESSAGE_SEND_TIMEOUT_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def meta_graph_api_version(default: str = "v21.0") -> str:
+    return (os.environ.get("META_GRAPH_API_VERSION", default) or default).strip()

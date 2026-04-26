@@ -492,15 +492,40 @@ async def update_message_delivery_status(
                         ts_value = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
                     except Exception:
                         pass
-        await db.execute(
+        conversation_id = await db.fetchval(
             f"UPDATE messages SET delivery_status=$1, {column}=$2, updated_at=NOW() "
             "WHERE company_id=$3 AND external_message_id=$4 "
-            f"AND ({column} IS NULL)",
+            f"AND ({column} IS NULL) RETURNING conversation_id",
             status,
             ts_value,
             company_id,
             message_external_id,
         )
+        if conversation_id:
+            message_row = await db.fetchrow(
+                "SELECT * FROM messages WHERE company_id=$1 AND external_message_id=$2 LIMIT 1",
+                company_id,
+                message_external_id,
+            )
+            if message_row:
+                attachments = await db.fetch(
+                    "SELECT * FROM message_attachments WHERE message_id=$1 ORDER BY created_at ASC",
+                    message_row["id"],
+                )
+                payload = dict(message_row)
+                payload["attachments"] = [
+                    {
+                        "id": row["id"],
+                        "type": row["file_type"],
+                        "url": row["file_url"],
+                        "name": row["file_name"],
+                        "size": row["file_size"],
+                    }
+                    for row in attachments
+                ]
+                from core.socket import emit_message_updated
+
+                await emit_message_updated(str(conversation_id), payload)
     except Exception as exc:
         logger.warning(
             "Delivery status update failed company_id=%s msg=%s status=%s: %s",

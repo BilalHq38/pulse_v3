@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -28,6 +28,93 @@ _EVENT_RETRY_POLL_SECONDS = max(1.0, float(os.environ.get("IDENTITY_EVENT_RETRY_
 _EVENT_MAX_RETRIES = max(1, int(os.environ.get("IDENTITY_EVENT_MAX_RETRIES", "8") or 8))
 _EVENT_RETRY_BACKOFF_SECONDS = max(1.0, float(os.environ.get("IDENTITY_EVENT_RETRY_BACKOFF_SECONDS", "2") or 2))
 _EVENT_MAX_BACKOFF_SECONDS = max(10.0, float(os.environ.get("IDENTITY_EVENT_MAX_BACKOFF_SECONDS", "300") or 300))
+
+
+async def _ensure_dead_letter_queue_table(db) -> None:
+    await db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                id TEXT PRIMARY KEY,
+                task_name TEXT NOT NULL DEFAULT '',
+                event_id TEXT NOT NULL DEFAULT '',
+                trace_id TEXT NOT NULL DEFAULT '',
+                company_id TEXT NOT NULL DEFAULT '',
+                channel TEXT NOT NULL DEFAULT '',
+                source_queue TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                status TEXT NOT NULL DEFAULT 'failed',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ
+            )
+            """
+        )
+    )
+    for ddl in (
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS task_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS idx_dlq_status ON dead_letter_queue(status)",
+        "CREATE INDEX IF NOT EXISTS idx_dlq_company_id ON dead_letter_queue(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_dlq_created_at ON dead_letter_queue(created_at)",
+    ):
+        await db.execute(text(ddl))
+
+
+async def _write_dead_letter_record(
+    db,
+    *,
+    task_name: str,
+    event: IdentityEvent,
+    outbox: EventOutbox,
+    payload: dict[str, Any],
+    error_message: str,
+) -> None:
+    await _ensure_dead_letter_queue_table(db)
+    trace_id = str((payload or {}).get("trace_id") or "").strip()
+    event_id = str(event.event_id)
+    company_id = str(event.tenant_id or "").strip()
+    channel = "identity"
+    serialized_payload = json.dumps(payload or {}, ensure_ascii=True, separators=(",", ":"), default=str)
+    capped_error = str(error_message or "unknown error")[:4000]
+    await db.execute(
+        text(
+            """
+            INSERT INTO dead_letter_queue(
+                id, task_name, event_id, trace_id, company_id, channel,
+                source_queue, event_type, payload, error, error_message,
+                retry_count, max_retries, status, created_at, updated_at
+            ) VALUES(
+                :id, :task_name, :event_id, :trace_id, :company_id, :channel,
+                :source_queue, :event_type, :payload, :error, :error_message,
+                :retry_count, :max_retries, 'failed', NOW(), NOW()
+            )
+            """
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "task_name": str(task_name or "identity_event_retry_worker").strip() or "identity_event_retry_worker",
+            "event_id": event_id,
+            "trace_id": trace_id,
+            "company_id": company_id,
+            "channel": channel,
+            "source_queue": "identity.events",
+            "event_type": str(event.event_type or "").strip(),
+            "payload": serialized_payload,
+            "error": capped_error,
+            "error_message": capped_error,
+            "retry_count": int(outbox.retry_count or 0),
+            "max_retries": int(_EVENT_MAX_RETRIES),
+        },
+    )
 
 
 @dataclass(slots=True)
@@ -206,6 +293,15 @@ class IdentityEventPublisher:
                 await self._publish_to_stream(outbox.stream_name or self._stream_name, envelope)
             except Exception as exc:
                 self._mark_retry(outbox, event, str(exc))
+                if outbox.status == "failed":
+                    await _write_dead_letter_record(
+                        db,
+                        task_name="identity_event_retry_worker",
+                        event=event,
+                        outbox=outbox,
+                        payload=envelope,
+                        error_message=str(exc),
+                    )
                 await db.commit()
                 increment_counter(
                     "identity.events.publish_failed",

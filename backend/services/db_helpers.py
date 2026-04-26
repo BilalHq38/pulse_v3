@@ -28,7 +28,11 @@ from core.config import (
     VERIFICATION_RESEND_MAX_ATTEMPTS,
 )
 from core.request_helpers import get_client_ip, resolve_frontend_base_url
-from core.phone_normalization import normalize_to_e164_digits, phone_lookup_candidates
+from core.phone_normalization import (
+    normalize_to_e164_digits,
+    phone_lookup_candidates,
+    strict_normalize_to_e164_digits,
+)
 from core.utils import make_id, parse_dt
 from models.reference_data import ensure_company_reference_data, resolve_role_id
 from services.email_service import render_platform_email_html, send_email_async
@@ -41,6 +45,184 @@ _auth_security_lock = asyncio.Lock()
 _embedding_vector_ready = False
 _embedding_vector_lock = asyncio.Lock()
 _SUPER_ADMIN_COMPANY_ID_FALLBACK = "00000000-0000-0000-0000-000000000001"
+
+
+def _normalize_lookup_email(value: str | None) -> str:
+    email = str(value or "").strip().lower()
+    if not email:
+        return ""
+    if "@" not in email:
+        return email
+    local, _, domain = email.partition("@")
+    local = local.split("+")[0]
+    if domain in {"gmail.com", "googlemail.com"}:
+        local = local.replace(".", "")
+    return f"{local}@{domain}" if local else email
+
+
+async def _company_default_phone_region(db, company_id: str) -> str:
+    scoped_company_id = str(company_id or "").strip()
+    if not db or not scoped_company_id:
+        return ""
+    try:
+        row = await db.fetchrow(
+            "SELECT default_phone_region FROM company_settings WHERE company_id=$1 LIMIT 1",
+            scoped_company_id,
+        )
+    except Exception as exc:
+        logger.debug("Failed to load company phone region company_id=%s: %s", scoped_company_id, exc)
+        return ""
+    if not row:
+        return ""
+    region = str(dict(row).get("default_phone_region") or "").strip().upper()
+    if len(region) == 2 and region.isalpha():
+        return region
+    return ""
+
+
+async def normalize_customer_contact_phone(db, company_id: str, raw_phone: str) -> str:
+    raw = str(raw_phone or "").strip()
+    if not raw:
+        return ""
+    fallback_region = await _company_default_phone_region(db, company_id)
+    normalized = strict_normalize_to_e164_digits(raw, fallback_region=fallback_region)
+    if normalized:
+        return normalized
+    return normalize_to_e164_digits(raw, fallback_region=fallback_region)
+
+
+def _unique_ordered(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _should_replace_customer_phone(existing_phone: str, candidate_phone: str) -> bool:
+    current = re.sub(r"\D", "", str(existing_phone or "").strip())
+    incoming = re.sub(r"\D", "", str(candidate_phone or "").strip())
+    if not incoming:
+        return False
+    if not current:
+        return True
+    if current == incoming:
+        return str(existing_phone or "").strip() != str(candidate_phone or "").strip()
+    if len(current) < len(incoming) and incoming.endswith(current):
+        return True
+    return False
+
+
+async def upsert_customer_social_profile(db, customer_id: str, platform: str, profile_id: str) -> None:
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_profile_id = str(profile_id or "").strip()
+    if normalized_platform not in {"facebook", "instagram"} or not normalized_profile_id:
+        return
+    await db.execute(
+        "INSERT INTO customer_social_profiles(customer_id,platform,profile_id) VALUES($1,$2,$3) "
+        "ON CONFLICT (customer_id,platform) DO UPDATE SET profile_id=EXCLUDED.profile_id",
+        customer_id,
+        normalized_platform,
+        normalized_profile_id,
+    )
+
+
+async def resolve_customer_by_contact(
+    db,
+    company_id: str,
+    *,
+    phone: str = "",
+    email: str = "",
+    channel: str = "",
+    channel_profile_id: str = "",
+    explicit_customer_id: str = "",
+) -> Optional[dict]:
+    scoped_company_id = str(company_id or "").strip()
+    if not scoped_company_id:
+        return None
+
+    customer_id = str(explicit_customer_id or "").strip()
+    if customer_id:
+        row = await db.fetchrow(
+            "SELECT * FROM customers WHERE id=$1 AND company_id=$2 LIMIT 1",
+            customer_id,
+            scoped_company_id,
+        )
+        if row:
+            return dict(row)
+
+    normalized_channel = str(channel or "").strip().lower()
+    normalized_channel_profile_id = str(channel_profile_id or "").strip()
+    if normalized_channel in {"facebook", "instagram"} and normalized_channel_profile_id:
+        row = await db.fetchrow(
+            "SELECT c.* FROM customers c "
+            "JOIN customer_social_profiles csp ON csp.customer_id=c.id "
+            "WHERE c.company_id=$1 AND csp.platform=$2 AND csp.profile_id=$3 "
+            "ORDER BY c.updated_at DESC LIMIT 1",
+            scoped_company_id,
+            normalized_channel,
+            normalized_channel_profile_id,
+        )
+        if row:
+            return dict(row)
+
+    normalized_email = _normalize_lookup_email(email)
+    for email_candidate in _unique_ordered([str(email or "").strip().lower(), normalized_email]):
+        row = await db.fetchrow(
+            "SELECT * FROM customers WHERE company_id=$1 AND LOWER(email)=$2 "
+            "ORDER BY updated_at DESC LIMIT 1",
+            scoped_company_id,
+            email_candidate,
+        )
+        if row:
+            return dict(row)
+
+    raw_phone = str(phone or "").strip()
+    if not raw_phone:
+        return None
+
+    fallback_region = await _company_default_phone_region(db, scoped_company_id)
+    phone_candidates = phone_lookup_candidates(raw_phone, fallback_region=fallback_region)
+    normalized_phone = normalize_to_e164_digits(raw_phone, fallback_region=fallback_region)
+    phone_candidates = _unique_ordered(phone_candidates + [normalized_phone])
+    for phone_candidate in phone_candidates:
+        row = await db.fetchrow(
+            "SELECT * FROM customers WHERE company_id=$1 AND phone=$2 "
+            "ORDER BY updated_at DESC LIMIT 1",
+            scoped_company_id,
+            phone_candidate,
+        )
+        if row:
+            return dict(row)
+
+    digit_candidates = _unique_ordered([re.sub(r"\D", "", candidate) for candidate in phone_candidates])
+    for digits in digit_candidates:
+        row = await db.fetchrow(
+            "SELECT * FROM customers WHERE company_id=$1 "
+            "AND regexp_replace(phone, '\\D', '', 'g')=$2 "
+            "ORDER BY updated_at DESC LIMIT 1",
+            scoped_company_id,
+            digits,
+        )
+        if row:
+            return dict(row)
+
+    last10 = normalized_phone[-10:] if len(normalized_phone) >= 10 else re.sub(r"\D", "", raw_phone)[-10:]
+    if last10:
+        rows = await db.fetch(
+            "SELECT * FROM customers WHERE company_id=$1 "
+            "AND regexp_replace(phone, '\\D', '', 'g') LIKE $2 "
+            "ORDER BY updated_at DESC LIMIT 2",
+            scoped_company_id,
+            f"%{last10}",
+        )
+        if len(rows or []) == 1:
+            return dict(rows[0])
+    return None
 
 
 def build_user_payload(user: dict) -> dict:
@@ -1003,6 +1185,45 @@ async def record_webhook_event(
         return None
 
 
+async def insert_chat_history_record(db, conversation: dict, message: dict):
+    if not conversation or not message:
+        return
+    company_id = str(conversation.get("company_id") or message.get("company_id") or "").strip()
+    if not company_id:
+        return
+    ca = message.get("created_at")
+    ca_dt = parse_dt(ca) if isinstance(ca, str) else (ca if isinstance(ca, datetime) else datetime.now(timezone.utc))
+    if hasattr(db, "_get_pool"):
+        async with company_context(db, company_id):
+            await db.execute(
+                "INSERT INTO chat_histories(id,company_id,conversation_id,customer_id,customer_name,channel,sender_type,sender_name,content,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",  # noqa: E501
+                make_id(),
+                company_id,
+                conversation.get("id", message.get("conversation_id", "")),
+                conversation.get("customer_id", ""),
+                conversation.get("customer_name", message.get("sender_name", "")),
+                conversation.get("channel", "web_chat"),
+                message.get("sender_type", "agent"),
+                message.get("sender_name", ""),
+                message.get("content", ""),
+                ca_dt,
+            )
+        return
+    await db.execute(
+        "INSERT INTO chat_histories(id,company_id,conversation_id,customer_id,customer_name,channel,sender_type,sender_name,content,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",  # noqa: E501
+        make_id(),
+        company_id,
+        conversation.get("id", message.get("conversation_id", "")),
+        conversation.get("customer_id", ""),
+        conversation.get("customer_name", message.get("sender_name", "")),
+        conversation.get("channel", "web_chat"),
+        message.get("sender_type", "agent"),
+        message.get("sender_name", ""),
+        message.get("content", ""),
+        ca_dt,
+    )
+
+
 async def persist_chat_history(db, conversation: dict, message: dict):
     if not conversation or not message:
         return
@@ -1011,20 +1232,7 @@ async def persist_chat_history(db, conversation: dict, message: dict):
         return
     ca = message.get("created_at")
     ca_dt = parse_dt(ca) if isinstance(ca, str) else (ca if isinstance(ca, datetime) else datetime.now(timezone.utc))
-    async with company_context(db, company_id):
-        await db.execute(
-            "INSERT INTO chat_histories(id,company_id,conversation_id,customer_id,customer_name,channel,sender_type,sender_name,content,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",  # noqa: E501
-            make_id(),
-            company_id,
-            conversation.get("id", message.get("conversation_id", "")),
-            conversation.get("customer_id", ""),
-            conversation.get("customer_name", message.get("sender_name", "")),
-            conversation.get("channel", "web_chat"),
-            message.get("sender_type", "agent"),
-            message.get("sender_name", ""),
-            message.get("content", ""),
-            ca_dt,
-        )
+    await insert_chat_history_record(db, conversation, message)
     try:
         from data_pipeline.ingestion.raw_store import capture_raw_message
 
@@ -1643,40 +1851,67 @@ async def refresh_conversation_rollup(db, convo_id: str):
     )
 
 
-async def get_or_create_customer_from_contact(db, name: str, phone: str, current_user: dict) -> dict:
+async def get_or_create_customer_from_contact(
+    db,
+    name: str,
+    phone: str,
+    current_user: dict,
+    *,
+    email: str = "",
+    channel: str = "",
+    channel_profile_id: str = "",
+) -> dict:
     raw = (phone or "").strip()
-    e164 = normalize_to_e164_digits(raw) if raw else ""
-    stored = e164 or (re.sub(r"\D", "", raw) if raw else "")
+    stored = await normalize_customer_contact_phone(db, current_user.get("company_id", ""), raw) if raw else ""
+    if raw and not stored:
+        stored = re.sub(r"\D", "", raw)
+    normalized_email = (email or "").strip().lower()
+    normalized_channel = str(channel or "").strip().lower()
+    normalized_channel_profile_id = str(channel_profile_id or "").strip()
     cid = current_user.get("company_id", "")
-    if raw:
-        for phone_candidate in phone_lookup_candidates(raw):
-            if not phone_candidate:
-                continue
-            row = await db.fetchrow(
-                "SELECT * FROM customers WHERE phone=$1 AND company_id=$2 LIMIT 1",
-                phone_candidate,
-                cid,
+    existing = await resolve_customer_by_contact(
+        db,
+        cid,
+        phone=raw,
+        email=normalized_email,
+        channel=normalized_channel,
+        channel_profile_id=normalized_channel_profile_id,
+    )
+    if existing:
+        cust = dict(existing)
+        updates = []
+        args = []
+        if name and cust.get("name") != name:
+            updates.append(f"name=${len(args) + 1}")
+            args.append(name)
+        if normalized_email and not cust.get("email"):
+            updates.append(f"email=${len(args) + 1}")
+            args.append(normalized_email)
+        if stored and _should_replace_customer_phone(cust.get("phone", ""), stored):
+            updates.append(f"phone=${len(args) + 1}")
+            args.append(stored)
+        if updates:
+            args.append(cust["id"])
+            await db.execute(
+                f"UPDATE customers SET {', '.join(updates)},updated_at=NOW() WHERE id=${len(args)}",
+                *args,
             )
-            if row:
-                break
-        else:
-            row = None
-        if row:
-            cust = dict(row)
-            if name and cust.get("name") != name:
-                await db.execute(
-                    "UPDATE customers SET name=$1,updated_at=NOW() WHERE id=$2",
-                    name,
-                    cust["id"],
-                )
-                cust["name"] = name
-            return cust
+            cust = dict(await db.fetchrow("SELECT * FROM customers WHERE id=$1", cust["id"]))
+        await upsert_customer_social_profile(db, cust["id"], normalized_channel, normalized_channel_profile_id)
+        if normalized_channel:
+            await db.execute(
+                "INSERT INTO customer_channels(customer_id,channel) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                cust["id"],
+                normalized_channel,
+            )
+        return cust
     nid = make_id()
     await db.execute(
-        "INSERT INTO customers(id,company_id,name,email,phone,customer_company_name,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) VALUES($1,$2,$3,'',$4,'','general','','lead',0,0,0,0,0,0,NOW(),NOW())",  # noqa: E501
+        "INSERT INTO customers(id,company_id,name,email,phone,customer_company_name,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'','general','','lead',0,0,0,0,0,0,NOW(),NOW())",  # noqa: E501
         nid,
         cid,
         name or "Unknown",
+        normalized_email,
         stored,
     )
     cust = dict(await db.fetchrow("SELECT * FROM customers WHERE id=$1", nid))
@@ -1684,11 +1919,26 @@ async def get_or_create_customer_from_contact(db, name: str, phone: str, current
         "INSERT INTO customer_tags(customer_id,tag) VALUES($1,'profile-message') ON CONFLICT DO NOTHING",
         nid,
     )
+    if normalized_channel:
+        await db.execute(
+            "INSERT INTO customer_channels(customer_id,channel) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            nid,
+            normalized_channel,
+        )
+    await upsert_customer_social_profile(db, nid, normalized_channel, normalized_channel_profile_id)
     await ensure_customer_profile(db, cust)
     return cust
 
 
-async def get_or_create_contact_conversation(db, customer: dict, channel: str, source: str, current_user: dict) -> dict:
+async def get_or_create_contact_conversation(
+    db,
+    customer: dict,
+    channel: str,
+    source: str,
+    current_user: dict,
+    *,
+    channel_id: str = "",
+) -> dict:
     cid = current_user.get("company_id", "")
     row = await db.fetchrow(
         "SELECT * FROM conversations WHERE customer_id=$1 AND channel=$2 AND status=ANY($3) AND company_id=$4 LIMIT 1",
@@ -1698,16 +1948,28 @@ async def get_or_create_contact_conversation(db, customer: dict, channel: str, s
         cid,
     )
     if row:
-        return dict(row)
+        convo = dict(row)
+        normalized_channel_id = str(channel_id or "").strip()
+        if normalized_channel_id and convo.get("channel_id") != normalized_channel_id:
+            await db.execute(
+                "UPDATE conversations SET channel_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                normalized_channel_id,
+                convo["id"],
+                cid,
+            )
+            convo["channel_id"] = normalized_channel_id
+        return convo
     nid = make_id()
+    normalized_channel_id = str(channel_id or "").strip()
     await db.execute(
-        "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,TRUE,0,'neutral',0,'',NOW(),0,NOW(),NOW())",  # noqa: E501
+        "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,channel_id,subject,status,priority,assigned_to,assigned_name,ai_handled,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'open','medium',$9,$10,TRUE,0,'neutral',0,'',NOW(),0,NOW(),NOW())",  # noqa: E501
         nid,
         cid,
         customer["id"],
         customer.get("name", "Unknown"),
         customer.get("avatar", ""),
         channel,
+        normalized_channel_id,
         f"Profile outreach ({source})",
         current_user.get("sub", ""),
         current_user.get("name", ""),

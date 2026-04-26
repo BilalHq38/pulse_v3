@@ -100,6 +100,12 @@ def _tenant_resource_company_id(current_user: dict, body: dict) -> str:
     return (current_user.get("company_id", "") or "").strip()
 
 
+def _super_admin_requested_company_id(request: Request, current_user: dict) -> str:
+    if not _is_super_admin(current_user):
+        return (current_user.get("company_id", "") or "").strip()
+    return (request.query_params.get("company_id", "") or "").strip()
+
+
 @router.get("/ai/architecture")
 async def ai_architecture(request: Request):
     await get_current_user_flexible(request)
@@ -247,23 +253,18 @@ async def ai_classify(request: Request):
 async def list_llm_engines(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
-    cid = (cu.get("company_id", "") or "").strip()
+    cid = _super_admin_requested_company_id(request, cu)
+    if _is_super_admin(cu) and not cid:
+        raise HTTPException(400, "company_id query parameter is required for super_admin LLM engine queries")
     selected_id = ""
     if cid:
         settings = await ensure_company_settings_row(db, cid)
         selected_id = settings.get("active_llm_engine_id", "")
-    rows = (
-        await db.fetch(
-            "SELECT * FROM llm_engines "
-            "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, company_id, provider, model_name"
-        )
-        if _is_super_admin(cu)
-        else await db.fetch(
-            "SELECT * FROM llm_engines "
-            "WHERE company_id='' OR company_id=$1 "
-            "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, provider, model_name",
-            cid,
-        )
+    rows = await db.fetch(
+        "SELECT * FROM llm_engines "
+        "WHERE company_id='' OR company_id=$1 "
+        "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, provider, model_name",
+        cid,
     )
     return [enrich_llm_engine(engine, selected_id=selected_id) for engine in rs(rows)]
 
@@ -383,13 +384,11 @@ async def list_ai_agents(request: Request):
     cid = (cu.get("company_id", "") or "").strip()
     requested_company_id = (request.query_params.get("company_id", "") or "").strip()
     scoped_company_id = requested_company_id if _is_super_admin(cu) and requested_company_id else cid
-    rows = (
-        await db.fetch("SELECT * FROM ai_agents ORDER BY company_id, registered_at DESC")
-        if _is_super_admin(cu) and not scoped_company_id
-        else await db.fetch(
-            "SELECT * FROM ai_agents WHERE company_id=$1 ORDER BY registered_at DESC",
-            scoped_company_id,
-        )
+    if _is_super_admin(cu) and not scoped_company_id:
+        raise HTTPException(400, "company_id query parameter is required for super_admin AI agent queries")
+    rows = await db.fetch(
+        "SELECT * FROM ai_agents WHERE company_id=$1 ORDER BY registered_at DESC",
+        scoped_company_id,
     )
     agents = rs(rows)
     for agent in agents:
@@ -554,7 +553,9 @@ async def list_ai_sessions(
 ):
     db = _db(request)
     cu = await get_current_user_flexible(request)
-    cid = cu.get("company_id", "")
+    cid = _super_admin_requested_company_id(request, cu)
+    if _is_super_admin(cu) and not cid:
+        raise HTTPException(400, "company_id query parameter is required for super_admin AI session queries")
     if convo_id:
         return rs(
             await db.fetch(

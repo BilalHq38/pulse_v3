@@ -18,6 +18,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
 import { startOAuthLoginRedirect } from '@/lib/oauthLoginRedirect';
 import { getSignupStripePlanOptions, getSignupTrialPlanOptions } from '@/data/publicPricingPlans';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 
 const F = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
 
@@ -372,10 +373,10 @@ export default function SignUpPage() {
             </div>
           )}
           {error && (
-            <div style={{ marginBottom: 14, padding: '12px 14px', borderRadius: 12, border: '1px solid #fecaca', background: '#fef2f2', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <XCircle size={15} color="#dc2626" />
-              <span style={{ fontSize: 13, color: '#dc2626' }}>{error}</span>
-            </div>
+            <Alert variant="destructive" className="mb-4 border-red-200 bg-red-50 text-red-700">
+              <XCircle className="h-4 w-4" />
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
           )}
 
           <div style={{ background: '#fff', borderRadius: 24, border: '1px solid rgba(148,163,184,0.18)', padding: 20, boxShadow: '0 18px 42px rgba(15,23,42,0.06)', marginBottom: 14 }}>

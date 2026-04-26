@@ -17,8 +17,8 @@ from services.ai_service.facade import (
 from services.agent_orchestrator.facade import orchestrate_message_workflow
 from core.socket import emit_message_deleted, emit_message_updated, emit_new_message
 from core.utils import make_id, now_ts
-from shared.database import create_detached_task
 from shared.tracing import current_trace_context
+from shared.webhook_task_runner import create_safe_detached_task
 from services.db_helpers import (
     _notify_agents_handoff,
     escalate_conversation_to_human,
@@ -91,31 +91,20 @@ def _channel_type_from_name(channel: str) -> Optional[ChannelType]:
 
 def _resolve_conversation_recipient(channel: str, convo: dict, customer: dict) -> str:
     normalized = str(channel or "").strip().lower()
+    conversation_channel_id = str(convo.get("channel_id") or convo.get("session_id") or "").strip()
     if normalized == "whatsapp":
-        return str(convo.get("customer_phone") or customer.get("phone") or convo.get("contact_ref") or "").strip()
+        return str(conversation_channel_id or customer.get("phone") or "").strip()
     if normalized in {"facebook", "instagram"}:
         return str(
-            convo.get("external_recipient_id")
-            or convo.get("channel_recipient_id")
-            or convo.get("channel_user_id")
-            or convo.get("contact_ref")
-            or convo.get("customer_phone")
+            conversation_channel_id
             or customer.get("phone")
             or customer.get("email")
             or ""
         ).strip()
     if normalized == "web_chat":
-        return str(
-            convo.get("session_id") or convo.get("contact_ref") or customer.get("email") or customer.get("id") or ""
-        ).strip()
+        return str(conversation_channel_id or customer.get("email") or customer.get("id") or "").strip()
     if normalized == "email":
-        return str(
-            customer.get("email")
-            or convo.get("contact_ref")
-            or convo.get("channel_recipient_id")
-            or convo.get("external_recipient_id")
-            or ""
-        ).strip()
+        return str(conversation_channel_id or customer.get("email") or "").strip()
     return ""
 
 
@@ -236,8 +225,15 @@ async def start_conversation(request: Request):
     name = (body.get("name", "") or "").strip()
     channel = body.get("channel") or "web_chat"
     source = body.get("source") or "inbox_start"
-    customer = await get_or_create_customer_from_contact(db, name, phone, cu)
-    convo = await get_or_create_contact_conversation(db, customer, channel, source, cu)
+    customer = await get_or_create_customer_from_contact(db, name, phone, cu, channel=channel)
+    convo = await get_or_create_contact_conversation(
+        db,
+        customer,
+        channel,
+        source,
+        cu,
+        channel_id=customer.get("phone") or phone,
+    )
     return {"conversation": convo, "customer": customer}
 
 
@@ -248,8 +244,8 @@ async def start_outbound_conversation(request: Request):
     cid = get_company_id(cu)
     body = await request.json()
     channel = (body.get("channel", "") or "").strip().lower()
-    if channel not in ("whatsapp", "facebook", "instagram"):
-        raise HTTPException(400, "Channel must be whatsapp, facebook, or instagram")
+    if channel not in ("whatsapp", "facebook", "instagram", "email"):
+        raise HTTPException(400, "Channel must be whatsapp, facebook, instagram, or email")
     name = (body.get("name", "") or "").strip()
     if not name:
         raise HTTPException(400, "Name is required")
@@ -268,8 +264,23 @@ async def start_outbound_conversation(request: Request):
             raise HTTPException(400, f"{channel.capitalize()} recipient ID is required")
         contact_ref = recipient_id
 
-    customer = await get_or_create_customer_from_contact(db, name, contact_ref, cu)
-    convo = await get_or_create_contact_conversation(db, customer, channel, body.get("source", f"inbox_{channel}"), cu)
+    customer = await get_or_create_customer_from_contact(
+        db,
+        name,
+        contact_ref if channel == "whatsapp" else "",
+        cu,
+        email=contact_ref if channel == "email" else "",
+        channel=channel,
+        channel_profile_id=recipient_id if channel in {"facebook", "instagram"} else "",
+    )
+    convo = await get_or_create_contact_conversation(
+        db,
+        customer,
+        channel,
+        body.get("source", f"inbox_{channel}"),
+        cu,
+        channel_id=(customer.get("phone") or contact_ref) if channel == "whatsapp" else contact_ref,
+    )
 
     msg_id = make_id()
     await db.execute(
@@ -299,15 +310,8 @@ async def start_outbound_conversation(request: Request):
             "trace_id": _trace_id_from_context(),
         },
     )
-    if not sent:
-        await db.execute(
-            "DELETE FROM messages WHERE id=$1 AND company_id=$2",
-            msg_id,
-            cid,
-        )
-        raise HTTPException(502, error or f"Failed to send outbound {channel} message")
     await db.execute(
-        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1 "
+        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,ai_handled=FALSE "
         "WHERE id=$2",
         initial_message[:100],
         convo["id"],
@@ -324,15 +328,16 @@ async def start_outbound_conversation(request: Request):
             "created_at": now_ts(),
         },
     )
-    res = await reserve_conversation_usage(
-        db,
-        cid,
-        channel=channel,
-        idempotency_key=f"api:{cid}:msg:{msg_id}",
-    )
-    if res == "denied":
-        await db.execute("DELETE FROM messages WHERE id=$1 AND company_id=$2", msg_id, cid)
-        raise HTTPException(429, "Monthly conversation limit reached")
+    if sent:
+        res = await reserve_conversation_usage(
+            db,
+            cid,
+            channel=channel,
+            idempotency_key=f"api:{cid}:msg:{msg_id}",
+        )
+        if res == "denied":
+            await db.execute("DELETE FROM messages WHERE id=$1 AND company_id=$2", msg_id, cid)
+            raise HTTPException(429, "Monthly conversation limit reached")
     updated_convo = r(
         await db.fetchrow(
             "SELECT * FROM conversations WHERE id=$1 AND company_id=$2",
@@ -343,7 +348,8 @@ async def start_outbound_conversation(request: Request):
     return {
         "conversation": updated_convo,
         "customer": customer,
-        "outbound_sent": True,
+        "outbound_sent": bool(sent),
+        "outbound_error": str(error or "").strip(),
         "channel": channel,
     }
 
@@ -539,6 +545,8 @@ async def send_message(convo_id: str, request: Request):
     conversation_sentiment = {}
     sentiment_gate = build_sentiment_gate(content, sentiment)
     trace_id = _trace_id_from_context()
+    outbound_delivered = True
+    outbound_error = ""
 
     await db.execute(
         "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
@@ -574,10 +582,11 @@ async def send_message(convo_id: str, request: Request):
     )
     await db.execute(
         "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,"
-        "unread_count=unread_count+$2 WHERE id=$3",
+        "unread_count=unread_count+$2,ai_handled=CASE WHEN $4 THEN FALSE ELSE ai_handled END WHERE id=$3",
         preview,
         1 if sender_type == "customer" else 0,
         convo_id,
+        sender_type == "agent",
     )
     if sender_type in ("customer", "agent"):
         res = await reserve_conversation_usage(
@@ -679,7 +688,8 @@ async def send_message(convo_id: str, request: Request):
     try:
         from data_pipeline.ingestion.raw_store import capture_raw_message
 
-        create_detached_task(
+        create_safe_detached_task(
+            db,
             capture_raw_message(
                 db,
                 conversation=dict(convo),
@@ -698,6 +708,11 @@ async def send_message(convo_id: str, request: Request):
             ),
             name=f"etl-capture-message-{msg_id}",
             idempotency_key=f"etl:msg:{company_id}:{msg_id}",
+            company_id=company_id,
+            channel=str(convo.get("channel") or ""),
+            trace_id=trace_id,
+            event_id=msg_id,
+            source_queue="etl",
         )
     except Exception as exc:
         logger.warning("ETL message capture dispatch failed msg_id=%s: %s", msg_id, exc)
@@ -714,39 +729,41 @@ async def send_message(convo_id: str, request: Request):
         )
         outbound_channel = str(convo.get("channel") or "")
         recipient_id = _resolve_conversation_recipient(outbound_channel, convo, cust)
-        if recipient_id:
-            outbound_attachments = saved_attachments if outbound_channel == "whatsapp" else []
-            outbound_subject = ""
-            if outbound_channel == "email":
-                base_subj = str(convo.get("subject") or "").strip()
-                if base_subj:
-                    outbound_subject = base_subj if base_subj.lower().startswith("re:") else f"Re: {base_subj}"
-                else:
-                    outbound_subject = "Re: your message"
-            sent, error = await _send_outbound_via_channel_layer(
-                db=db,
-                company_id=company_id,
-                channel=outbound_channel,
-                recipient_id=recipient_id,
-                content=content,
-                conversation_id=convo_id,
-                attachments=outbound_attachments,
-                db_message_id=msg_id,
-                subject=outbound_subject,
-                metadata={
-                    "source": "send_message",
-                    "actor_user_id": cu.get("sub", ""),
-                    "actor_user_role": cu.get("role", ""),
-                    "trace_id": trace_id,
-                },
+        outbound_attachments = saved_attachments if outbound_channel == "whatsapp" else []
+        outbound_subject = ""
+        if outbound_channel == "email":
+            base_subj = str(convo.get("subject") or "").strip()
+            if base_subj:
+                outbound_subject = base_subj if base_subj.lower().startswith("re:") else f"Re: {base_subj}"
+            else:
+                outbound_subject = "Re: your message"
+        sent, error = await _send_outbound_via_channel_layer(
+            db=db,
+            company_id=company_id,
+            channel=outbound_channel,
+            recipient_id=recipient_id,
+            content=content,
+            conversation_id=convo_id,
+            attachments=outbound_attachments,
+            db_message_id=msg_id,
+            subject=outbound_subject,
+            metadata={
+                "source": "send_message",
+                "actor_user_id": cu.get("sub", ""),
+                "actor_user_role": cu.get("role", ""),
+                "trace_id": trace_id,
+            },
+        )
+        outbound_delivered = bool(sent)
+        outbound_error = str(error or "").strip()
+        if not sent:
+            logger.warning(
+                "Outbound send failed for conversation %s channel=%s: %s",
+                convo_id,
+                outbound_channel,
+                error,
             )
-            if not sent:
-                logger.warning(
-                    "Outbound send failed for conversation %s channel=%s: %s",
-                    convo_id,
-                    outbound_channel,
-                    error,
-                )
+        message = await _load_message_with_attachments(db, msg_id)
 
     ai_response = None
     cust_full = None
@@ -803,7 +820,8 @@ async def send_message(convo_id: str, request: Request):
                     automatic=True,
                 )
                 await emit_new_message(convo_id, escalation["message"])
-                create_detached_task(
+                create_safe_detached_task(
+                    db,
                     _notify_agents_handoff(
                         db,
                         None,
@@ -812,7 +830,12 @@ async def send_message(convo_id: str, request: Request):
                         convo_id,
                         (cust_full or {}).get("name", "Customer"),
                         float(result.get("confidence", 0.0) or 0.0),
-                    )
+                    ),
+                    name=f"notify-handoff-{convo_id}",
+                    company_id=company_id,
+                    channel=str(convo.get("channel") or ""),
+                    trace_id=trace_id,
+                    event_id=msg_id,
                 )
                 return {
                     "message": message,
@@ -852,7 +875,8 @@ async def send_message(convo_id: str, request: Request):
                     },
                 )
                 await persist_user_ai_memory(db, cu, result["response"], "ai")
-                create_detached_task(
+                create_safe_detached_task(
+                    db,
                     persist_ai_session_record(
                         db,
                         company_id,
@@ -867,7 +891,12 @@ async def send_message(convo_id: str, request: Request):
                             "intent_name": result.get("intent_name", ""),
                             "channel": convo.get("channel", ""),
                         },
-                    )
+                    ),
+                    name=f"persist-ai-session-{convo_id}",
+                    company_id=company_id,
+                    channel=str(convo.get("channel") or ""),
+                    trace_id=trace_id,
+                    event_id=ai_id,
                 )
                 await db.execute(
                     "UPDATE conversations SET last_message=$1,last_message_at=NOW(),message_count=message_count+1,ai_handled=TRUE "  # noqa: E501
@@ -928,7 +957,8 @@ async def send_message(convo_id: str, request: Request):
                     automatic=True,
                 )
                 await emit_new_message(convo_id, escalation["message"])
-                create_detached_task(
+                create_safe_detached_task(
+                    db,
                     _notify_agents_handoff(
                         db,
                         None,
@@ -937,7 +967,12 @@ async def send_message(convo_id: str, request: Request):
                         convo_id,
                         (cust_full or {}).get("name", "Customer"),
                         float(result.get("confidence", 0.0) or 0.0),
-                    )
+                    ),
+                    name=f"notify-handoff-{convo_id}",
+                    company_id=company_id,
+                    channel=str(convo.get("channel") or ""),
+                    trace_id=trace_id,
+                    event_id=msg_id,
                 )
         except Exception as e:
             logger.error(f"AI response failed: {e}")
@@ -945,6 +980,8 @@ async def send_message(convo_id: str, request: Request):
         "message": message,
         "ai_response": ai_response,
         "sentiment_analysis": sentiment_gate if sender_type == "customer" else None,
+        "outbound_delivered": outbound_delivered if sender_type == "agent" else None,
+        "outbound_error": outbound_error if sender_type == "agent" and outbound_error else "",
     }
 
 
@@ -1098,7 +1135,8 @@ async def trigger_ai_response(convo_id: str, request: Request):
             "created_at": now_ts(),
         },
     )
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         persist_ai_session_record(
             db,
             company_id,
@@ -1113,7 +1151,12 @@ async def trigger_ai_response(convo_id: str, request: Request):
                 "intent_name": result.get("intent_name", ""),
                 "channel": convo.get("channel", ""),
             },
-        )
+        ),
+        name=f"persist-ai-session-{convo_id}",
+        company_id=company_id,
+        channel=str(convo.get("channel") or ""),
+        trace_id=trace_id,
+        event_id=ai_id,
     )
     await db.execute(
         "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1 WHERE id=$2",  # noqa: E501

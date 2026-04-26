@@ -5,6 +5,7 @@ import api from '@/lib/api';
 import { postAuthDestination } from '@/lib/auth-gates';
 import { startOAuthLoginRedirect } from '@/lib/oauthLoginRedirect';
 import PlatformLogo from '@/components/PlatformLogo';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { LogIn, Mail, Lock, Eye, EyeOff, ArrowLeft, CheckCircle, AlertCircle } from 'lucide-react';
 
 const GoogleIcon = () => (
@@ -224,7 +225,12 @@ export default function SignInPage() {
                   <label style={{ fontSize: 12, fontWeight: 500, color: '#475569', display: 'block', marginBottom: 6 }}>Workspace</label>
                   <input type="text" value={resetWorkspace} onChange={(e) => setResetWorkspace(e.target.value)} placeholder="Optional workspace name or id" style={{ ...inputStyle, paddingLeft: 14 }} onFocus={focusIn} onBlur={focusOut} />
                 </div>
-                {resetError && <div style={{ marginBottom: 12, padding: '10px 14px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, color: '#dc2626', display: 'flex', alignItems: 'center', gap: 8 }}><AlertCircle size={14} /> {resetError}</div>}
+                {resetError && (
+                  <Alert variant="destructive" className="mb-3 border-red-200 bg-red-50 text-red-700">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription>{resetError}</AlertDescription>
+                  </Alert>
+                )}
                 <button type="submit" disabled={resetLoading || !resetEmail} style={{ width: '100%', padding: '12px 0', borderRadius: 10, border: 'none', background: 'linear-gradient(135deg,#2563eb,#6366f1)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer', fontFamily: F, boxShadow: '0 4px 14px rgba(37,99,235,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, opacity: resetLoading ? 0.7 : 1 }} data-testid="generate-token-btn">
                   {resetLoading ? <div style={{ width: 16, height: 16, border: '2px solid #fff', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} /> : <Mail size={16} />} Send Reset Email
                 </button>
@@ -291,7 +297,12 @@ export default function SignInPage() {
                     ))}
                   </div>
                 )}
-                {resetError && <div style={{ marginBottom: 12, padding: '10px 14px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10, fontSize: 13, color: '#dc2626', display: 'flex', alignItems: 'center', gap: 8 }}><AlertCircle size={14} /> {resetError}</div>}
+                {resetError && (
+                  <Alert variant="destructive" className="mb-3 border-red-200 bg-red-50 text-red-700">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription>{resetError}</AlertDescription>
+                  </Alert>
+                )}
                 {resetSuccess && <div style={{ marginBottom: 12, padding: '10px 14px', background: '#ecfdf5', border: '1px solid #bbf7d0', borderRadius: 10, fontSize: 13, color: '#16a34a', display: 'flex', alignItems: 'center', gap: 8 }}><CheckCircle size={14} /> {resetSuccess}</div>}
                 <button type="submit" disabled={resetLoading} style={{ width: '100%', padding: '12px 0', borderRadius: 10, border: 'none', background: 'linear-gradient(135deg,#059669,#10b981)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer', fontFamily: F, boxShadow: '0 4px 14px rgba(5,150,105,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, opacity: resetLoading ? 0.7 : 1 }} data-testid="reset-password-btn">
                   {resetLoading ? <div style={{ width: 16, height: 16, border: '2px solid #fff', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} /> : <Lock size={16} />} Reset Password
@@ -325,7 +336,16 @@ export default function SignInPage() {
               </p>
             </div>
 
-            {error && <div style={{ marginBottom: 16, padding: '10px 14px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 8 }} data-testid="signin-error"><AlertCircle size={15} color="#dc2626" /><span style={{ fontSize: 13, color: '#dc2626' }}>{error}</span></div>}
+            {error && (
+              <Alert
+                variant="destructive"
+                className="mb-4 border-red-200 bg-red-50 text-red-700"
+                data-testid="signin-error"
+              >
+                <AlertCircle className="h-4 w-4" />
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
 
             <div style={{ background: '#fff', borderRadius: 16, border: '1px solid #e2e8f0', padding: 16, boxShadow: '0 4px 20px rgba(0,0,0,0.04)', marginBottom: 14 }}>
               <button

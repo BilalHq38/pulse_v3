@@ -21,6 +21,7 @@ from channel_layer.schemas import (
     UnifiedAttachment,
     UnifiedMessage,
 )
+from core.phone_normalization import normalize_to_e164_digits
 from core.utils import make_id
 
 logger = logging.getLogger(__name__)
@@ -221,7 +222,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 msg = messages[0] or {}
                 result["raw_message"] = msg
                 result["message_id"] = str(msg.get("id") or "").strip()
-                result["sender_phone"] = str(msg.get("from") or "").strip()
+                result["sender_phone"] = normalize_to_e164_digits(str(msg.get("from") or "").strip())
                 result["message_type"] = str(msg.get("type") or "text").strip()
 
                 # Parse timestamp (Meta may deliver seconds or milliseconds)

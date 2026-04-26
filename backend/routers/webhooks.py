@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -28,6 +29,7 @@ from services.ai_service.facade import (
     build_sentiment_gate,
     wait_for_ai_response_timing,
 )
+from services.ai_service.common import estimate_tokens
 from services.agent_orchestrator.facade import (
     orchestrate_lead_workflow,
     orchestrate_message_workflow,
@@ -36,13 +38,25 @@ from core.socket import emit_new_message
 from core.utils import make_id, now_ts
 from shared.background_queue import get_background_queue, serialize_coroutine
 from shared.cache import get_cache_client
-from shared.database import create_detached_task
 from shared.config import (
+    ai_input_token_budget,
+    ai_response_cooldown_seconds,
+    dedup_cache_ttl_seconds,
     identity_tenant_api_keys,
     is_production,
+    meta_webhook_event_replay_ttl_seconds,
+    meta_webhook_rate_limit_per_minute,
+    outbound_retry_base_delay_seconds,
     service_urls,
+    unprocessed_event_max_retries,
+    unprocessed_event_retry_base_seconds,
+    webhook_identity_resolve_timeout_seconds,
+    webhook_message_history_fetch_limit,
+    webhook_replay_ttl_seconds,
+    webhook_signature_max_skew_seconds,
 )
 from shared.tracing import current_trace_context
+from shared.webhook_task_runner import create_safe_detached_task
 from services.billing_helpers import relaxed_billing_env
 from shared.usage_guard import (
     inbound_conversation_billing_precheck,
@@ -50,18 +64,23 @@ from shared.usage_guard import (
     insert_conversation_usage_row,
 )
 from services.db_helpers import (
-    r,
-    get_current_user_flexible,
-    persist_ai_session_record,
-    persist_chat_history,
-    record_webhook_event,
-    _notify_agents_handoff,
     convert_lead_to_customer_state,
     escalate_conversation_to_human,
     fetch_messages_with_attachments,
+    get_current_user_flexible,
     is_company_ai_enabled,
+    insert_chat_history_record,
+    normalize_customer_contact_phone,
+    persist_ai_session_record,
+    persist_chat_history,
+    r,
+    record_webhook_event,
+    resolve_customer_by_contact,
     save_message_attachments,
+    upsert_customer_social_profile,
+    _notify_agents_handoff,
 )
+from services.messaging_service import _persist_outbound_message_state
 from services.meta_service import (
     decrypt_meta_secret,
     fetch_user_profile,
@@ -73,24 +92,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _IDENTITY_BASE_URL = service_urls().identity.rstrip("/")
-_WEBHOOK_REPLAY_TTL_SECONDS = max(60, int(os.environ.get("WEBHOOK_REPLAY_TTL_SECONDS", "300") or 300))
-_WEBHOOK_MAX_SKEW_SECONDS = max(30, int(os.environ.get("WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS", "300") or 300))
-_META_WEBHOOK_RATE_LIMIT_PER_MINUTE = max(
-    10,
-    int(os.environ.get("META_WEBHOOK_RATE_LIMIT_PER_MINUTE", "120") or 120),
-)
-_META_EVENT_REPLAY_TTL_SECONDS = max(
-    300,
-    int(os.environ.get("META_WEBHOOK_EVENT_REPLAY_TTL_SECONDS", "86400") or 86400),
-)
-_UNPROCESSED_EVENT_MAX_RETRIES = max(
-    1,
-    int(os.environ.get("UNPROCESSED_EVENT_MAX_RETRIES", "8") or 8),
-)
-_UNPROCESSED_EVENT_RETRY_BASE_SECONDS = max(
-    15,
-    int(os.environ.get("UNPROCESSED_EVENT_RETRY_BASE_SECONDS", "60") or 60),
-)
+_WEBHOOK_REPLAY_TTL_SECONDS = webhook_replay_ttl_seconds()
+_WEBHOOK_MAX_SKEW_SECONDS = webhook_signature_max_skew_seconds()
+_META_WEBHOOK_RATE_LIMIT_PER_MINUTE = meta_webhook_rate_limit_per_minute()
+_META_EVENT_REPLAY_TTL_SECONDS = meta_webhook_event_replay_ttl_seconds()
+_UNPROCESSED_EVENT_MAX_RETRIES = unprocessed_event_max_retries()
+_UNPROCESSED_EVENT_RETRY_BASE_SECONDS = unprocessed_event_retry_base_seconds()
 _UNPROCESSED_SCHEMA_READY = False
 _UNPROCESSED_SCHEMA_LOCK = asyncio.Lock()
 _CHANNEL_NORMALIZER = MessageNormalizer()
@@ -105,6 +112,54 @@ def _float_or_none(value):
         return float(value)
     except Exception:
         return None
+
+
+def _looks_like_phone(value: str) -> bool:
+    digits = re.sub(r"\D", "", str(value or "").strip())
+    return len(digits) >= 7
+
+
+def _extract_sender_contact_fields(channel: str, sender_contact: str, metadata_payload: dict | None) -> dict[str, str]:
+    payload = dict(metadata_payload or {})
+    normalized_channel = str(channel or "").strip().lower()
+    raw_contact = str(sender_contact or "").strip()
+    metadata_contact = str(payload.get("sender_contact") or "").strip()
+    session_id = str(payload.get("session_id") or "").strip()
+    social_profile_id = str(payload.get("social_profile_id") or "").strip()
+    channel_id = raw_contact or session_id or metadata_contact or social_profile_id
+
+    email = ""
+    phone = ""
+    profile_id = ""
+    if normalized_channel == "whatsapp":
+        phone = raw_contact or metadata_contact
+        channel_id = phone or channel_id
+    elif normalized_channel == "email":
+        email = (raw_contact or metadata_contact).lower()
+        channel_id = email or channel_id
+    elif normalized_channel in {"facebook", "instagram"}:
+        profile_id = social_profile_id or raw_contact or metadata_contact
+        channel_id = profile_id or channel_id
+    elif normalized_channel == "web_chat":
+        candidate = metadata_contact or raw_contact
+        if "@" in candidate:
+            email = candidate.lower()
+        elif _looks_like_phone(candidate):
+            phone = candidate
+        channel_id = session_id or channel_id
+    else:
+        candidate = metadata_contact or raw_contact
+        if "@" in candidate:
+            email = candidate.lower()
+        elif _looks_like_phone(candidate):
+            phone = candidate
+
+    return {
+        "email": email,
+        "phone": phone,
+        "social_profile_id": profile_id,
+        "channel_id": str(channel_id or "").strip(),
+    }
 
 
 def _is_truthy(value: str | None) -> bool:
@@ -756,6 +811,102 @@ async def _mark_unprocessed_event_resolved(
     )
 
 
+def _redact_inbound_metadata(value: Any) -> Any:
+    secret_markers = (
+        "secret",
+        "token",
+        "signature",
+        "authorization",
+        "password",
+        "api_key",
+        "access_key",
+        "webhook_secret",
+    )
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key or "")
+            lowered = key_text.lower()
+            if any(marker in lowered for marker in secret_markers):
+                redacted[key_text] = "[redacted]"
+                continue
+            redacted[key_text] = _redact_inbound_metadata(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_inbound_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_inbound_metadata(item) for item in value]
+    return value
+
+
+def _derive_unprocessed_event_id(channel: str, metadata: Optional[dict], payload: Optional[dict], fallback: str = "") -> str:
+    explicit = str(fallback or "").strip()
+    if explicit:
+        return explicit
+    meta = dict(metadata or {})
+    for key in (
+        "event_id",
+        "external_message_id",
+        "inbound_external_message_id",
+        "message_id",
+        "mid",
+    ):
+        value = str(meta.get(key, "") or "").strip()
+        if value:
+            return value
+    payload_blob = {
+        "channel": str(channel or "").strip(),
+        "metadata": _redact_inbound_metadata(meta),
+        "payload": _redact_inbound_metadata(payload or {}),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload_blob, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"{str(channel or 'event').strip() or 'event'}:{fingerprint[:40]}"
+
+
+async def _validate_resolved_company_id(db, company_id: str, *, channel: str, descriptor: str) -> str:
+    scoped_company_id = str(company_id or "").strip()
+    if not scoped_company_id:
+        return ""
+    exists = await db.fetchval(
+        "SELECT id FROM companies WHERE id=$1 AND deleted_at IS NULL LIMIT 1",
+        scoped_company_id,
+    )
+    if exists:
+        return scoped_company_id
+    logger.error(
+        "Resolved inbound tenant failed validation channel=%s descriptor=%s company_id=%s",
+        channel,
+        descriptor,
+        scoped_company_id,
+    )
+    return ""
+
+
+async def _store_unresolved_inbound_event(
+    db,
+    *,
+    channel: str,
+    metadata: Optional[dict],
+    payload: Optional[dict],
+    reason: str,
+    event_id: str = "",
+) -> None:
+    safe_metadata = _redact_inbound_metadata(dict(metadata or {}))
+    safe_payload = _redact_inbound_metadata(dict(payload or {}))
+    derived_event_id = _derive_unprocessed_event_id(channel, safe_metadata, safe_payload, fallback=event_id)
+    await _store_unprocessed_event(
+        db,
+        channel=channel,
+        event_id=derived_event_id,
+        payload=safe_payload,
+        metadata=safe_metadata,
+        reason=reason,
+        last_error=reason,
+    )
+
+
 async def _retry_unprocessed_events(
     db,
     *,
@@ -942,7 +1093,8 @@ def _schedule_unprocessed_retry(db, channel: str, *, delay_seconds: float = 0.0)
     timeout_seconds = None
     if delay_seconds and delay_seconds > 0:
         timeout_seconds = max(120.0, float(delay_seconds) + 60.0)
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _enqueue_delayed_unprocessed_retry(
             db,
             channel=channel,
@@ -951,6 +1103,8 @@ def _schedule_unprocessed_retry(db, channel: str, *, delay_seconds: float = 0.0)
         name=retry_job_name,
         job_id=retry_job_id,
         timeout_seconds=timeout_seconds,
+        channel=channel,
+        source_queue="unprocessed_event_retry",
     )
 
 
@@ -1112,6 +1266,7 @@ async def _handle_whatsapp_webhook_payload(
     allow_direct_company_id: bool = False,
 ) -> bool:
     resolved_company_id = ""
+    dedup_cache = get_cache_client(namespace="inbound_dedup")
     try:
         registry = get_channel_registry()
         adapter = registry.get_or_none(ChannelType.WHATSAPP)
@@ -1136,6 +1291,9 @@ async def _handle_whatsapp_webhook_payload(
                     "whatsapp",
                     inbound_metadata,
                     allow_direct_company_id=allow_direct_company_id,
+                    store_unprocessed=store_unresolved,
+                    event_id=event_id,
+                    payload=payload,
                 )
                 if not resolved_company_id:
                     logger.warning(
@@ -1143,6 +1301,8 @@ async def _handle_whatsapp_webhook_payload(
                         event_id,
                         unresolved_metadata,
                     )
+                    if store_unresolved:
+                        _schedule_unprocessed_retry(db, "whatsapp")
                     continue
 
                 await _record_webhook_event_safe(
@@ -1210,6 +1370,43 @@ async def _handle_whatsapp_webhook_payload(
                         }
                     )
                     unified_message = await _CHANNEL_NORMALIZER.normalize(unified_message, db)
+                    dedup_message_id = str(
+                        (msg or {}).get("id")
+                        or unified_message.message_id
+                        or (unified_message.metadata or {}).get("inbound_external_message_id")
+                        or (unified_message.metadata or {}).get("external_message_id")
+                        or ""
+                    ).strip()
+                    if dedup_message_id:
+                        dedup_key = _dedup_cache_key("whatsapp", resolved_company_id, dedup_message_id)
+                        try:
+                            cached = await dedup_cache.get_json(dedup_key)
+                            if cached:
+                                logger.info(
+                                    "Skipping duplicate WhatsApp inbound before persistence company_id=%s event_id=%s external_message_id=%s trace_id=%s",
+                                    resolved_company_id,
+                                    event_id,
+                                    dedup_message_id,
+                                    unified_message.trace_id,
+                                )
+                                continue
+                            await dedup_cache.set_json(
+                                dedup_key,
+                                {
+                                    "event_id": event_id,
+                                    "message_id": dedup_message_id,
+                                    "channel": "whatsapp",
+                                },
+                                ttl_seconds=dedup_cache_ttl_seconds(),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "WhatsApp inbound dedup cache unavailable company_id=%s event_id=%s external_message_id=%s error=%s",
+                                resolved_company_id,
+                                event_id,
+                                dedup_message_id,
+                                exc,
+                            )
 
                     sender_name = (
                         str(((contact or {}).get("profile") or {}).get("name") or "").strip()
@@ -1281,6 +1478,9 @@ async def _handle_facebook_webhook_payload(
                 "facebook",
                 {"page_id": page_id},
                 allow_direct_company_id=False,
+                store_unprocessed=store_unresolved,
+                event_id=event_id,
+                payload=payload,
             )
             if not company_id:
                 logger.warning(
@@ -1288,15 +1488,7 @@ async def _handle_facebook_webhook_payload(
                     event_id,
                     page_id,
                 )
-                if store_unresolved and event_id:
-                    await _store_unprocessed_event(
-                        db,
-                        channel="facebook",
-                        event_id=event_id,
-                        payload=payload,
-                        metadata={"page_id": page_id},
-                        reason="tenant_unresolved",
-                    )
+                if store_unresolved:
                     _schedule_unprocessed_retry(db, "facebook")
                 return False
             entry_contexts.append((entry, page_id, company_id))
@@ -1444,6 +1636,9 @@ async def _handle_instagram_webhook_payload(
                 "instagram",
                 {"page_id": page_id},
                 allow_direct_company_id=False,
+                store_unprocessed=store_unresolved,
+                event_id=event_id,
+                payload=payload,
             )
             if not company_id:
                 logger.warning(
@@ -1451,15 +1646,7 @@ async def _handle_instagram_webhook_payload(
                     event_id,
                     page_id,
                 )
-                if store_unresolved and event_id:
-                    await _store_unprocessed_event(
-                        db,
-                        channel="instagram",
-                        event_id=event_id,
-                        payload=payload,
-                        metadata={"page_id": page_id},
-                        reason="tenant_unresolved",
-                    )
+                if store_unresolved:
                     _schedule_unprocessed_retry(db, "instagram")
                 return False
             entry_contexts.append((entry, page_id, company_id))
@@ -1609,6 +1796,9 @@ async def _handle_lead_form_webhook_payload(
                 "lead_form",
                 {"page_id": page_id},
                 allow_direct_company_id=False,
+                store_unprocessed=store_unresolved,
+                event_id=event_id,
+                payload=payload,
             )
             if not company_id:
                 logger.warning(
@@ -1616,15 +1806,7 @@ async def _handle_lead_form_webhook_payload(
                     event_id,
                     page_id,
                 )
-                if store_unresolved and event_id:
-                    await _store_unprocessed_event(
-                        db,
-                        channel="lead_form",
-                        event_id=event_id,
-                        payload=payload,
-                        metadata={"page_id": page_id},
-                        reason="tenant_unresolved",
-                    )
+                if store_unresolved:
                     _schedule_unprocessed_retry(db, "lead_form")
                 return False
             entry_contexts.append((entry, company_id))
@@ -1781,16 +1963,27 @@ async def _resolve_inbound_company_id(
     metadata: Optional[dict] = None,
     *,
     allow_direct_company_id: bool = True,
+    store_unprocessed: bool = False,
+    event_id: str = "",
+    payload: Optional[dict] = None,
 ) -> str:
     meta = metadata or {}
+    safe_channel = str(channel or "").strip()
+    safe_event_id = str(event_id or "").strip()
+
+    async def _validated(candidate: str, *, descriptor: str) -> str:
+        return await _validate_resolved_company_id(
+            db,
+            candidate,
+            channel=safe_channel,
+            descriptor=descriptor,
+        )
+
     direct_company_id = (meta.get("company_id", "") or "").strip()
     if allow_direct_company_id and direct_company_id:
-        exists = await db.fetchval(
-            "SELECT id FROM companies WHERE id=$1 AND deleted_at IS NULL LIMIT 1",
-            direct_company_id,
-        )
-        if exists:
-            return direct_company_id
+        resolved = await _validated(direct_company_id, descriptor="direct_company_id")
+        if resolved:
+            return resolved
         logger.warning(
             "Inbound company_id metadata not found in companies table channel=%s company_id=%s",
             channel,
@@ -1813,7 +2006,12 @@ async def _resolve_inbound_company_id(
                 descriptor=f"whatsapp_channel_phone_number_id:{phone_number_id}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(
+                    resolved,
+                    descriptor=f"whatsapp_channel_phone_number_id:{phone_number_id}",
+                )
+                if validated:
+                    return validated
             resolved = await _resolve_single_company_id(
                 db,
                 "SELECT company_id FROM tenant_meta_config tmc "
@@ -1824,7 +2022,12 @@ async def _resolve_inbound_company_id(
                 descriptor=f"tenant_meta_phone_number_id:{phone_number_id}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(
+                    resolved,
+                    descriptor=f"tenant_meta_phone_number_id:{phone_number_id}",
+                )
+                if validated:
+                    return validated
             resolved = await _resolve_single_company_id(
                 db,
                 "SELECT cs.company_id FROM channel_settings cs "
@@ -1835,7 +2038,9 @@ async def _resolve_inbound_company_id(
                 descriptor=f"phone_number_id:{phone_number_id}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(resolved, descriptor=f"phone_number_id:{phone_number_id}")
+                if validated:
+                    return validated
         if recipient_phone_number:
             resolved = await _resolve_single_company_id(
                 db,
@@ -1847,7 +2052,12 @@ async def _resolve_inbound_company_id(
                 descriptor=f"recipient_phone_number:{recipient_phone_number}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(
+                    resolved,
+                    descriptor=f"recipient_phone_number:{recipient_phone_number}",
+                )
+                if validated:
+                    return validated
         if business_account_id:
             resolved = await _resolve_single_company_id(
                 db,
@@ -1859,7 +2069,12 @@ async def _resolve_inbound_company_id(
                 descriptor=f"whatsapp_channel_business_account_id:{business_account_id}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(
+                    resolved,
+                    descriptor=f"whatsapp_channel_business_account_id:{business_account_id}",
+                )
+                if validated:
+                    return validated
             resolved = await _resolve_single_company_id(
                 db,
                 "SELECT company_id FROM tenant_meta_config tmc "
@@ -1870,7 +2085,12 @@ async def _resolve_inbound_company_id(
                 descriptor=f"tenant_meta_business_account_id:{business_account_id}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(
+                    resolved,
+                    descriptor=f"tenant_meta_business_account_id:{business_account_id}",
+                )
+                if validated:
+                    return validated
             resolved = await _resolve_single_company_id(
                 db,
                 "SELECT cs.company_id FROM channel_settings cs "
@@ -1881,7 +2101,12 @@ async def _resolve_inbound_company_id(
                 descriptor=f"business_account_id:{business_account_id}",
             )
             if resolved:
-                return resolved
+                validated = await _validated(
+                    resolved,
+                    descriptor=f"business_account_id:{business_account_id}",
+                )
+                if validated:
+                    return validated
     if channel == "lead_form" and page_id:
         resolved = await _resolve_single_company_id(
             db,
@@ -1894,7 +2119,9 @@ async def _resolve_inbound_company_id(
             descriptor=f"lead_form_meta_page_id:{page_id}",
         )
         if resolved:
-            return resolved
+            validated = await _validated(resolved, descriptor=f"lead_form_meta_page_id:{page_id}")
+            if validated:
+                return validated
         resolved = await _resolve_single_company_id(
             db,
             "SELECT company_id FROM channel_settings cs "
@@ -1905,7 +2132,9 @@ async def _resolve_inbound_company_id(
             descriptor=f"lead_form_page_id:{page_id}",
         )
         if resolved:
-            return resolved
+            validated = await _validated(resolved, descriptor=f"lead_form_page_id:{page_id}")
+            if validated:
+                return validated
     if channel in {"facebook", "instagram"} and page_id:
         resolved = await _resolve_single_company_id(
             db,
@@ -1929,13 +2158,30 @@ async def _resolve_inbound_company_id(
             descriptor=f"page_id:{page_id}",
         )
         if resolved:
-            return resolved
+            validated = await _validated(resolved, descriptor=f"page_id:{page_id}")
+            if validated:
+                return validated
 
+    redacted_metadata = {
+        key: value
+        for key, value in (_redact_inbound_metadata(meta) or {}).items()
+        if value not in ("", None, [], {})
+    }
     logger.warning(
-        "Unable to resolve inbound company context without explicit channel mapping channel=%s metadata=%s",
-        channel,
-        {k: v for k, v in meta.items() if v},
+        "Unable to resolve inbound company context channel=%s event_id=%s metadata=%s",
+        safe_channel,
+        safe_event_id,
+        redacted_metadata,
     )
+    if store_unprocessed:
+        await _store_unresolved_inbound_event(
+            db,
+            channel=safe_channel,
+            metadata=redacted_metadata,
+            payload=payload,
+            reason="tenant_unresolved",
+            event_id=safe_event_id,
+        )
     return ""
 
 
@@ -2002,6 +2248,241 @@ async def _load_message_with_attachments(db, message_id: str) -> dict:
     return msg
 
 
+def _workflow_debug_dump(workflow: Any) -> Any:
+    if workflow is None:
+        return None
+    if hasattr(workflow, "model_dump"):
+        try:
+            return workflow.model_dump()
+        except Exception:
+            return repr(workflow)
+    return workflow
+
+
+def _coerce_workflow_dict(
+    value: Any,
+    *,
+    field_name: str,
+    workflow: Any,
+    context_label: str,
+    company_id: str,
+    conversation_id: str,
+    channel: str,
+    trace_id: str,
+) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    logger.warning(
+        "Unexpected workflow field shape context=%s field=%s company_id=%s conversation_id=%s channel=%s trace_id=%s workflow=%s",
+        context_label,
+        field_name,
+        company_id,
+        conversation_id,
+        channel,
+        trace_id,
+        _workflow_debug_dump(workflow),
+    )
+    return {}
+
+
+def _coerce_workflow_list(
+    value: Any,
+    *,
+    field_name: str,
+    workflow: Any,
+    context_label: str,
+    company_id: str,
+    conversation_id: str,
+    channel: str,
+    trace_id: str,
+) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    logger.warning(
+        "Unexpected workflow list shape context=%s field=%s company_id=%s conversation_id=%s channel=%s trace_id=%s workflow=%s",
+        context_label,
+        field_name,
+        company_id,
+        conversation_id,
+        channel,
+        trace_id,
+        _workflow_debug_dump(workflow),
+    )
+    return []
+
+
+def _extract_workflow_outputs(
+    workflow: Any,
+    *,
+    context_label: str,
+    company_id: str,
+    conversation_id: str,
+    channel: str,
+    trace_id: str,
+) -> tuple[dict, dict, dict, dict]:
+    agent_outputs = getattr(workflow, "agent_outputs", None)
+    if agent_outputs is None:
+        logger.warning(
+            "Workflow agent_outputs missing context=%s company_id=%s conversation_id=%s channel=%s trace_id=%s workflow=%s",
+            context_label,
+            company_id,
+            conversation_id,
+            channel,
+            trace_id,
+            _workflow_debug_dump(workflow),
+        )
+        return {}, {}, {}, {}
+    return (
+        _coerce_workflow_dict(
+            getattr(agent_outputs, "capture", None),
+            field_name="agent_outputs.capture",
+            workflow=workflow,
+            context_label=context_label,
+            company_id=company_id,
+            conversation_id=conversation_id,
+            channel=channel,
+            trace_id=trace_id,
+        ),
+        _coerce_workflow_dict(
+            getattr(agent_outputs, "qualification", None),
+            field_name="agent_outputs.qualification",
+            workflow=workflow,
+            context_label=context_label,
+            company_id=company_id,
+            conversation_id=conversation_id,
+            channel=channel,
+            trace_id=trace_id,
+        ),
+        _coerce_workflow_dict(
+            getattr(agent_outputs, "support", None),
+            field_name="agent_outputs.support",
+            workflow=workflow,
+            context_label=context_label,
+            company_id=company_id,
+            conversation_id=conversation_id,
+            channel=channel,
+            trace_id=trace_id,
+        ),
+        _coerce_workflow_dict(
+            getattr(agent_outputs, "analytics", None),
+            field_name="agent_outputs.analytics",
+            workflow=workflow,
+            context_label=context_label,
+            company_id=company_id,
+            conversation_id=conversation_id,
+            channel=channel,
+            trace_id=trace_id,
+        ),
+    )
+
+
+def _estimate_conversation_history_tokens(messages: list[dict]) -> int:
+    payload = json.dumps(messages or [], ensure_ascii=False, default=str)
+    return estimate_tokens(payload)
+
+
+def _truncate_history_for_token_budget(
+    msgs_history: list[dict],
+    *,
+    company_id: str,
+    conversation_id: str,
+    channel: str,
+    trace_id: str,
+) -> list[dict]:
+    history = list(msgs_history or [])
+    budget = ai_input_token_budget()
+    if budget <= 0 or not history:
+        return history
+    original_estimate = _estimate_conversation_history_tokens(history)
+    trimmed_history = list(history)
+    removed_count = 0
+    final_estimate = original_estimate
+    while len(trimmed_history) > 1 and final_estimate > budget:
+        trimmed_history.pop(0)
+        removed_count += 1
+        final_estimate = _estimate_conversation_history_tokens(trimmed_history)
+    if removed_count:
+        logger.warning(
+            "Conversation history truncated for token budget company_id=%s conversation_id=%s channel=%s trace_id=%s removed_messages=%s original_tokens=%s final_tokens=%s budget=%s",
+            company_id,
+            conversation_id,
+            channel,
+            trace_id,
+            removed_count,
+            original_estimate,
+            final_estimate,
+            budget,
+        )
+    return trimmed_history
+
+
+async def _recent_human_agent_message_within_cooldown(
+    db,
+    *,
+    company_id: str,
+    conversation_id: str,
+) -> dict:
+    cooldown_seconds = ai_response_cooldown_seconds()
+    if not company_id or not conversation_id or cooldown_seconds <= 0:
+        return {}
+    row = await db.fetchrow(
+        "SELECT id,sender_id,sender_name,created_at FROM messages "
+        "WHERE company_id=$1 AND conversation_id=$2 AND sender_type='agent' "
+        "AND created_at >= NOW() - ($3 * INTERVAL '1 second') "
+        "ORDER BY created_at DESC LIMIT 1",
+        company_id,
+        conversation_id,
+        cooldown_seconds,
+    )
+    return r(row)
+
+
+async def _emit_outbound_failure_notice(
+    db,
+    *,
+    company_id: str,
+    conversation_id: str,
+    channel: str,
+    trace_id: str,
+    failed_message_id: str,
+    error: str,
+) -> None:
+    if not db or not company_id or not conversation_id:
+        return
+    logger.warning(
+        "Emitting outbound failure notice company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s error=%s",
+        company_id,
+        conversation_id,
+        channel,
+        failed_message_id,
+        trace_id,
+        error,
+    )
+    notice_id = make_id()
+    notice_text = (
+        f"Delivery failed on {channel}. Message {failed_message_id or 'unknown'} was not sent. "
+        f"Error: {str(error or 'Unknown delivery error').strip()}"
+    )
+    await db.execute(
+        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "
+        "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
+        notice_id,
+        company_id,
+        conversation_id,
+        notice_text,
+    )
+    notice_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", notice_id))
+    await emit_new_message(conversation_id, notice_message)
+
+
+def _dedup_cache_key(channel: str, company_id: str, external_message_id: str) -> str:
+    return f"{str(company_id or '').strip()}:{str(channel or '').strip()}:{str(external_message_id or '').strip()}"
+
+
 async def _run_lead_workflow_sync(
     db,
     *,
@@ -2025,8 +2506,14 @@ async def _run_lead_workflow_sync(
         ),
         db=db,
     )
-    qualification = dict(workflow.agent_outputs.qualification or {})
-    support = dict(workflow.agent_outputs.support or {})
+    _, qualification, support, _ = _extract_workflow_outputs(
+        workflow,
+        context_label="lead_workflow_sync",
+        company_id=company_id,
+        conversation_id=str(customer.get("conversation_id") or ""),
+        channel=str(source or "lead"),
+        trace_id=str((metadata or {}).get("trace_id") or ""),
+    )
     await db.execute(
         "UPDATE leads SET score=$1,grade=$2,phase=$3,scoring_reason=$4,next_action=$5,updated_at=NOW() WHERE id=$6",
         int(qualification.get("score", 0) or 0),
@@ -2227,7 +2714,14 @@ async def _auto_capture_lead(
     """Auto-capture lead from incoming channel message."""
     try:
         metadata_payload = dict(metadata or {})
-        company_id = await _resolve_inbound_company_id(db, channel, metadata_payload)
+        company_id = await _resolve_inbound_company_id(
+            db,
+            channel,
+            metadata_payload,
+            store_unprocessed=True,
+            event_id=_derive_unprocessed_event_id(channel, metadata_payload, {"metadata": metadata_payload}),
+            payload={"metadata": metadata_payload},
+        )
         if not company_id:
             logger.warning(
                 "Skipping inbound message capture because tenant resolution failed channel=%s sender_contact=%s",
@@ -2295,9 +2789,25 @@ async def _auto_capture_lead(
                                 f"%{last10}",
                             )
                         )
+        contact_fields = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)
+        social_profile_id = contact_fields["social_profile_id"] or social_profile_id
+        if not existing:
+            existing = await resolve_customer_by_contact(
+                db,
+                company_id,
+                phone=contact_fields["phone"],
+                email=contact_fields["email"],
+                channel=channel,
+                channel_profile_id=social_profile_id,
+                explicit_customer_id=explicit_customer_id,
+            )
         if not existing:
             nid = make_id()
-            is_email = "@" in (sender_contact or "")
+            normalized_phone = (
+                await normalize_customer_contact_phone(db, company_id, contact_fields["phone"])
+                if contact_fields["phone"]
+                else ""
+            )
             await db.execute(
                 "INSERT INTO customers(id,company_id,name,email,phone,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,"  # noqa: E501
                 "recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "
@@ -2305,8 +2815,8 @@ async def _auto_capture_lead(
                 nid,
                 company_id,
                 sender_name or "Unknown Contact",
-                sender_contact if is_email else "",
-                sender_contact if not is_email else "",
+                contact_fields["email"],
+                normalized_phone,
             )
             existing = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1", nid))
         else:
@@ -2320,6 +2830,28 @@ async def _auto_capture_lead(
                 customer_updates.append(f"name=${len(args) + 1}")
                 args.append(sender_name)
                 existing["name"] = sender_name
+            normalized_email = contact_fields["email"]
+            normalized_phone = (
+                await normalize_customer_contact_phone(db, company_id, contact_fields["phone"])
+                if contact_fields["phone"]
+                else ""
+            )
+            existing_phone_digits = re.sub(r"\D", "", str(existing.get("phone") or ""))
+            normalized_phone_digits = re.sub(r"\D", "", normalized_phone)
+            if normalized_email and not existing.get("email"):
+                customer_updates.append(f"email=${len(args) + 1}")
+                args.append(normalized_email)
+                existing["email"] = normalized_email
+            if normalized_phone and (
+                not existing_phone_digits
+                or (
+                    len(normalized_phone_digits) > len(existing_phone_digits)
+                    and normalized_phone_digits.endswith(existing_phone_digits)
+                )
+            ):
+                customer_updates.append(f"phone=${len(args) + 1}")
+                args.append(normalized_phone)
+                existing["phone"] = normalized_phone
             if existing.get("lifecycle_stage") != "customer":
                 customer_updates.append(f"lifecycle_stage=${len(args) + 1}")
                 args.append("lead")
@@ -2330,6 +2862,7 @@ async def _auto_capture_lead(
                     f"UPDATE customers SET {', '.join(customer_updates)},updated_at=NOW() WHERE id=${len(args)}",
                     *args,
                 )
+        await upsert_customer_social_profile(db, existing["id"], channel, social_profile_id)
         await db.execute(
             "INSERT INTO customer_tags(customer_id,tag) VALUES($1,'auto-captured') ON CONFLICT DO NOTHING",
             existing["id"],
@@ -2529,7 +3062,7 @@ async def _try_auto_unify(db, company_id: str, customer: dict, channel: str):
         if not payload["platform_user_id"]:
             return
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=webhook_identity_resolve_timeout_seconds()) as client:
             response = await client.post(
                 f"{_IDENTITY_BASE_URL}/api/identity/resolve",
                 headers={
@@ -2548,11 +3081,43 @@ async def _try_auto_unify(db, company_id: str, customer: dict, channel: str):
             return
 
         body = response.json() if response.content else {}
+        resolved_profile_id = str(body.get("customer_id") or "").strip()
+        resolved_profile = body.get("profile") or {}
+        member_count = int((resolved_profile or {}).get("member_count") or 0)
+        write_result = ""
+        if resolved_profile_id and str(customer.get("id") or "").strip() and tenant_id:
+            metadata_patch = json.dumps(
+                {
+                    "identity_unification": {
+                        "profile_id": resolved_profile_id,
+                        "match_type": str(body.get("match_type") or "").strip(),
+                        "confidence_score": float(body.get("confidence_score") or 0),
+                        "review_required": bool(body.get("review_required", False)),
+                        "merge_performed": bool(body.get("merge_performed", False)),
+                        "member_count": member_count,
+                        "channel": normalized_channel,
+                        "unified": member_count > 1,
+                        "resolved_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            write_result = await db.execute(
+                "UPDATE customers "
+                "SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb, updated_at=NOW() "
+                "WHERE id=$2 AND company_id=$3",
+                metadata_patch,
+                customer.get("id"),
+                tenant_id,
+            )
         logger.info(
-            "Identity resolved customer=%s unified_members=%s review_required=%s",
+            "Identity resolved customer=%s resolved_profile_id=%s unified_members=%s review_required=%s write_result=%s",
             customer.get("id"),
-            (body.get("profile") or {}).get("member_count", 0),
+            resolved_profile_id,
+            member_count,
             body.get("review_required", False),
+            write_result or "skipped",
         )
     except Exception as exc:
         logger.warning("Auto-unification identity resolve failed: %s", exc)
@@ -2596,15 +3161,18 @@ def _legacy_attachments_from_unified(attachments: list[UnifiedAttachment]) -> li
     return normalized
 
 
-def _resolve_outbound_recipient(channel: str, customer: dict, sender_contact: str = "") -> str:
+def _resolve_outbound_recipient(channel: str, convo: dict, customer: dict, sender_contact: str = "") -> str:
     normalized_channel = str(channel or "").strip().lower()
+    conversation_channel_id = str(convo.get("channel_id") or convo.get("session_id") or "").strip()
     if normalized_channel == "whatsapp":
-        return str(customer.get("phone") or sender_contact or "").strip()
+        return str(conversation_channel_id or customer.get("phone") or sender_contact or "").strip()
     if normalized_channel in {"facebook", "instagram"}:
-        return str(sender_contact or customer.get("phone") or customer.get("email") or "").strip()
+        return str(conversation_channel_id or sender_contact or "").strip()
     if normalized_channel == "web_chat":
-        return str(sender_contact or customer.get("email") or customer.get("id") or "").strip()
-    return str(sender_contact or "").strip()
+        return str(conversation_channel_id or sender_contact or customer.get("email") or customer.get("id") or "").strip()
+    if normalized_channel == "email":
+        return str(conversation_channel_id or customer.get("email") or sender_contact or "").strip()
+    return str(conversation_channel_id or sender_contact or "").strip()
 
 
 async def _send_outbound_response_via_channel_layer(
@@ -2621,30 +3189,162 @@ async def _send_outbound_response_via_channel_layer(
 ) -> tuple[bool, str]:
     channel_type = _channel_type_from_name(channel)
     if not channel_type:
-        return False, f"Unsupported outbound channel: {channel}"
+        error = f"Unsupported outbound channel: {channel}"
+        if db_message_id:
+            await _persist_outbound_message_state(
+                db,
+                company_id=company_id,
+                db_message_id=db_message_id,
+                delivery_status="failed",
+            )
+            try:
+                await _emit_outbound_failure_notice(
+                    db,
+                    company_id=company_id,
+                    conversation_id=conversation_id,
+                    channel=channel,
+                    trace_id=str((metadata or {}).get("trace_id") or ""),
+                    failed_message_id=db_message_id,
+                    error=error,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to emit outbound failure notice for unsupported channel company_id=%s conversation_id=%s channel=%s message_id=%s",
+                    company_id,
+                    conversation_id,
+                    channel,
+                    db_message_id,
+                )
+        return False, error
     recipient = str(recipient_id or "").strip()
     if not recipient:
-        return False, "Missing outbound recipient"
+        error = "Missing outbound recipient"
+        if db_message_id:
+            await _persist_outbound_message_state(
+                db,
+                company_id=company_id,
+                db_message_id=db_message_id,
+                delivery_status="failed",
+            )
+            try:
+                await _emit_outbound_failure_notice(
+                    db,
+                    company_id=company_id,
+                    conversation_id=conversation_id,
+                    channel=channel,
+                    trace_id=str((metadata or {}).get("trace_id") or ""),
+                    failed_message_id=db_message_id,
+                    error=error,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to emit outbound failure notice for missing recipient company_id=%s conversation_id=%s channel=%s message_id=%s",
+                    company_id,
+                    conversation_id,
+                    channel,
+                    db_message_id,
+                )
+        return False, error
 
     outbound = get_outbound_router()
     message_metadata = dict(metadata or {})
     if db_message_id and not message_metadata.get("db_message_id"):
         message_metadata["db_message_id"] = db_message_id
-    if not message_metadata.get("trace_id"):
-        message_metadata["trace_id"] = _trace_id_from_context()
+    trace_id = str(message_metadata.get("trace_id") or "").strip() or _trace_id_from_context()
+    message_metadata["trace_id"] = trace_id
 
-    result = await outbound.send_to_channel(
-        tenant_id=company_id,
-        channel_type=channel_type,
-        external_user_id=recipient,
-        content=content,
-        db=db,
-        metadata=message_metadata,
-        conversation_id=conversation_id,
-        attachments=attachments or [],
-        db_message_id=db_message_id,
+    max_attempts = 3
+    base_delay = outbound_retry_base_delay_seconds()
+    external_message_id = ""
+    last_error = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await outbound.send_to_channel(
+                tenant_id=company_id,
+                channel_type=channel_type,
+                external_user_id=recipient,
+                content=content,
+                db=db,
+                metadata=message_metadata,
+                conversation_id=conversation_id,
+                attachments=attachments or [],
+                db_message_id=db_message_id,
+            )
+            external_message_id = str(result.external_message_id or "").strip()
+            last_error = str(result.error or "").strip()
+            if result.success:
+                if db_message_id:
+                    await _persist_outbound_message_state(
+                        db,
+                        company_id=company_id,
+                        db_message_id=db_message_id,
+                        delivery_status="delivered",
+                        external_message_id=external_message_id,
+                    )
+                return True, ""
+            logger.warning(
+                "Outbound send attempt failed company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s attempt=%s/%s error=%s",
+                company_id,
+                conversation_id,
+                channel,
+                db_message_id,
+                trace_id,
+                attempt,
+                max_attempts,
+                last_error or "unknown",
+            )
+        except Exception as exc:
+            last_error = str(exc).strip() or "Unhandled outbound send error"
+            logger.exception(
+                "Outbound send attempt raised company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s attempt=%s/%s",
+                company_id,
+                conversation_id,
+                channel,
+                db_message_id,
+                trace_id,
+                attempt,
+                max_attempts,
+            )
+        if attempt < max_attempts:
+            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+
+    if db_message_id:
+        await _persist_outbound_message_state(
+            db,
+            company_id=company_id,
+            db_message_id=db_message_id,
+            delivery_status="failed",
+            external_message_id=external_message_id,
+        )
+        try:
+            await _emit_outbound_failure_notice(
+                db,
+                company_id=company_id,
+                conversation_id=conversation_id,
+                channel=channel,
+                trace_id=trace_id,
+                failed_message_id=db_message_id,
+                error=last_error,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit outbound failure notice company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s",
+                company_id,
+                conversation_id,
+                channel,
+                db_message_id,
+                trace_id,
+            )
+    logger.error(
+        "Outbound send permanently failed company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s error=%s",
+        company_id,
+        conversation_id,
+        channel,
+        db_message_id,
+        trace_id,
+        last_error or "unknown",
     )
-    return bool(result.success), str(result.error or "")
+    return False, last_error or "Outbound send failed"
 
 
 async def _process_unified_incoming_message(
@@ -2746,9 +3446,24 @@ async def _process_incoming_message(
     lead = dict(result.get("lead") or {})
     cid = customer.get("id", "")
     company_id = result.get("company_id") or customer.get("company_id", "")
+    company_id = await _validate_resolved_company_id(
+        db,
+        company_id,
+        channel=channel,
+        descriptor="process_incoming_message",
+    )
+    if not company_id:
+        logger.error(
+            "Inbound message aborted due to invalid tenant channel=%s sender_contact=%s customer_id=%s",
+            channel,
+            sender_contact,
+            cid,
+        )
+        return None
     inbound_external_message_id = str(
         metadata_payload.get("inbound_external_message_id") or metadata_payload.get("external_message_id") or ""
     ).strip()
+    channel_binding = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)["channel_id"]
 
     if inbound_external_message_id and company_id:
         existing = r(
@@ -2784,135 +3499,198 @@ async def _process_incoming_message(
     usage_idempotency_key = (
         f"in:{company_id}:{channel}:{ext_part}" if ext_part else f"in:{company_id}:{channel}:msg:{msg_id}"
     )
+    saved_attachments: list[dict] = []
+    convo: dict = {}
+    convo_id = ""
+    sent_score = None
+    sent_emotion = None
+    sent_conf = None
+    intent_type = None
+    sentiment = {}
+    conversation_sentiment = {}
+    intent = {}
+    sentiment_gate = build_sentiment_gate(message_text, {})
+    support_plan: dict = {}
+    history_message = {
+        "id": msg_id,
+        "conversation_id": "",
+        "content": message_text,
+        "sender_type": "customer",
+        "sender_name": customer.get("name", "Unknown"),
+        "attachments": [],
+        "created_at": now_ts(),
+        "company_id": company_id,
+    }
+    try:
+        async with db.transaction() as conn:
+            if relaxed_billing_env():
+                billing_gate = "allow"
+            else:
+                billing_gate = await inbound_conversation_billing_precheck(
+                    conn, company_id, idempotency_key=usage_idempotency_key
+                )
+            if billing_gate == "duplicate":
+                logger.info(
+                    "Inbound billing idempotent replay skipped company_id=%s channel=%s key=%s",
+                    company_id,
+                    channel,
+                    usage_idempotency_key,
+                )
+                return None
+            if billing_gate == "denied":
+                logger.warning(
+                    "Inbound message skipped: monthly conversation quota exceeded company_id=%s channel=%s",
+                    company_id,
+                    channel,
+                )
+                return None
 
-    async with db.transaction() as conn:
-        if relaxed_billing_env():
-            billing_gate = "allow"
-        else:
-            billing_gate = await inbound_conversation_billing_precheck(
-                conn, company_id, idempotency_key=usage_idempotency_key
+            convo = r(
+                await conn.fetchrow(
+                    "SELECT * FROM conversations WHERE customer_id=$1 AND channel=$2 AND status=ANY($3) AND company_id=$4 "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    cid,
+                    channel,
+                    ["open", "pending", "escalated"],
+                    company_id,
+                )
             )
-        if billing_gate == "duplicate":
-            logger.info(
-                "Inbound billing idempotent replay skipped company_id=%s channel=%s key=%s",
-                company_id,
-                channel,
-                usage_idempotency_key,
-            )
-            return None
-        if billing_gate == "denied":
-            logger.warning(
-                "Inbound message skipped: monthly conversation quota exceeded company_id=%s channel=%s",
-                company_id,
-                channel,
-            )
-            return None
+            if not convo:
+                convo_id = make_id()
+                # Match db_helpers get_or_create_contact_conversation: list columns through agent_type, then NOT NULL sentiment fields as bound parameters.
+                await conn.execute(
+                    "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,agent_type,"  # noqa: E501
+                    "channel_id,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,session_id,page_url,created_at,updated_at) "  # noqa: E501
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,TRUE,'generic',$10,$11::numeric,$12,0,'',NOW(),0,'','',NOW(),NOW())",
+                    convo_id,
+                    company_id,
+                    cid,
+                    customer.get("name", "Unknown"),
+                    "",
+                    channel,
+                    f"New {channel} conversation",
+                    "",
+                    "",
+                    channel_binding,
+                    0,
+                    "neutral",
+                )
+                await conn.execute(
+                    "INSERT INTO conversation_tags(conversation_id,tag) VALUES($1,'auto-captured') ON CONFLICT DO NOTHING",
+                    convo_id,
+                )
+                convo = r(await conn.fetchrow("SELECT * FROM conversations WHERE id=$1", convo_id))
+            elif company_id and not convo.get("company_id"):
+                await conn.execute(
+                    "UPDATE conversations SET company_id=$1,updated_at=NOW() WHERE id=$2",
+                    company_id,
+                    convo["id"],
+                )
+                convo["company_id"] = company_id
+            if channel_binding and convo.get("channel_id") != channel_binding:
+                await conn.execute(
+                    "UPDATE conversations SET channel_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                    channel_binding,
+                    convo["id"],
+                    company_id,
+                )
+                convo["channel_id"] = channel_binding
 
-        convo = r(
-            await conn.fetchrow(
-                "SELECT * FROM conversations WHERE customer_id=$1 AND channel=$2 AND status=ANY($3) AND company_id=$4 "
-                "ORDER BY updated_at DESC LIMIT 1",
-                cid,
-                channel,
-                ["open", "pending", "escalated"],
-                company_id,
-            )
-        )
-        if not convo:
-            convo_id = make_id()
+            convo_id = str(convo["id"])
+            history_message["conversation_id"] = convo_id
             await conn.execute(
-                "INSERT INTO conversations(id,company_id,customer_id,customer_name,channel,subject,status,priority,ai_handled,"  # noqa: E501
-                "sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,created_at,updated_at) "  # noqa: E501
-                "VALUES($1,$2,$3,$4,$5,$6,'open','medium',TRUE,NULL,'',0,'',NOW(),0,NOW(),NOW())",
-                convo_id,
+                "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,sentiment_score,"
+                "sentiment_emotion,sentiment_confidence,intent_type,external_message_id,read,created_at) "
+                "VALUES($1,$2,$3,$4,'customer',$5,$6,$7,$8,$9,$10,$11,FALSE,NOW())",
+                msg_id,
                 company_id,
+                convo_id,
+                message_text,
                 cid,
                 customer.get("name", "Unknown"),
-                channel,
-                f"New {channel} conversation",
+                sent_score,
+                sent_emotion,
+                sent_conf,
+                intent_type,
+                inbound_external_message_id,
             )
+            if relaxed_billing_env():
+                await insert_conversation_usage_relaxed(
+                    conn,
+                    company_id,
+                    channel=channel,
+                    idempotency_key=usage_idempotency_key,
+                )
+            else:
+                await insert_conversation_usage_row(
+                    conn,
+                    company_id,
+                    channel=channel,
+                    idempotency_key=usage_idempotency_key,
+                )
+            saved_attachments = await save_message_attachments(conn, msg_id, attachments or [])
+            history_message["attachments"] = saved_attachments
+            await insert_chat_history_record(conn, convo, history_message)
             await conn.execute(
-                "INSERT INTO conversation_tags(conversation_id,tag) VALUES($1,'auto-captured') ON CONFLICT DO NOTHING",
+                "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,unread_count=unread_count+1 "  # noqa: E501
+                "WHERE id=$2",
+                _message_preview(message_text, saved_attachments, "customer"),
                 convo_id,
             )
-            convo = r(await conn.fetchrow("SELECT * FROM conversations WHERE id=$1", convo_id))
-        elif company_id and not convo.get("company_id"):
-            await conn.execute(
-                "UPDATE conversations SET company_id=$1,updated_at=NOW() WHERE id=$2",
-                company_id,
-                convo["id"],
-            )
-            convo["company_id"] = company_id
-
-        convo_id = convo["id"]
-        sent_score = None
-        sent_emotion = None
-        sent_conf = None
-        intent_type = None
-        sentiment = {}
-        conversation_sentiment = {}
-        intent = {}
-        sentiment_gate = build_sentiment_gate(message_text, {})
-        support_plan: dict = {}
-
-        await conn.execute(
-            "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,sentiment_score,"
-            "sentiment_emotion,sentiment_confidence,intent_type,external_message_id,read,created_at) "
-            "VALUES($1,$2,$3,$4,'customer',$5,$6,$7,$8,$9,$10,$11,FALSE,NOW())",
-            msg_id,
+    except Exception:
+        logger.exception(
+            "Inbound message transaction failed company_id=%s channel=%s message_id=%s external_message_id=%s",
             company_id,
-            convo_id,
-            message_text,
-            cid,
-            customer.get("name", "Unknown"),
-            sent_score,
-            sent_emotion,
-            sent_conf,
-            intent_type,
+            channel,
+            msg_id,
             inbound_external_message_id,
         )
-        if relaxed_billing_env():
-            await insert_conversation_usage_relaxed(
-                conn,
-                company_id,
-                channel=channel,
-                idempotency_key=usage_idempotency_key,
-            )
-        else:
-            await insert_conversation_usage_row(
-                conn,
-                company_id,
-                channel=channel,
-                idempotency_key=usage_idempotency_key,
-            )
+        return None
 
-    create_detached_task(_try_auto_unify(db, company_id, customer, channel))
-    saved_attachments = await save_message_attachments(db, msg_id, attachments or [])
-    await persist_chat_history(
+    create_safe_detached_task(
         db,
-        convo,
-        {
-            "id": msg_id,
-            "conversation_id": convo_id,
-            "content": message_text,
-            "sender_type": "customer",
-            "sender_name": customer.get("name", "Unknown"),
-            "attachments": saved_attachments,
-            "created_at": now_ts(),
-        },
+        _try_auto_unify(db, company_id, customer, channel),
+        name=f"webhook-auto-unify-{msg_id}",
+        company_id=company_id,
+        channel=channel,
+        trace_id=str(metadata_payload.get("trace_id") or ""),
+        event_id=inbound_external_message_id or msg_id,
+        payload={"customer_id": cid, "message_id": msg_id},
     )
-    await db.execute(
-        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,unread_count=unread_count+1 "  # noqa: E501
-        "WHERE id=$2",
-        _message_preview(message_text, saved_attachments, "customer"),
-        convo_id,
-    )
+    try:
+        from data_pipeline.ingestion.raw_store import capture_raw_message
+
+        await capture_raw_message(
+            db,
+            conversation=dict(convo),
+            message=dict(history_message),
+            source=str(convo.get("channel") or "message"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "raw message capture failed company_id=%s conversation_id=%s message_id=%s error=%s",
+            company_id,
+            convo_id,
+            msg_id,
+            exc,
+        )
     trace_id = _trace_id_from_context(str(metadata_payload.get("trace_id") or ""))
     if trace_id:
         metadata_payload["trace_id"] = trace_id
 
     try:
-        msgs_history = await fetch_messages_with_attachments(db, convo_id, limit=20)
+        msgs_history = await fetch_messages_with_attachments(
+            db,
+            convo_id,
+            limit=webhook_message_history_fetch_limit(),
+        )
+        msgs_history = _truncate_history_for_token_budget(
+            msgs_history,
+            company_id=company_id,
+            conversation_id=convo_id,
+            channel=channel,
+            trace_id=trace_id,
+        )
         workflow = await orchestrate_message_workflow(
             MessageWorkflowRequest(
                 trace_id=trace_id,
@@ -2937,12 +3715,55 @@ async def _process_incoming_message(
             ),
             db=db,
         )
-        capture = workflow.agent_outputs.capture
-        support_plan = dict(workflow.agent_outputs.support or {})
-        sentiment = dict(capture.get("sentiment") or {})
-        conversation_sentiment = dict(capture.get("conversation_sentiment") or {})
-        intent = dict(capture.get("intent") or {})
-        sentiment_gate = dict(capture.get("sentiment_gate") or {}) or build_sentiment_gate(message_text, sentiment)
+        capture, _, support_output, _ = _extract_workflow_outputs(
+            workflow,
+            context_label="process_incoming_message",
+            company_id=company_id,
+            conversation_id=convo_id,
+            channel=channel,
+            trace_id=trace_id,
+        )
+        support_plan = dict(support_output or {})
+        sentiment = _coerce_workflow_dict(
+            capture.get("sentiment"),
+            field_name="capture.sentiment",
+            workflow=workflow,
+            context_label="process_incoming_message",
+            company_id=company_id,
+            conversation_id=convo_id,
+            channel=channel,
+            trace_id=trace_id,
+        )
+        conversation_sentiment = _coerce_workflow_dict(
+            capture.get("conversation_sentiment"),
+            field_name="capture.conversation_sentiment",
+            workflow=workflow,
+            context_label="process_incoming_message",
+            company_id=company_id,
+            conversation_id=convo_id,
+            channel=channel,
+            trace_id=trace_id,
+        )
+        intent = _coerce_workflow_dict(
+            capture.get("intent"),
+            field_name="capture.intent",
+            workflow=workflow,
+            context_label="process_incoming_message",
+            company_id=company_id,
+            conversation_id=convo_id,
+            channel=channel,
+            trace_id=trace_id,
+        )
+        sentiment_gate = _coerce_workflow_dict(
+            capture.get("sentiment_gate"),
+            field_name="capture.sentiment_gate",
+            workflow=workflow,
+            context_label="process_incoming_message",
+            company_id=company_id,
+            conversation_id=convo_id,
+            channel=channel,
+            trace_id=trace_id,
+        ) or build_sentiment_gate(message_text, sentiment)
         sent_score = _float_or_none(sentiment.get("score"))
         sent_emotion = str(sentiment.get("emotion", "neutral"))
         sent_conf = _float_or_none(sentiment.get("confidence"))
@@ -2988,7 +3809,23 @@ async def _process_incoming_message(
     await emit_new_message(convo_id, customer_message)
 
     ai_message = None
-    if convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
+    recent_human_agent_message = await _recent_human_agent_message_within_cooldown(
+        db,
+        company_id=company_id,
+        conversation_id=convo_id,
+    )
+    if recent_human_agent_message:
+        logger.info(
+            "Skipping AI reply due to recent human agent activity company_id=%s conversation_id=%s channel=%s trace_id=%s cooldown_seconds=%s agent_message_id=%s agent_name=%s",
+            company_id,
+            convo_id,
+            channel,
+            trace_id,
+            ai_response_cooldown_seconds(),
+            recent_human_agent_message.get("id", ""),
+            recent_human_agent_message.get("sender_name", ""),
+        )
+    elif convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
         try:
             support_result = dict(support_plan or {})
             if not support_result:
@@ -3036,7 +3873,8 @@ async def _process_incoming_message(
                     automatic=True,
                 )
                 await emit_new_message(convo_id, escalation["message"])
-                create_detached_task(
+                create_safe_detached_task(
+                    db,
                     _notify_agents_handoff(
                         db,
                         None,
@@ -3045,7 +3883,12 @@ async def _process_incoming_message(
                         convo_id,
                         customer.get("name", "Customer"),
                         float(support_result.get("confidence", 0.0) or 0.0),
-                    )
+                    ),
+                    name=f"notify-handoff-{convo_id}",
+                    company_id=company_id,
+                    channel=channel,
+                    trace_id=trace_id,
+                    event_id=inbound_external_message_id or msg_id,
                 )
                 return {
                     "conversation_id": convo_id,
@@ -3072,7 +3915,26 @@ async def _process_incoming_message(
                 ai_attachments = await save_message_attachments(
                     db,
                     ai_id,
-                    support_result.get("attachments") or support_result.get("product_images") or [],
+                    _coerce_workflow_list(
+                        support_result.get("attachments"),
+                        field_name="support.attachments",
+                        workflow=None,
+                        context_label="process_incoming_message",
+                        company_id=company_id,
+                        conversation_id=convo_id,
+                        channel=channel,
+                        trace_id=trace_id,
+                    )
+                    or _coerce_workflow_list(
+                        support_result.get("product_images"),
+                        field_name="support.product_images",
+                        workflow=None,
+                        context_label="process_incoming_message",
+                        company_id=company_id,
+                        conversation_id=convo_id,
+                        channel=channel,
+                        trace_id=trace_id,
+                    ),
                 )
                 await persist_chat_history(
                     db,
@@ -3092,7 +3954,8 @@ async def _process_incoming_message(
                     _message_preview(support_result["response"], ai_attachments, "ai"),
                     convo_id,
                 )
-                create_detached_task(
+                create_safe_detached_task(
+                    db,
                     persist_ai_session_record(
                         db,
                         company_id,
@@ -3107,12 +3970,18 @@ async def _process_incoming_message(
                             "intent_name": support_result.get("intent_name", ""),
                             "channel": channel,
                         },
-                    )
+                    ),
+                    name=f"persist-ai-session-{convo_id}",
+                    company_id=company_id,
+                    channel=channel,
+                    trace_id=trace_id,
+                    event_id=ai_id,
                 )
                 ai_message = await _load_message_with_attachments(db, ai_id)
                 await emit_new_message(convo_id, ai_message)
                 recipient_id = _resolve_outbound_recipient(
                     channel,
+                    convo,
                     customer,
                     sender_contact,
                 )
@@ -3138,6 +4007,29 @@ async def _process_incoming_message(
                             channel,
                             error,
                         )
+                else:
+                    await _persist_outbound_message_state(
+                        db,
+                        company_id=company_id,
+                        db_message_id=ai_id,
+                        delivery_status="failed",
+                    )
+                    await _emit_outbound_failure_notice(
+                        db,
+                        company_id=company_id,
+                        conversation_id=convo_id,
+                        channel=channel,
+                        trace_id=trace_id,
+                        failed_message_id=ai_id,
+                        error="Missing outbound recipient",
+                    )
+                    logger.warning(
+                        "Unified outbound skipped due to missing recipient company_id=%s conversation_id=%s channel=%s trace_id=%s",
+                        company_id,
+                        convo_id,
+                        channel,
+                        trace_id,
+                    )
             else:
                 escalation = await escalate_conversation_to_human(
                     db,
@@ -3152,7 +4044,8 @@ async def _process_incoming_message(
                     automatic=True,
                 )
                 await emit_new_message(convo_id, escalation["message"])
-                create_detached_task(
+                create_safe_detached_task(
+                    db,
                     _notify_agents_handoff(
                         db,
                         None,
@@ -3161,7 +4054,12 @@ async def _process_incoming_message(
                         convo_id,
                         customer.get("name", "Customer"),
                         float(support_result.get("confidence", 0.0) or 0.0),
-                    )
+                    ),
+                    name=f"notify-handoff-{convo_id}",
+                    company_id=company_id,
+                    channel=channel,
+                    trace_id=trace_id,
+                    event_id=inbound_external_message_id or msg_id,
                 )
         except Exception as e:
             logger.error(f"AI auto-response failed: {e}")
@@ -3216,7 +4114,8 @@ async def whatsapp_webhook(request: Request):
     trusted_bridge = bool(
         bridge_secret and provided_bridge_secret and hmac.compare_digest(provided_bridge_secret, bridge_secret)
     )
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _handle_whatsapp_webhook_payload(
             db,
             payload,
@@ -3224,6 +4123,9 @@ async def whatsapp_webhook(request: Request):
             allow_direct_company_id=trusted_bridge,
         ),
         name="webhook-whatsapp",
+        channel="whatsapp",
+        event_id=event_id,
+        payload=payload,
     )
     return {"status": "received"}
 
@@ -3252,9 +4154,13 @@ async def facebook_webhook(request: Request):
     raw_body = await request.body()
     event_id = await _verify_meta_webhook_request(request, db, "facebook", raw_body)
     payload = _decode_webhook_json(raw_body)
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _handle_facebook_webhook_payload(db, payload, event_id=event_id),
         name="webhook-facebook",
+        channel="facebook",
+        event_id=event_id,
+        payload=payload,
     )
     return {"status": "received"}
 
@@ -3282,9 +4188,13 @@ async def instagram_webhook(request: Request):
     raw_body = await request.body()
     event_id = await _verify_meta_webhook_request(request, db, "instagram", raw_body)
     payload = _decode_webhook_json(raw_body)
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _handle_instagram_webhook_payload(db, payload, event_id=event_id),
         name="webhook-instagram",
+        channel="instagram",
+        event_id=event_id,
+        payload=payload,
     )
     return {"status": "received"}
 
@@ -3305,13 +4215,18 @@ async def web_chat_webhook(request: Request):
     else:
         await _verify_web_chat_widget_request(request, db, payload)
 
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _record_webhook_event_safe(
             db,
             "web_chat",
             payload,
             metadata={"company_id": payload.get("company_id", "")},
-        )
+        ),
+        name="webhook-web-chat-audit",
+        channel="web_chat",
+        event_id=str(payload.get("event_id") or payload.get("message_id") or ""),
+        payload=payload,
     )
     try:
         adapter = get_channel_registry().get_or_none(ChannelType.WEB_CHAT)
@@ -3479,7 +4394,8 @@ async def web_chat_webhook(request: Request):
         try:
             from data_pipeline.ingestion.raw_store import capture_raw_message as _capture_raw_msg
 
-            create_detached_task(
+            create_safe_detached_task(
+                db,
                 _capture_raw_msg(
                     db,
                     conversation=dict(convo),
@@ -3496,11 +4412,27 @@ async def web_chat_webhook(request: Request):
                 ),
                 name=f"etl-webchat-{msg_id}",
                 idempotency_key=f"etl:msg:{company_id}:{msg_id}",
+                company_id=company_id,
+                channel="web_chat",
+                trace_id=trace_id,
+                event_id=msg_id,
+                source_queue="etl",
             )
         except Exception as _etl_exc:
             logger.debug("ETL web chat capture dispatch failed: %s", _etl_exc)
         try:
-            msgs_history = await fetch_messages_with_attachments(db, convo_id, limit=20)
+            msgs_history = await fetch_messages_with_attachments(
+                db,
+                convo_id,
+                limit=webhook_message_history_fetch_limit(),
+            )
+            msgs_history = _truncate_history_for_token_budget(
+                msgs_history,
+                company_id=company_id,
+                conversation_id=convo_id,
+                channel="web_chat",
+                trace_id=trace_id,
+            )
             workflow = await orchestrate_message_workflow(
                 MessageWorkflowRequest(
                     trace_id=trace_id,
@@ -3525,12 +4457,55 @@ async def web_chat_webhook(request: Request):
                 ),
                 db=db,
             )
-            capture = workflow.agent_outputs.capture
-            support_plan = dict(workflow.agent_outputs.support or {})
-            sentiment = dict(capture.get("sentiment") or {})
-            conversation_sentiment = dict(capture.get("conversation_sentiment") or {})
-            intent = dict(capture.get("intent") or {})
-            sentiment_gate = dict(capture.get("sentiment_gate") or {}) or build_sentiment_gate(content, sentiment)
+            capture, _, support_output, _ = _extract_workflow_outputs(
+                workflow,
+                context_label="web_chat_webhook",
+                company_id=company_id,
+                conversation_id=convo_id,
+                channel="web_chat",
+                trace_id=trace_id,
+            )
+            support_plan = dict(support_output or {})
+            sentiment = _coerce_workflow_dict(
+                capture.get("sentiment"),
+                field_name="capture.sentiment",
+                workflow=workflow,
+                context_label="web_chat_webhook",
+                company_id=company_id,
+                conversation_id=convo_id,
+                channel="web_chat",
+                trace_id=trace_id,
+            )
+            conversation_sentiment = _coerce_workflow_dict(
+                capture.get("conversation_sentiment"),
+                field_name="capture.conversation_sentiment",
+                workflow=workflow,
+                context_label="web_chat_webhook",
+                company_id=company_id,
+                conversation_id=convo_id,
+                channel="web_chat",
+                trace_id=trace_id,
+            )
+            intent = _coerce_workflow_dict(
+                capture.get("intent"),
+                field_name="capture.intent",
+                workflow=workflow,
+                context_label="web_chat_webhook",
+                company_id=company_id,
+                conversation_id=convo_id,
+                channel="web_chat",
+                trace_id=trace_id,
+            )
+            sentiment_gate = _coerce_workflow_dict(
+                capture.get("sentiment_gate"),
+                field_name="capture.sentiment_gate",
+                workflow=workflow,
+                context_label="web_chat_webhook",
+                company_id=company_id,
+                conversation_id=convo_id,
+                channel="web_chat",
+                trace_id=trace_id,
+            ) or build_sentiment_gate(content, sentiment)
             sent_score = _float_or_none(sentiment.get("score"))
             sent_emotion = str(sentiment.get("emotion", "neutral"))
             sent_conf = _float_or_none(sentiment.get("confidence"))
@@ -3576,7 +4551,22 @@ async def web_chat_webhook(request: Request):
         ai_response_text = None
         ai_message = None
         is_ai = False
-        if convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
+        recent_human_agent_message = await _recent_human_agent_message_within_cooldown(
+            db,
+            company_id=company_id,
+            conversation_id=convo_id,
+        )
+        if recent_human_agent_message:
+            logger.info(
+                "Skipping web chat AI reply due to recent human agent activity company_id=%s conversation_id=%s trace_id=%s cooldown_seconds=%s agent_message_id=%s agent_name=%s",
+                company_id,
+                convo_id,
+                trace_id,
+                ai_response_cooldown_seconds(),
+                recent_human_agent_message.get("id", ""),
+                recent_human_agent_message.get("sender_name", ""),
+            )
+        elif convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
             try:
                 support_result = dict(support_plan or {})
                 if not support_result:
@@ -3623,7 +4613,8 @@ async def web_chat_webhook(request: Request):
                         automatic=True,
                     )
                     await emit_new_message(convo_id, escalation["message"])
-                    create_detached_task(
+                    create_safe_detached_task(
+                        db,
                         _notify_agents_handoff(
                             db,
                             None,
@@ -3632,7 +4623,12 @@ async def web_chat_webhook(request: Request):
                             convo_id,
                             customer.get("name", customer_name),
                             float(support_result.get("confidence", 0.0) or 0.0),
-                        )
+                        ),
+                        name=f"notify-handoff-{convo_id}",
+                        company_id=company_id,
+                        channel="web_chat",
+                        trace_id=trace_id,
+                        event_id=msg_id,
                     )
                     return {
                         "status": "ok",
@@ -3657,7 +4653,26 @@ async def web_chat_webhook(request: Request):
                     ai_attachments = await save_message_attachments(
                         db,
                         ai_id,
-                        support_result.get("attachments") or support_result.get("product_images") or [],
+                        _coerce_workflow_list(
+                            support_result.get("attachments"),
+                            field_name="support.attachments",
+                            workflow=None,
+                            context_label="web_chat_webhook",
+                            company_id=company_id,
+                            conversation_id=convo_id,
+                            channel="web_chat",
+                            trace_id=trace_id,
+                        )
+                        or _coerce_workflow_list(
+                            support_result.get("product_images"),
+                            field_name="support.product_images",
+                            workflow=None,
+                            context_label="web_chat_webhook",
+                            company_id=company_id,
+                            conversation_id=convo_id,
+                            channel="web_chat",
+                            trace_id=trace_id,
+                        ),
                     )
                     await persist_chat_history(
                         db,
@@ -3677,7 +4692,8 @@ async def web_chat_webhook(request: Request):
                         _message_preview(support_result["response"], ai_attachments, "ai"),
                         convo_id,
                     )
-                    create_detached_task(
+                    create_safe_detached_task(
+                        db,
                         persist_ai_session_record(
                             db,
                             company_id,
@@ -3692,7 +4708,12 @@ async def web_chat_webhook(request: Request):
                                 "intent_name": support_result.get("intent_name", ""),
                                 "channel": "web_chat",
                             },
-                        )
+                        ),
+                        name=f"persist-ai-session-{convo_id}",
+                        company_id=company_id,
+                        channel="web_chat",
+                        trace_id=trace_id,
+                        event_id=ai_id,
                     )
                     ai_message = await _load_message_with_attachments(db, ai_id)
                     sent, error = await _send_outbound_response_via_channel_layer(
@@ -3734,7 +4755,8 @@ async def web_chat_webhook(request: Request):
                         automatic=True,
                     )
                     await emit_new_message(convo_id, escalation["message"])
-                    create_detached_task(
+                    create_safe_detached_task(
+                        db,
                         _notify_agents_handoff(
                             db,
                             None,
@@ -3743,7 +4765,12 @@ async def web_chat_webhook(request: Request):
                             convo_id,
                             customer.get("name", customer_name),
                             float(support_result.get("confidence", 0.0) or 0.0),
-                        )
+                        ),
+                        name=f"notify-handoff-{convo_id}",
+                        company_id=company_id,
+                        channel="web_chat",
+                        trace_id=trace_id,
+                        event_id=msg_id,
                     )
             except Exception as e:
                 logger.error(f"Web chat AI failed: {e}")
@@ -3766,9 +4793,13 @@ async def lead_form_webhook(request: Request):
     raw_body = await request.body()
     event_id = await _verify_meta_webhook_request(request, db, "lead_form", raw_body)
     payload = _decode_webhook_json(raw_body)
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _handle_lead_form_webhook_payload(db, payload, event_id=event_id),
         name="webhook-lead-form",
+        channel="lead_form",
+        event_id=event_id,
+        payload={"page_payload": payload},
     )
     return {"status": "received"}
 
@@ -3848,7 +4879,8 @@ async def external_purchase_webhook(request: Request, token: Optional[str] = Que
     if not phone:
         raise HTTPException(400, "customer_phone is required")
     purchase_id = make_id()
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         _handle_external_purchase_webhook_payload(
             db,
             body,
@@ -3856,6 +4888,9 @@ async def external_purchase_webhook(request: Request, token: Optional[str] = Que
             purchase_id=purchase_id,
         ),
         name="webhook-external-purchase",
+        channel="external_purchase",
+        event_id=str(body.get("event_id") or purchase_id),
+        payload=body,
     )
     return {"status": "received", "purchase_id": purchase_id}
 

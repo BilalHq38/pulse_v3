@@ -15,8 +15,8 @@ from services.data_pipeline_service.etl_leads import (
     clean_leads_dataframe,
     write_clean_leads,
 )
-from shared.background_queue import collect_background_queue_snapshot, get_background_queue
-from shared.database import create_detached_task
+from shared.background_queue import collect_background_queue_snapshot
+from shared.webhook_task_runner import create_safe_detached_task
 
 router = APIRouter()
 routers = (router,)
@@ -90,20 +90,19 @@ async def reprocess_pipeline_record(kind: str, raw_id: str, request: Request):
     job_id = (
         f"etl:reprocess:{company_id}:{normalized_kind}:{raw_id}:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
     )
-    queue = get_background_queue(service_label="data-pipeline")
-    if queue is not None and queue.enabled:
-        await queue.enqueue_coroutine(
-            job,
-            name=name,
-            job_id=job_id,
-            idempotency_key=job_id,
-        )
-        try:
-            job.close()
-        except Exception:
-            pass
-    else:
-        create_detached_task(job, name=name, job_id=job_id, idempotency_key=job_id)
+    create_safe_detached_task(
+        db,
+        job,
+        name=name,
+        job_id=job_id,
+        idempotency_key=job_id,
+        company_id=company_id,
+        channel=normalized_kind,
+        event_id=raw_id,
+        payload={"raw_id": raw_id, "kind": normalized_kind},
+        source_queue="data-pipeline",
+        service_label="data-pipeline",
+    )
     return {
         "status": "queued",
         "kind": normalized_kind,

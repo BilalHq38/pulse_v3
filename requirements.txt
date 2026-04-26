@@ -34,6 +34,10 @@ aiofiles>=23.2.1
 Pillow>=10.0.0
 openpyxl>=3.1.0
 
+# Tabular imports (shared/tabular_uploads.py, customer bulk upload routes)
+numpy>=1.26.0
+pandas>=2.0.0
+
 # Environment variables
 python-dotenv>=1.0.0
 

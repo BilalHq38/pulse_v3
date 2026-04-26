@@ -23,7 +23,6 @@ dnspython==2.8.0
 dotenv==0.9.9
 ecdsa==0.19.1
 email-validator==2.3.0
-emergentintegrations==0.1.0
 et_xmlfile==2.0.0
 fastapi==0.134.0
 fastuuid==0.14.0

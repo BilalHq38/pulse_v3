@@ -279,7 +279,7 @@ class CompanySettingsUpdate(BaseModel):
 
     company_name: Optional[str] = Field(default=None, max_length=255)
     industry: Optional[str] = Field(default=None, max_length=255)
-    tagline: Optional[str] = Field(default=None, max_length=255)
+    tagline: Optional[str] = Field(default=None, max_length=500)
     description: Optional[str] = Field(default=None, max_length=5000)
     logo_url: Optional[str] = Field(default=None, max_length=5000)
     phone: Optional[str] = Field(default=None, max_length=64)
@@ -511,6 +511,8 @@ async def update_company_settings(body: CompanySettingsUpdate, request: Request)
     # Map preferred_language → language column
     if "preferred_language" in payload:
         payload["language"] = payload.pop("preferred_language")
+    if "default_phone_region" in payload and payload["default_phone_region"]:
+        payload["default_phone_region"] = str(payload["default_phone_region"]).upper()
 
     # Apply allowlist + type coercion (guards against any Pydantic extra="ignore" leakage)
     safe = _safe_fields(payload, ALLOWED_COMPANY_SETTINGS_FIELDS)

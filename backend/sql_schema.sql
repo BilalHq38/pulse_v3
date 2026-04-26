@@ -39,15 +39,6 @@ CREATE INDEX IF NOT EXISTS idx_companies_active ON companies(is_active);
 CREATE INDEX IF NOT EXISTS idx_companies_created_at ON companies(created_at);
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS enterprise_team_gate_met BOOLEAN NOT NULL DEFAULT FALSE;
 
--- ============================================================================
--- Default local tenant seed (dev / docker compose)
--- ============================================================================
--- Services enforce UUID tenant IDs; keep a stable UUID for local bootstrapping.
--- This matches `.env` DEFAULT_TENANT_ID and WHATSAPP_BRIDGE default.
-INSERT INTO companies(id, name, is_active, created_at, updated_at)
-VALUES ('d7c253c7-3c35-47c6-8f93-b10cf50a0370', 'Local Tenant', TRUE, NOW(), NOW())
-ON CONFLICT (id) DO NOTHING;
-
 CREATE TABLE IF NOT EXISTS deleted_companies (
     id         TEXT PRIMARY KEY,
     created_at TIMESTAMPTZ,
@@ -113,15 +104,6 @@ CREATE INDEX IF NOT EXISTS idx_company_settings_created_at ON company_settings(c
 ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS preferred_channels JSONB NOT NULL DEFAULT '[]'::jsonb;
 -- Per-tenant default region (ISO 3166-1 alpha-2) for parsing local phone numbers; empty = use env WHATSAPP_DEFAULT_COUNTRY only.
 ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_phone_region TEXT NOT NULL DEFAULT '';
-
-INSERT INTO company_settings(id, company_id, created_at, updated_at)
-VALUES (
-  'company_settings_d7c253c7-3c35-47c6-8f93-b10cf50a0370',
-  'd7c253c7-3c35-47c6-8f93-b10cf50a0370',
-  NOW(),
-  NOW()
-)
-ON CONFLICT (company_id) DO NOTHING;
 
 -- ============================================================================
 -- Users and authentication
@@ -1079,10 +1061,15 @@ CREATE INDEX IF NOT EXISTS idx_context_memories_convo_id
 -- Dead-letter queue for failed external/pipeline events.
 CREATE TABLE IF NOT EXISTS dead_letter_queue (
     id            TEXT PRIMARY KEY,
+    task_name     TEXT NOT NULL DEFAULT '',
+    event_id      TEXT NOT NULL DEFAULT '',
+    trace_id      TEXT NOT NULL DEFAULT '',
     company_id    TEXT NOT NULL DEFAULT '',
+    channel       TEXT NOT NULL DEFAULT '',
     source_queue  TEXT NOT NULL DEFAULT '',
     event_type    TEXT NOT NULL DEFAULT '',
     payload       TEXT NOT NULL DEFAULT '',
+    error         TEXT NOT NULL DEFAULT '',
     error_message TEXT NOT NULL DEFAULT '',
     retry_count   INTEGER NOT NULL DEFAULT 0,
     max_retries   INTEGER NOT NULL DEFAULT 3,
@@ -1777,6 +1764,7 @@ CREATE TABLE IF NOT EXISTS unified_customers (
     consent_id           UUID REFERENCES consent_ledger(consent_id) ON DELETE SET NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unified_customers_id ON unified_customers(id);
+CREATE INDEX IF NOT EXISTS idx_unified_customers_customer_id ON unified_customers(customer_id);
 CREATE INDEX IF NOT EXISTS idx_unified_customers_tenant_id ON unified_customers(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_unified_customers_tenant_active ON unified_customers(tenant_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_unified_customers_phone_hash ON unified_customers(primary_phone_hash);
@@ -1803,6 +1791,7 @@ CREATE TABLE IF NOT EXISTS identity_mappings (
     CONSTRAINT uq_identity_mapping_platform_user UNIQUE (tenant_id, platform, platform_user_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_mappings_id ON identity_mappings(id);
+CREATE INDEX IF NOT EXISTS idx_identity_mappings_mapping_id ON identity_mappings(mapping_id);
 CREATE INDEX IF NOT EXISTS idx_identity_mappings_tenant_id ON identity_mappings(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_identity_mappings_customer_id ON identity_mappings(customer_id);
 CREATE INDEX IF NOT EXISTS idx_identity_mappings_platform ON identity_mappings(platform);
@@ -1827,7 +1816,7 @@ CREATE INDEX IF NOT EXISTS idx_device_fingerprints_tenant_hash ON device_fingerp
 CREATE TABLE IF NOT EXISTS resolution_audit_log (
     resolution_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id            TEXT NOT NULL CHECK (BTRIM(tenant_id) <> ''),
-    customer_id          UUID,
+    customer_id          UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
     input_signals        JSONB NOT NULL DEFAULT '{}'::jsonb,
     score_breakdown      JSONB NOT NULL DEFAULT '{}'::jsonb,
     match_type           TEXT NOT NULL,
@@ -1846,8 +1835,8 @@ CREATE INDEX IF NOT EXISTS idx_resolution_audit_log_match_type ON resolution_aud
 CREATE TABLE IF NOT EXISTS profile_merge_history (
     merge_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id            TEXT NOT NULL CHECK (BTRIM(tenant_id) <> ''),
-    source_customer_id   UUID NOT NULL,
-    target_customer_id   UUID NOT NULL,
+    source_customer_id   UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
+    target_customer_id   UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
     merge_reason         TEXT NOT NULL,
     merged_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     merged_by            TEXT NOT NULL DEFAULT 'auto'
@@ -1856,13 +1845,17 @@ CREATE INDEX IF NOT EXISTS idx_profile_merge_history_tenant_id ON profile_merge_
 CREATE INDEX IF NOT EXISTS idx_profile_merge_history_source ON profile_merge_history(source_customer_id);
 CREATE INDEX IF NOT EXISTS idx_profile_merge_history_target ON profile_merge_history(target_customer_id);
 CREATE INDEX IF NOT EXISTS idx_profile_merge_history_tenant_merged_at ON profile_merge_history(tenant_id, merged_at);
+COMMENT ON COLUMN profile_merge_history.source_customer_id IS
+    'Identity profile UUID from unified_customers.customer_id, not Pulse CRM customers.id.';
+COMMENT ON COLUMN profile_merge_history.target_customer_id IS
+    'Identity profile UUID from unified_customers.customer_id, not Pulse CRM customers.id.';
 
 CREATE TABLE IF NOT EXISTS review_queue (
     review_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id             TEXT NOT NULL CHECK (BTRIM(tenant_id) <> ''),
     resolution_id         UUID NOT NULL,
-    source_customer_id    UUID NOT NULL,
-    candidate_customer_id UUID,
+    source_customer_id    UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
+    candidate_customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
     status                TEXT NOT NULL DEFAULT 'pending',
     source                TEXT NOT NULL DEFAULT 'internal',
     reason                TEXT NOT NULL,
@@ -1877,6 +1870,7 @@ CREATE INDEX IF NOT EXISTS idx_review_queue_tenant_id ON review_queue(tenant_id)
 CREATE INDEX IF NOT EXISTS idx_review_queue_resolution_id ON review_queue(resolution_id);
 CREATE INDEX IF NOT EXISTS idx_review_queue_source_customer_id ON review_queue(source_customer_id);
 CREATE INDEX IF NOT EXISTS idx_review_queue_candidate_customer_id ON review_queue(candidate_customer_id);
+CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
 CREATE INDEX IF NOT EXISTS idx_review_queue_tenant_status ON review_queue(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_review_queue_source ON review_queue(source);
 
@@ -1956,6 +1950,129 @@ ALTER TABLE consent_records ADD COLUMN IF NOT EXISTS tenant_id TEXT;
 UPDATE consent_records cr
 SET tenant_id = COALESCE(NULLIF(cr.tenant_id, ''), (SELECT uc.tenant_id FROM unified_customers uc WHERE uc.customer_id = cr.customer_id), 'demo_tenant')
 WHERE cr.tenant_id IS NULL OR BTRIM(cr.tenant_id) = '';
+
+ALTER TABLE dead_letter_queue ADD COLUMN IF NOT EXISTS task_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE dead_letter_queue ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE dead_letter_queue ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE dead_letter_queue ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT '';
+ALTER TABLE dead_letter_queue ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_unified_customers_customer_id ON unified_customers(customer_id);
+CREATE INDEX IF NOT EXISTS idx_identity_mappings_mapping_id ON identity_mappings(mapping_id);
+CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
+
+UPDATE resolution_audit_log ral
+SET customer_id = NULL
+WHERE customer_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unified_customers uc
+      WHERE uc.customer_id = ral.customer_id
+  );
+
+UPDATE profile_merge_history pmh
+SET source_customer_id = NULL
+WHERE source_customer_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unified_customers uc
+      WHERE uc.customer_id = pmh.source_customer_id
+  );
+
+UPDATE profile_merge_history pmh
+SET target_customer_id = NULL
+WHERE target_customer_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unified_customers uc
+      WHERE uc.customer_id = pmh.target_customer_id
+  );
+
+UPDATE review_queue rq
+SET source_customer_id = NULL
+WHERE source_customer_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unified_customers uc
+      WHERE uc.customer_id = rq.source_customer_id
+  );
+
+UPDATE review_queue rq
+SET candidate_customer_id = NULL
+WHERE candidate_customer_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unified_customers uc
+      WHERE uc.customer_id = rq.candidate_customer_id
+  );
+
+ALTER TABLE profile_merge_history ALTER COLUMN source_customer_id DROP NOT NULL;
+ALTER TABLE profile_merge_history ALTER COLUMN target_customer_id DROP NOT NULL;
+ALTER TABLE review_queue ALTER COLUMN source_customer_id DROP NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_resolution_audit_log_customer_id'
+    ) THEN
+        ALTER TABLE resolution_audit_log
+            ADD CONSTRAINT fk_resolution_audit_log_customer_id
+            FOREIGN KEY (customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_profile_merge_history_source_customer_id'
+    ) THEN
+        ALTER TABLE profile_merge_history
+            ADD CONSTRAINT fk_profile_merge_history_source_customer_id
+            FOREIGN KEY (source_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_profile_merge_history_target_customer_id'
+    ) THEN
+        ALTER TABLE profile_merge_history
+            ADD CONSTRAINT fk_profile_merge_history_target_customer_id
+            FOREIGN KEY (target_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_review_queue_source_customer_id'
+    ) THEN
+        ALTER TABLE review_queue
+            ADD CONSTRAINT fk_review_queue_source_customer_id
+            FOREIGN KEY (source_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_review_queue_candidate_customer_id'
+    ) THEN
+        ALTER TABLE review_queue
+            ADD CONSTRAINT fk_review_queue_candidate_customer_id
+            FOREIGN KEY (candidate_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 
 -- ============================================================================
@@ -2054,6 +2171,21 @@ ALTER TABLE deleted_companies ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DE
 -- ============================================================================
 -- Seed data
 -- ============================================================================
+
+-- Services enforce UUID tenant IDs; keep a stable UUID for local bootstrapping.
+-- This matches `.env` DEFAULT_TENANT_ID and WHATSAPP_BRIDGE default.
+INSERT INTO companies(id, name, is_active, created_at, updated_at)
+VALUES ('d7c253c7-3c35-47c6-8f93-b10cf50a0370', 'Local Tenant', TRUE, NOW(), NOW())
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO company_settings(id, company_id, created_at, updated_at)
+VALUES (
+  'company_settings_d7c253c7-3c35-47c6-8f93-b10cf50a0370',
+  'd7c253c7-3c35-47c6-8f93-b10cf50a0370',
+  NOW(),
+  NOW()
+)
+ON CONFLICT (company_id) DO NOTHING;
 
 INSERT INTO roles (id, role_name, description, perm_scope, perm_all)
 VALUES

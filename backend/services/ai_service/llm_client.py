@@ -2,13 +2,28 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from typing import Any, Optional
 
 from pydantic import BaseModel
 
+from shared.config import (
+    ai_max_tokens,
+    ai_model_name,
+    ai_provider_name,
+    ai_temperature,
+    anthropic_api_key,
+    anthropic_model_name,
+    gemini_api_key,
+    gemini_embedding_model_name,
+    gemini_fallback_models,
+    gemini_flash_model_name,
+    gemini_pro_model_name,
+    openai_api_key,
+    openai_embedding_model_name,
+    openai_model_name,
+)
 from services.ai_service.common import _extract_data_url_payload, _sanitize_schema, estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -31,48 +46,20 @@ except Exception:
     AsyncAnthropic = None
 
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+GEMINI_API_KEY = gemini_api_key()
+OPENAI_API_KEY = openai_api_key()
+ANTHROPIC_API_KEY = anthropic_api_key()
 
-
-def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)) or default)
-    except Exception:
-        return default
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)) or default)
-    except Exception:
-        return default
-
-
-OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-ANTHROPIC_DEFAULT_MODEL = (
-    os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip() or "claude-3-5-sonnet-20241022"
-)
-FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-PRO_MODEL = os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
-GEMINI_FALLBACK_MODELS = tuple(
-    model.strip()
-    for model in os.getenv(
-        "GEMINI_FALLBACK_MODELS",
-        "gemini-2.5-flash-lite,gemini-2.5-flash",
-    ).split(",")
-    if model.strip()
-)
-GEMINI_EMBEDDING_MODEL = (
-    os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004").strip() or "models/text-embedding-004"
-)
-OPENAI_EMBEDDING_MODEL = (
-    os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
-)
+OPENAI_DEFAULT_MODEL = openai_model_name()
+ANTHROPIC_DEFAULT_MODEL = anthropic_model_name()
+FLASH_MODEL = gemini_flash_model_name()
+PRO_MODEL = gemini_pro_model_name()
+GEMINI_FALLBACK_MODELS = tuple(gemini_fallback_models())
+GEMINI_EMBEDDING_MODEL = gemini_embedding_model_name()
+OPENAI_EMBEDDING_MODEL = openai_embedding_model_name()
 EMBEDDING_MODEL = GEMINI_EMBEDDING_MODEL
-DEFAULT_TEMPERATURE = _float_env("AI_TEMPERATURE", 0.7)
-DEFAULT_MAX_TOKENS = _int_env("AI_MAX_TOKENS", 2048)
+DEFAULT_TEMPERATURE = ai_temperature()
+DEFAULT_MAX_TOKENS = ai_max_tokens()
 
 _gemini_client = None
 if genai and GEMINI_API_KEY:
@@ -86,7 +73,7 @@ _anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if AsyncAnthropic 
 
 
 def _default_engine(use_pro: bool = False) -> dict:
-    provider = (os.getenv("AI_PROVIDER", "openai") or "openai").strip().lower()
+    provider = ai_provider_name("openai")
     provider_defaults = {
         "openai": OPENAI_DEFAULT_MODEL,
         "anthropic": ANTHROPIC_DEFAULT_MODEL,
@@ -96,7 +83,7 @@ def _default_engine(use_pro: bool = False) -> dict:
         provider = "openai"
     return {
         "provider": provider,
-        "model_name": (os.getenv("AI_MODEL_NAME") or provider_defaults[provider]).strip() or provider_defaults[provider],
+        "model_name": ai_model_name() or provider_defaults[provider],
         "temperature": DEFAULT_TEMPERATURE,
         "max_tokens": DEFAULT_MAX_TOKENS,
         "supports_vision": provider in {"gemini", "openai"},

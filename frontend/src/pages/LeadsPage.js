@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useDeferredValue, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
-import { toast } from '@/hooks/use-toast';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
+import BulkUploadModal from '@/components/BulkUploadModal';
 import {
   Target,
   Search,
@@ -19,6 +21,19 @@ import { buildLeadMethods, CHANNEL_META } from '@/lib/channelUtils';
 
 const GRADE_COLORS = { hot: 'bg-red-50 text-red-500 border-red-500/30', warm: 'bg-amber-50 text-amber-600 border-amber-500/30', cold: 'bg-blue-50 text-blue-600 border-blue-500/30' };
 const STATUS_COLORS = { new: 'bg-blue-50 text-blue-600', contacted: 'bg-cyan-50 text-cyan-600', qualified: 'bg-emerald-50 text-emerald-600', proposal: 'bg-amber-50 text-amber-600', negotiation: 'bg-fuchsia-50 text-fuchsia-600', won: 'bg-green-500/10 text-green-400', lost: 'bg-red-50 text-red-500' };
+const LEAD_BULK_TEMPLATE_HEADERS = ['name', 'email', 'phone', 'company', 'source', 'status', 'notes', 'tags', 'channels'];
+const LEAD_BULK_TEMPLATE_SAMPLE = ['Avery Stone', 'avery@northstar.io', '+1 415 555 0188', 'Northstar Labs', 'whatsapp', 'new', 'Requested a pricing follow-up', 'hot_lead, interested', 'whatsapp, email'];
+const LEAD_BULK_GUIDE_ROWS = [
+  { column: 'name', help: 'Lead name. Use full name when possible.' },
+  { column: 'email', help: 'Optional, but recommended for matching and follow-up.' },
+  { column: 'phone', help: 'Optional, but recommended. International format works best, for example +1 415 555 0188.' },
+  { column: 'company', help: 'Optional company or organization name.' },
+  { column: 'source', help: 'Optional channel source such as whatsapp, email, instagram, facebook, or web_chat.' },
+  { column: 'status', help: 'Optional lead status such as new, contacted, qualified, won, or lost.' },
+  { column: 'notes', help: 'Optional notes for the lead profile.' },
+  { column: 'tags', help: 'Optional comma-separated tags.' },
+  { column: 'channels', help: 'Optional comma-separated channels such as whatsapp, email, or instagram.' },
+];
 
 function LeadCardSkeleton() {
   return (
@@ -42,12 +57,14 @@ function LeadCardSkeleton() {
 }
 
 export default function LeadsPage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [leads, setLeads] = useState([]);
   const [leadStatuses, setLeadStatuses] = useState([]);
   const [leadSources, setLeadSources] = useState([]);
   const [selectedLead, setSelectedLead] = useState(null);
   const [showForm, setShowForm] = useState(false);
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [filterGrade, setFilterGrade] = useState('');
   const [filterTag, setFilterTag] = useState('');
   const [filterSource, setFilterSource] = useState('');
@@ -69,6 +86,8 @@ export default function LeadsPage() {
   const [creatingLead, setCreatingLead] = useState(false);
   const [createLeadError, setCreateLeadError] = useState('');
   const [loadError, setLoadError] = useState('');
+  const [showBulkUpload, setShowBulkUpload] = useState(false);
+  const [bulkUploading, setBulkUploading] = useState(false);
   const dismissedLeadIdRef = useRef('');
 
   const navigate = useNavigate();
@@ -88,7 +107,7 @@ export default function LeadsPage() {
     setLoadError('');
     try {
       const params = {};
-      if (search) params.search = search;
+      if (deferredSearch) params.search = deferredSearch;
       if (filterGrade) params.grade = filterGrade;
       if (filterTag) params.tag = filterTag;
       if (filterSource) params.source = filterSource;
@@ -106,7 +125,7 @@ export default function LeadsPage() {
     } finally {
       setLoading(false);
     }
-  }, [search, filterGrade, filterTag, filterSource]);
+  }, [deferredSearch, filterGrade, filterTag, filterSource]);
 
   const loadReferenceData = useCallback(async () => {
     try {
@@ -219,9 +238,18 @@ export default function LeadsPage() {
       const refreshed = await api.get(`/leads/${leadId}`);
       upsertLeadState(refreshed.data);
       loadLeads();
+      showToast({
+        type: 'success',
+        title: 'Draft Generated',
+        message: `A nurture draft is ready for ${refreshed.data?.name || 'this lead'}.`,
+      });
     } catch (err) {
       console.error(err);
-      alert('Failed to generate nurture message.');
+      showToast({
+        type: 'error',
+        title: 'Draft Failed',
+        message: getErrorMessage(err, 'We could not generate a nurture message for that lead.'),
+      });
     } finally {
       setNurturingLead(false);
     }
@@ -231,9 +259,20 @@ export default function LeadsPage() {
     setNurturingAll(true);
     try {
       const res = await api.post('/leads/auto-nurture-all');
-      alert(`Processed ${res.data.total_processed} leads. Check each lead for updated scores and nurture messages.`);
+      showToast({
+        type: 'success',
+        title: 'Batch Complete',
+        message: `Processed ${res.data.total_processed || 0} leads for scoring and nurture drafts.`,
+      });
       loadLeads();
-    } catch (err) { console.error(err); alert('Failed to auto-nurture leads.'); }
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Batch Failed',
+        message: getErrorMessage(err, 'We could not run AI nurture for the selected leads.'),
+      });
+    }
     finally { setNurturingAll(false); }
   };
 
@@ -247,19 +286,33 @@ export default function LeadsPage() {
 
   const deleteLead = async (lead, event) => {
     if (event) event.stopPropagation();
-    const confirmed = window.confirm(`Delete lead "${lead.name || 'this lead'}"?`);
-    if (!confirmed) return;
-    setDeletingLeadId(lead.id);
-    try {
-      await api.delete(`/leads/${lead.id}`);
-      setLeads((prev) => prev.filter((item) => item.id !== lead.id));
-      if (selectedLead?.id === lead.id) closeLeadDetail();
-    } catch (err) {
-      console.error(err);
-      alert('Failed to delete lead.');
-    } finally {
-      setDeletingLeadId(null);
-    }
+    requestConfirmation({
+      title: 'Delete Lead',
+      description: `Delete ${lead.name || 'this lead'} permanently. This action cannot be undone.`,
+      confirmLabel: 'Delete lead',
+      onConfirm: async () => {
+        setDeletingLeadId(lead.id);
+        try {
+          await api.delete(`/leads/${lead.id}`);
+          setLeads((prev) => prev.filter((item) => item.id !== lead.id));
+          if (selectedLead?.id === lead.id) closeLeadDetail();
+          showToast({
+            type: 'success',
+            title: 'Lead Deleted',
+            message: `${lead.name || 'The lead'} was removed.`,
+          });
+        } catch (err) {
+          console.error(err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, `We could not delete ${lead.name || 'that lead'}.`),
+          });
+        } finally {
+          setDeletingLeadId(null);
+        }
+      },
+    });
   };
 
   const openEditLead = (lead) => {
@@ -282,9 +335,56 @@ export default function LeadsPage() {
       upsertLeadState(res.data);
       setShowEditLead(false);
       loadLeads();
+      showToast({
+        type: 'success',
+        title: 'Lead Updated',
+        message: `${res.data?.name || selectedLead.name || 'The lead'} was updated.`,
+      });
     } catch (err) {
       console.error(err);
-      alert('Failed to update lead.');
+      showToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: getErrorMessage(err, `We could not update ${selectedLead.name || 'that lead'}.`),
+      });
+    }
+  };
+
+  const handleBulkUpload = async (file) => {
+    setBulkUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await api.post('/leads/bulk-upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const result = res.data || {};
+      await loadLeads();
+      setShowBulkUpload(false);
+      const message = `Created ${result.created || 0}, updated ${result.updated || 0}, skipped ${result.skipped || 0}.`;
+      if (Array.isArray(result.errors) && result.errors.length > 0) {
+        const firstError = result.errors[0];
+        showToast({
+          type: 'warning',
+          title: 'Import Completed with Warnings',
+          message: `${message} First issue: row ${firstError.row} - ${firstError.error}`,
+        });
+      } else {
+        showToast({
+          type: 'success',
+          title: 'Lead Import Complete',
+          message,
+        });
+      }
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Import Failed',
+        message: getErrorMessage(err, 'We could not import that lead spreadsheet.'),
+      });
+    } finally {
+      setBulkUploading(false);
     }
   };
 
@@ -310,16 +410,17 @@ export default function LeadsPage() {
         subject: draft.subject,
         body: draft.body,
       });
-      toast({
-        title: 'Message sent',
-        description: `Email sent to ${lead.email}.`,
+      showToast({
+        type: 'success',
+        title: 'Email Sent',
+        message: `${lead.name || lead.email} received an email on ${lead.email}.`,
       });
     } catch (err) {
       console.error(err);
-      toast({
-        variant: 'destructive',
-        title: 'Message failed',
-        description: err?.response?.data?.detail || 'Failed to send email from Pulse Engine.',
+      showToast({
+        type: 'error',
+        title: 'Email Failed',
+        message: getErrorMessage(err, `We could not send an email to ${lead.email}.`),
       });
     }
   };
@@ -359,10 +460,10 @@ export default function LeadsPage() {
     if (event) event.stopPropagation();
     const channels = getLeadSendChannels(lead);
     if (!channels.length) {
-      toast({
-        variant: 'destructive',
-        title: 'No sendable channels',
-        description: 'Add an email address or WhatsApp number before sending this nurture message.',
+      showToast({
+        type: 'error',
+        title: 'No Channels',
+        message: 'Add an email address or WhatsApp number before sending this nurture message.',
       });
       return;
     }
@@ -382,10 +483,10 @@ export default function LeadsPage() {
       navigate(`/inbox?conversation=${encodeURIComponent(conversationId)}`);
     } catch (err) {
       console.error(err);
-      toast({
-        variant: 'destructive',
-        title: 'Chat unavailable',
-        description: err?.response?.data?.detail || 'Failed to open the lead chat.',
+      showToast({
+        type: 'error',
+        title: 'Chat Unavailable',
+        message: getErrorMessage(err, 'We could not open the lead conversation.'),
       });
     }
   };
@@ -393,10 +494,10 @@ export default function LeadsPage() {
   const openMessagePicker = (lead) => {
     const methods = buildLeadMethods(lead);
     if (methods.length === 0) {
-      toast({
-        variant: 'destructive',
-        title: 'No messaging channels',
-        description: 'No messaging channels are available for this lead yet.',
+      showToast({
+        type: 'error',
+        title: 'No Channels',
+        message: 'No messaging channels are available for this lead yet.',
       });
       return;
     }
@@ -436,19 +537,19 @@ export default function LeadsPage() {
     const email = contactForm.email.trim();
 
     if (contactPrompt.mode === 'message' && !phone) {
-      toast({
-        variant: 'destructive',
-        title: 'Phone required',
-        description: 'Phone is required to start a chat conversation.',
+      showToast({
+        type: 'error',
+        title: 'Phone Missing',
+        message: 'Add a phone number before starting a chat conversation.',
       });
       return;
     }
 
     if (contactPrompt.mode === 'email' && !email) {
-      toast({
-        variant: 'destructive',
-        title: 'Email required',
-        description: 'Email is required to send an email.',
+      showToast({
+        type: 'error',
+        title: 'Email Missing',
+        message: 'Add an email address before sending an email.',
       });
       return;
     }
@@ -479,10 +580,10 @@ export default function LeadsPage() {
       await openInboxForLead(updatedLead);
     } catch (err) {
       console.error(err);
-      toast({
-        variant: 'destructive',
-        title: 'Contact update failed',
-        description: err?.response?.data?.detail || 'Failed to save contact details.',
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save those lead contact details.'),
       });
     }
   };
@@ -501,17 +602,18 @@ export default function LeadsPage() {
       if (updatedLead) upsertLeadState(updatedLead);
       await loadLeads();
       closeNurtureComposer();
-      toast({
-        title: 'Message sent',
-        description: `Nurture message sent via ${(CHANNEL_META[selectedChannel] || {}).label || selectedChannel}.`,
+      showToast({
+        type: 'success',
+        title: 'Message Sent',
+        message: `${lead.name || 'This lead'} was contacted via ${(CHANNEL_META[selectedChannel] || {}).label || selectedChannel}.`,
       });
       if (res.data?.conversation_id) navigate(`/inbox?conversation=${encodeURIComponent(res.data.conversation_id)}`);
     } catch (err) {
       console.error(err);
-      toast({
-        variant: 'destructive',
-        title: 'Message failed',
-        description: err?.response?.data?.detail || 'Failed to send nurture message.',
+      showToast({
+        type: 'error',
+        title: 'Message Failed',
+        message: getErrorMessage(err, 'We could not send that nurture message.'),
       });
     } finally {
       setSendingNurtureId('');
@@ -532,6 +634,7 @@ export default function LeadsPage() {
   });
 
   return (
+    <>
     <div className="p-6 lg:p-8 space-y-6" data-testid="leads-page">
       {loadError && (
         <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">
@@ -553,6 +656,13 @@ export default function LeadsPage() {
           <p className="text-slate-400 text-sm mt-1">{leads.length} leads total</p>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowBulkUpload(true)}
+            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition-all hover:bg-slate-50"
+            data-testid="bulk-upload-leads-btn"
+          >
+            Bulk Upload
+          </button>
           <button
             onClick={nurtureAllLeads}
             disabled={nurturingAll}
@@ -1060,11 +1170,26 @@ export default function LeadsPage() {
         </div>
       )}
 
+      <BulkUploadModal
+        isOpen={showBulkUpload}
+        onClose={() => { if (!bulkUploading) setShowBulkUpload(false); }}
+        title="Bulk Upload Leads"
+        subtitle="Import a spreadsheet of leads in one pass, with duplicate-safe create or update behavior."
+        entityLabel="Lead"
+        uploading={bulkUploading}
+        onUpload={handleBulkUpload}
+        templateHeaders={LEAD_BULK_TEMPLATE_HEADERS}
+        templateSample={LEAD_BULK_TEMPLATE_SAMPLE}
+        guideRows={LEAD_BULK_GUIDE_ROWS}
+      />
+
       {loading && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" aria-label="Loading leads">
           {Array.from({ length: 6 }).map((_, i) => <LeadCardSkeleton key={i} />)}
         </div>
       )}
     </div>
+    {confirmDialog}
+    </>
   );
 }

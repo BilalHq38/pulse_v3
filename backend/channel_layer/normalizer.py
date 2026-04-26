@@ -181,21 +181,31 @@ class MessageNormalizer:
                 # Last-10-digits fallback — handles stored numbers that include
                 # country code / spaces / dashes while the webhook delivers the
                 # raw E.164 form (or vice versa).
-                import re as _re_norm
-
-                digits = _re_norm.sub(r"\D", "", external_id)
-                last10 = digits[-10:] if len(digits) >= 10 else digits
-                if last10:
+                digits = re.sub(r"\D", "", external_id)
+                if digits:
                     customer_id = await db.fetchval(
                         "SELECT id FROM customers "
                         "WHERE company_id=$1 "
-                        "AND regexp_replace(phone, '\\D', '', 'g') LIKE $2 "
+                        "AND regexp_replace(phone, '\\D', '', 'g')=$2 "
                         "LIMIT 1",
                         message.tenant_id,
-                        f"%{last10}",
+                        digits,
                     )
                     if customer_id:
                         return await _set_resolved(customer_id)
+
+                last10 = digits[-10:] if len(digits) >= 10 else digits
+                if last10:
+                    rows = await db.fetch(
+                        "SELECT id FROM customers "
+                        "WHERE company_id=$1 "
+                        "AND regexp_replace(phone, '\\D', '', 'g') LIKE $2 "
+                        "LIMIT 2",
+                        message.tenant_id,
+                        f"%{last10}",
+                    )
+                    if len(rows or []) == 1:
+                        return await _set_resolved(str(rows[0]["id"]))
 
             # Try email match — try raw and normalized forms (case-insensitive)
             elif message.channel_type == ChannelType.EMAIL:

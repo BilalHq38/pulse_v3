@@ -1,13 +1,7 @@
 import { create } from 'zustand';
 import { identityUnificationApi, isTenantConfigUnavailableError } from '@/lib/identityUnificationApi';
 
-const TENANT_ID_KEY = 'pe_identity_tenant_id';
-const API_KEY_KEY = 'pe_identity_api_key';
-
-const DEFAULT_TENANT_ID =
-  String(process.env.REACT_APP_DEFAULT_TENANT_ID || '').trim() || 'demo_tenant';
-const DEFAULT_TENANT_API_KEY =
-  String(process.env.REACT_APP_DEFAULT_TENANT_API_KEY || '').trim() || 'demo-identity-key';
+const DEFAULT_TENANT_ID = String(process.env.REACT_APP_DEFAULT_TENANT_ID || '').trim();
 
 const normalizeId = (value) => String(value || '').trim();
 const normalizeRole = (value) => String(value || '').trim().toLowerCase();
@@ -63,24 +57,11 @@ export const deriveTagKind = (profile = {}, profileMeta = null) => {
 };
 
 export const buildTenantContextFromUser = (user = null) => {
-  const savedTenant = String(localStorage.getItem(TENANT_ID_KEY) || '').trim();
-  const savedApiKey = String(localStorage.getItem(API_KEY_KEY) || '').trim();
   const userRole = normalizeRole(user?.role) || 'company_agent';
   const companyTenantId = normalizeId(user?.company_id);
-  const canOverrideTenant = userRole === 'super_admin';
-
-  if (!canOverrideTenant && (savedTenant || savedApiKey)) {
-    localStorage.removeItem(TENANT_ID_KEY);
-    localStorage.removeItem(API_KEY_KEY);
-  }
 
   return {
-    tenantId: canOverrideTenant
-      ? savedTenant || companyTenantId || DEFAULT_TENANT_ID
-      : companyTenantId || DEFAULT_TENANT_ID,
-    apiKey: canOverrideTenant
-      ? savedApiKey || DEFAULT_TENANT_API_KEY
-      : DEFAULT_TENANT_API_KEY,
+    tenantId: companyTenantId || DEFAULT_TENANT_ID,
     userRole,
   };
 };
@@ -117,7 +98,6 @@ const updateProfileMeta = (currentMeta, profileId, metaPatch) => {
 export const useIdentityUnificationStore = create((set, get) => ({
   tenantContext: {
     tenantId: DEFAULT_TENANT_ID,
-    apiKey: DEFAULT_TENANT_API_KEY,
     userRole: 'company_agent',
   },
   profiles: [],
@@ -139,24 +119,16 @@ export const useIdentityUnificationStore = create((set, get) => ({
   },
 
   setTenantContext: (tenantContext, options = {}) => {
-    const persist = options.persist !== false;
     const current = get().tenantContext;
 
     const nextTenantId = normalizeId(tenantContext?.tenantId || current.tenantId);
-    const nextApiKey = normalizeId(tenantContext?.apiKey || current.apiKey);
     const nextUserRole = normalizeRole(tenantContext?.userRole || current.userRole || 'company_agent');
 
     const tenantChanged = normalizeId(current.tenantId) !== nextTenantId;
 
-    if (persist) {
-      localStorage.setItem(TENANT_ID_KEY, nextTenantId);
-      localStorage.setItem(API_KEY_KEY, nextApiKey);
-    }
-
     set((state) => ({
       tenantContext: {
         tenantId: nextTenantId,
-        apiKey: nextApiKey,
         userRole: nextUserRole,
       },
       ...(tenantChanged
@@ -199,7 +171,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ loadingProfiles: true, errorMessage: '' });
 
     try {
-      const profiles = await identityUnificationApi.listProfiles(tenantContext);
+      const profiles = await identityUnificationApi.listProfiles();
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return;
 
       set((state) => {
@@ -233,7 +205,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ loadingDetails: true, errorMessage: '' });
 
     try {
-      const detail = await identityUnificationApi.getProfileDetail(key, tenantContext);
+      const detail = await identityUnificationApi.getProfileDetail(key);
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
 
       set((state) => ({
@@ -268,7 +240,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ loadingReviewQueue: true, errorMessage: '' });
 
     try {
-      const queue = await identityUnificationApi.listSuggestions(tenantContext);
+      const queue = await identityUnificationApi.listSuggestions();
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return;
 
       set((state) => {
@@ -319,7 +291,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ actionInFlight: true, errorMessage: '' });
 
     try {
-      const result = await identityUnificationApi.resolve(payload, tenantContext);
+      const result = await identityUnificationApi.resolve(payload);
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
 
       const profile = result.profile || {};
@@ -379,7 +351,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ actionInFlight: true, errorMessage: '' });
 
     try {
-      const result = await identityUnificationApi.unify(payload, tenantContext);
+      const result = await identityUnificationApi.unify(payload);
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
 
       const profile = result.profile || {};
@@ -447,7 +419,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ actionInFlight: true, errorMessage: '' });
 
     try {
-      const profile = await identityUnificationApi.merge(normalized, tenantContext);
+      const profile = await identityUnificationApi.merge(normalized);
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
 
       const profileId = normalizeId(profile.id || profile.customer_id);
@@ -483,7 +455,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     }
   },
 
-  runSplit: async ({ profileId, mappingIds = [], fingerprintIds = [] }) => {
+  runSplit: async ({ profileId, customerId = '', mappingIds = [], fingerprintIds = [] }) => {
     const safeProfileId = normalizeId(profileId);
     if (!safeProfileId) {
       set({ errorMessage: 'Profile ID is required for split.' });
@@ -499,10 +471,10 @@ export const useIdentityUnificationStore = create((set, get) => ({
       const response = await identityUnificationApi.split(
         {
           profileId: safeProfileId,
+          customerId: customerId || safeProfileId,
           mappingIds,
           fingerprintIds,
         },
-        tenantContext,
       );
 
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
@@ -512,6 +484,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
           type: 'split',
           requestPayload: {
             profile_id: safeProfileId,
+            customer_id: customerId || safeProfileId,
             mapping_ids: mappingIds,
             fingerprint_ids: fingerprintIds,
           },
@@ -545,7 +518,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
     set({ actionInFlight: true, errorMessage: '' });
 
     try {
-      const result = await identityUnificationApi.autoDetect(tenantContext);
+      const result = await identityUnificationApi.autoDetect();
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
 
       set({
@@ -585,7 +558,6 @@ export const useIdentityUnificationStore = create((set, get) => ({
         suggestionId,
         action,
         notes,
-        tenantContext,
       );
 
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;

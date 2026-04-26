@@ -15,8 +15,8 @@ from data_pipeline.utils import (
     stable_json_dumps,
     stable_json_hash,
 )
-from shared.background_queue import get_background_queue
-from shared.database import company_context, create_detached_task
+from shared.database import company_context
+from shared.webhook_task_runner import create_safe_detached_task
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
@@ -46,21 +46,30 @@ def _normalize_payload(payload: Any) -> dict[str, Any]:
     return {"value": payload}
 
 
-async def _enqueue_pipeline_job(coro, *, name: str, job_id: str) -> None:
-    queue = get_background_queue(service_label=PIPELINE_SERVICE_LABEL)
-    if queue is not None and queue.enabled:
-        await queue.enqueue_coroutine(
-            coro,
-            name=name,
-            job_id=job_id,
-            idempotency_key=job_id,
-        )
-        try:
-            coro.close()
-        except Exception:
-            pass
-        return
-    create_detached_task(coro, name=name, job_id=job_id, idempotency_key=job_id)
+async def _enqueue_pipeline_job(
+    db,
+    coro,
+    *,
+    name: str,
+    job_id: str,
+    company_id: str,
+    channel: str,
+    event_id: str = "",
+    payload: Any | None = None,
+) -> None:
+    create_safe_detached_task(
+        db,
+        coro,
+        name=name,
+        job_id=job_id,
+        idempotency_key=job_id,
+        company_id=str(company_id or "").strip(),
+        channel=str(channel or "pipeline"),
+        event_id=str(event_id or "").strip(),
+        payload=payload or {},
+        source_queue=PIPELINE_SERVICE_LABEL,
+        service_label=PIPELINE_SERVICE_LABEL,
+    )
 
 
 async def capture_raw_event(
@@ -122,6 +131,7 @@ async def capture_raw_event(
     record = _row_to_dict(row)
     if record:
         await _enqueue_pipeline_job(
+            db,
             process_raw_event_job(
                 db=db,
                 raw_event_id=record["id"],
@@ -129,6 +139,10 @@ async def capture_raw_event(
             ),
             name="process-raw-event",
             job_id=f"etl:event:{scoped_company_id}:{record['id']}",
+            company_id=scoped_company_id,
+            channel=normalized_source,
+            event_id=resolved_event_id,
+            payload={"raw_event_id": record["id"], "event_type": normalized_type},
         )
     return record
 
@@ -204,6 +218,7 @@ async def capture_raw_message(
     record = _row_to_dict(row)
     if record:
         await _enqueue_pipeline_job(
+            db,
             process_raw_message_job(
                 db=db,
                 raw_message_id=record["id"],
@@ -211,6 +226,10 @@ async def capture_raw_message(
             ),
             name="process-raw-message",
             job_id=f"etl:message:{scoped_company_id}:{record['id']}",
+            company_id=scoped_company_id,
+            channel=str(source or "message"),
+            event_id=message_id or record["id"],
+            payload={"raw_message_id": record["id"], "source": str(source or "message")},
         )
     return record
 
@@ -286,6 +305,7 @@ async def capture_raw_lead(
     record = _row_to_dict(row)
     if record:
         await _enqueue_pipeline_job(
+            db,
             process_raw_lead_job(
                 db=db,
                 raw_lead_id=record["id"],
@@ -293,5 +313,9 @@ async def capture_raw_lead(
             ),
             name="process-raw-lead",
             job_id=f"etl:lead:{scoped_company_id}:{record['id']}",
+            company_id=scoped_company_id,
+            channel=str(source or "lead"),
+            event_id=lead_id or record["id"],
+            payload={"raw_lead_id": record["id"], "source": str(source or "lead")},
         )
     return record

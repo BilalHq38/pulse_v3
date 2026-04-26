@@ -4,11 +4,24 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import random
 import time
 
 from shared.metrics import increment_counter, observe_histogram
+from shared.config import (
+    ai_enable_rule_based_recovery,
+    ai_input_token_budget,
+    ai_response_recent_ai_message_limit,
+    ai_response_retry_temperature_delta,
+    ai_response_retry_temperature_max,
+    ai_response_temperature_base,
+    ai_response_temperature_jitter_steps,
+    ai_response_temperature_max,
+    ai_response_temperature_min,
+    ai_response_temperature_negative_delta,
+    ai_response_temperature_product_delta,
+    ai_response_temperature_repetition_delta,
+)
 from services.ai_service.common import (
     LeadScoreResult,
     _json_safe,
@@ -84,12 +97,7 @@ AGENT_RUNTIME_PROFILES = {
 
 
 def _allow_rule_based_recovery() -> bool:
-    return str(os.getenv("AI_ENABLE_RULE_BASED_RECOVERY", "false")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return ai_enable_rule_based_recovery()
 
 
 def _sentiment_label(sentiment: dict | None) -> str:
@@ -175,6 +183,7 @@ def _derive_conversation_state(
 
 
 def _recent_ai_messages(conversation_context: list[dict], *, limit: int = 3) -> list[str]:
+    limit = max(1, int(limit or ai_response_recent_ai_message_limit()))
     recent: list[str] = []
     for message in reversed(conversation_context or []):
         if str(message.get("sender_type") or "").strip().lower() != "ai":
@@ -195,34 +204,13 @@ def _build_generation_config(
     observed_sentiment: dict,
     recent_ai_replies: list[str],
 ) -> dict:
-    try:
-        base_temperature = float(os.getenv("AI_RESPONSE_TEMPERATURE_BASE", "0.72") or 0.72)
-    except Exception:
-        base_temperature = 0.72
-    try:
-        min_temperature = float(os.getenv("AI_RESPONSE_TEMPERATURE_MIN", "0.55") or 0.55)
-    except Exception:
-        min_temperature = 0.55
-    try:
-        max_temperature = float(os.getenv("AI_RESPONSE_TEMPERATURE_MAX", "1.05") or 1.05)
-    except Exception:
-        max_temperature = 1.05
-    try:
-        jitter_steps = max(0, int(os.getenv("AI_RESPONSE_TEMPERATURE_JITTER_STEPS", "6") or 6))
-    except Exception:
-        jitter_steps = 6
-    try:
-        product_delta = float(os.getenv("AI_RESPONSE_TEMPERATURE_PRODUCT_DELTA", "0.08") or 0.08)
-    except Exception:
-        product_delta = 0.08
-    try:
-        negative_delta = float(os.getenv("AI_RESPONSE_TEMPERATURE_NEGATIVE_DELTA", "-0.10") or -0.10)
-    except Exception:
-        negative_delta = -0.10
-    try:
-        repetition_delta = float(os.getenv("AI_RESPONSE_TEMPERATURE_REPETITION_DELTA", "0.06") or 0.06)
-    except Exception:
-        repetition_delta = 0.06
+    base_temperature = ai_response_temperature_base()
+    min_temperature = ai_response_temperature_min()
+    max_temperature = ai_response_temperature_max()
+    jitter_steps = ai_response_temperature_jitter_steps()
+    product_delta = ai_response_temperature_product_delta()
+    negative_delta = ai_response_temperature_negative_delta()
+    repetition_delta = ai_response_temperature_repetition_delta()
     intent_name = str((observed_intent or {}).get("intent") or "").strip().lower()
     sentiment_label = _sentiment_label(observed_sentiment)
     if intent_name in {"product_recommendation", "purchase_inquiry"}:
@@ -952,7 +940,10 @@ async def generate_ai_response(
         str(item).strip() for item in (last_response_context.get("product_ids") or []) if str(item).strip()
     ]
     shown_product_ids = list(dict.fromkeys([*shown_product_ids, *previous_product_ids]))
-    recent_ai_replies = _recent_ai_messages(conversation_context, limit=3)
+    recent_ai_replies = _recent_ai_messages(
+        conversation_context,
+        limit=ai_response_recent_ai_message_limit(),
+    )
     if previous_response and previous_response not in recent_ai_replies:
         recent_ai_replies.append(previous_response)
     conversation_state = _derive_conversation_state(
@@ -1208,7 +1199,7 @@ async def generate_ai_response(
     )
     if prompt_context and getattr(prompt_context, "conversation_history", ""):
         conversation_text = prompt_context.conversation_history
-    budget = int(os.getenv("AI_INPUT_TOKEN_BUDGET", os.getenv("GEMINI_INPUT_TOKEN_BUDGET", "12000")))
+    budget = ai_input_token_budget()
     prompt = (
         f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
         f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.35))}\n\n"  # noqa: E501
@@ -1268,16 +1259,13 @@ async def generate_ai_response(
         )
         if max_similarity >= 0.88:
             retry_generation_config = dict(generation_config)
-            try:
-                retry_delta = float(os.getenv("AI_RESPONSE_RETRY_TEMPERATURE_DELTA", "0.14") or 0.14)
-            except Exception:
-                retry_delta = 0.14
-            try:
-                retry_max = float(os.getenv("AI_RESPONSE_RETRY_TEMPERATURE_MAX", "1.1") or 1.1)
-            except Exception:
-                retry_max = 1.1
+            retry_delta = ai_response_retry_temperature_delta()
+            retry_max = ai_response_retry_temperature_max()
             retry_generation_config["temperature"] = round(
-                min(retry_max, float(generation_config.get("temperature", os.getenv("AI_RESPONSE_TEMPERATURE_BASE", "0.72"))) + retry_delta),
+                min(
+                    retry_max,
+                    float(generation_config.get("temperature", ai_response_temperature_base())) + retry_delta,
+                ),
                 2,
             )
             retry_prompt = (

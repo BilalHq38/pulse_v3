@@ -3,7 +3,16 @@ import io from 'socket.io-client';
 import { useAuth } from '@/contexts/AuthContext';
 import { getAccessToken } from '@/lib/api';
 
-const SOCKET_EVENTS = ['new_message', 'conversation_updated', 'message_updated', 'message_deleted', 'notification'];
+const SOCKET_EVENTS = [
+  'new_message',
+  'conversation_updated',
+  'message_updated',
+  'message_deleted',
+  'notification',
+  'identity_merged',
+  'identity_split',
+  'identity_resolved',
+];
 
 const SOCKET_URL = (
   process.env.REACT_APP_SOCKET_URL

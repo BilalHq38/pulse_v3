@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
-  ArrowUpRight,
   GitMerge,
   RefreshCw,
   Search,
@@ -16,6 +15,9 @@ import ReviewQueuePanel from '@/components/unification/ReviewQueuePanel';
 import SplitPanel from '@/components/unification/SplitPanel';
 import TagBadge from '@/components/unification/TagBadge';
 import { deriveTagKind, useIdentityUnificationStore } from '@/stores/useIdentityUnificationStore';
+import { showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
+import { useSocket } from '@/lib/useSocket';
 
 const TAG_FILTERS = [
   { value: 'all', label: 'All Profiles' },
@@ -75,6 +77,7 @@ function StatCard({ title, value, hint, badge }) {
 
 export default function UnificationPage() {
   const { user } = useAuth();
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
 
   const tenantContext = useIdentityUnificationStore((state) => state.tenantContext);
   const profiles = useIdentityUnificationStore((state) => state.profiles);
@@ -90,7 +93,6 @@ export default function UnificationPage() {
   const actionInFlight = useIdentityUnificationStore((state) => state.actionInFlight);
 
   const initializeTenantContext = useIdentityUnificationStore((state) => state.initializeTenantContext);
-  const setTenantContext = useIdentityUnificationStore((state) => state.setTenantContext);
   const toggleProfileSelection = useIdentityUnificationStore((state) => state.toggleProfileSelection);
   const clearSelection = useIdentityUnificationStore((state) => state.clearSelection);
   const fetchProfileDetail = useIdentityUnificationStore((state) => state.fetchProfileDetail);
@@ -106,24 +108,97 @@ export default function UnificationPage() {
   const [mergeModalOpen, setMergeModalOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [tagFilter, setTagFilter] = useState('all');
-  const [tenantDraft, setTenantDraft] = useState({ tenantId: '', apiKey: '' });
   const [selectedDetailId, setSelectedDetailId] = useState('');
   const [resolveDraft, setResolveDraft] = useState(EMPTY_RESOLVE_FORM);
   const [resolveResult, setResolveResult] = useState(null);
+  const lastOperationToastRef = useRef(0);
+  const lastErrorToastRef = useRef('');
 
   const isAdmin = user?.role === 'admin' || user?.role === 'super_admin';
-  const canSwitchTenant = user?.role === 'super_admin';
 
   useEffect(() => {
     if (!user?.id) return;
-    const context = initializeTenantContext(user);
-    setTenantDraft({ tenantId: context.tenantId, apiKey: context.apiKey });
+    initializeTenantContext(user);
     refreshAll();
   }, [
     user,
     initializeTenantContext,
     refreshAll,
   ]);
+
+  useEffect(() => {
+    const operationTimestamp = Number(lastOperation?.timestamp || 0) || 0;
+    if (!operationTimestamp || operationTimestamp === lastOperationToastRef.current) return;
+    lastOperationToastRef.current = operationTimestamp;
+
+    const type = String(lastOperation?.type || '').trim();
+    const response = lastOperation?.response || {};
+    const requestPayload = lastOperation?.requestPayload || {};
+
+    if (type === 'merge') {
+      showToast({
+        type: 'success',
+        title: 'Profiles Merged',
+        message: `${Array.isArray(requestPayload.profile_ids) ? requestPayload.profile_ids.length : 0} profiles were merged into one identity.`,
+      });
+      return;
+    }
+    if (type === 'split') {
+      showToast({
+        type: 'success',
+        title: 'Split Complete',
+        message: `${response.moved_mapping_count || 0} mapping${response.moved_mapping_count === 1 ? '' : 's'} and ${response.moved_fingerprint_count || 0} fingerprint${response.moved_fingerprint_count === 1 ? '' : 's'} were moved to a new profile.`,
+      });
+      return;
+    }
+    if (type === 'auto-detect') {
+      showToast({
+        type: 'success',
+        title: 'Scan Complete',
+        message: `Found ${response.new_suggestions || 0} new merge suggestion${response.new_suggestions === 1 ? '' : 's'}.`,
+      });
+      return;
+    }
+    if (type === 'review-resolve') {
+      showToast({
+        type: 'success',
+        title: 'Review Updated',
+        message: `Suggestion ${response.suggestion_id || response.resolution_id || ''} was processed successfully.`,
+      });
+      return;
+    }
+    if (type === 'resolve' || type === 'unify') {
+      showToast({
+        type: 'success',
+        title: type === 'unify' ? 'Profiles Linked' : 'Identity Resolved',
+        message: `Profile ${(response.profile || {}).display_name || response.customer_id || 'record'} was updated successfully.`,
+      });
+    }
+  }, [lastOperation]);
+
+  useEffect(() => {
+    const safeError = String(errorMessage || '').trim();
+    if (!safeError || safeError === lastErrorToastRef.current) return;
+    lastErrorToastRef.current = safeError;
+    showToast({
+      type: 'error',
+      title: 'Action Failed',
+      message: safeError,
+    });
+  }, [errorMessage]);
+
+  const handleIdentitySocketEvent = useCallback(async () => {
+    await refreshAll();
+    if (selectedDetailId) {
+      await fetchProfileDetail(selectedDetailId, { force: true });
+    }
+  }, [fetchProfileDetail, refreshAll, selectedDetailId]);
+
+  useSocket((eventName) => {
+    if (['identity_merged', 'identity_split', 'identity_resolved'].includes(eventName)) {
+      void handleIdentitySocketEvent();
+    }
+  });
 
   const filteredProfiles = useMemo(() => {
     const normalizedSearch = searchTerm.trim().toLowerCase();
@@ -166,22 +241,6 @@ export default function UnificationPage() {
   const pendingReviewCount = Array.isArray(reviewQueue) ? reviewQueue.length : 0;
   const totalLinkedProfiles = profiles.reduce((sum, profile) => sum + (Number(profile.member_count || 0) || 0), 0);
 
-  const handleApplyTenantScope = async () => {
-    const nextTenantId = normalizeId(tenantDraft.tenantId);
-    const nextApiKey = normalizeId(tenantDraft.apiKey);
-    if (!nextTenantId || !nextApiKey) return;
-
-    setTenantContext({
-      tenantId: nextTenantId,
-      apiKey: nextApiKey,
-      userRole: user?.role,
-    });
-
-    setSelectedDetailId('');
-    setResolveResult(null);
-    await refreshAll();
-  };
-
   const handleOpenProfile = async (profileId) => {
     const safe = normalizeId(profileId);
     if (!safe) return;
@@ -200,11 +259,19 @@ export default function UnificationPage() {
     }
   };
 
-  const handleSplit = async ({ profileId, mappingIds, fingerprintIds }) => {
-    const result = await runSplit({ profileId, mappingIds, fingerprintIds });
-    if (result) {
-      await fetchReviewQueue();
-    }
+  const handleSplit = async ({ profileId, customerId, mappingIds, fingerprintIds }) => {
+    const selectedSignals = (mappingIds?.length || 0) + (fingerprintIds?.length || 0);
+    requestConfirmation({
+      title: 'Split Identity Signals',
+      description: `This will move ${selectedSignals} selected signal${selectedSignals === 1 ? '' : 's'} into a new unified profile. You can merge them back later if needed.`,
+      confirmLabel: 'Split profile',
+      onConfirm: async () => {
+        const result = await runSplit({ profileId, customerId, mappingIds, fingerprintIds });
+        if (result) {
+          await fetchReviewQueue();
+        }
+      },
+    });
   };
 
   const handleResolveSuggestion = async ({ suggestionId, action, notes }) => {
@@ -213,7 +280,14 @@ export default function UnificationPage() {
 
   const handleResolveAction = async (actionType) => {
     const payload = createResolvePayload(resolveDraft);
-    if (!payload.platform_user_id) return;
+    if (!payload.platform_user_id) {
+      showToast({
+        type: 'error',
+        title: 'User ID Required',
+        message: 'Enter the platform user ID before resolving identity.',
+      });
+      return;
+    }
 
     const result = actionType === 'unify' ? await runUnify(payload) : await runResolve(payload);
     if (result) {
@@ -316,9 +390,9 @@ export default function UnificationPage() {
           <section className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="mb-4 flex items-center justify-between gap-3">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">Tenant Request Scope</h2>
+                <h2 className="text-sm font-semibold text-slate-900">Authenticated Request Scope</h2>
                 <p className="mt-1 text-xs text-slate-500">
-                  Every call includes tenant and role headers. Requests are isolated per tenant in the gateway.
+                  Identity requests now flow through the gateway using the active authenticated session. Tenant context is derived from your account, not manual API keys.
                 </p>
               </div>
               <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600">
@@ -328,38 +402,14 @@ export default function UnificationPage() {
             </div>
 
             <div className="grid gap-3 md:grid-cols-2">
-              <label className="text-xs text-slate-600">
-                <span className="mb-1.5 block font-semibold text-slate-500">Tenant ID</span>
-                <input
-                  value={tenantDraft.tenantId}
-                  onChange={(event) => setTenantDraft((prev) => ({ ...prev, tenantId: event.target.value }))}
-                  disabled={!canSwitchTenant}
-                  className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700 outline-none ring-blue-300 transition focus:border-blue-300 focus:ring disabled:cursor-not-allowed disabled:bg-slate-100"
-                />
-              </label>
-              <label className="text-xs text-slate-600">
-                <span className="mb-1.5 block font-semibold text-slate-500">Identity API Key</span>
-                <input
-                  value={tenantDraft.apiKey}
-                  onChange={(event) => setTenantDraft((prev) => ({ ...prev, apiKey: event.target.value }))}
-                  type="password"
-                  className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700 outline-none ring-blue-300 transition focus:border-blue-300 focus:ring"
-                />
-              </label>
-            </div>
-
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <p className="text-[11px] text-slate-500">
-                Active tenant: <span className="font-mono text-slate-700">{tenantContext.tenantId}</span>
-              </p>
-              <button
-                type="button"
-                onClick={handleApplyTenantScope}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-100 px-3 py-1.5 text-[11px] font-medium text-slate-700 hover:bg-slate-200"
-              >
-                <ArrowUpRight size={12} />
-                Apply Scope
-              </button>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
+                <span className="mb-1 block font-semibold text-slate-500">Tenant ID</span>
+                <span className="font-mono text-slate-700">{tenantContext.tenantId || 'Derived by gateway'}</span>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
+                <span className="mb-1 block font-semibold text-slate-500">Auth Path</span>
+                <span className="text-slate-700">JWT session via API gateway</span>
+              </div>
             </div>
           </section>
 
@@ -574,6 +624,7 @@ export default function UnificationPage() {
         onConfirm={handleMergeConfirm}
         actionInFlight={actionInFlight}
       />
+      {confirmDialog}
     </div>
   );
 }

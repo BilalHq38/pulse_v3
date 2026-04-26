@@ -12,6 +12,8 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY frontend/ ./
 ARG REACT_APP_BACKEND_URL=http://localhost:8000
 ENV REACT_APP_BACKEND_URL=${REACT_APP_BACKEND_URL}
+ARG REACT_APP_SOCKET_URL=http://localhost:8003
+ENV REACT_APP_SOCKET_URL=${REACT_APP_SOCKET_URL}
 ARG REACT_APP_DEMO_MODE=false
 ENV REACT_APP_DEMO_MODE=${REACT_APP_DEMO_MODE}
 # Production bundle; craco and webpack expect this for the build step.

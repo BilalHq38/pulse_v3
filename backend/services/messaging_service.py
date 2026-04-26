@@ -3,7 +3,6 @@ WhatsApp and Meta channel message sending helpers.
 """
 
 import logging
-import os
 from typing import Any
 
 import httpx
@@ -11,20 +10,42 @@ from fastapi import HTTPException
 
 from core.config import WHATSAPP_PHONE_ID, WHATSAPP_TOKEN
 from core.phone_normalization import normalize_to_e164_digits, strict_normalize_to_e164_digits
+from shared.config import (
+    messaging_http_connect_timeout_seconds,
+    messaging_http_keepalive_expiry_seconds,
+    messaging_http_max_connections,
+    messaging_http_max_keepalive_connections,
+    messaging_http_pool_timeout_seconds,
+    messaging_http_timeout_seconds,
+    meta_graph_api_version,
+    meta_message_send_timeout_seconds,
+    whatsapp_bridge_health_timeout_seconds,
+    whatsapp_bridge_secret,
+    whatsapp_bridge_send_timeout_seconds,
+    whatsapp_bridge_session_timeout_seconds,
+    whatsapp_bridge_url,
+    whatsapp_mode,
+)
 from services.ai_service.common import _extract_data_url_payload
 from services.meta_service import get_meta_config, meta_api_request
 
 logger = logging.getLogger(__name__)
 
-_BRIDGE_URL = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3001").rstrip("/")
-_BRIDGE_SECRET = (os.environ.get("WHATSAPP_BRIDGE_SECRET", "") or "").strip()
-_MODE = os.environ.get("WHATSAPP_MODE", "").strip().lower()
+_BRIDGE_URL = whatsapp_bridge_url()
+_BRIDGE_SECRET = whatsapp_bridge_secret()
+_MODE = whatsapp_mode("")
 _HTTP_CLIENT = httpx.AsyncClient(
-    timeout=httpx.Timeout(20.0, connect=5.0, read=20.0, write=20.0, pool=5.0),
+    timeout=httpx.Timeout(
+        messaging_http_timeout_seconds(),
+        connect=messaging_http_connect_timeout_seconds(),
+        read=messaging_http_timeout_seconds(),
+        write=messaging_http_timeout_seconds(),
+        pool=messaging_http_pool_timeout_seconds(),
+    ),
     limits=httpx.Limits(
-        max_keepalive_connections=10,
-        max_connections=20,
-        keepalive_expiry=60.0,
+        max_keepalive_connections=messaging_http_max_keepalive_connections(),
+        max_connections=messaging_http_max_connections(),
+        keepalive_expiry=messaging_http_keepalive_expiry_seconds(),
     ),
 )
 
@@ -55,7 +76,7 @@ async def _bridge_session_status(*, company_id: str = "", user_id: str = "") -> 
         resp = await _HTTP_CLIENT.get(
             f"{_BRIDGE_URL}/session",
             headers=_bridge_headers(company_id=company_id, user_id=user_id),
-            timeout=5.0,
+            timeout=whatsapp_bridge_session_timeout_seconds(),
         )
         if resp.status_code != 200 or not resp.content:
             return "error"
@@ -169,23 +190,58 @@ async def _persist_outbound_message_state(
         return
 
     try:
+        conversation_id = ""
         if status == "sent":
-            await db.execute(
+            conversation_id = await db.fetchval(
                 "UPDATE messages SET external_message_id=COALESCE(NULLIF($1,''), external_message_id), "
                 "delivery_status='sent', sent_at=COALESCE(sent_at, NOW()), updated_at=NOW() "
-                "WHERE id=$2 AND company_id=$3",
+                "WHERE id=$2 AND company_id=$3 RETURNING conversation_id",
                 (external_message_id or "").strip(),
                 local_message_id,
                 scoped_company_id,
             )
-            return
-        if status == "failed":
-            await db.execute(
-                "UPDATE messages SET delivery_status='failed', failed_at=COALESCE(failed_at, NOW()), updated_at=NOW() "
-                "WHERE id=$1 AND company_id=$2",
+        elif status == "delivered":
+            conversation_id = await db.fetchval(
+                "UPDATE messages SET external_message_id=COALESCE(NULLIF($1,''), external_message_id), "
+                "delivery_status='delivered', sent_at=COALESCE(sent_at, NOW()), "
+                "delivered_at=COALESCE(delivered_at, NOW()), updated_at=NOW() "
+                "WHERE id=$2 AND company_id=$3 RETURNING conversation_id",
+                (external_message_id or "").strip(),
                 local_message_id,
                 scoped_company_id,
             )
+        elif status == "failed":
+            conversation_id = await db.fetchval(
+                "UPDATE messages SET delivery_status='failed', failed_at=COALESCE(failed_at, NOW()), updated_at=NOW() "
+                "WHERE id=$1 AND company_id=$2 RETURNING conversation_id",
+                local_message_id,
+                scoped_company_id,
+            )
+        if conversation_id:
+            message_row = await db.fetchrow(
+                "SELECT * FROM messages WHERE id=$1 AND company_id=$2 LIMIT 1",
+                local_message_id,
+                scoped_company_id,
+            )
+            if message_row:
+                attachments = await db.fetch(
+                    "SELECT * FROM message_attachments WHERE message_id=$1 ORDER BY created_at ASC",
+                    local_message_id,
+                )
+                payload = dict(message_row)
+                payload["attachments"] = [
+                    {
+                        "id": row["id"],
+                        "type": row["file_type"],
+                        "url": row["file_url"],
+                        "name": row["file_name"],
+                        "size": row["file_size"],
+                    }
+                    for row in attachments
+                ]
+                from core.socket import emit_message_updated
+
+                await emit_message_updated(str(conversation_id), payload)
     except Exception as exc:
         logger.warning(
             "Failed to persist outbound message state company_id=%s message_id=%s status=%s: %s",
@@ -220,7 +276,7 @@ async def _send_via_bridge(
             f"{_BRIDGE_URL}/send",
             json={"to": phone, "message": message_text, "attachments": attachments or []},
             headers=_bridge_headers(company_id=company_id, user_id=user_id),
-            timeout=20.0,
+            timeout=whatsapp_bridge_send_timeout_seconds(),
         )
         data = {}
         if resp.content:
@@ -244,7 +300,7 @@ async def _send_via_bridge(
 
 async def _bridge_health() -> dict:
     try:
-        resp = await _HTTP_CLIENT.get(f"{_BRIDGE_URL}/health", timeout=5.0)
+        resp = await _HTTP_CLIENT.get(f"{_BRIDGE_URL}/health", timeout=whatsapp_bridge_health_timeout_seconds())
         return resp.json() if resp.status_code == 200 else {"status": "error"}
     except Exception:
         return {"status": "offline"}
@@ -262,7 +318,7 @@ async def _send_via_meta(
     if not phone:
         logger.warning("send_whatsapp_message: invalid meta phone error=%s", phone_error)
         return False, phone_error or "Phone number is required", ""
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/{meta_graph_api_version()}/{WHATSAPP_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload: dict[str, Any] = {
         "messaging_product": "whatsapp",
@@ -282,7 +338,7 @@ async def _send_via_meta(
                 "image": {"link": link, **({"caption": message_text} if message_text else {})},
             }
     try:
-        resp = await _HTTP_CLIENT.post(url, json=payload, headers=headers, timeout=15.0)
+        resp = await _HTTP_CLIENT.post(url, json=payload, headers=headers, timeout=meta_message_send_timeout_seconds())
         if resp.status_code == 200:
             logger.info("[Meta] WhatsApp sent to %s", phone)
             data = resp.json() if resp.content else {}
@@ -526,11 +582,11 @@ async def _send_meta_channel_via_legacy_settings(
     if not access_token or not page_id:
         return False, f"{channel.capitalize()} channel is not configured (missing access_token or page_id)", ""
 
-    url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
+    url = f"https://graph.facebook.com/{meta_graph_api_version()}/{page_id}/messages"
     payload = {"recipient": {"id": recipient_id}, "message": {"text": message_text}}
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
     try:
-        resp = await _HTTP_CLIENT.post(url, json=payload, headers=headers, timeout=15.0)
+        resp = await _HTTP_CLIENT.post(url, json=payload, headers=headers, timeout=meta_message_send_timeout_seconds())
         if resp.status_code < 300:
             data = resp.json() if resp.content else {}
             return True, "", _extract_meta_message_id(data)

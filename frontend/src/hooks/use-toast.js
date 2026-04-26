@@ -4,6 +4,14 @@ import * as React from "react"
 
 const TOAST_LIMIT = 1
 const TOAST_REMOVE_DELAY = 1000000
+const TYPE_TO_VARIANT = {
+  success: "success",
+  warning: "warning",
+  info: "info",
+  error: "destructive",
+  destructive: "destructive",
+  default: "default",
+}
 
 let count = 0
 
@@ -127,6 +135,63 @@ function toast({
   }
 }
 
+function sanitizeToastTitle(title, fallback = "Notice") {
+  const cleaned = String(title || "").trim()
+  return cleaned || fallback
+}
+
+function sanitizeToastMessage(message) {
+  return String(message || "").trim()
+}
+
+function getErrorMessage(error, fallback = "We couldn't finish that action.") {
+  const responseDetail = error?.response?.data?.detail
+  const responseError = error?.response?.data?.error
+  const raw = responseDetail ?? responseError ?? error?.message ?? ""
+
+  if (Array.isArray(raw)) {
+    const joined = raw
+      .map((item) => {
+        if (typeof item === "string") return item.trim()
+        if (item && typeof item === "object") return String(item.msg || item.message || "").trim()
+        return String(item || "").trim()
+      })
+      .filter(Boolean)
+      .join(". ")
+    return joined || fallback
+  }
+
+  if (raw && typeof raw === "object") {
+    const message = String(raw.message || raw.detail || "").trim()
+    return message || fallback
+  }
+
+  const text = String(raw || "").trim()
+  if (!text) return fallback
+  if (/network error/i.test(text)) return "The request could not reach the server. Please try again."
+  if (/request failed with status code/i.test(text)) return fallback
+  if (text.startsWith("{") || text.startsWith("[")) return fallback
+  return text
+}
+
+function showToast({
+  type = "info",
+  title = "",
+  message = "",
+  ...rest
+}) {
+  const variant = TYPE_TO_VARIANT[type] || "default"
+  return toast({
+    variant,
+    title: sanitizeToastTitle(
+      title,
+      type === "error" ? "Action Failed" : type === "success" ? "Action Complete" : "Notice",
+    ),
+    description: sanitizeToastMessage(message),
+    ...rest,
+  })
+}
+
 function useToast() {
   const [state, setState] = React.useState(memoryState)
 
@@ -143,8 +208,9 @@ function useToast() {
   return {
     ...state,
     toast,
+    showToast,
     dismiss: (toastId) => dispatch({ type: "DISMISS_TOAST", toastId }),
   };
 }
 
-export { useToast, toast }
+export { useToast, toast, showToast, getErrorMessage }

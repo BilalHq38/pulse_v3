@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api from '@/lib/api';
-import { toast } from '@/hooks/use-toast';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { useSocket } from '@/lib/useSocket';
 import {
   Send,
@@ -88,6 +90,30 @@ function normalizeMessage(message) {
     ...message,
     attachments: normalizeAttachments(message.attachments),
   };
+}
+
+function mergeMessageUpdate(currentMessage, incomingMessage) {
+  const normalized = normalizeMessage(incomingMessage);
+  if (!currentMessage) return normalized;
+  return {
+    ...currentMessage,
+    ...normalized,
+    attachments: normalized.attachments?.length ? normalized.attachments : (currentMessage.attachments || []),
+  };
+}
+
+function getDeliveryStatusMeta(status) {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'failed') return { label: 'Failed', className: 'bg-red-50 text-red-700 border-red-200' };
+  if (normalized === 'delivered') return { label: 'Delivered', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+  if (normalized === 'sent') return { label: 'Sent', className: 'bg-blue-50 text-blue-700 border-blue-200' };
+  if (normalized === 'pending') return { label: 'Sending', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+  return null;
+}
+
+function formatInboxChannel(channelKey) {
+  const match = CHANNELS.find((channel) => channel.key === channelKey);
+  return match?.label || String(channelKey || 'message').replace(/_/g, ' ');
 }
 
 function fileToDataUrl(file) {
@@ -189,6 +215,7 @@ function getSentimentMeta(rawScore, label = '', emotion = '') {
 }
 
 export default function InboxPage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const navigate = useNavigate();
   const [conversations, setConversations] = useState([]);
   const [selectedConvo, setSelectedConvo] = useState(null);
@@ -230,8 +257,10 @@ export default function InboxPage() {
   const [identityVerifying, setIdentityVerifying] = useState(false);
   const [identityResult, setIdentityResult] = useState(null);
   const [identityError, setIdentityError] = useState('');
+  const [notifyNewMessage, setNotifyNewMessage] = useState(true);
   const messagesEndRef = useRef(null);
   const composerFileRef = useRef(null);
+  const customerSidebarRef = useRef(null);
   const selectedConvoIdRef = useRef('');
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -248,6 +277,20 @@ export default function InboxPage() {
       });
     } catch (err) {
       console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Inbox Unavailable',
+        message: 'Conversations could not be loaded. Refresh the page or contact support if this continues.',
+      });
+    }
+  }, []);
+
+  const loadNotificationSettings = useCallback(async () => {
+    try {
+      const res = await api.get('/notification-settings');
+      setNotifyNewMessage(res.data?.notify_new_message !== false);
+    } catch {
+      setNotifyNewMessage(true);
     }
   }, []);
 
@@ -262,6 +305,19 @@ export default function InboxPage() {
       const activeConvoId = selectedConvoIdRef.current;
       if (!activeConvoId || data.conversation_id !== activeConvoId) {
         loadConversations(data.conversation_id);
+        if (notifyNewMessage) {
+          const senderName =
+            data.message?.sender_name ||
+            data.customer_name ||
+            data.conversation?.customer_name ||
+            'A contact';
+          const channel = data.message?.channel || data.channel || data.conversation?.channel || '';
+          showToast({
+            type: 'info',
+            title: 'New Message',
+            message: `${senderName} sent a message via ${formatInboxChannel(channel)}.`,
+          });
+        }
         return;
       }
       setMessages(prev => {
@@ -273,18 +329,21 @@ export default function InboxPage() {
       loadConversations(data?.conversation_id || '');
     } else if (eventName === 'message_updated') {
       if (data?.conversation_id && data?.message) {
-        setMessages(prev => prev.map(m => m.id === data.message.id ? normalizeMessage(data.message) : m));
+        setMessages(prev => prev.map(m => m.id === data.message.id ? mergeMessageUpdate(m, data.message) : m));
       }
     } else if (eventName === 'message_deleted') {
       if (data?.conversation_id && data?.message_id) {
         setMessages(prev => prev.filter(m => m.id !== data.message_id));
       }
     }
-  }, [loadConversations]);
+  }, [loadConversations, notifyNewMessage]);
 
   const { joinConversation } = useSocket(handleSocketEvent, { conversationId: selectedConvo?.id || '' });
 
-  useEffect(() => { loadConversations(); }, [loadConversations]);
+  useEffect(() => {
+    loadConversations();
+    loadNotificationSettings();
+  }, [loadConversations, loadNotificationSettings]);
 
   useEffect(() => {
     const platform = searchParams.get('platform');
@@ -348,6 +407,11 @@ export default function InboxPage() {
         }
       } catch (err) {
         console.error('Failed to open conversation from profile:', err);
+        showToast({
+          type: 'error',
+          title: 'Load Failed',
+          message: 'The conversation could not be loaded. Refresh the page or contact support if it keeps happening.',
+        });
       } finally {
         if (platform) setSearchParams({ platform }, { replace: true });
         else setSearchParams({}, { replace: true });
@@ -402,42 +466,44 @@ export default function InboxPage() {
     const message = outboundMessage.trim();
 
     if (!name) {
-      toast({
-        variant: 'destructive',
-        title: 'Name required',
-        description: 'Name is required.',
+      showToast({
+        type: 'error',
+        title: 'Name Required',
+        message: 'Enter a contact name before starting the conversation.',
       });
       return;
     }
     if (channel === 'whatsapp' && !phone) {
-      toast({
-        variant: 'destructive',
-        title: 'Phone required',
-        description: 'Phone number is required for WhatsApp.',
+      showToast({
+        type: 'error',
+        title: 'Phone Required',
+        message: 'Enter a phone number before starting a WhatsApp conversation.',
       });
       return;
     }
     if ((channel === 'facebook' || channel === 'instagram') && !recipientId) {
-      toast({
-        variant: 'destructive',
-        title: 'Recipient required',
-        description: channel === 'facebook' ? 'Facebook recipient ID is required.' : 'Instagram recipient ID is required.',
+      showToast({
+        type: 'error',
+        title: 'Recipient Required',
+        message: channel === 'facebook'
+          ? 'Enter the Facebook recipient ID before sending.'
+          : 'Enter the Instagram recipient ID before sending.',
       });
       return;
     }
     if (channel === 'email' && !recipientId) {
-      toast({
-        variant: 'destructive',
-        title: 'Recipient required',
-        description: 'Recipient email is required.',
+      showToast({
+        type: 'error',
+        title: 'Email Required',
+        message: 'Enter the recipient email before starting an email conversation.',
       });
       return;
     }
     if (!message) {
-      toast({
-        variant: 'destructive',
-        title: 'Message required',
-        description: 'Initial outbound message is required.',
+      showToast({
+        type: 'error',
+        title: 'Message Required',
+        message: 'Enter the first outbound message before sending.',
       });
       return;
     }
@@ -462,17 +528,25 @@ export default function InboxPage() {
       setOutboundComposerOpen(false);
       await loadConversations();
       if (convo?.id) await loadMessages(convo.id);
-      toast({
-        title: 'Message sent',
-        description: `Outbound ${channel} conversation started successfully.`,
-      });
+      if (res.data?.outbound_sent === false) {
+        showToast({
+          type: 'warning',
+          title: 'Conversation Saved',
+          message: res.data?.outbound_error || `The conversation with ${name} was created, but the first message could not be delivered yet.`,
+        });
+      } else {
+        showToast({
+          type: 'success',
+          title: 'Conversation Started',
+          message: `Started a ${formatInboxChannel(channel)} conversation with ${name}.`,
+        });
+      }
     } catch (err) {
       console.error('Failed to start outbound conversation', err);
-      const detail = err?.response?.data?.detail;
-      toast({
-        variant: 'destructive',
-        title: 'Message failed',
-        description: detail || 'Failed to start outbound conversation',
+      showToast({
+        type: 'error',
+        title: 'Start Failed',
+        message: getErrorMessage(err, 'We could not start that outbound conversation.'),
       });
     } finally {
       setOutboundSubmitting(false);
@@ -484,7 +558,14 @@ export default function InboxPage() {
       const res = await api.get(`/conversations/${convoId}/messages`);
       setMessages(Array.isArray(res.data) ? res.data.map(normalizeMessage) : []);
     }
-    catch (err) { console.error(err); }
+    catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Messages Unavailable',
+        message: 'This conversation could not be loaded right now. Refresh and try again.',
+      });
+    }
   };
 
   const resetIdentityContext = useCallback(() => {
@@ -714,16 +795,25 @@ export default function InboxPage() {
       setComposerError('');
       if (composerFileRef.current) composerFileRef.current.value = '';
       loadConversations();
-      toast({
-        title: 'Message sent',
-        description: `Message sent via ${selectedConvo.channel?.replace('_', ' ') || 'the active channel'}.`,
-      });
+      if (res.data?.outbound_delivered === false) {
+        showToast({
+          type: 'warning',
+          title: 'Delivery Failed',
+          message: res.data?.outbound_error || `The message was saved, but ${selectedConvo.customer_name || 'this contact'} did not receive it yet.`,
+        });
+      } else {
+        showToast({
+          type: 'success',
+          title: 'Message Sent',
+          message: `Sent to ${selectedConvo.customer_name || 'this contact'} via ${formatInboxChannel(selectedConvo.channel)}.`,
+        });
+      }
     } catch (err) {
       console.error('Send message error:', err);
-      toast({
-        variant: 'destructive',
-        title: 'Message failed',
-        description: err?.response?.data?.detail || 'Failed to send message. Please try again.',
+      showToast({
+        type: 'error',
+        title: 'Send Failed',
+        message: getErrorMessage(err, 'We could not send that message.'),
       });
     }
     finally { setSending(false); }
@@ -751,9 +841,18 @@ export default function InboxPage() {
       }
       cancelEditMessage();
       loadConversations();
+      showToast({
+        type: 'success',
+        title: 'Message Updated',
+        message: `The reply for ${selectedConvo.customer_name || 'this conversation'} was updated.`,
+      });
     } catch (err) {
       console.error('Edit message failed:', err);
-      alert(err?.response?.data?.detail || 'Failed to edit message');
+      showToast({
+        type: 'error',
+        title: 'Edit Failed',
+        message: getErrorMessage(err, 'We could not update that message.'),
+      });
     } finally {
       setMessageActionLoadingId('');
     }
@@ -761,19 +860,34 @@ export default function InboxPage() {
 
   const deleteConversationMessage = async (msg) => {
     if (!selectedConvo) return;
-    if (!window.confirm('Delete this message?')) return;
-    setMessageActionLoadingId(msg.id);
-    try {
-      await api.delete(`/conversations/${selectedConvo.id}/messages/${msg.id}`);
-      setMessages(prev => prev.filter(m => m.id !== msg.id));
-      if (editingMessageId === msg.id) cancelEditMessage();
-      loadConversations();
-    } catch (err) {
-      console.error('Delete message failed:', err);
-      alert(err?.response?.data?.detail || 'Failed to delete message');
-    } finally {
-      setMessageActionLoadingId('');
-    }
+    requestConfirmation({
+      title: 'Delete Message',
+      description: 'Delete this message from the conversation. This action cannot be undone.',
+      confirmLabel: 'Delete message',
+      onConfirm: async () => {
+        setMessageActionLoadingId(msg.id);
+        try {
+          await api.delete(`/conversations/${selectedConvo.id}/messages/${msg.id}`);
+          setMessages(prev => prev.filter(m => m.id !== msg.id));
+          if (editingMessageId === msg.id) cancelEditMessage();
+          loadConversations();
+          showToast({
+            type: 'success',
+            title: 'Message Deleted',
+            message: `The message in ${selectedConvo.customer_name || 'this conversation'} was removed.`,
+          });
+        } catch (err) {
+          console.error('Delete message failed:', err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that message.'),
+          });
+        } finally {
+          setMessageActionLoadingId('');
+        }
+      },
+    });
   };
 
   const triggerAI = async () => {
@@ -787,7 +901,19 @@ export default function InboxPage() {
         return [...prev, nextMessage];
       });
       loadConversations();
-    } catch (err) { console.error(err); }
+      showToast({
+        type: 'success',
+        title: 'AI Reply Ready',
+        message: `AI generated a reply for ${selectedConvo.customer_name || 'this conversation'}.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'AI Reply Failed',
+        message: getErrorMessage(err, 'We could not generate an AI reply.'),
+      });
+    }
     finally { setAiLoading(false); }
   };
 
@@ -803,7 +929,19 @@ export default function InboxPage() {
       setSelectedConvo(updatedConvo);
       setConversations(prev => prev.map(c => c.id === updatedConvo.id ? updatedConvo : c));
       await loadMessages(selectedConvo.id);
-    } catch (err) { console.error('Toggle AI failed:', err); }
+      showToast({
+        type: 'success',
+        title: 'AI Mode Updated',
+        message: `${newAiState ? 'AI responses enabled' : 'AI responses paused'} for ${selectedConvo.customer_name || 'this conversation'}.`,
+      });
+    } catch (err) {
+      console.error('Toggle AI failed:', err);
+      showToast({
+        type: 'error',
+        title: 'Toggle Failed',
+        message: getErrorMessage(err, 'We could not update AI handling for this conversation.'),
+      });
+    }
     finally { setAiToggling(false); }
   };
 
@@ -830,9 +968,20 @@ export default function InboxPage() {
     resetIdentityContext();
   };
 
+  const openCustomerProfileSidebar = useCallback(() => {
+    setShowCustomerSidebar(true);
+    requestAnimationFrame(() => {
+      customerSidebarRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }, []);
+
   const openCustomerEdit = async (convo) => {
     if (!convo?.customer_id) {
-      alert('No customer is linked to this conversation.');
+      showToast({
+        type: 'error',
+        title: 'No Customer Linked',
+        message: 'This conversation is not linked to a customer profile yet.',
+      });
       return;
     }
     setMenuConvoId(null);
@@ -850,7 +999,11 @@ export default function InboxPage() {
       setCustomerEditOpen(true);
     } catch (err) {
       console.error('Failed to load customer for edit:', err);
-      alert('Failed to load customer details.');
+      showToast({
+        type: 'error',
+        title: 'Load Failed',
+        message: 'The customer profile could not be loaded. Refresh and try again.',
+      });
     } finally {
       setCustomerEditLoading(false);
     }
@@ -877,9 +1030,18 @@ export default function InboxPage() {
         ? { ...prev, ...updated }
         : prev);
       setCustomerEditOpen(false);
+      showToast({
+        type: 'success',
+        title: 'Customer Saved',
+        message: `${updated.name || customerEditForm.name || 'The customer'} was updated.`,
+      });
     } catch (err) {
       console.error('Failed to save customer:', err);
-      alert(err?.response?.data?.detail || 'Failed to save customer details.');
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save the customer details.'),
+      });
     } finally {
       setCustomerEditLoading(false);
     }
@@ -887,21 +1049,36 @@ export default function InboxPage() {
 
   const deleteFullConversation = async (convo) => {
     setMenuConvoId(null);
-    if (!window.confirm(`Delete entire chat for ${convo.customer_name}? This will remove all messages in this conversation.`)) return;
-    try {
-      await api.delete(`/conversations/${convo.id}`);
-      setConversations(prev => prev.filter(c => c.id !== convo.id));
-      if (selectedConvo?.id === convo.id) {
-        setSelectedConvo(null);
-        setMessages([]);
-        setCustomerInfo(null);
-        setMaximized(false);
-      }
-      await loadConversations();
-    } catch (err) {
-      console.error('Failed to delete conversation:', err);
-      alert(err?.response?.data?.detail || 'Failed to delete chat.');
-    }
+    requestConfirmation({
+      title: 'Delete Conversation',
+      description: `Delete the full chat for ${convo.customer_name || 'this contact'}. All messages in this conversation will be removed.`,
+      confirmLabel: 'Delete chat',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/conversations/${convo.id}`);
+          setConversations(prev => prev.filter(c => c.id !== convo.id));
+          if (selectedConvo?.id === convo.id) {
+            setSelectedConvo(null);
+            setMessages([]);
+            setCustomerInfo(null);
+            setMaximized(false);
+          }
+          await loadConversations();
+          showToast({
+            type: 'success',
+            title: 'Chat Deleted',
+            message: `${convo.customer_name || 'The conversation'} was removed.`,
+          });
+        } catch (err) {
+          console.error('Failed to delete conversation:', err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that conversation.'),
+          });
+        }
+      },
+    });
   };
 
   const grouped = {};
@@ -924,6 +1101,7 @@ export default function InboxPage() {
   const desktopChannels = platformView ? CHANNELS.filter((ch) => ch.key === platformView) : CHANNELS;
 
   return (
+    <>
     <div className="flex h-[calc(100vh-3.5rem)]" data-testid="inbox-page">
       {platformView && (
         <div className="absolute top-2 right-4 z-20 bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
@@ -1257,11 +1435,22 @@ export default function InboxPage() {
                 <button onClick={handleBack} className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 transition-colors flex-shrink-0" data-testid="back-to-inbox-btn">
                   <ArrowLeft size={18} />
                 </button>
-                <div className={`w-8 h-8 sm:w-10 sm:h-10 rounded-full ${chInfo?.lightBg || 'bg-slate-100'} flex items-center justify-center text-xs sm:text-sm font-bold ${chInfo?.text || 'text-slate-600'} flex-shrink-0`}>
-                  {selectedConvo.customer_name?.charAt(0)}
-                </div>
+                <button
+                  type="button"
+                  onClick={openCustomerProfileSidebar}
+                  className="flex items-center gap-2 sm:gap-3 min-w-0 rounded-xl px-1.5 py-1 -mx-1.5 hover:bg-slate-50 transition-colors text-left"
+                >
+                  <div className={`w-8 h-8 sm:w-10 sm:h-10 rounded-full ${chInfo?.lightBg || 'bg-slate-100'} flex items-center justify-center text-xs sm:text-sm font-bold ${chInfo?.text || 'text-slate-600'} flex-shrink-0`}>
+                    {selectedConvo.customer_name?.charAt(0)}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-semibold text-slate-900 truncate">{selectedConvo.customer_name}</h3>
+                      <span className="hidden md:inline-flex items-center text-[10px] text-slate-400">View profile <ChevronRight size={11} className="ml-0.5" /></span>
+                    </div>
+                  </div>
+                </button>
                 <div className="min-w-0">
-                  <h3 className="text-sm font-semibold text-slate-900 truncate">{selectedConvo.customer_name}</h3>
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className={`text-[10px] px-1.5 py-0.5 rounded ${chInfo?.lightBg} ${chInfo?.text} font-medium inline-flex items-center gap-1`}><ChannelLogo channelKey={chInfo?.key} size={11} />{chInfo?.label}</span>
                     {selectedConvoSentiment && (
@@ -1421,6 +1610,11 @@ export default function InboxPage() {
                         <span className="text-[10px] text-slate-300">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         {msg.edited_at && <span className="text-[10px] text-slate-300 italic">(edited)</span>}
                         {isAI && <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-50 text-purple-500 font-medium">AI {msg.ai_confidence ? `${Math.round(msg.ai_confidence * 100)}%` : ''}</span>}
+                        {!isCustomer && !isAI && getDeliveryStatusMeta(msg.delivery_status) && (
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${getDeliveryStatusMeta(msg.delivery_status).className}`}>
+                            {getDeliveryStatusMeta(msg.delivery_status).label}
+                          </span>
+                        )}
                         <div className="flex items-center gap-1 ml-1">
                           <button
                             type="button"
@@ -1531,9 +1725,9 @@ export default function InboxPage() {
                 </div>
               )}
               {composerError && (
-                <div className="mb-3 text-[11px] text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-                  {composerError}
-                </div>
+                <Alert variant="destructive" className="mb-3 border-red-200 bg-red-50 text-red-700">
+                  <AlertDescription>{composerError}</AlertDescription>
+                </Alert>
               )}
               <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
                 <div className="flex items-start gap-2.5 sm:items-center">
@@ -1563,7 +1757,9 @@ export default function InboxPage() {
                       </p>
                     )}
                     {identityError && (
-                      <p className="text-[10px] text-red-600 mt-1">{identityError}</p>
+                      <Alert variant="destructive" className="mt-2 border-red-200 bg-red-50 text-red-700">
+                        <AlertDescription className="text-[10px]">{identityError}</AlertDescription>
+                      </Alert>
                     )}
                   </div>
                   <button
@@ -1623,7 +1819,7 @@ export default function InboxPage() {
                 w-72 flex-shrink-0 border-l border-slate-100 bg-white overflow-y-auto
                 transform transition-transform duration-300 lg:transform-none
                 ${showCustomerSidebar ? 'translate-x-0' : 'translate-x-full lg:translate-x-0'}
-              `} data-testid="customer-sidebar">
+              `} data-testid="customer-sidebar" ref={customerSidebarRef}>
                 {/* Mobile close button */}
                 <div className="lg:hidden h-14 px-4 flex items-center justify-between border-b border-slate-100">
                   <span className="text-sm font-semibold text-slate-900">Customer Info</span>
@@ -1673,6 +1869,34 @@ export default function InboxPage() {
                     )}
 
                     <div>
+                      <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Lifecycle</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 capitalize">
+                          {customerInfo.lifecycle_stage || 'customer'}
+                        </span>
+                        {(customerInfo.channels || []).map(channel => (
+                          <span key={channel} className="text-[10px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200 capitalize">
+                            {formatInboxChannel(channel)}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    {customerInfo.social_profiles && Object.keys(customerInfo.social_profiles).length > 0 && (
+                      <div>
+                        <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Channel IDs</p>
+                        <div className="space-y-1.5">
+                          {Object.entries(customerInfo.social_profiles).map(([platform, profileId]) => (
+                            <div key={platform} className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                              <p className="text-[10px] font-semibold text-slate-500 capitalize">{platform}</p>
+                              <p className="text-[11px] text-slate-700 break-all">{profileId}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div>
                       <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Tags</p>
                       <div className="flex flex-wrap gap-1">
                         {(customerInfo.tags || []).map(tag => (
@@ -1688,5 +1912,7 @@ export default function InboxPage() {
         </div>
       )}
     </div>
+    {confirmDialog}
+    </>
   );
 }

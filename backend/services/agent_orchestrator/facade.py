@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 
 from agent_orchestrator.schemas import (
     LeadWorkflowRequest,
@@ -12,8 +14,10 @@ from agent_orchestrator.schemas import (
 )
 from core.utils import make_id
 from shared.config import (
+    ai_fallback_timeout_seconds,
     ai_service_retry_attempts,
     ai_service_timeout_seconds,
+    orchestrator_request_timeout_seconds,
     service_name,
     service_urls,
 )
@@ -28,6 +32,8 @@ from services.ai_service.facade import (
     should_auto_escalate,
 )
 from agent_orchestrator.repository import fetch_company_ai_threshold
+
+logger = logging.getLogger(__name__)
 
 ORCHESTRATOR_CLIENT = ServiceClient(
     service_urls().orchestrator,
@@ -45,6 +51,54 @@ def _service_user(payload: MessageWorkflowRequest | LeadWorkflowRequest) -> str:
     return str(payload.actor_user_id or "agent-orchestrator-proxy").strip() or "agent-orchestrator-proxy"
 
 
+def _safe_message_workflow_defaults(
+    payload: MessageWorkflowRequest,
+    *,
+    reason: str,
+) -> WorkflowResponse:
+    safe_trace_id = str(payload.trace_id or "").strip().replace("-", "") or make_id().replace("-", "")
+    return WorkflowResponse(
+        workflow_id=str(payload.workflow_id or "").strip() or make_id(),
+        trace_id=safe_trace_id,
+        workflow_kind=WorkflowKind.MESSAGE,
+        status=WorkflowStatus.COMPLETED,
+        current_agent="support",
+        route=WorkflowRouteDecision(
+            current_agent="support",
+            next_agent="support",
+            decision_mode="timeout_fallback",
+            reason=reason,
+        ),
+        agent_outputs=WorkflowOutputs(
+            capture={
+                "structured_event": {
+                    "entity_type": "message",
+                    "message_id": payload.message_id,
+                    "conversation_id": payload.conversation_id,
+                    "source": payload.source or payload.channel,
+                    "channel": payload.channel,
+                    "message_text": payload.message_text,
+                },
+                # Neutral placeholders so webhook DB updates never write NULL to NOT NULL conversation columns.
+                "sentiment": {"score": 0.0, "emotion": "neutral", "confidence": 0.0},
+                "conversation_sentiment": {"score": 0.0, "sentiment_label": "neutral", "label": "neutral"},
+                "intent": {"intent": ""},
+            },
+            support={
+                "response": "",
+                "confidence": 0.0,
+                "deliver_response": False,
+                "escalate": True,
+                "escalation_reason": reason,
+                "next_action": "manual_review",
+                "api_error": True,
+            },
+            analytics={"queued": False},
+        ),
+        error=reason,
+    )
+
+
 async def orchestrate_message_workflow(
     payload: MessageWorkflowRequest,
     *,
@@ -54,22 +108,82 @@ async def orchestrate_message_workflow(
     if service_name("").strip().lower() == "agent-orchestrator-service":
         raise RuntimeError("Use the local orchestrator engine from inside the orchestrator service")
     try:
-        response = await ORCHESTRATOR_CLIENT.request(
-            "POST",
-            "/api/orchestrator/workflows/messages",
-            headers=build_internal_headers(
-                authorization=authorization,
-                company_id=payload.company_id,
-                user_id=_service_user(payload),
-                user_role=_service_role(payload),
+        response = await asyncio.wait_for(
+            ORCHESTRATOR_CLIENT.request(
+                "POST",
+                "/api/orchestrator/workflows/messages",
+                headers=build_internal_headers(
+                    authorization=authorization,
+                    company_id=payload.company_id,
+                    user_id=_service_user(payload),
+                    user_role=_service_role(payload),
+                ),
+                json=payload.model_dump(),
             ),
-            json=payload.model_dump(),
+            timeout=orchestrator_request_timeout_seconds(),
         )
         return WorkflowResponse.model_validate(response)
-    except Exception:
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Orchestrator message workflow timed out company_id=%s conversation_id=%s trace_id=%s timeout_seconds=%s",
+            payload.company_id,
+            payload.conversation_id,
+            payload.trace_id,
+            orchestrator_request_timeout_seconds(),
+        )
+        if db is None:
+            return _safe_message_workflow_defaults(
+                payload,
+                reason="Orchestrator timed out and no local fallback database context was available.",
+            )
+        try:
+            return await asyncio.wait_for(
+                _message_workflow_fallback(payload, db=db),
+                timeout=ai_fallback_timeout_seconds(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Message workflow fallback timed out company_id=%s conversation_id=%s trace_id=%s timeout_seconds=%s",
+                payload.company_id,
+                payload.conversation_id,
+                payload.trace_id,
+                ai_fallback_timeout_seconds(),
+            )
+        except Exception:
+            logger.exception(
+                "Message workflow fallback failed after orchestrator timeout company_id=%s conversation_id=%s trace_id=%s",
+                payload.company_id,
+                payload.conversation_id,
+                payload.trace_id,
+            )
+        return _safe_message_workflow_defaults(
+            payload,
+            reason="Message orchestration timed out and the local AI fallback could not complete in time.",
+        )
+    except Exception as exc:
         if db is None:
             raise
-        return await _message_workflow_fallback(payload, db=db)
+        logger.warning(
+            "Orchestrator message workflow request failed company_id=%s conversation_id=%s trace_id=%s error=%s; trying local AI fallback",
+            payload.company_id,
+            payload.conversation_id,
+            payload.trace_id,
+            exc,
+        )
+        try:
+            return await _message_workflow_fallback(payload, db=db)
+        except Exception as fallback_exc:
+            logger.warning(
+                "Local AI message workflow fallback failed (e.g. LLM unavailable) company_id=%s conversation_id=%s trace_id=%s error=%s",
+                payload.company_id,
+                payload.conversation_id,
+                payload.trace_id,
+                fallback_exc,
+            )
+            return _safe_message_workflow_defaults(
+                payload,
+                reason="Orchestrator unavailable and local AI calls failed; inbound message is still stored for human review.",
+            )
 
 
 async def orchestrate_lead_workflow(

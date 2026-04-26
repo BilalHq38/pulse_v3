@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from agent_orchestrator.schemas import LeadWorkflowRequest
 from channel_layer.router import get_outbound_router
 from channel_layer.schemas import ChannelType
@@ -16,8 +16,9 @@ from core.socket import emit_new_message
 from core.phone_normalization import strict_normalize_to_e164_digits
 from core.utils import make_id, now_ts, normalize_reference_key
 from models.reference_data import resolve_company_reference_id
-from shared.database import create_detached_task
 from shared.tracing import current_trace_context
+from shared.tabular_uploads import parse_tabular_upload, split_multi_value
+from shared.webhook_task_runner import create_safe_detached_task
 from services.db_helpers import (
     r,
     rs,
@@ -100,6 +101,27 @@ def _resolve_lead_recipient(channel: str, customer: dict, lead: dict) -> str:
         ).strip()
     if normalized == "web_chat":
         return str(customer.get("email") or customer.get("id") or lead.get("email") or "").strip()
+    if normalized == "email":
+        return str(customer.get("email") or lead.get("email") or "").strip().lower()
+    return ""
+
+
+def _resolve_lead_conversation_channel_id(channel: str, customer: dict, lead: dict) -> str:
+    normalized = str(channel or "").strip().lower()
+    if normalized == "whatsapp":
+        return str(customer.get("phone") or lead.get("phone") or "").strip()
+    if normalized in {"facebook", "instagram"}:
+        customer_social_profiles = (
+            customer.get("social_profiles") if isinstance(customer.get("social_profiles"), dict) else {}
+        )
+        lead_social_profiles = lead.get("social_profiles") if isinstance(lead.get("social_profiles"), dict) else {}
+        return str(
+            customer_social_profiles.get(normalized)
+            or lead_social_profiles.get(normalized)
+            or lead.get("channel_recipient_id")
+            or lead.get("external_recipient_id")
+            or ""
+        ).strip()
     if normalized == "email":
         return str(customer.get("email") or lead.get("email") or "").strip().lower()
     return ""
@@ -193,6 +215,82 @@ def _normalize_lead_channel(lead: dict) -> str:
     return "whatsapp" if lead.get("phone") else "web_chat"
 
 
+def _row_has_any(row: dict, *keys: str) -> bool:
+    return any(key in row for key in keys)
+
+
+def _get_first_value(row: dict, *keys: str) -> str:
+    for key in keys:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _normalize_upload_channels(raw_value: str) -> list[str]:
+    allowed = {"whatsapp", "email", "facebook", "instagram", "web_chat"}
+    channels: list[str] = []
+    for item in split_multi_value(raw_value):
+        normalized = normalize_reference_key(item).replace("-", "_")
+        if normalized in allowed and normalized not in channels:
+            channels.append(normalized)
+    return channels
+
+
+def _normalize_upload_tags(raw_value: str) -> list[str]:
+    tags: list[str] = []
+    for item in split_multi_value(raw_value):
+        normalized = normalize_reference_key(item).replace("-", "_")
+        if normalized and normalized not in tags:
+            tags.append(normalized)
+    return tags
+
+
+async def _find_existing_lead_for_upload(db, company_id: str, *, phone: str = "", email: str = "") -> dict | None:
+    if phone:
+        lead = r(
+            await db.fetchrow(
+                "SELECT * FROM leads WHERE company_id=$1 AND phone=$2 LIMIT 1",
+                company_id,
+                phone,
+            )
+        )
+        if lead:
+            return lead
+    if email:
+        return r(
+            await db.fetchrow(
+                "SELECT * FROM leads WHERE company_id=$1 AND email=$2 LIMIT 1",
+                company_id,
+                email,
+            )
+        )
+    return None
+
+
+async def _sync_lead_links(
+    db,
+    lead_id: str,
+    *,
+    tags: list[str] | None = None,
+    channels: list[str] | None = None,
+) -> None:
+    if tags is not None:
+        await db.execute("DELETE FROM lead_tags WHERE lead_id=$1", lead_id)
+        if tags:
+            await db.executemany(
+                "INSERT INTO lead_tags(lead_id,tag) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                [(lead_id, tag) for tag in tags],
+            )
+    if channels is not None:
+        await db.execute("DELETE FROM lead_channels WHERE lead_id=$1", lead_id)
+        if channels:
+            await db.executemany(
+                "INSERT INTO lead_channels(lead_id,channel) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                [(lead_id, channel) for channel in channels],
+            )
+
+
 async def _create_email_only_customer(db, lead: dict, current_user: dict) -> dict:
     cid = get_company_id(current_user)
     customer_id = make_id()
@@ -268,9 +366,16 @@ async def _resolve_lead_customer(db, lead: dict, current_user: dict, *, channel:
                 )
             )
         return customer
-    if phone:
-        return await get_or_create_customer_from_contact(db, lead.get("name", ""), phone, current_user)
     normalized_channel = str(channel or "").strip().lower()
+    if phone:
+        return await get_or_create_customer_from_contact(
+            db,
+            lead.get("name", ""),
+            phone,
+            current_user,
+            email=email,
+            channel=normalized_channel,
+        )
     if normalized_channel == "email" and email:
         return await _create_email_only_customer(db, lead, current_user)
     raise HTTPException(
@@ -296,6 +401,7 @@ async def _resolve_lead_conversation(
         resolved_channel,
         "lead_profile",
         current_user,
+        channel_id=_resolve_lead_conversation_channel_id(resolved_channel, customer, lead),
     )
     return customer, conversation
 
@@ -386,7 +492,7 @@ async def _send_lead_nurture_message(
         },
     )
     await db.execute(
-        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1 WHERE id=$2",  # noqa: E501
+        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,ai_handled=FALSE WHERE id=$2",  # noqa: E501
         content[:100],
         conversation["id"],
     )
@@ -672,6 +778,185 @@ async def delete_lead(lead_id: str, request: Request):
     return {"status": "deleted"}
 
 
+@router.post("/leads/bulk-upload")
+async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    rows = parse_tabular_upload(file.filename or "", await file.read())
+    summary = {
+        "total_rows": len(rows),
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    for entry in rows:
+        row_number = entry["row_number"]
+        row = entry["data"]
+        try:
+            name = _get_first_value(row, "name", "full_name", "lead_name")
+            email = _get_first_value(row, "email", "email_address", "e_mail").lower()
+            raw_phone = _get_first_value(row, "phone", "phone_number", "mobile", "mobile_number", "whatsapp")
+            company_name = _get_first_value(
+                row,
+                "company",
+                "customer_company_name",
+                "company_name",
+                "organization",
+            )
+            status_input = _get_first_value(row, "status", "lead_status")
+            source_input = _get_first_value(row, "source", "lead_source")
+            notes_value = _get_first_value(row, "notes", "note", "comments")
+            tags = _normalize_upload_tags(_get_first_value(row, "tags", "labels"))
+            channels = _normalize_upload_channels(_get_first_value(row, "channels", "preferred_channels"))
+
+            if not any([name, email, raw_phone]):
+                summary["skipped"] += 1
+                continue
+
+            normalized_phone = ""
+            if raw_phone:
+                normalized_phone = strict_normalize_to_e164_digits(raw_phone) or ""
+                if not normalized_phone:
+                    raise HTTPException(
+                        400,
+                        "Invalid phone number. Use a valid international number such as +1..., +44..., or +92....",
+                    )
+
+            existing = await _find_existing_lead_for_upload(
+                db,
+                cid,
+                phone=normalized_phone,
+                email=email,
+            )
+
+            if existing:
+                update_fields: dict[str, str] = {}
+                if name:
+                    update_fields["name"] = name
+                if email:
+                    update_fields["email"] = email
+                if normalized_phone:
+                    update_fields["phone"] = normalized_phone
+                if company_name:
+                    update_fields["customer_company_name"] = company_name
+                if _row_has_any(row, "notes", "note", "comments"):
+                    update_fields["notes"] = notes_value
+                if status_input:
+                    update_fields["status"] = status_input
+                    update_fields["status_id"] = await resolve_company_reference_id(
+                        db,
+                        cid,
+                        "lead_statuses",
+                        "status_name",
+                        status_input,
+                        {"description": "Lead status", "order_index": 999},
+                    )
+                if source_input:
+                    update_fields["source"] = source_input
+                    update_fields["source_id"] = await resolve_company_reference_id(
+                        db,
+                        cid,
+                        "sources",
+                        "source_name",
+                        source_input,
+                        {"source_type": "channel", "platform": normalize_reference_key(source_input)},
+                    )
+                if update_fields:
+                    update_fields["updated_at"] = now_ts()
+                    columns = list(update_fields.keys())
+                    set_parts = ", ".join(f"{key}=${index + 3}" for index, key in enumerate(columns))
+                    await db.execute(
+                        f"UPDATE leads SET {set_parts} WHERE id=$1 AND company_id=$2",
+                        existing["id"],
+                        cid,
+                        *[update_fields[column] for column in columns],
+                    )
+                await _sync_lead_links(
+                    db,
+                    existing["id"],
+                    tags=tags if _row_has_any(row, "tags", "labels") else None,
+                    channels=channels if _row_has_any(row, "channels", "preferred_channels") else None,
+                )
+                updated_lead = r(
+                    await db.fetchrow(
+                        "SELECT * FROM leads WHERE id=$1 AND company_id=$2",
+                        existing["id"],
+                        cid,
+                    )
+                )
+                await _capture_lead_snapshot(
+                    db,
+                    updated_lead,
+                    source=str((updated_lead or {}).get("source") or source_input or "lead"),
+                    action="lead_updated_bulk",
+                    extra_metadata={"row_number": row_number},
+                )
+                summary["updated"] += 1
+                continue
+
+            status_value = status_input or "new"
+            source_value = source_input or "web_chat"
+            status_id = await resolve_company_reference_id(
+                db,
+                cid,
+                "lead_statuses",
+                "status_name",
+                status_value,
+                {"description": "Lead status", "order_index": 999},
+            )
+            source_id = await resolve_company_reference_id(
+                db,
+                cid,
+                "sources",
+                "source_name",
+                source_value,
+                {"source_type": "channel", "platform": normalize_reference_key(source_value)},
+            )
+
+            lead_id = make_id()
+            await db.execute(
+                "INSERT INTO leads(id,company_id,name,email,phone,customer_company_name,source,source_id,status,status_id,score,grade,phase,notes,assigned_to,assigned_name,scoring_reason,next_action,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,50,'warm','awareness',$11,$12,$13,'','',NOW(),NOW())",  # noqa: E501
+                lead_id,
+                cid,
+                name,
+                email,
+                normalized_phone,
+                company_name,
+                source_value,
+                source_id,
+                status_value,
+                status_id,
+                notes_value,
+                cu["sub"],
+                cu.get("name", ""),
+            )
+            await _sync_lead_links(
+                db,
+                lead_id,
+                tags=tags if _row_has_any(row, "tags", "labels") else None,
+                channels=channels if _row_has_any(row, "channels", "preferred_channels") else None,
+            )
+            created_lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid))
+            await _capture_lead_snapshot(
+                db,
+                created_lead,
+                source=source_value,
+                action="lead_created_bulk",
+                extra_metadata={"row_number": row_number},
+            )
+            summary["created"] += 1
+        except HTTPException as exc:
+            summary["errors"].append({"row": row_number, "error": str(exc.detail)})
+        except Exception as exc:  # pragma: no cover - defensive import path
+            logger.exception("lead bulk upload failed row=%s", row_number)
+            summary["errors"].append({"row": row_number, "error": str(exc)})
+
+    return summary
+
+
 @router.post("/leads/{lead_id}/score")
 async def score_lead(lead_id: str, request: Request):
     db = _db(request)
@@ -902,7 +1187,8 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
         f"{lead.get('name', 'Lead')} upgraded to customer",
         "customer",
     )
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         db.execute(
             "INSERT INTO journey_tracking(id,company_id,user_id,lead_id,customer_id,phase,started_at,completed_at,created_at) VALUES($1,$2,$3,$4,$5,'conversion',NOW(),NOW(),NOW())",  # noqa: E501
             make_id(),
@@ -910,9 +1196,15 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
             cu.get("sub", ""),
             lead_id,
             customer.get("id", ""),
-        )
+        ),
+        name=f"lead-conversion-journey-{lead_id}",
+        company_id=cid,
+        channel="lead",
+        trace_id=_trace_id_from_context(),
+        event_id=lead_id,
     )
-    create_detached_task(
+    create_safe_detached_task(
+        db,
         record_system_log(
             db,
             cu,
@@ -920,7 +1212,12 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
             "lead",
             lead_id,
             {"customer_id": customer.get("id", "")},
-        )
+        ),
+        name=f"lead-conversion-log-{lead_id}",
+        company_id=cid,
+        channel="lead",
+        trace_id=_trace_id_from_context(),
+        event_id=lead_id,
     )
     return {"status": "converted", "customer": customer, "lead_id": lead_id}
 

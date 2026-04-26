@@ -110,8 +110,9 @@ async def _dispatch_detached_task(
     job_id: str | None = None,
     idempotency_key: str | None = None,
     timeout_seconds: float | None = None,
+    service_label: str | None = None,
 ) -> None:
-    queue = get_background_queue()
+    queue = get_background_queue(service_label=service_label)
     if queue is not None:
         try:
             await queue.enqueue_coroutine(
@@ -148,6 +149,7 @@ def create_detached_task(
     job_id: str | None = None,
     idempotency_key: str | None = None,
     timeout_seconds: float | None = None,
+    service_label: str | None = None,
 ) -> asyncio.Task:
     """Spawn a task without inheriting the request-bound database connection."""
 
@@ -164,6 +166,7 @@ def create_detached_task(
                     job_id=job_id,
                     idempotency_key=idempotency_key,
                     timeout_seconds=timeout_seconds,
+                    service_label=service_label,
                 ),
                 name=name,
             )
@@ -173,6 +176,7 @@ def create_detached_task(
                 job_id=job_id,
                 idempotency_key=idempotency_key,
                 timeout_seconds=timeout_seconds,
+                service_label=service_label,
             )
         )
 

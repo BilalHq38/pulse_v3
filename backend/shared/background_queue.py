@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import importlib
 import inspect
@@ -9,6 +10,7 @@ import logging
 import os
 import socket
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -37,7 +39,12 @@ from shared.metrics import increment_counter, observe_histogram, timed_metric
 logger = logging.getLogger(__name__)
 
 _DB_SENTINEL = {"__pulse_background_queue__": "db"}
+_COROUTINE_SENTINEL_KEY = "__pulse_background_queue_coroutine__"
 _QUEUE_CACHE: dict[str, "BackgroundQueue"] = {}
+_BACKGROUND_WORKER_EXECUTION: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "background_worker_execution",
+    default=False,
+)
 
 
 @dataclass(slots=True)
@@ -58,6 +65,8 @@ def _serialize_value(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, Decimal):
         return float(value)
+    if inspect.iscoroutine(value):
+        return {_COROUTINE_SENTINEL_KEY: serialize_coroutine(value)}
     if _looks_like_db_handle(value):
         return dict(_DB_SENTINEL)
     if isinstance(value, dict):
@@ -73,10 +82,33 @@ def _deserialize_value(value: Any, db) -> Any:
     if isinstance(value, dict):
         if value == _DB_SENTINEL:
             return db
+        nested_coro = value.get(_COROUTINE_SENTINEL_KEY)
+        if isinstance(nested_coro, dict):
+            return _deserialize_coroutine_spec(nested_coro, db)
         return {key: _deserialize_value(item, db) for key, item in value.items()}
     if isinstance(value, list):
         return [_deserialize_value(item, db) for item in value]
     return value
+
+
+def _deserialize_coroutine_spec(spec: dict[str, Any], db):
+    module_name = str(spec.get("module", "")).strip()
+    function_name = str(spec.get("function", "")).strip()
+    if not module_name or not function_name:
+        raise ValueError("Nested coroutine payload is missing module/function information")
+    module = importlib.import_module(module_name)
+    function = getattr(module, function_name, None)
+    if function is None:
+        raise AttributeError(f"Nested coroutine target {module_name}.{function_name} not found")
+    kwargs = _deserialize_value(dict(spec.get("kwargs", {}) or {}), db)
+    result = function(**kwargs)
+    if inspect.isawaitable(result):
+        return result
+    raise TypeError(f"Nested coroutine target {module_name}.{function_name} did not return an awaitable")
+
+
+def in_background_worker_execution() -> bool:
+    return bool(_BACKGROUND_WORKER_EXECUTION.get())
 
 
 def _stable_job_fingerprint(module_name: str, function_name: str, kwargs: dict[str, Any], name: str) -> str:
@@ -612,6 +644,17 @@ class BackgroundQueue:
                     maxlen=10000,
                     approximate=True,
                 )
+                try:
+                    from shared.webhook_task_runner import record_final_background_task_failure
+
+                    await record_final_background_task_failure(
+                        db,
+                        spec,
+                        error_message=str(exc),
+                        traceback_text=traceback.format_exc(),
+                    )
+                except Exception:
+                    logger.exception("background_queue final dead-letter persistence failed")
                 increment_counter("background_queue.jobs.dead_lettered", labels=self._metric_labels)
                 logger.error(
                     "background_queue dead_letter service=%s job=%s attempt=%s error=%s",
@@ -634,10 +677,14 @@ class BackgroundQueue:
         if function is None:
             raise AttributeError(f"Background job target {module_name}.{function_name} not found")
         kwargs = _deserialize_value(dict(spec.get("kwargs", {}) or {}), db)
-        result = function(**kwargs)
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        token = _BACKGROUND_WORKER_EXECUTION.set(True)
+        try:
+            result = function(**kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        finally:
+            _BACKGROUND_WORKER_EXECUTION.reset(token)
 
 
 def get_background_queue(*, service_label: str | None = None) -> BackgroundQueue | None:
@@ -740,6 +787,7 @@ __all__ = [
     "collect_background_queue_snapshot",
     "enqueue_detached_coroutine",
     "get_background_queue",
+    "in_background_worker_execution",
     "serialize_coroutine",
     "start_background_queue_worker",
     "stop_background_queue_worker",

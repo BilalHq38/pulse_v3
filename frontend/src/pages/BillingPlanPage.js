@@ -5,6 +5,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
 import PlatformLogo from '@/components/PlatformLogo';
 import { postAuthDestination } from '@/lib/auth-gates';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 
 const F = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
 
@@ -95,9 +96,9 @@ export default function BillingPlanPage() {
           Complete this step to unlock your workspace. Start with a 30-day free trial or continue to a paid subscription when you are ready for full production access.
         </p>
         {error && (
-          <div style={{ marginBottom: 16, padding: 12, borderRadius: 12, background: '#fef2f2', color: '#b91c1c', fontSize: 14 }}>
-            {error}
-          </div>
+          <Alert variant="destructive" className="mb-4 border-red-200 bg-red-50 text-red-700">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
         )}
         <div style={{ display: 'grid', gap: 16, gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
           <button

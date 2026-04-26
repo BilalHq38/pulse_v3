@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from core.utils import make_id
 from services.ai_service.llm_client import call_model_json, get_active_llm_engine
 from services.email_service import send_email_async
-from shared.database import create_detached_task
+from shared.webhook_task_runner import create_safe_detached_task
 
 logger = logging.getLogger(__name__)
 
@@ -455,15 +455,13 @@ async def _send_single(
 
 
 async def _dispatch_campaign(
-    db_factory,
+    db,
     campaign_id: str,
     company_id: str,
 ) -> None:
     """Run a campaign end-to-end. Safe to call as a detached task.
 
-    ``db_factory`` must be a zero-arg callable returning the app DB connection
-    pool (typically ``lambda: app.state.db``) because the detached task clears
-    the request-bound DB context.
+    ``db`` must be the shared database handle from ``app.state.db``.
     """
     concurrency = DEFAULT_BATCH_CONCURRENCY
     try:
@@ -473,7 +471,6 @@ async def _dispatch_campaign(
     except Exception:
         pass
 
-    db = db_factory()
     if db is None:
         logger.error("Campaign dispatch: no DB available for campaign %s", campaign_id)
         return
@@ -580,15 +577,18 @@ async def _dispatch_campaign(
 def schedule_campaign_send(app, campaign_id: str, company_id: str) -> None:
     """Enqueue a campaign dispatch as a detached asyncio task.
 
-    We rely on ``create_detached_task`` (already used elsewhere in the backend)
-    which also routes through the background queue when one is configured.
+    We route through the shared safe detached-task wrapper, which keeps the
+    existing background queue behavior and adds failure observability.
     """
 
-    def _factory():
-        return getattr(app.state, "db", None)
-
-    create_detached_task(
-        _dispatch_campaign(_factory, campaign_id, company_id),
+    db = getattr(app.state, "db", None)
+    create_safe_detached_task(
+        db,
+        _dispatch_campaign(db, campaign_id, company_id),
         name=f"email_campaign:{campaign_id}",
         job_id=f"campaign:{campaign_id}",
+        company_id=company_id,
+        channel="email_campaign",
+        event_id=campaign_id,
+        payload={"campaign_id": campaign_id},
     )

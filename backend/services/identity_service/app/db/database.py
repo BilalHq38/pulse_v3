@@ -154,9 +154,30 @@ async def init_db_schema() -> None:
         "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS fingerprint TEXT",
         "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS confidence_score DOUBLE PRECISION",
         "UPDATE identity_mappings SET confidence_score = COALESCE(confidence_score, confidence)",
+        "CREATE INDEX IF NOT EXISTS idx_identity_mappings_mapping_id ON identity_mappings(mapping_id)",
+        "CREATE INDEX IF NOT EXISTS idx_unified_customers_customer_id ON unified_customers(customer_id)",
         "ALTER TABLE IF EXISTS review_queue ADD COLUMN IF NOT EXISTS source VARCHAR(64)",
         "UPDATE review_queue SET source = 'internal' WHERE source IS NULL OR BTRIM(source) = ''",
         "CREATE INDEX IF NOT EXISTS idx_review_queue_source ON review_queue(source)",
+        "CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status)",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS task_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT ''",
+        "UPDATE resolution_audit_log ral SET customer_id = NULL WHERE customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = ral.customer_id)",  # noqa: E501
+        "UPDATE profile_merge_history pmh SET source_customer_id = NULL WHERE source_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = pmh.source_customer_id)",  # noqa: E501
+        "UPDATE profile_merge_history pmh SET target_customer_id = NULL WHERE target_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = pmh.target_customer_id)",  # noqa: E501
+        "UPDATE review_queue rq SET source_customer_id = NULL WHERE source_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = rq.source_customer_id)",  # noqa: E501
+        "UPDATE review_queue rq SET candidate_customer_id = NULL WHERE candidate_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = rq.candidate_customer_id)",  # noqa: E501
+        "ALTER TABLE IF EXISTS profile_merge_history ALTER COLUMN source_customer_id DROP NOT NULL",
+        "ALTER TABLE IF EXISTS profile_merge_history ALTER COLUMN target_customer_id DROP NOT NULL",
+        "ALTER TABLE IF EXISTS review_queue ALTER COLUMN source_customer_id DROP NOT NULL",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_resolution_audit_log_customer_id') THEN ALTER TABLE resolution_audit_log ADD CONSTRAINT fk_resolution_audit_log_customer_id FOREIGN KEY (customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_profile_merge_history_source_customer_id') THEN ALTER TABLE profile_merge_history ADD CONSTRAINT fk_profile_merge_history_source_customer_id FOREIGN KEY (source_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_profile_merge_history_target_customer_id') THEN ALTER TABLE profile_merge_history ADD CONSTRAINT fk_profile_merge_history_target_customer_id FOREIGN KEY (target_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_review_queue_source_customer_id') THEN ALTER TABLE review_queue ADD CONSTRAINT fk_review_queue_source_customer_id FOREIGN KEY (source_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_review_queue_candidate_customer_id') THEN ALTER TABLE review_queue ADD CONSTRAINT fk_review_queue_candidate_customer_id FOREIGN KEY (candidate_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
         f"CREATE TABLE IF NOT EXISTS identity_history (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id VARCHAR(128) NOT NULL DEFAULT '{fallback_tenant}', customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE CASCADE, event_type TEXT NOT NULL, data_snapshot JSONB NOT NULL DEFAULT '{{}}'::jsonb, timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW())",  # noqa: E501
         "ALTER TABLE IF EXISTS identity_history ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(128)",
         "CREATE INDEX IF NOT EXISTS idx_identity_history_customer ON identity_history(customer_id)",

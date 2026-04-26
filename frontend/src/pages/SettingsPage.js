@@ -3,8 +3,11 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
 import { normalizeAvatarUrl, displayNameInitial } from '@/lib/avatar';
+import { PHONE_COUNTRIES } from '@/lib/phoneCountries';
 import AiSettingsTab from '@/components/settings/AiSettingsTab';
 import UnificationTab from '@/components/settings/UnificationTab';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
   Shield,
   Users,
@@ -159,6 +162,7 @@ function validatePassword(password) {
 
 export default function SettingsPage() {
   const { user, logout, refreshUser } = useAuth();
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -315,7 +319,14 @@ export default function SettingsPage() {
       ]);
       setUnifiedProfiles(profilesRes.data || []);
       setMergeSuggestions(suggestionsRes.data || []);
-    } catch (err) { console.error(err); }
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Load Failed',
+        message: getErrorMessage(err, 'We could not load identity unification data.'),
+      });
+    }
     finally { setUnificationLoading(false); }
   }, []);
 
@@ -324,44 +335,137 @@ export default function SettingsPage() {
     try {
       const res = await api.post('/identity/auto-detect');
       await loadUnificationData();
-      alert(`Auto-detection complete. Found ${res.data.new_suggestions} new suggestion(s).`);
-    } catch (err) { alert('Auto-detection failed'); }
+      showToast({
+        type: 'success',
+        title: 'Scan Complete',
+        message: `Found ${res.data.new_suggestions || 0} new merge suggestion${res.data.new_suggestions === 1 ? '' : 's'}.`,
+      });
+    } catch (err) {
+      showToast({
+        type: 'error',
+        title: 'Scan Failed',
+        message: getErrorMessage(err, 'We could not run customer auto-detection.'),
+      });
+    }
     finally { setUnificationLoading(false); }
   };
 
   const acceptSuggestion = async (suggestionId) => {
+    setUnificationLoading(true);
     try {
       await api.post(`/identity/suggestions/${suggestionId}/resolve`, { action: 'accept' });
       await loadUnificationData();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed to accept suggestion'); }
+      showToast({
+        type: 'success',
+        title: 'Suggestion Accepted',
+        message: 'The merge suggestion was accepted.',
+      });
+    } catch (err) {
+      showToast({
+        type: 'error',
+        title: 'Accept Failed',
+        message: getErrorMessage(err, 'We could not accept that suggestion.'),
+      });
+    } finally {
+      setUnificationLoading(false);
+    }
   };
 
   const rejectSuggestion = async (suggestionId) => {
+    setUnificationLoading(true);
     try {
       await api.post(`/identity/suggestions/${suggestionId}/resolve`, { action: 'reject' });
       await loadUnificationData();
-    } catch (err) { alert('Failed to reject suggestion'); }
+      showToast({
+        type: 'success',
+        title: 'Suggestion Rejected',
+        message: 'The merge suggestion was rejected.',
+      });
+    } catch (err) {
+      showToast({
+        type: 'error',
+        title: 'Reject Failed',
+        message: getErrorMessage(err, 'We could not reject that suggestion.'),
+      });
+    } finally {
+      setUnificationLoading(false);
+    }
   };
 
   const manualMerge = async () => {
     const ids = manualMergeIds.filter(Boolean);
-    if (ids.length < 2) { alert('Select at least 2 customers to merge'); return; }
+    if (ids.length < 2) {
+      showToast({
+        type: 'error',
+        title: 'Selection Needed',
+        message: 'Select at least two customers before merging profiles.',
+      });
+      return;
+    }
+    setUnificationLoading(true);
     try {
       await api.post('/identity/merge', { customer_ids: ids });
       setManualMergeIds(['', '']);
       await loadUnificationData();
-      alert('Customers merged successfully');
-    } catch (err) { alert(err.response?.data?.detail || 'Merge failed'); }
+      showToast({
+        type: 'success',
+        title: 'Profiles Merged',
+        message: `${ids.length} customer profiles were merged successfully.`,
+      });
+    } catch (err) {
+      showToast({
+        type: 'error',
+        title: 'Merge Failed',
+        message: getErrorMessage(err, 'We could not merge those customer profiles.'),
+      });
+    } finally {
+      setUnificationLoading(false);
+    }
   };
 
-  const splitFromProfile = async (profileId, customerId) => {
-    if (!window.confirm('Remove this customer from the unified profile?')) return;
-    try {
-      await api.post('/identity/split', { profile_id: profileId, customer_id: customerId });
-      await loadUnificationData();
-      setSelectedUnifiedProfile(null);
-    } catch (err) { alert('Split failed'); }
+  const splitFromProfile = async (profileId, mappingId) => {
+    requestConfirmation({
+      title: 'Remove From Profile',
+      description: 'Remove this customer from the unified profile. This can be reversed only by merging again later.',
+      confirmLabel: 'Remove customer',
+      onConfirm: async () => {
+        setUnificationLoading(true);
+        try {
+          await api.post('/identity/split', {
+            profile_id: profileId,
+            customer_id: String(mappingId || '').trim(),
+            mapping_ids: mappingId ? [String(mappingId).trim()] : [],
+          });
+          await loadUnificationData();
+          setSelectedUnifiedProfile(null);
+          showToast({
+            type: 'success',
+            title: 'Profile Updated',
+            message: 'The customer was removed from the unified profile.',
+          });
+        } catch (err) {
+          showToast({
+            type: 'error',
+            title: 'Split Failed',
+            message: getErrorMessage(err, 'We could not split that customer from the unified profile.'),
+          });
+        } finally {
+          setUnificationLoading(false);
+        }
+      },
+    });
   };
+
+  const handleUnificationIdentityEvent = useCallback(async () => {
+    await loadUnificationData();
+    if (!selectedUnifiedProfile?.id) return;
+    try {
+      const profileRes = await api.get(`/identity/profiles/${selectedUnifiedProfile.id}`);
+      setSelectedUnifiedProfile(profileRes.data || null);
+    } catch {
+      setSelectedUnifiedProfile(null);
+    }
+  }, [loadUnificationData, selectedUnifiedProfile?.id]);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -406,22 +510,26 @@ export default function SettingsPage() {
         return;
       }
 
-      const [ch, co, us, tm, pr, fq, personal] = await Promise.all([
-        api.get('/settings/channels').catch(() => ({ data: [] })),
+      const shouldLoadChannels = activeTab === 'channels';
+      const shouldLoadUsers = activeTab === 'users';
+      const shouldLoadKnowledge = activeTab === 'templates';
+
+      const [co, personal, ch, us, tm, pr, fq] = await Promise.all([
         api.get('/settings/company').catch(() => ({ data: null })),
-        api.get('/users').catch(() => ({ data: [] })),
-        api.get('/settings/templates').catch(() => ({ data: [] })),
-        api.get('/company-data/products').catch(() => ({ data: [] })),
-        api.get('/company-data/faqs').catch(() => ({ data: [] })),
         api.get('/settings/personal').catch(() => ({ data: null })),
+        shouldLoadChannels ? api.get('/settings/channels').catch(() => ({ data: [] })) : Promise.resolve(null),
+        shouldLoadUsers ? api.get('/users').catch(() => ({ data: [] })) : Promise.resolve(null),
+        shouldLoadKnowledge ? api.get('/settings/templates').catch(() => ({ data: [] })) : Promise.resolve(null),
+        shouldLoadKnowledge ? api.get('/company-data/products').catch(() => ({ data: [] })) : Promise.resolve(null),
+        shouldLoadKnowledge ? api.get('/company-data/faqs').catch(() => ({ data: [] })) : Promise.resolve(null),
       ]);
 
-      setChannels(normalizeChannelsResponse(ch.data));
       setCompany(co.data || null);
-      setUsers(us.data || []);
-      setTemplates(tm.data || []);
-      setProducts(pr.data || []);
-      setFaqs(fq.data || []);
+      if (ch) setChannels(normalizeChannelsResponse(ch.data));
+      if (us) setUsers(us.data || []);
+      if (tm) setTemplates(tm.data || []);
+      if (pr) setProducts(pr.data || []);
+      if (fq) setFaqs(fq.data || []);
 
       const fallbackPersonal = {
         name: user?.name || '',
@@ -456,7 +564,7 @@ export default function SettingsPage() {
         currency: 'USD',
       });
     }
-  }, [onboardingInviteMode, user]);
+  }, [activeTab, onboardingInviteMode, user]);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
@@ -582,7 +690,18 @@ export default function SettingsPage() {
       await api.put('/notification-settings', notifSettings);
       setNotifSaved(true);
       setTimeout(() => setNotifSaved(false), 2500);
-    } catch {}
+      showToast({
+        type: 'success',
+        title: 'Notifications Saved',
+        message: 'Your notification preferences were updated.',
+      });
+    } catch (err) {
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save your notification settings.'),
+      });
+    }
     setNotifSaving(false);
   };
 
@@ -612,7 +731,11 @@ export default function SettingsPage() {
   const saveChannel = async (channel) => {
     const validationError = getMetaChannelValidationError(channel);
     if (validationError) {
-      alert(validationError);
+      showToast({
+        type: 'error',
+        title: 'Channel Incomplete',
+        message: validationError,
+      });
       return;
     }
     const fallbackVerifyToken = (webhookInfo?.verify_token || '').trim();
@@ -625,9 +748,19 @@ export default function SettingsPage() {
       if (res?.data) {
         setChannels((prev) => prev.map((item) => (item.channel === channel.channel ? { ...item, ...res.data } : item)));
       }
+      showToast({
+        type: 'success',
+        title: 'Channel Saved',
+        message: `${CHANNEL_CONFIG[channel.channel]?.label || channel.channel} settings were updated.`,
+      });
       setSaving('');
     } catch (err) {
       console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, `We could not save ${CHANNEL_CONFIG[channel.channel]?.label || channel.channel} settings.`),
+      });
       setSaving('');
     }
   };
@@ -658,8 +791,18 @@ export default function SettingsPage() {
         });
       }
       setShowAddMcpForm(false);
+      showToast({
+        type: 'success',
+        title: 'MCP Connected',
+        message: `${preset.name} is now connected.`,
+      });
     } catch (err) {
       console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Connect Failed',
+        message: getErrorMessage(err, `We could not connect ${preset.name}.`),
+      });
     } finally {
       setMcpPresetSaving('');
     }
@@ -671,9 +814,19 @@ export default function SettingsPage() {
       const res = await api.put('/settings/company', company);
       if (res?.data) setCompany(res.data);
       setSaving('company_done');
+      showToast({
+        type: 'success',
+        title: 'Company Saved',
+        message: `${res?.data?.company_name || company?.company_name || 'Company'} settings were updated.`,
+      });
       setTimeout(() => setSaving(''), 2000);
     } catch (err) {
       console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save the company profile.'),
+      });
       setSaving('');
     }
   };
@@ -699,8 +852,21 @@ export default function SettingsPage() {
         setPersonalSettings(prev => ({ ...prev, ...payload }));
       }
       setSaving('personal_done');
+      showToast({
+        type: 'success',
+        title: 'Profile Saved',
+        message: 'Your personal settings were updated.',
+      });
       setTimeout(() => setSaving(''), 2000);
-    } catch (err) { console.error(err); setSaving(''); }
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save your personal profile.'),
+      });
+      setSaving('');
+    }
   };
 
   const handlePersonalAvatarChange = (e) => {
@@ -721,10 +887,46 @@ export default function SettingsPage() {
   };
 
   const createTemplate = async () => {
-    try { await api.post('/settings/templates', templateForm); setShowTemplateForm(false); setTemplateForm({ name: '', content: '', category: 'general', channel: 'all' }); const res = await api.get('/settings/templates'); setTemplates(res.data); } catch (err) { console.error(err); }
+    try {
+      await api.post('/settings/templates', templateForm);
+      setShowTemplateForm(false);
+      setTemplateForm({ name: '', content: '', category: 'general', channel: 'all' });
+      const res = await api.get('/settings/templates');
+      setTemplates(res.data);
+      showToast({
+        type: 'success',
+        title: 'Template Saved',
+        message: `${templateForm.name || 'The template'} is ready to use.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save that template.'),
+      });
+    }
   };
 
-  const deleteTemplate = async (id) => { try { await api.delete(`/settings/templates/${id}`); setTemplates(prev => prev.filter(t => t.id !== id)); } catch (err) { console.error(err); } };
+  const deleteTemplate = async (id) => {
+    const template = templates.find((item) => item.id === id);
+    try {
+      await api.delete(`/settings/templates/${id}`);
+      setTemplates(prev => prev.filter(t => t.id !== id));
+      showToast({
+        type: 'success',
+        title: 'Template Deleted',
+        message: `${template?.name || 'The template'} was removed.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: getErrorMessage(err, 'We could not delete that template.'),
+      });
+    }
+  };
 
   const openPasswordModal = (u) => { setPasswordModal(u); setNewPassword(''); setConfirmPassword(''); setShowPassword(false); setPasswordError(''); setPasswordSuccess(''); };
   const closePasswordModal = () => { setPasswordModal(null); setNewPassword(''); setConfirmPassword(''); setPasswordError(''); setPasswordSuccess(''); };
@@ -824,17 +1026,52 @@ export default function SettingsPage() {
       await api.put(`/users/${editUserModal.id}`, editUserForm);
       setEditUserModal(null);
       loadSettings();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed to update user'); }
+      showToast({
+        type: 'success',
+        title: 'User Updated',
+        message: `${editUserForm.name || 'The user'} was updated.`,
+      });
+    } catch (err) {
+      showToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: getErrorMessage(err, 'We could not update that user.'),
+      });
+    }
   };
 
   const deleteUser = async (u) => {
-    if (!window.confirm(`Are you sure you want to delete ${u.name}? This action cannot be undone.`)) return;
-    try { await api.delete(`/users/${u.id}`); loadSettings(); } catch (err) { alert(err.response?.data?.detail || 'Failed to delete user'); }
+    requestConfirmation({
+      title: 'Delete User',
+      description: `Delete ${u.name || 'this user'} permanently. This action cannot be undone.`,
+      confirmLabel: 'Delete user',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/users/${u.id}`);
+          loadSettings();
+          showToast({
+            type: 'success',
+            title: 'User Deleted',
+            message: `${u.name || 'The user'} was removed.`,
+          });
+        } catch (err) {
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that user.'),
+          });
+        }
+      },
+    });
   };
 
   const createUser = async () => {
     if (!createUserForm.name.trim() || !createUserForm.email.trim()) {
-      alert('Name and email are required.');
+      showToast({
+        type: 'error',
+        title: 'Details Missing',
+        message: 'Name and email are required before sending an invitation.',
+      });
       return;
     }
     try {
@@ -843,25 +1080,56 @@ export default function SettingsPage() {
       const invitedEmail = createUserForm.email.trim();
       setCreateUserForm({ name: '', email: '', role: 'company_agent', sub_role: '', status: 'active' });
       if (onboardingInviteMode) {
-        alert(`Invitation sent to ${invitedEmail}. Continue to billing when you're ready.`);
+        showToast({
+          type: 'success',
+          title: 'Invite Sent',
+          message: `Invitation sent to ${invitedEmail}.`,
+        });
         navigate('/billing', { replace: true });
         return;
       }
-      alert(`Invitation sent to ${invitedEmail}.`);
+      showToast({
+        type: 'success',
+        title: 'Invite Sent',
+        message: `Invitation sent to ${invitedEmail}.`,
+      });
       loadSettings();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to send invitation');
+      showToast({
+        type: 'error',
+        title: 'Invite Failed',
+        message: getErrorMessage(err, 'We could not send that invitation.'),
+      });
     }
   };
 
   const revokeSession = async (sessionToken) => {
-    try { await api.delete(`/security/sessions/${sessionToken}`); loadSecurity(); } catch (err) { console.error(err); }
+    try {
+      await api.delete(`/security/sessions/${sessionToken}`);
+      loadSecurity();
+      showToast({
+        type: 'success',
+        title: 'Session Revoked',
+        message: 'The selected session was signed out.',
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Revoke Failed',
+        message: getErrorMessage(err, 'We could not revoke that session.'),
+      });
+    }
   };
 
   const createApiKey = async () => {
     const trimmedName = apiKeyName.trim();
     if (!trimmedName) {
-      alert('API key name is required.');
+      showToast({
+        type: 'error',
+        title: 'Name Required',
+        message: 'Enter an API key name before generating it.',
+      });
       return;
     }
     try {
@@ -869,18 +1137,56 @@ export default function SettingsPage() {
       setNewApiKey(res.data.key);
       setShowApiKeyForm(false); setApiKeyName('');
       loadSecurity();
+      showToast({
+        type: 'success',
+        title: 'Key Created',
+        message: `${trimmedName} is ready. Store the key securely now.`,
+      });
     } catch (err) {
       console.error(err);
-      alert(err.response?.data?.detail || 'Failed to generate API key');
+      showToast({
+        type: 'error',
+        title: 'Create Failed',
+        message: getErrorMessage(err, 'We could not generate that API key.'),
+      });
     }
   };
 
   const revokeApiKey = async (keyId) => {
-    if (!window.confirm('Revoke this API key?')) return;
-    try { await api.delete(`/security/api-keys/${keyId}`); loadSecurity(); } catch (err) { console.error(err); }
+    const key = apiKeys.find((item) => item.id === keyId);
+    requestConfirmation({
+      title: 'Revoke API Key',
+      description: `Revoke ${key?.name || 'this API key'}. Existing integrations using it will stop working immediately.`,
+      confirmLabel: 'Revoke key',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/security/api-keys/${keyId}`);
+          loadSecurity();
+          showToast({
+            type: 'success',
+            title: 'Key Revoked',
+            message: `${key?.name || 'The API key'} was revoked.`,
+          });
+        } catch (err) {
+          console.error(err);
+          showToast({
+            type: 'error',
+            title: 'Revoke Failed',
+            message: getErrorMessage(err, 'We could not revoke that API key.'),
+          });
+        }
+      },
+    });
   };
 
-  const copyToClipboard = (text) => { navigator.clipboard.writeText(text); };
+  const copyToClipboard = (text, label = 'Value') => {
+    navigator.clipboard.writeText(text);
+    showToast({
+      type: 'success',
+      title: 'Copied',
+      message: `${label} was copied to your clipboard.`,
+    });
+  };
 
   const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -973,9 +1279,19 @@ export default function SettingsPage() {
       });
       if (res.data?.description) {
         setProductForm(prev => ({ ...prev, description: res.data.description }));
+        showToast({
+          type: 'success',
+          title: 'Description Ready',
+          message: `AI drafted a description for ${productForm.name}.`,
+        });
       }
     } catch (err) {
       console.error('Failed to generate description:', err);
+      showToast({
+        type: 'error',
+        title: 'Generation Failed',
+        message: getErrorMessage(err, 'We could not generate a product description.'),
+      });
     } finally {
       setGeneratingDesc(false);
     }
@@ -1029,11 +1345,79 @@ export default function SettingsPage() {
       resetProductForm();
       const r = await api.get('/company-data/products');
       setProducts(r.data);
-    } catch (err) { console.error(err); }
+      showToast({
+        type: 'success',
+        title: editingProduct?.id ? 'Product Updated' : 'Product Added',
+        message: `${payload.name || 'The product'} was saved.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save that product.'),
+      });
+    }
   };
-  const deleteProduct = async (id) => { try { await api.delete(`/company-data/products/${id}`); setProducts(prev => prev.filter(p => p.id !== id)); setSelectedProduct(prev => prev?.id === id ? null : prev); } catch (err) { console.error(err); } };
-  const createFaq = async () => { try { await api.post('/company-data/faqs', faqForm); setShowFaqForm(false); setFaqForm({ question: '', answer: '', category: 'general' }); const r = await api.get('/company-data/faqs'); setFaqs(r.data); } catch (err) { console.error(err); } };
-  const deleteFaq = async (id) => { try { await api.delete(`/company-data/faqs/${id}`); setFaqs(prev => prev.filter(f => f.id !== id)); } catch (err) { console.error(err); } };
+  const deleteProduct = async (id) => {
+    const product = products.find((item) => item.id === id) || selectedProduct;
+    try {
+      await api.delete(`/company-data/products/${id}`);
+      setProducts(prev => prev.filter(p => p.id !== id));
+      setSelectedProduct(prev => prev?.id === id ? null : prev);
+      showToast({
+        type: 'success',
+        title: 'Product Deleted',
+        message: `${product?.name || 'The product'} was removed.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: getErrorMessage(err, 'We could not delete that product.'),
+      });
+    }
+  };
+  const createFaq = async () => {
+    try {
+      await api.post('/company-data/faqs', faqForm);
+      setShowFaqForm(false);
+      setFaqForm({ question: '', answer: '', category: 'general' });
+      const r = await api.get('/company-data/faqs');
+      setFaqs(r.data);
+      showToast({
+        type: 'success',
+        title: 'FAQ Saved',
+        message: 'The FAQ entry was added.',
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save that FAQ entry.'),
+      });
+    }
+  };
+  const deleteFaq = async (id) => {
+    try {
+      await api.delete(`/company-data/faqs/${id}`);
+      setFaqs(prev => prev.filter(f => f.id !== id));
+      showToast({
+        type: 'success',
+        title: 'FAQ Deleted',
+        message: 'The FAQ entry was removed.',
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: getErrorMessage(err, 'We could not delete that FAQ entry.'),
+      });
+    }
+  };
 
   const passwordValidation = validatePassword(newPassword);
 
@@ -1162,12 +1546,13 @@ export default function SettingsPage() {
   ];
 
   return (
+    <>
     <div className="p-6 lg:p-8" data-testid="settings-page">
       <h1 className="text-2xl font-bold text-slate-900 mb-6">{standaloneUnification ? 'Unification' : 'Settings'}</h1>
 
       <div className={`flex ${standaloneUnification ? '' : 'gap-8'}`}>
         {!standaloneUnification && (
-          <div className="w-48 flex-shrink-0 space-y-0.5">
+          <div className="sticky top-24 max-h-[calc(100vh-7rem)] w-48 flex-shrink-0 self-start space-y-0.5 overflow-y-auto pr-1">
             {tabs.map(tab => (
               <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className={`group w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-200 hover:translate-x-1 active:scale-95 ${
@@ -1542,7 +1927,31 @@ export default function SettingsPage() {
                           <div className="flex items-center gap-2">
                             {acct && <span className={`text-[10px] px-2 py-0.5 rounded font-medium ${acct.is_active !== false ? 'bg-green-50 text-green-600' : 'bg-gray-100 text-gray-400'}`}>{acct.is_active !== false ? 'Active' : 'Inactive'}</span>}
                             {isAdmin && <button onClick={() => { if (isEditing) { setEditingSocialPlatform(null); } else { setEditingSocialPlatform(platform); setSocialDraft(acct ? { account_handle: acct.account_handle || '', page_id: acct.page_id || '', access_token_ref: '', app_id: acct.app_id || '', phone_number_id: acct.phone_number_id || '' } : { account_handle: '', page_id: '', access_token_ref: '', app_id: '', phone_number_id: '' }); } }} className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-lg text-xs text-slate-600 font-medium">{isEditing ? 'Close' : acct ? 'Edit' : 'Configure'}</button>}
-                            {isAdmin && acct && <button onClick={async () => { if (!window.confirm(`Disconnect ${label}?`)) return; await api.delete(`/social/accounts/${acct.id}`).catch(() => null); setSocialAccounts(prev => prev.filter(x => x.id !== acct.id)); if (editingSocialPlatform === platform) setEditingSocialPlatform(null); }} className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>}
+                            {isAdmin && acct && <button onClick={() => {
+                              requestConfirmation({
+                                title: 'Disconnect Social Account',
+                                description: `Disconnect ${label}. Incoming and outgoing social messaging for this account will stop until it is reconnected.`,
+                                confirmLabel: 'Disconnect account',
+                                onConfirm: async () => {
+                                  try {
+                                    await api.delete(`/social/accounts/${acct.id}`);
+                                    setSocialAccounts(prev => prev.filter(x => x.id !== acct.id));
+                                    if (editingSocialPlatform === platform) setEditingSocialPlatform(null);
+                                    showToast({
+                                      type: 'success',
+                                      title: 'Account Disconnected',
+                                      message: `${label} was disconnected.`,
+                                    });
+                                  } catch (err) {
+                                    showToast({
+                                      type: 'error',
+                                      title: 'Disconnect Failed',
+                                      message: getErrorMessage(err, `We could not disconnect ${label}.`),
+                                    });
+                                  }
+                                },
+                              });
+                            }} className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>}
                           </div>
                         </div>
                         {isEditing && (
@@ -1606,18 +2015,46 @@ export default function SettingsPage() {
                 <div><label className="text-xs text-slate-400 mb-1 block">Tagline</label><input value={company.tagline || ''} onChange={(e) => setCompany({...company, tagline: e.target.value})} placeholder="A short catchy phrase that describes your brand" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
                 <div><label className="text-xs text-slate-400 mb-1 block">Industry</label>
                   <select value={company.industry || ''} onChange={(e) => setCompany({...company, industry: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">
-                    <option value="">— Select industry —</option>
+                    <option value="">Select industry</option>
                     {['Technology', 'E-commerce', 'Finance & Banking', 'Healthcare', 'Education', 'Real Estate', 'Marketing & Advertising', 'Logistics', 'Hospitality', 'Retail', 'Manufacturing', 'Consulting', 'Other'].map(i => <option key={i} value={i}>{i}</option>)}
                   </select>
                 </div>
-                <div><label className="text-xs text-slate-400 mb-1 block">Description</label><textarea value={company.description || ''} onChange={(e) => setCompany({...company, description: e.target.value})} rows={3} placeholder="Brief description of your company — the AI will use this when introducing itself to customers." className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div>
+                  <label className="text-xs text-slate-400 mb-1 block">Description</label>
+                  <textarea
+                    value={company.description || ''}
+                    onChange={(e) => setCompany({...company, description: e.target.value})}
+                    rows={5}
+                    maxLength={5000}
+                    placeholder="Brief description of your company - the AI will use this when introducing itself to customers."
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                  />
+                  <div className="mt-1 text-right text-[11px] text-slate-400">
+                    {(company.description || '').length} / 5000
+                  </div>
+                </div>
                 <div><label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Image size={11} /> Logo URL</label><input value={company.logo_url || ''} onChange={(e) => setCompany({...company, logo_url: e.target.value})} placeholder="https://yourcompany.com/logo.png" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
               </div>
 
               {/* -- Contact Info -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Phone size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Contact Information</span></div>
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                  <div>
+                    <label className="text-xs text-slate-400 mb-1 block">Default Phone Region</label>
+                    <select
+                      value={(company.default_phone_region || '').toUpperCase()}
+                      onChange={(e) => setCompany({...company, default_phone_region: e.target.value})}
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    >
+                      <option value="">Use workspace default</option>
+                      {PHONE_COUNTRIES.map((country) => (
+                        <option key={country.code} value={country.code}>
+                          {country.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                   <div><label className="text-xs text-slate-400 mb-1 block">Phone Number</label><input value={company.phone || ''} onChange={(e) => setCompany({...company, phone: e.target.value})} placeholder="+1 555 000 0000" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
                   <div><label className="text-xs text-slate-400 mb-1 block">Support Email</label><input type="email" value={company.support_email || ''} onChange={(e) => setCompany({...company, support_email: e.target.value})} placeholder="support@yourcompany.com" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
                 </div>
@@ -1896,13 +2333,13 @@ export default function SettingsPage() {
                       <div key={key} className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200">
                         <span className="text-xs font-medium text-slate-600 w-24 capitalize">{key.replace('_', ' ')}</span>
                         <code className="flex-1 text-[11px] text-slate-500 font-mono bg-white px-3 py-1.5 rounded border border-slate-200 truncate">{url}</code>
-                        <button onClick={() => copyToClipboard(url)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Copy"><Copy size={14} /></button>
+                        <button onClick={() => copyToClipboard(url, 'Webhook URL')} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Copy"><Copy size={14} /></button>
                       </div>
                     ))}
                     <div className="flex items-center gap-2 p-3 bg-blue-50 rounded-lg border border-blue-200">
                       <Key size={14} className="text-blue-600" />
                       <span className="text-xs text-blue-700">Verify Token: <code className="font-mono bg-white px-2 py-0.5 rounded border border-blue-200">{webhookInfo.verify_token}</code></span>
-                      <button onClick={() => copyToClipboard(webhookInfo.verify_token)} className="ml-auto text-blue-400 hover:text-blue-600"><Copy size={12} /></button>
+                      <button onClick={() => copyToClipboard(webhookInfo.verify_token, 'Verify token')} className="ml-auto text-blue-400 hover:text-blue-600"><Copy size={12} /></button>
                     </div>
                   </div>
 
@@ -2022,7 +2459,30 @@ export default function SettingsPage() {
                         <div className="flex items-center gap-2 ml-3 flex-shrink-0">
                           <button onClick={async () => { const newStatus = s.status === 'active' ? 'inactive' : 'active'; const r = await api.put(`/mcp/servers/${s.id}`, { status: newStatus }).catch(() => null); if (r) setMcpServers(prev => prev.map(x => x.id === s.id ? { ...x, status: newStatus } : x)); }} className={`relative w-9 h-5 rounded-full transition-colors ${s.status === 'active' ? 'bg-green-500' : 'bg-gray-300'}`}><span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow ${s.status === 'active' ? 'translate-x-4' : ''}`} /></button>
                           {isAdmin && <button onClick={() => { setEditingMcpId(editingMcpId === s.id ? null : s.id); setMcpDraft({ endpoint: s.endpoint || '', region: s.region || '', status: s.status || 'active' }); }} className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>}
-                          {isAdmin && <button onClick={async () => { if (!window.confirm('Remove this MCP server?')) return; await api.delete(`/mcp/servers/${s.id}`).catch(() => null); setMcpServers(prev => prev.filter(x => x.id !== s.id)); }} className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>}
+                          {isAdmin && <button onClick={() => {
+                            requestConfirmation({
+                              title: 'Remove MCP Server',
+                              description: `Remove ${s.endpoint || 'this MCP server'}. Connected agents will lose access to that MCP integration.`,
+                              confirmLabel: 'Remove server',
+                              onConfirm: async () => {
+                                try {
+                                  await api.delete(`/mcp/servers/${s.id}`);
+                                  setMcpServers(prev => prev.filter(x => x.id !== s.id));
+                                  showToast({
+                                    type: 'success',
+                                    title: 'Server Removed',
+                                    message: `${s.endpoint || 'The MCP server'} was removed.`,
+                                  });
+                                } catch (err) {
+                                  showToast({
+                                    type: 'error',
+                                    title: 'Remove Failed',
+                                    message: getErrorMessage(err, 'We could not remove that MCP server.'),
+                                  });
+                                }
+                              },
+                            });
+                          }} className="p-1.5 hover:bg-red-50 rounded text-slate-400 hover:text-red-500"><Trash2 size={13} /></button>}
                         </div>
                       </div>
                       {editingMcpId === s.id && (
@@ -2083,6 +2543,7 @@ export default function SettingsPage() {
               selectedUnifiedProfile={selectedUnifiedProfile} setSelectedUnifiedProfile={setSelectedUnifiedProfile}
               suggestionDetail={suggestionDetail} setSuggestionDetail={setSuggestionDetail}
               splitFromProfile={splitFromProfile}
+              onIdentityEvent={handleUnificationIdentityEvent}
             />
           )}
 
@@ -2290,7 +2751,7 @@ export default function SettingsPage() {
                       <p className="text-xs text-emerald-700 mb-1 font-medium">New API Key (copy now - won't be shown again):</p>
                       <div className="flex items-center gap-2">
                         <code className="flex-1 text-[11px] font-mono bg-white px-2 py-1 rounded border border-emerald-200 break-all">{newApiKey}</code>
-                        <button onClick={() => { copyToClipboard(newApiKey); }} className="p-1.5 text-emerald-600 hover:bg-emerald-100 rounded"><Copy size={14} /></button>
+                        <button onClick={() => { copyToClipboard(newApiKey, 'API key'); }} className="p-1.5 text-emerald-600 hover:bg-emerald-100 rounded"><Copy size={14} /></button>
                       </div>
                       <button onClick={() => setNewApiKey('')} className="mt-2 text-[10px] text-slate-400 hover:text-slate-600">Dismiss</button>
                     </div>
@@ -2669,7 +3130,17 @@ export default function SettingsPage() {
                         </div>
                         <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
                           <button
-                            onClick={(e) => { e.stopPropagation(); if (window.confirm(`Delete "${selectedProduct.name}"?`)) { deleteProduct(selectedProduct.id); } }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              requestConfirmation({
+                                title: 'Delete Product',
+                                description: `Delete "${selectedProduct.name}". This removes it from the catalog and cannot be undone.`,
+                                confirmLabel: 'Delete product',
+                                onConfirm: async () => {
+                                  await deleteProduct(selectedProduct.id);
+                                },
+                              });
+                            }}
                             className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"
                           >
                             <Trash2 size={13} /> Delete product
@@ -2898,5 +3369,7 @@ export default function SettingsPage() {
         </div>
       )}
     </div>
+    {confirmDialog}
+    </>
   );
 }

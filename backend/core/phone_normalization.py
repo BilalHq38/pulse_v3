@@ -96,12 +96,12 @@ def _last_n_digits(digits: str, n: int) -> str:
     return d or ""
 
 
-def phone_lookup_candidates(raw: str) -> list[str]:
+def phone_lookup_candidates(raw: str, fallback_region: Optional[str] = None) -> list[str]:
     """Possible stored `customers.phone` values: E.164 (loose), raw, last-10 legacy (collision-prone)."""
     if not (raw or "").strip():
         return []
     raw = raw.strip()
-    e164 = normalize_to_e164_digits(raw)
+    e164 = normalize_to_e164_digits(raw, fallback_region=fallback_region)
     out: list[str] = []
     for c in (e164, raw):
         if c and c not in out:

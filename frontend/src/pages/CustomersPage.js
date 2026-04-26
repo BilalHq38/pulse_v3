@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useDeferredValue } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
-import { toast } from '@/hooks/use-toast';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
+import BulkUploadModal from '@/components/BulkUploadModal';
 import {
   Search,
   Plus,
@@ -18,6 +20,17 @@ import {
 import { buildCustomerMethods, CHANNEL_META } from '@/lib/channelUtils';
 
 const SEGMENT_COLORS = { vip: 'bg-amber-50 text-amber-600 border-amber-500/30', enterprise: 'bg-blue-50 text-blue-600 border-blue-200', growth: 'bg-cyan-50 text-cyan-600 border-cyan-500/30', general: 'bg-gray-700/50 text-slate-500 border-gray-600/30' };
+const CUSTOMER_BULK_TEMPLATE_HEADERS = ['name', 'email', 'phone', 'company', 'segment', 'tags', 'channels'];
+const CUSTOMER_BULK_TEMPLATE_SAMPLE = ['Jordan Reyes', 'jordan@brightworks.com', '+1 646 555 0199', 'BrightWorks', 'growth', 'vip, beta', 'email, whatsapp'];
+const CUSTOMER_BULK_GUIDE_ROWS = [
+  { column: 'name', help: 'Customer name. Use full name when possible.' },
+  { column: 'email', help: 'Optional, but recommended for matching and email outreach.' },
+  { column: 'phone', help: 'Optional, but recommended. International format works best, for example +1 646 555 0199.' },
+  { column: 'company', help: 'Optional company or organization name.' },
+  { column: 'segment', help: 'Optional segment such as general, growth, enterprise, or vip.' },
+  { column: 'tags', help: 'Optional comma-separated tags.' },
+  { column: 'channels', help: 'Optional comma-separated channels such as email, whatsapp, or instagram.' },
+];
 
 function CustomerCardSkeleton() {
   return (
@@ -43,9 +56,11 @@ function CustomerCardSkeleton() {
 // buildCustomerMethods and related utils are now imported from @/lib/channelUtils.
 
 export default function CustomersPage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [customers, setCustomers] = useState([]);
   const [selected, setSelected] = useState(null);
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [filterSeg, setFilterSeg] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', email: '', phone: '', company: '', segment: 'general', tags: '' });
@@ -75,6 +90,8 @@ export default function CustomersPage() {
   const [customerPurchases, setCustomerPurchases] = useState([]);
   const [customerJourney, setCustomerJourney] = useState([]);
   const [customerUnifiedProfile, setCustomerUnifiedProfile] = useState(null);
+  const [showBulkUpload, setShowBulkUpload] = useState(false);
+  const [bulkUploading, setBulkUploading] = useState(false);
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -96,7 +113,7 @@ export default function CustomersPage() {
     setLoadError('');
     try {
       const params = {};
-      if (search) params.search = search;
+      if (deferredSearch) params.search = deferredSearch;
       if (filterSeg) params.segment = filterSeg;
       const res = await api.get('/customers', { params });
       setCustomers(res.data);
@@ -112,7 +129,7 @@ export default function CustomersPage() {
     } finally {
       setLoading(false);
     }
-  }, [search, filterSeg]);
+  }, [deferredSearch, filterSeg]);
 
   useEffect(() => { loadCustomers(); }, [loadCustomers]);
   useEffect(() => {
@@ -163,10 +180,22 @@ export default function CustomersPage() {
   const createCustomer = async () => {
     try {
       await api.post('/customers', { ...form, tags: form.tags.split(',').map((t) => t.trim()).filter(Boolean), channels: [] });
+      showToast({
+        type: 'success',
+        title: 'Customer Added',
+        message: `${form.name || 'The customer'} is ready to manage.`,
+      });
       setShowForm(false);
       setForm({ name: '', email: '', phone: '', company: '', segment: 'general', tags: '' });
       loadCustomers();
-    } catch (err) { console.error(err); }
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Create Failed',
+        message: getErrorMessage(err, 'We could not add that customer.'),
+      });
+    }
   };
 
   const openInboxForCustomer = (customer, method) => {
@@ -181,10 +210,10 @@ export default function CustomersPage() {
   const openMessagePicker = (customer) => {
     const methods = buildCustomerMethods(customer);
     if (methods.length === 0) {
-      toast({
-        variant: 'destructive',
-        title: 'No messaging channels',
-        description: 'No messaging channels are available for this customer yet.',
+      showToast({
+        type: 'error',
+        title: 'No Channels',
+        message: 'No messaging channels are available for this customer yet.',
       });
       return;
     }
@@ -235,18 +264,18 @@ export default function CustomersPage() {
     const body = mode === 'direct' ? emailComposer.originalBody : emailComposer.body.trim();
 
     if (!subject) {
-      toast({
-        variant: 'destructive',
-        title: 'Subject required',
-        description: 'Email subject is required before sending.',
+      showToast({
+        type: 'error',
+        title: 'Subject Missing',
+        message: 'Add an email subject before sending.',
       });
       return;
     }
     if (!body) {
-      toast({
-        variant: 'destructive',
-        title: 'Body required',
-        description: 'Email body is required before sending.',
+      showToast({
+        type: 'error',
+        title: 'Body Missing',
+        message: 'Add email content before sending.',
       });
       return;
     }
@@ -259,17 +288,18 @@ export default function CustomersPage() {
         body,
       });
       closeEmailComposer();
-      toast({
-        title: 'Message sent',
-        description: `Email sent to ${customer.email}.`,
+      showToast({
+        type: 'success',
+        title: 'Email Sent',
+        message: `${customer.name || customer.email} received an email on ${customer.email}.`,
       });
     } catch (err) {
       console.error(err);
       setEmailComposer((prev) => ({ ...prev, sending: false }));
-      toast({
-        variant: 'destructive',
-        title: 'Message failed',
-        description: err?.response?.data?.detail || 'Failed to send email from Pulse Engine.',
+      showToast({
+        type: 'error',
+        title: 'Email Failed',
+        message: getErrorMessage(err, `We could not send an email to ${customer.email}.`),
       });
     }
   };
@@ -301,19 +331,19 @@ export default function CustomersPage() {
     const email = contactForm.email.trim();
 
     if (contactPrompt.mode === 'message' && !phone) {
-      toast({
-        variant: 'destructive',
-        title: 'Phone required',
-        description: 'Phone is required to start a chat conversation.',
+      showToast({
+        type: 'error',
+        title: 'Phone Missing',
+        message: 'Add a phone number before starting a chat conversation.',
       });
       return;
     }
 
     if (contactPrompt.mode === 'email' && !email) {
-      toast({
-        variant: 'destructive',
-        title: 'Email required',
-        description: 'Email is required to send an email.',
+      showToast({
+        type: 'error',
+        title: 'Email Missing',
+        message: 'Add an email address before sending an email.',
       });
       return;
     }
@@ -343,29 +373,43 @@ export default function CustomersPage() {
       openInboxForCustomer(updatedCustomer, contactPrompt.method || { channel: 'web_chat', source: 'customer_profile' });
     } catch (err) {
       console.error(err);
-      toast({
-        variant: 'destructive',
-        title: 'Contact update failed',
-        description: err?.response?.data?.detail || 'Failed to save contact details.',
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save those contact details.'),
       });
     }
   };
 
   const deleteCustomer = async (customer, event) => {
     if (event) event.stopPropagation();
-    const confirmed = window.confirm(`Delete customer "${customer.name || 'this customer'}"?`);
-    if (!confirmed) return;
-    setDeletingCustomerId(customer.id);
-    try {
-      await api.delete(`/customers/${customer.id}`);
-      setCustomers((prev) => prev.filter((item) => item.id !== customer.id));
-      if (selected?.id === customer.id) closeCustomerDetail();
-    } catch (err) {
-      console.error(err);
-      alert('Failed to delete customer.');
-    } finally {
-      setDeletingCustomerId(null);
-    }
+    requestConfirmation({
+      title: 'Delete Customer',
+      description: `Delete ${customer.name || 'this customer'} permanently. This action cannot be undone.`,
+      confirmLabel: 'Delete customer',
+      onConfirm: async () => {
+        setDeletingCustomerId(customer.id);
+        try {
+          await api.delete(`/customers/${customer.id}`);
+          setCustomers((prev) => prev.filter((item) => item.id !== customer.id));
+          if (selected?.id === customer.id) closeCustomerDetail();
+          showToast({
+            type: 'success',
+            title: 'Customer Deleted',
+            message: `${customer.name || 'The customer'} was removed.`,
+          });
+        } catch (err) {
+          console.error(err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, `We could not delete ${customer.name || 'that customer'}.`),
+          });
+        } finally {
+          setDeletingCustomerId(null);
+        }
+      },
+    });
   };
 
   const openEditCustomer = (customer) => {
@@ -391,13 +435,61 @@ export default function CustomersPage() {
       upsertCustomerState(res.data);
       setShowEditCustomer(false);
       loadCustomers();
+      showToast({
+        type: 'success',
+        title: 'Customer Updated',
+        message: `${res.data?.name || selected.name || 'The customer'} was updated.`,
+      });
     } catch (err) {
       console.error(err);
-      alert('Failed to update customer.');
+      showToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: getErrorMessage(err, `We could not update ${selected.name || 'that customer'}.`),
+      });
+    }
+  };
+
+  const handleBulkUpload = async (file) => {
+    setBulkUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await api.post('/customers/bulk-upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const result = res.data || {};
+      await loadCustomers();
+      setShowBulkUpload(false);
+      const message = `Created ${result.created || 0}, updated ${result.updated || 0}, skipped ${result.skipped || 0}.`;
+      if (Array.isArray(result.errors) && result.errors.length > 0) {
+        const firstError = result.errors[0];
+        showToast({
+          type: 'warning',
+          title: 'Import Completed with Warnings',
+          message: `${message} First issue: row ${firstError.row} - ${firstError.error}`,
+        });
+      } else {
+        showToast({
+          type: 'success',
+          title: 'Customer Import Complete',
+          message,
+        });
+      }
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Import Failed',
+        message: getErrorMessage(err, 'We could not import that customer spreadsheet.'),
+      });
+    } finally {
+      setBulkUploading(false);
     }
   };
 
   return (
+    <>
     <div className="p-6 lg:p-8 space-y-6" data-testid="customers-page">
       {loadError && (
         <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">
@@ -418,9 +510,14 @@ export default function CustomersPage() {
           <h1 className="text-2xl font-bold text-slate-900">Customers</h1>
           <p className="text-slate-400 text-sm mt-1">{customers.length} total customers</p>
         </div>
-        <button onClick={() => setShowForm(true)} className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl text-sm font-medium hover:from-blue-500 hover:to-blue-600 transition-all shadow-lg shadow-blue-600/15" data-testid="add-customer-btn">
-          <Plus size={16} /> Add Customer
-        </button>
+        <div className="flex items-center gap-3">
+          <button onClick={() => setShowBulkUpload(true)} className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition-all hover:bg-slate-50" data-testid="bulk-upload-customers-btn">
+            Bulk Upload
+          </button>
+          <button onClick={() => setShowForm(true)} className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl text-sm font-medium hover:from-blue-500 hover:to-blue-600 transition-all shadow-lg shadow-blue-600/15" data-testid="add-customer-btn">
+            <Plus size={16} /> Add Customer
+          </button>
+        </div>
       </div>
 
       <div className="flex items-center gap-3">
@@ -891,11 +988,26 @@ export default function CustomersPage() {
         </div>
       )}
 
+      <BulkUploadModal
+        isOpen={showBulkUpload}
+        onClose={() => { if (!bulkUploading) setShowBulkUpload(false); }}
+        title="Bulk Upload Customers"
+        subtitle="Import a spreadsheet of customers in one pass, with duplicate-safe create or update behavior."
+        entityLabel="Customer"
+        uploading={bulkUploading}
+        onUpload={handleBulkUpload}
+        templateHeaders={CUSTOMER_BULK_TEMPLATE_HEADERS}
+        templateSample={CUSTOMER_BULK_TEMPLATE_SAMPLE}
+        guideRows={CUSTOMER_BULK_GUIDE_ROWS}
+      />
+
       {loading && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" aria-label="Loading customers">
           {Array.from({ length: 6 }).map((_, i) => <CustomerCardSkeleton key={i} />)}
         </div>
       )}
     </div>
+    {confirmDialog}
+    </>
   );
 }

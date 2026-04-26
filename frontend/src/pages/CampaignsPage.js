@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '@/lib/api';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
   AlertCircle,
-  CheckCircle2,
   Mail,
   Package,
   Plus,
@@ -54,6 +55,7 @@ const EMPTY_AI_DETAILS = {
 };
 
 export default function CampaignsPage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -71,7 +73,6 @@ export default function CampaignsPage() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [sendNow, setSendNow] = useState(true);
-  const [notice, setNotice] = useState('');
 
   const loadCampaigns = useCallback(async () => {
     setLoadError('');
@@ -143,11 +144,14 @@ export default function CampaignsPage() {
 
   const generateCampaignCopy = async () => {
     if (!aiGenerationReady) {
-      setNotice('Select a product and complete the required AI campaign details first.');
+      showToast({
+        type: 'error',
+        title: 'Details Missing',
+        message: 'Select a product and complete the required campaign details first.',
+      });
       return;
     }
     setGeneratingCopy(true);
-    setNotice('');
     try {
       const res = await api.post('/campaigns/generate', {
         product_id: form.product_id,
@@ -159,10 +163,17 @@ export default function CampaignsPage() {
         body: res.data?.body || prev.body,
         html_body: res.data?.html_body || prev.html_body,
       }));
-      setNotice('AI campaign copy generated. You can edit it before sending.');
+      showToast({
+        type: 'success',
+        title: 'Copy Ready',
+        message: `AI created draft copy for ${form.name || form.subject || 'this campaign'}.`,
+      });
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setNotice(detail || 'Failed to generate campaign copy');
+      showToast({
+        type: 'error',
+        title: 'Copy Failed',
+        message: getErrorMessage(err, 'We could not generate campaign copy.'),
+      });
     } finally {
       setGeneratingCopy(false);
     }
@@ -171,11 +182,14 @@ export default function CampaignsPage() {
   const submit = async (e) => {
     e?.preventDefault?.();
     if (!form.subject.trim() || !form.body.trim()) {
-      setNotice('Subject and body are required');
+      showToast({
+        type: 'error',
+        title: 'Content Missing',
+        message: 'Add both a subject and body before saving the campaign.',
+      });
       return;
     }
     setSubmitting(true);
-    setNotice('');
     try {
       const payload = {
         name: form.name || form.subject,
@@ -193,35 +207,71 @@ export default function CampaignsPage() {
       setSelectedCustomerIds([]);
       setAiDetails(EMPTY_AI_DETAILS);
       setPreview(null);
-      setNotice('Campaign created' + (sendNow ? ' and queued for delivery.' : '.'));
+      const recipientCount = preview?.count ?? 0;
+      const campaignName = form.name || form.subject || 'Campaign';
+      showToast({
+        type: 'success',
+        title: sendNow ? 'Campaign Queued' : 'Draft Saved',
+        message: sendNow
+          ? `${campaignName} is queued for ${recipientCount} recipient${recipientCount === 1 ? '' : 's'}.`
+          : `${campaignName} was saved${recipientCount ? ` with ${recipientCount} planned recipient${recipientCount === 1 ? '' : 's'}` : ''}.`,
+      });
       loadCampaigns();
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setNotice(detail || 'Failed to create campaign');
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save that campaign.'),
+      });
     } finally {
       setSubmitting(false);
     }
   };
 
   const sendCampaign = async (id) => {
+    const campaign = campaigns.find((item) => item.id === id);
     try {
       await api.post(`/campaigns/${id}/send`);
       loadCampaigns();
+      const recipientCount = campaign?.total_recipients || 0;
+      showToast({
+        type: 'success',
+        title: 'Campaign Queued',
+        message: `${campaign?.name || campaign?.subject || 'Campaign'} is queued for ${recipientCount} recipient${recipientCount === 1 ? '' : 's'}.`,
+      });
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      alert(detail || 'Failed to queue campaign');
+      showToast({
+        type: 'error',
+        title: 'Send Failed',
+        message: getErrorMessage(err, 'We could not queue that campaign.'),
+      });
     }
   };
 
   const deleteCampaign = async (id) => {
-    if (!window.confirm('Delete this campaign and its recipient list?')) return;
-    try {
-      await api.delete(`/campaigns/${id}`);
-      loadCampaigns();
-    } catch (err) {
-      const detail = err?.response?.data?.detail;
-      alert(detail || 'Failed to delete campaign');
-    }
+    const campaign = campaigns.find((item) => item.id === id);
+    requestConfirmation({
+      title: 'Delete Campaign',
+      description: `Delete ${campaign?.name || campaign?.subject || 'this campaign'} and its recipient list. This cannot be undone.`,
+      confirmLabel: 'Delete campaign',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/campaigns/${id}`);
+          loadCampaigns();
+          showToast({
+            type: 'success',
+            title: 'Campaign Deleted',
+            message: `${campaign?.name || campaign?.subject || 'The campaign'} was removed.`,
+          });
+        } catch (err) {
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that campaign.'),
+          });
+        }
+      },
+    });
   };
 
   const totals = useMemo(() => {
@@ -232,6 +282,7 @@ export default function CampaignsPage() {
   }, [campaigns]);
 
   return (
+    <>
     <div className="min-h-screen bg-slate-50/60">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-10">
         <div className="flex items-center justify-between mb-6">
@@ -253,7 +304,7 @@ export default function CampaignsPage() {
               <RefreshCw size={14} />
             </button>
             <button
-              onClick={() => { setShowForm(true); setNotice(''); }}
+              onClick={() => { setShowForm(true); }}
               className="inline-flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
               data-testid="new-campaign-btn"
             >
@@ -261,12 +312,6 @@ export default function CampaignsPage() {
             </button>
           </div>
         </div>
-
-        {notice && (
-          <div className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700 px-3 py-2 text-sm inline-flex items-center gap-2">
-            <CheckCircle2 size={14} /> {notice}
-          </div>
-        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
           <StatCard label="Campaigns" value={campaigns.length} />
@@ -620,10 +665,6 @@ export default function CampaignsPage() {
                 Start sending immediately after save
               </label>
 
-              {notice && (
-                <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">{notice}</div>
-              )}
-
               <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
                 <button
                   type="button"
@@ -651,6 +692,8 @@ export default function CampaignsPage() {
         </div>
       )}
     </div>
+    {confirmDialog}
+    </>
   );
 }
 

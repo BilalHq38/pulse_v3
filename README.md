@@ -48,9 +48,9 @@ Do not maintain a separate `backend/.env` for Compose; it is easy to get out of 
 
 ### Database schema
 
-- **Canonical schema file:** [`schema.sql`](schema.sql) at the repository root.
-- `schema.sql` merges the legacy consolidated schema plus the standalone SQL migrations and microservice bootstrap SQL into one idempotent entrypoint for database setup.
-- The original SQL files under `backend/` are retained for traceability until the team decides to retire them, but `schema.sql` is now the file to review and run first.
+- **Canonical schema file:** [`backend/sql_schema.sql`](backend/sql_schema.sql).
+- `backend/sql_schema.sql` is the single source of truth for PostgreSQL bootstrap and compatibility setup.
+- The old repository-root `schema.sql` snapshot has been retired to avoid drift; review and run `backend/sql_schema.sql` first.
 
 ### URLs (default local)
 

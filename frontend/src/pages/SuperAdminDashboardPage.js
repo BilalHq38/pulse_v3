@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, Fragment } from 'react';
 import api from '@/lib/api';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
   Shield, Users, MessageSquare, Target, UserCheck, Package, Ticket,
   Search, RefreshCw, ChevronDown, ChevronUp, ChevronRight, Building2, Mail, Phone,
@@ -8,6 +10,7 @@ import {
 } from 'lucide-react';
 
 export default function SuperAdminDashboardPage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [overview, setOverview] = useState(null);
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -16,7 +19,6 @@ export default function SuperAdminDashboardPage() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [expandedTree, setExpandedTree] = useState(new Set());
   const [actionLoading, setActionLoading] = useState('');
-  const [feedback, setFeedback] = useState({ msg: '', type: '' });
   const [expandedUser, setExpandedUser] = useState(null);
   const [sortBy, setSortBy] = useState('created_at');
   const [sortDir, setSortDir] = useState('desc');
@@ -107,18 +109,27 @@ export default function SuperAdminDashboardPage() {
       if (mc !== '') payload.monthly_conversation_limit = parseInt(mc, 10);
       if (mu !== '') payload.max_users = parseInt(mu, 10);
       if (!Object.keys(payload).length) {
-        setFeedback({ msg: 'Enter at least one limit to update', type: 'error' });
-        setTimeout(() => setFeedback({ msg: '', type: '' }), 4000);
+        showToast({
+          type: 'error',
+          title: 'Limits Missing',
+          message: 'Enter at least one limit before saving plan changes.',
+        });
         return;
       }
       await api.put(`/admin/tenants/${planEditTenant.company_id}/plan-limits`, payload);
-      setFeedback({ msg: 'Plan limits updated', type: 'success' });
-      setTimeout(() => setFeedback({ msg: '', type: '' }), 4000);
+      showToast({
+        type: 'success',
+        title: 'Limits Updated',
+        message: `${planEditTenant.company_name || 'The workspace'} plan limits were updated.`,
+      });
       setPlanEditTenant(null);
       await fetchTenants();
     } catch (err) {
-      setFeedback({ msg: err.response?.data?.detail || 'Update failed', type: 'error' });
-      setTimeout(() => setFeedback({ msg: '', type: '' }), 5000);
+      showToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: getErrorMessage(err, 'We could not update those plan limits.'),
+      });
     } finally {
       setPlanSaveLoading('');
     }
@@ -129,28 +140,48 @@ export default function SuperAdminDashboardPage() {
     try {
       await api.put(`/admin/users/${userId}/status`, { status: newStatus });
       setUsers(prev => prev.map(u => u.id === userId ? { ...u, status: newStatus } : u));
-      setFeedback({ msg: `${userName}'s account is now ${newStatus}`, type: 'success' });
-      setTimeout(() => setFeedback({ msg: '', type: '' }), 4000);
+      showToast({
+        type: 'success',
+        title: 'Status Updated',
+        message: `${userName || 'The user'} is now ${newStatus}.`,
+      });
     } catch (err) {
-      setFeedback({ msg: err.response?.data?.detail || 'Action failed', type: 'error' });
-      setTimeout(() => setFeedback({ msg: '', type: '' }), 4000);
+      showToast({
+        type: 'error',
+        title: 'Action Failed',
+        message: getErrorMessage(err, 'We could not update that user status.'),
+      });
     } finally { setActionLoading(''); }
   };
 
   const deleteUser = async (userId, userName) => {
-    if (!window.confirm(`Delete ${userName || 'this user'} permanently? This action cannot be undone.`)) return;
-    setActionLoading(userId + 'delete');
-    try {
-      await api.delete(`/admin/users/${userId}`);
-      setExpandedUser(prev => prev === userId ? null : prev);
-      setExpandedTree(new Set());
-      await fetchData();
-      setFeedback({ msg: `${userName}'s account was deleted`, type: 'success' });
-      setTimeout(() => setFeedback({ msg: '', type: '' }), 4000);
-    } catch (err) {
-      setFeedback({ msg: err.response?.data?.detail || 'Delete failed', type: 'error' });
-      setTimeout(() => setFeedback({ msg: '', type: '' }), 4000);
-    } finally { setActionLoading(''); }
+    requestConfirmation({
+      title: 'Delete User',
+      description: `Delete ${userName || 'this user'} permanently. This action cannot be undone.`,
+      confirmLabel: 'Delete user',
+      onConfirm: async () => {
+        setActionLoading(userId + 'delete');
+        try {
+          await api.delete(`/admin/users/${userId}`);
+          setExpandedUser(prev => prev === userId ? null : prev);
+          setExpandedTree(new Set());
+          await fetchData();
+          showToast({
+            type: 'success',
+            title: 'User Deleted',
+            message: `${userName || 'The user'} was removed.`,
+          });
+        } catch (err) {
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that user.'),
+          });
+        } finally {
+          setActionLoading('');
+        }
+      },
+    });
   };
 
   /* Build admin → agent tree */
@@ -263,14 +294,6 @@ export default function SuperAdminDashboardPage() {
       </div>
 
       {/* ─── Feedback ─── */}
-      {feedback.msg && (
-        <div className={`mb-4 px-4 py-2.5 rounded-lg text-sm flex items-center gap-2 ${
-          feedback.type === 'success' ? 'bg-emerald-50 border border-emerald-200 text-emerald-700' : 'bg-red-50 border border-red-200 text-red-600'
-        }`}>
-          {feedback.type === 'success' ? <CheckCircle size={15} /> : <XCircle size={15} />}
-          {feedback.msg}
-        </div>
-      )}
       {error && (
         <div className="mb-4 px-4 py-2.5 rounded-lg text-sm flex items-center gap-2 bg-red-50 border border-red-200 text-red-600">
           <XCircle size={15} /> {error}
@@ -1318,6 +1341,7 @@ export default function SuperAdminDashboardPage() {
           )}
         </div>
       )}
+      {confirmDialog}
     </div>
   );
 }
