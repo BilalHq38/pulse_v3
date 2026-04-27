@@ -1,0 +1,1918 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useSearchParams, useNavigate } from 'react-router-dom';
+import api from '@/lib/api';
+import { getErrorMessage, showToast } from '@/hooks/use-toast';
+import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { useSocket } from '@/lib/useSocket';
+import {
+  Send,
+  Bot,
+  Sparkles,
+  Phone,
+  Mail,
+  Tag,
+  MessageSquare,
+  UserCircle,
+  X,
+  ArrowLeft,
+  AlertTriangle,
+  User,
+  ChevronRight,
+  Plus,
+  Pencil,
+  Trash2,
+  Check,
+  MoreVertical,
+  Image as ImageIcon,
+} from 'lucide-react';
+
+const CHANNELS = [
+  { key: 'whatsapp', label: 'WhatsApp', color: 'bg-emerald-500', lightBg: 'bg-emerald-50', text: 'text-emerald-600', border: 'border-emerald-200' },
+  { key: 'facebook', label: 'Facebook', color: 'bg-blue-500', lightBg: 'bg-blue-50', text: 'text-blue-600', border: 'border-blue-200' },
+  { key: 'instagram', label: 'Instagram', color: 'bg-pink-500', lightBg: 'bg-pink-50', text: 'text-pink-600', border: 'border-pink-200' },
+  { key: 'email', label: 'Email', color: 'bg-sky-500', lightBg: 'bg-sky-50', text: 'text-sky-600', border: 'border-sky-200' },
+  { key: 'web_chat', label: 'Website', color: 'bg-violet-500', lightBg: 'bg-violet-50', text: 'text-violet-600', border: 'border-violet-200' },
+];
+
+const CHAT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const MAX_CHAT_IMAGE_SIZE_MB = 8;
+const MAX_CHAT_IMAGES = 4;
+const IDENTITY_CONSENT_VERSION = 'v1.0';
+const IDENTITY_CONSENT_METHOD = 'checkbox';
+
+function normalizeIdentityPlatform(channelKey) {
+  const normalized = String(channelKey || 'web_chat').trim().toLowerCase();
+  if (normalized === 'whatsapp' || normalized === 'facebook' || normalized === 'instagram' || normalized === 'web_chat' || normalized === 'email') {
+    return normalized;
+  }
+  return 'web_chat';
+}
+
+function resolveIdentityPlatformUserId(conversation, customer) {
+  if (!conversation) return '';
+  const fromConversation = String(conversation.channel_id || '').trim();
+  if (fromConversation) return fromConversation;
+
+  const platform = normalizeIdentityPlatform(conversation.channel);
+  const socialProfiles = (customer && typeof customer.social_profiles === 'object' && customer.social_profiles) || {};
+  if ((platform === 'facebook' || platform === 'instagram') && socialProfiles[platform]) {
+    return String(socialProfiles[platform]).trim();
+  }
+  if (platform === 'whatsapp' && customer?.phone) {
+    return String(customer.phone).trim();
+  }
+  if (customer?.email) {
+    return String(customer.email).trim().toLowerCase();
+  }
+  return String(conversation.customer_id || '').trim();
+}
+
+function normalizeAttachments(attachments) {
+  if (!Array.isArray(attachments)) return [];
+  return attachments
+    .map((attachment, index) => {
+      if (!attachment || typeof attachment !== 'object') return null;
+      return {
+        id: attachment.id || `att-${index}`,
+        type: attachment.type || attachment.file_type || 'unknown',
+        url: attachment.url || attachment.file_url || '',
+        name: attachment.name || attachment.file_name || '',
+        size: Number(attachment.size || attachment.file_size || 0),
+      };
+    })
+    .filter((attachment) => attachment && attachment.url);
+}
+
+function normalizeMessage(message) {
+  if (!message || typeof message !== 'object') return message;
+  return {
+    ...message,
+    attachments: normalizeAttachments(message.attachments),
+  };
+}
+
+function mergeMessageUpdate(currentMessage, incomingMessage) {
+  const normalized = normalizeMessage(incomingMessage);
+  if (!currentMessage) return normalized;
+  return {
+    ...currentMessage,
+    ...normalized,
+    attachments: normalized.attachments?.length ? normalized.attachments : (currentMessage.attachments || []),
+  };
+}
+
+function getDeliveryStatusMeta(status) {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'failed') return { label: 'Failed', className: 'bg-red-50 text-red-700 border-red-200' };
+  if (normalized === 'delivered') return { label: 'Delivered', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+  if (normalized === 'sent') return { label: 'Sent', className: 'bg-blue-50 text-blue-700 border-blue-200' };
+  if (normalized === 'pending') return { label: 'Sending', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+  return null;
+}
+
+function formatInboxChannel(channelKey) {
+  const match = CHANNELS.find((channel) => channel.key === channelKey);
+  return match?.label || String(channelKey || 'message').replace(/_/g, ' ');
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function ChannelLogo({ channelKey, size = 14 }) {
+  if (channelKey === 'whatsapp') return (
+    <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:size,height:size,borderRadius:3,background:'#25D366',flexShrink:0}}>
+      <svg viewBox="0 0 24 24" width={size*0.72} height={size*0.72} fill="white">
+        <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
+      </svg>
+    </span>
+  );
+  if (channelKey === 'facebook') return (
+    <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:size,height:size,borderRadius:3,background:'#1877F2',flexShrink:0}}>
+      <svg viewBox="0 0 24 24" width={size*0.72} height={size*0.72} fill="white">
+        <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
+      </svg>
+    </span>
+  );
+  if (channelKey === 'instagram') return (
+    <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:size,height:size,borderRadius:3,background:'radial-gradient(circle at 30% 107%, #fdf497 0%, #fdf497 5%, #fd5949 45%, #d6249f 60%, #285AEB 90%)',flexShrink:0}}>
+      <svg viewBox="0 0 24 24" width={size*0.72} height={size*0.72} fill="white">
+        <path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/>
+      </svg>
+    </span>
+  );
+  if (channelKey === 'email') return (
+    <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:size,height:size,borderRadius:3,background:'linear-gradient(135deg,#0ea5e9,#0284c7)',flexShrink:0}}>
+      <svg viewBox="0 0 24 24" width={size*0.72} height={size*0.72} fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+        <polyline points="22,6 12,13 2,6"/>
+      </svg>
+    </span>
+  );
+  return (
+    <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:size,height:size,borderRadius:3,background:'#475569',flexShrink:0}}>
+      <svg viewBox="0 0 24 24" width={size*0.72} height={size*0.72} fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
+        <path d="M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"/>
+      </svg>
+    </span>
+  );
+}
+
+const TAG_COLORS = {
+  pricing: 'bg-amber-50 text-amber-600 border-amber-200',
+  sales: 'bg-green-50 text-green-600 border-green-200',
+  vip: 'bg-purple-50 text-purple-600 border-purple-200',
+  support: 'bg-blue-50 text-blue-600 border-blue-200',
+  billing: 'bg-red-50 text-red-600 border-red-200',
+  complaint: 'bg-red-50 text-red-600 border-red-200',
+  technical: 'bg-cyan-50 text-cyan-600 border-cyan-200',
+  api: 'bg-slate-100 text-slate-600 border-slate-200',
+  'feature-request': 'bg-indigo-50 text-indigo-600 border-indigo-200',
+};
+
+function getTagColor(tag) { return TAG_COLORS[tag] || 'bg-slate-50 text-slate-500 border-slate-200'; }
+
+function normalizeSentimentScore(rawScore) {
+  if (rawScore === null || rawScore === undefined || Number.isNaN(Number(rawScore))) return null;
+  const numeric = Number(rawScore);
+  if (numeric >= 0 && numeric <= 1) return numeric;
+  return Math.max(0, Math.min(1, (numeric + 1) / 2));
+}
+
+function getSentimentMeta(rawScore, label = '', emotion = '') {
+  const score = normalizeSentimentScore(rawScore);
+  if (score === null) return null;
+  
+  const percentage = Math.round(score * 100);
+  
+  let tone, accentClass;
+  if (percentage < 40) {
+    tone = 'Negative';
+    accentClass = 'bg-red-50 text-red-700 border-red-200';
+  } else if (percentage < 60) {
+    tone = 'Neutral';
+    accentClass = 'bg-amber-50 text-amber-700 border-amber-200';
+  } else {
+    tone = 'Positive';
+    accentClass = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  }
+  
+  const displayLabel = emotion || label || tone;
+  return {
+    score,
+    percentage,
+    tone,
+    accentClass,
+    displayLabel,
+  };
+}
+
+export default function InboxPage() {
+  const { requestConfirmation, confirmDialog } = useConfirmDialog();
+  const navigate = useNavigate();
+  const [conversations, setConversations] = useState([]);
+  const [selectedConvo, setSelectedConvo] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [newMessage, setNewMessage] = useState('');
+  const [composerAttachments, setComposerAttachments] = useState([]);
+  const [composerError, setComposerError] = useState('');
+  const [sending, setSending] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [customerInfo, setCustomerInfo] = useState(null);
+  const [maximized, setMaximized] = useState(false);
+  const [tooltipChannel, setTooltipChannel] = useState(null);
+  const tooltipTimerRef = useRef(null);
+  const [aiToggling, setAiToggling] = useState(false);
+  const [activeChannel, setActiveChannel] = useState(null); // For mobile channel filter
+  const [showCustomerSidebar, setShowCustomerSidebar] = useState(false);
+  const [outboundComposerOpen, setOutboundComposerOpen] = useState(false);
+  const [outboundSubmitting, setOutboundSubmitting] = useState(false);
+  const [outboundChannel, setOutboundChannel] = useState('whatsapp');
+  const [unificationMatch, setUnificationMatch] = useState(null);
+  const [unificationPanelOpen, setUnificationPanelOpen] = useState(false);
+  const [outboundName, setOutboundName] = useState('');
+  const [outboundPhone, setOutboundPhone] = useState('');
+  const [outboundRecipientId, setOutboundRecipientId] = useState('');
+  const [outboundMessage, setOutboundMessage] = useState('');
+  const [platformView, setPlatformView] = useState(null);
+  const [editingMessageId, setEditingMessageId] = useState(null);
+  const [editingMessageContent, setEditingMessageContent] = useState('');
+  const [messageActionLoadingId, setMessageActionLoadingId] = useState('');
+  const [menuConvoId, setMenuConvoId] = useState(null);
+  const [customerEditOpen, setCustomerEditOpen] = useState(false);
+  const [customerEditLoading, setCustomerEditLoading] = useState(false);
+  const [customerEditTarget, setCustomerEditTarget] = useState(null);
+  const [customerEditForm, setCustomerEditForm] = useState({ name: '', email: '', phone: '', company: '' });
+  const [identityConsentChecked, setIdentityConsentChecked] = useState(false);
+  const [identityConsentActive, setIdentityConsentActive] = useState(false);
+  const [identityConsentToken, setIdentityConsentToken] = useState('');
+  const [identityStatusLoading, setIdentityStatusLoading] = useState(false);
+  const [identityVerifying, setIdentityVerifying] = useState(false);
+  const [identityResult, setIdentityResult] = useState(null);
+  const [identityError, setIdentityError] = useState('');
+  const [notifyNewMessage, setNotifyNewMessage] = useState(true);
+  const messagesEndRef = useRef(null);
+  const composerFileRef = useRef(null);
+  const customerSidebarRef = useRef(null);
+  const selectedConvoIdRef = useRef('');
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const loadConversations = useCallback(async (preferredConversationId = '') => {
+    try {
+      const res = await api.get('/conversations');
+      const items = Array.isArray(res.data) ? res.data : [];
+      setConversations(items);
+      setSelectedConvo(prev => {
+        const targetId = preferredConversationId || prev?.id || '';
+        if (!targetId) return prev;
+        const refreshed = items.find(c => c.id === targetId);
+        return refreshed || prev;
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Inbox Unavailable',
+        message: 'Conversations could not be loaded. Refresh the page or contact support if this continues.',
+      });
+    }
+  }, []);
+
+  const loadNotificationSettings = useCallback(async () => {
+    try {
+      const res = await api.get('/notification-settings');
+      setNotifyNewMessage(res.data?.notify_new_message !== false);
+    } catch {
+      setNotifyNewMessage(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    selectedConvoIdRef.current = selectedConvo?.id || '';
+  }, [selectedConvo?.id]);
+
+  // Socket event dispatcher — passed to useSocket hook below
+  const handleSocketEvent = useCallback((eventName, data) => {
+    if (eventName === 'new_message') {
+      if (!data?.conversation_id || !data?.message) return;
+      const activeConvoId = selectedConvoIdRef.current;
+      if (!activeConvoId || data.conversation_id !== activeConvoId) {
+        loadConversations(data.conversation_id);
+        if (notifyNewMessage) {
+          const senderName =
+            data.message?.sender_name ||
+            data.customer_name ||
+            data.conversation?.customer_name ||
+            'A contact';
+          const channel = data.message?.channel || data.channel || data.conversation?.channel || '';
+          showToast({
+            type: 'info',
+            title: 'New Message',
+            message: `${senderName} sent a message via ${formatInboxChannel(channel)}.`,
+          });
+        }
+        return;
+      }
+      setMessages(prev => {
+        const nextMessage = normalizeMessage(data.message);
+        if (prev.some(m => m.id === nextMessage.id)) return prev;
+        return [...prev, nextMessage];
+      });
+    } else if (eventName === 'conversation_updated') {
+      loadConversations(data?.conversation_id || '');
+    } else if (eventName === 'message_updated') {
+      if (data?.conversation_id && data?.message) {
+        setMessages(prev => prev.map(m => m.id === data.message.id ? mergeMessageUpdate(m, data.message) : m));
+      }
+    } else if (eventName === 'message_deleted') {
+      if (data?.conversation_id && data?.message_id) {
+        setMessages(prev => prev.filter(m => m.id !== data.message_id));
+      }
+    }
+  }, [loadConversations, notifyNewMessage]);
+
+  const { joinConversation } = useSocket(handleSocketEvent, { conversationId: selectedConvo?.id || '' });
+
+  useEffect(() => {
+    loadConversations();
+    loadNotificationSettings();
+  }, [loadConversations, loadNotificationSettings]);
+
+  useEffect(() => {
+    const platform = searchParams.get('platform');
+    if (['whatsapp', 'facebook', 'instagram', 'email', 'web_chat'].includes(platform)) {
+      setPlatformView(platform);
+      setActiveChannel(platform);
+    } else {
+      setPlatformView(null);
+    }
+
+    const directConversationId = searchParams.get('conversation');
+    if (directConversationId) {
+      loadConversations(directConversationId).then(() => {
+        setMaximized(true);
+      }).finally(() => {
+        if (platform) setSearchParams({ platform }, { replace: true });
+        else setSearchParams({}, { replace: true });
+      });
+      return;
+    }
+
+    const outboundMode = searchParams.get('outbound') === '1';
+    if (outboundMode) {
+      const requestedChannel = searchParams.get('channel') || 'whatsapp';
+      const channel = ['whatsapp', 'facebook', 'instagram', 'email'].includes(requestedChannel) ? requestedChannel : 'whatsapp';
+      setOutboundChannel(channel);
+      setOutboundName(searchParams.get('name') || '');
+      setOutboundPhone(searchParams.get('phone') || '');
+      setOutboundRecipientId('');
+      setOutboundMessage('');
+      setOutboundComposerOpen(true);
+      setActiveChannel(channel);
+      if (platform) setSearchParams({ platform }, { replace: true });
+      else setSearchParams({}, { replace: true });
+      return;
+    }
+
+    const contactName = searchParams.get('contactName');
+    const contactPhone = searchParams.get('contactPhone');
+    const contactChannel = searchParams.get('channel') || 'web_chat';
+    if (!contactPhone) {
+      const keepOnlyPlatform = platform ? { platform } : {};
+      const hasTransient = searchParams.get('contactName') || searchParams.get('contactPhone') || searchParams.get('outbound') || searchParams.get('source') || searchParams.get('channel');
+      if (hasTransient) setSearchParams(keepOnlyPlatform, { replace: true });
+      return;
+    }
+
+    const bootstrapConversation = async () => {
+      try {
+        const res = await api.post('/conversations/start', {
+          name: contactName || "Profile Contact",
+          phone: contactPhone,
+          source: searchParams.get('source') || "profile_card",
+          channel: contactChannel,
+        });
+        const convo = res.data?.conversation;
+        if (convo?.id) {
+          setSelectedConvo(convo);
+          setMaximized(true);
+          await loadConversations();
+        }
+      } catch (err) {
+        console.error('Failed to open conversation from profile:', err);
+        showToast({
+          type: 'error',
+          title: 'Load Failed',
+          message: 'The conversation could not be loaded. Refresh the page or contact support if it keeps happening.',
+        });
+      } finally {
+        if (platform) setSearchParams({ platform }, { replace: true });
+        else setSearchParams({}, { replace: true });
+      }
+    };
+
+    bootstrapConversation();
+  }, [loadConversations, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    const convoId = selectedConvo?.id;
+    const customerId = selectedConvo?.customer_id;
+    if (convoId) {
+      loadMessages(convoId);
+      markConversationRead(convoId);
+      if (customerId) {
+        api.get(`/customers/${customerId}`).then(r => setCustomerInfo(r.data)).catch(() => {});
+        api.get(`/identity/customer/${customerId}`).then(r => {
+          setUnificationMatch(r.data?.unified ? r.data.profile : null);
+        }).catch(() => setUnificationMatch(null));
+      } else {
+        setCustomerInfo(null);
+        setUnificationMatch(null);
+      }
+      joinConversation(convoId);
+    }
+  }, [selectedConvo?.id, selectedConvo?.customer_id, joinConversation]);
+
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+  useEffect(() => {
+    const closeMenu = () => setMenuConvoId(null);
+    window.addEventListener('click', closeMenu);
+    return () => window.removeEventListener('click', closeMenu);
+  }, []);
+
+  const openOutboundComposer = (channelKey) => {
+    setOutboundChannel(channelKey);
+    setOutboundName('');
+    setOutboundPhone('');
+    setOutboundRecipientId('');
+    setOutboundMessage('');
+    setOutboundComposerOpen(true);
+  };
+
+  const submitOutboundConversation = async () => {
+    if (outboundSubmitting) return;
+    const channel = outboundChannel;
+    const name = outboundName.trim();
+    const phone = outboundPhone.trim();
+    const recipientId = outboundRecipientId.trim();
+    const message = outboundMessage.trim();
+
+    if (!name) {
+      showToast({
+        type: 'error',
+        title: 'Name Required',
+        message: 'Enter a contact name before starting the conversation.',
+      });
+      return;
+    }
+    if (channel === 'whatsapp' && !phone) {
+      showToast({
+        type: 'error',
+        title: 'Phone Required',
+        message: 'Enter a phone number before starting a WhatsApp conversation.',
+      });
+      return;
+    }
+    if ((channel === 'facebook' || channel === 'instagram') && !recipientId) {
+      showToast({
+        type: 'error',
+        title: 'Recipient Required',
+        message: channel === 'facebook'
+          ? 'Enter the Facebook recipient ID before sending.'
+          : 'Enter the Instagram recipient ID before sending.',
+      });
+      return;
+    }
+    if (channel === 'email' && !recipientId) {
+      showToast({
+        type: 'error',
+        title: 'Email Required',
+        message: 'Enter the recipient email before starting an email conversation.',
+      });
+      return;
+    }
+    if (!message) {
+      showToast({
+        type: 'error',
+        title: 'Message Required',
+        message: 'Enter the first outbound message before sending.',
+      });
+      return;
+    }
+
+    setOutboundSubmitting(true);
+    try {
+      const payload = {
+        channel,
+        name,
+        initial_message: message,
+        source: `inbox_${channel}_plus`,
+      };
+      if (channel === 'whatsapp') payload.phone = phone;
+      else payload.recipient_id = recipientId;
+
+      const res = await api.post('/conversations/start-outbound', payload);
+      const convo = res.data?.conversation;
+      if (convo?.id) {
+        setSelectedConvo(convo);
+        setMaximized(true);
+      }
+      setOutboundComposerOpen(false);
+      await loadConversations();
+      if (convo?.id) await loadMessages(convo.id);
+      if (res.data?.outbound_sent === false) {
+        showToast({
+          type: 'warning',
+          title: 'Conversation Saved',
+          message: res.data?.outbound_error || `The conversation with ${name} was created, but the first message could not be delivered yet.`,
+        });
+      } else {
+        showToast({
+          type: 'success',
+          title: 'Conversation Started',
+          message: `Started a ${formatInboxChannel(channel)} conversation with ${name}.`,
+        });
+      }
+    } catch (err) {
+      console.error('Failed to start outbound conversation', err);
+      showToast({
+        type: 'error',
+        title: 'Start Failed',
+        message: getErrorMessage(err, 'We could not start that outbound conversation.'),
+      });
+    } finally {
+      setOutboundSubmitting(false);
+    }
+  };
+
+  const loadMessages = async (convoId) => {
+    try {
+      const res = await api.get(`/conversations/${convoId}/messages`);
+      setMessages(Array.isArray(res.data) ? res.data.map(normalizeMessage) : []);
+    }
+    catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Messages Unavailable',
+        message: 'This conversation could not be loaded right now. Refresh and try again.',
+      });
+    }
+  };
+
+  const resetIdentityContext = useCallback(() => {
+    setIdentityConsentChecked(false);
+    setIdentityConsentActive(false);
+    setIdentityConsentToken('');
+    setIdentityResult(null);
+    setIdentityError('');
+  }, []);
+
+  const loadIdentityConsentStatus = useCallback(async (conversation = selectedConvo, customer = customerInfo) => {
+    if (!conversation) return;
+    const platform = normalizeIdentityPlatform(conversation.channel);
+    const platformUserId = resolveIdentityPlatformUserId(conversation, customer);
+    if (!platformUserId) {
+      setIdentityConsentActive(false);
+      setIdentityConsentToken('');
+      return;
+    }
+
+    setIdentityStatusLoading(true);
+    try {
+      const res = await api.get(`/consent/status/${encodeURIComponent(platformUserId)}`);
+      const rows = Array.isArray(res.data) ? res.data : [];
+      const activeConsent = rows.find((row) => row?.platform === platform && row?.consent_active);
+      setIdentityConsentActive(Boolean(activeConsent));
+      setIdentityConsentToken(activeConsent?.consent_token || '');
+      setIdentityConsentChecked(Boolean(activeConsent));
+      setIdentityError('');
+    } catch (err) {
+      console.error('Failed to load identity consent status:', err);
+      setIdentityConsentActive(false);
+      setIdentityConsentToken('');
+      setIdentityError(err?.response?.data?.detail || 'Identity consent status could not be loaded.');
+    } finally {
+      setIdentityStatusLoading(false);
+    }
+  }, [selectedConvo, customerInfo]);
+
+  const resolveIdentityForConversation = useCallback(async (
+    consentToken,
+    conversation = selectedConvo,
+    customer = customerInfo,
+  ) => {
+    if (!conversation || !consentToken) return null;
+    const platform = normalizeIdentityPlatform(conversation.channel);
+    const platformUserId = resolveIdentityPlatformUserId(conversation, customer);
+    if (!platformUserId) {
+      setIdentityError('Platform user identifier is missing.');
+      return null;
+    }
+
+    setIdentityVerifying(true);
+    try {
+      const response = await api.post('/v1/identity/resolve', {
+        platform,
+        platform_user_id: platformUserId,
+        consent_token: consentToken,
+        phone_number: customer?.phone || undefined,
+        email_address: customer?.email || undefined,
+        full_name: conversation.customer_name || customer?.name || undefined,
+        username: customer?.social_profiles?.[platform] || undefined,
+        locale: window?.navigator?.language || undefined,
+        device_signals: {
+          conversation_id: conversation.id || '',
+          channel: conversation.channel || '',
+          channel_id: conversation.channel_id || '',
+          customer_id: conversation.customer_id || '',
+        },
+        cookie_id: conversation.session_id || undefined,
+      });
+      setIdentityResult(response.data || null);
+      setIdentityError('');
+      return response.data || null;
+    } catch (err) {
+      console.error('Identity resolve failed:', err);
+      setIdentityResult(null);
+      setIdentityError(err?.response?.data?.detail || 'Identity verification failed.');
+      return null;
+    } finally {
+      setIdentityVerifying(false);
+    }
+  }, [selectedConvo, customerInfo]);
+
+  const grantConsentAndResolveIdentity = useCallback(async (
+    conversation = selectedConvo,
+    customer = customerInfo,
+  ) => {
+    if (!conversation) return false;
+    if (!identityConsentChecked) {
+      setIdentityError('Consent checkbox must be confirmed before verification.');
+      return false;
+    }
+
+    const platform = normalizeIdentityPlatform(conversation.channel);
+    const platformUserId = resolveIdentityPlatformUserId(conversation, customer);
+    if (!platformUserId) {
+      setIdentityError('Platform user identifier is missing.');
+      return false;
+    }
+
+    try {
+      const consentRes = await api.post('/consent/grant', {
+        platform_user_id: platformUserId,
+        platform,
+        consent_version: IDENTITY_CONSENT_VERSION,
+        consent_method: IDENTITY_CONSENT_METHOD,
+        granular_consent: {
+          consent_device_tracking: false,
+          consent_behavioral_analysis: true,
+          consent_cross_platform_link: true,
+          consent_profile_picture: false,
+          consent_data_retention_days: 365,
+        },
+      });
+      const consentToken = consentRes?.data?.consent_token || '';
+      if (!consentToken) {
+        setIdentityError('Consent granted but no token was returned.');
+        return false;
+      }
+      setIdentityConsentActive(true);
+      setIdentityConsentToken(consentToken);
+      const result = await resolveIdentityForConversation(consentToken, conversation, customer);
+      return Boolean(result);
+    } catch (err) {
+      console.error('Consent grant failed:', err);
+      setIdentityError(err?.response?.data?.detail || 'Consent grant failed.');
+      return false;
+    }
+  }, [selectedConvo, customerInfo, identityConsentChecked, resolveIdentityForConversation]);
+
+  useEffect(() => {
+    if (!selectedConvo) {
+      resetIdentityContext();
+      return;
+    }
+    loadIdentityConsentStatus(selectedConvo, customerInfo);
+  }, [selectedConvo, customerInfo, loadIdentityConsentStatus, resetIdentityContext]);
+
+  const handleComposerFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setComposerError('');
+    const availableSlots = Math.max(0, MAX_CHAT_IMAGES - composerAttachments.length);
+    const selectedFiles = files.slice(0, availableSlots);
+    if (selectedFiles.length < files.length) {
+      setComposerError(`You can send up to ${MAX_CHAT_IMAGES} images at once.`);
+    }
+    try {
+      const nextAttachments = [];
+      for (const file of selectedFiles) {
+        if (!CHAT_IMAGE_TYPES.includes(file.type)) {
+          setComposerError('Only JPG, PNG, WEBP, and GIF images are supported.');
+          continue;
+        }
+        if (file.size > MAX_CHAT_IMAGE_SIZE_MB * 1024 * 1024) {
+          setComposerError(`Each image must be ${MAX_CHAT_IMAGE_SIZE_MB}MB or smaller.`);
+          continue;
+        }
+        const url = await fileToDataUrl(file);
+        nextAttachments.push({ type: 'image', url, name: file.name, size: file.size });
+      }
+      if (nextAttachments.length) {
+        setComposerAttachments((prev) => [...prev, ...nextAttachments].slice(0, MAX_CHAT_IMAGES));
+      }
+    } catch (err) {
+      console.error('Attachment read failed:', err);
+      setComposerError('Failed to read one of the selected images.');
+    } finally {
+      if (composerFileRef.current) composerFileRef.current.value = '';
+    }
+  };
+
+  const markConversationRead = async (convoId) => {
+    try {
+      await api.put(`/conversations/${convoId}/mark-read`);
+      setConversations(prev => prev.map(c => c.id === convoId ? { ...c, unread_count: 0 } : c));
+      setSelectedConvo(prev => prev && prev.id === convoId ? { ...prev, unread_count: 0 } : prev);
+    } catch (err) { console.error('Failed to mark as read:', err); }
+  };
+
+  const sendMessage = async () => {
+    if ((!newMessage.trim() && composerAttachments.length === 0) || !selectedConvo || sending) return;
+
+    const platformUserId = resolveIdentityPlatformUserId(selectedConvo, customerInfo);
+    if (platformUserId) {
+      let identityWarning = '';
+      if (identityConsentActive && identityConsentToken && !identityResult) {
+        const resolved = await resolveIdentityForConversation(identityConsentToken, selectedConvo, customerInfo);
+        if (!resolved) {
+          identityWarning = 'Identity verification is unavailable. Sending message without identity linking.';
+        }
+      } else if (identityConsentChecked && !identityConsentActive) {
+        const verified = await grantConsentAndResolveIdentity(selectedConvo, customerInfo);
+        if (!verified) {
+          identityWarning = 'Consent verification failed. Sending message without identity linking.';
+        }
+      }
+      if (identityWarning) {
+        setIdentityError(identityWarning);
+      }
+    }
+
+    setSending(true);
+    try {
+      const res = await api.post(`/conversations/${selectedConvo.id}/messages`, {
+        content: newMessage,
+        sender_type: 'agent',
+        attachments: composerAttachments,
+      });
+      if (res.data.message) {
+        setMessages(prev => {
+          const nextMessage = normalizeMessage(res.data.message);
+          if (prev.some(m => m.id === nextMessage.id)) return prev;
+          return [...prev, nextMessage];
+        });
+      }
+      if (res.data.ai_response) {
+        setMessages(prev => {
+          const nextMessage = normalizeMessage(res.data.ai_response);
+          if (prev.some(m => m.id === nextMessage.id)) return prev;
+          return [...prev, nextMessage];
+        });
+      }
+      setNewMessage('');
+      setComposerAttachments([]);
+      setComposerError('');
+      if (composerFileRef.current) composerFileRef.current.value = '';
+      loadConversations();
+      if (res.data?.outbound_delivered === false) {
+        showToast({
+          type: 'warning',
+          title: 'Delivery Failed',
+          message: res.data?.outbound_error || `The message was saved, but ${selectedConvo.customer_name || 'this contact'} did not receive it yet.`,
+        });
+      } else {
+        showToast({
+          type: 'success',
+          title: 'Message Sent',
+          message: `Sent to ${selectedConvo.customer_name || 'this contact'} via ${formatInboxChannel(selectedConvo.channel)}.`,
+        });
+      }
+    } catch (err) {
+      console.error('Send message error:', err);
+      showToast({
+        type: 'error',
+        title: 'Send Failed',
+        message: getErrorMessage(err, 'We could not send that message.'),
+      });
+    }
+    finally { setSending(false); }
+  };
+
+  const startEditMessage = (msg) => {
+    setEditingMessageId(msg.id);
+    setEditingMessageContent(msg.content || '');
+  };
+
+  const cancelEditMessage = () => {
+    setEditingMessageId(null);
+    setEditingMessageContent('');
+  };
+
+  const saveEditedMessage = async (msg) => {
+    if (!selectedConvo || !editingMessageId || !editingMessageContent.trim()) return;
+    setMessageActionLoadingId(msg.id);
+    try {
+      const res = await api.put(`/conversations/${selectedConvo.id}/messages/${msg.id}`, {
+        content: editingMessageContent.trim(),
+      });
+      if (res.data?.message) {
+        setMessages(prev => prev.map(m => m.id === res.data.message.id ? res.data.message : m));
+      }
+      cancelEditMessage();
+      loadConversations();
+      showToast({
+        type: 'success',
+        title: 'Message Updated',
+        message: `The reply for ${selectedConvo.customer_name || 'this conversation'} was updated.`,
+      });
+    } catch (err) {
+      console.error('Edit message failed:', err);
+      showToast({
+        type: 'error',
+        title: 'Edit Failed',
+        message: getErrorMessage(err, 'We could not update that message.'),
+      });
+    } finally {
+      setMessageActionLoadingId('');
+    }
+  };
+
+  const deleteConversationMessage = async (msg) => {
+    if (!selectedConvo) return;
+    requestConfirmation({
+      title: 'Delete Message',
+      description: 'Delete this message from the conversation. This action cannot be undone.',
+      confirmLabel: 'Delete message',
+      onConfirm: async () => {
+        setMessageActionLoadingId(msg.id);
+        try {
+          await api.delete(`/conversations/${selectedConvo.id}/messages/${msg.id}`);
+          setMessages(prev => prev.filter(m => m.id !== msg.id));
+          if (editingMessageId === msg.id) cancelEditMessage();
+          loadConversations();
+          showToast({
+            type: 'success',
+            title: 'Message Deleted',
+            message: `The message in ${selectedConvo.customer_name || 'this conversation'} was removed.`,
+          });
+        } catch (err) {
+          console.error('Delete message failed:', err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that message.'),
+          });
+        } finally {
+          setMessageActionLoadingId('');
+        }
+      },
+    });
+  };
+
+  const triggerAI = async () => {
+    if (!selectedConvo || aiLoading) return;
+    setAiLoading(true);
+    try {
+      const res = await api.post(`/conversations/${selectedConvo.id}/ai-respond`);
+      setMessages(prev => {
+        const nextMessage = normalizeMessage(res.data);
+        if (prev.some(m => m.id === nextMessage.id)) return prev;
+        return [...prev, nextMessage];
+      });
+      loadConversations();
+      showToast({
+        type: 'success',
+        title: 'AI Reply Ready',
+        message: `AI generated a reply for ${selectedConvo.customer_name || 'this conversation'}.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'AI Reply Failed',
+        message: getErrorMessage(err, 'We could not generate an AI reply.'),
+      });
+    }
+    finally { setAiLoading(false); }
+  };
+
+  const toggleAIMode = async () => {
+    if (!selectedConvo || aiToggling) return;
+    setAiToggling(true);
+    const newAiState = !selectedConvo.ai_handled;
+    try {
+      const res = await api.put(`/conversations/${selectedConvo.id}/toggle-ai`, {
+        enable_ai: newAiState
+      });
+      const updatedConvo = res.data.conversation;
+      setSelectedConvo(updatedConvo);
+      setConversations(prev => prev.map(c => c.id === updatedConvo.id ? updatedConvo : c));
+      await loadMessages(selectedConvo.id);
+      showToast({
+        type: 'success',
+        title: 'AI Mode Updated',
+        message: `${newAiState ? 'AI responses enabled' : 'AI responses paused'} for ${selectedConvo.customer_name || 'this conversation'}.`,
+      });
+    } catch (err) {
+      console.error('Toggle AI failed:', err);
+      showToast({
+        type: 'error',
+        title: 'Toggle Failed',
+        message: getErrorMessage(err, 'We could not update AI handling for this conversation.'),
+      });
+    }
+    finally { setAiToggling(false); }
+  };
+
+  const handleSelectConvo = (convo) => {
+    setMessages([]);
+    setCustomerInfo(null);
+    setComposerAttachments([]);
+    setComposerError('');
+    resetIdentityContext();
+    setSelectedConvo(convo);
+    setMaximized(true);
+    setShowCustomerSidebar(false);
+  };
+
+  const handleBack = () => {
+    setMaximized(false);
+    setSelectedConvo(null);
+    setCustomerInfo(null);
+    setShowCustomerSidebar(false);
+    setComposerAttachments([]);
+    setComposerError('');
+    setUnificationMatch(null);
+    setUnificationPanelOpen(false);
+    resetIdentityContext();
+  };
+
+  const openCustomerProfileSidebar = useCallback(() => {
+    setShowCustomerSidebar(true);
+    requestAnimationFrame(() => {
+      customerSidebarRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }, []);
+
+  const openCustomerEdit = async (convo) => {
+    if (!convo?.customer_id) {
+      showToast({
+        type: 'error',
+        title: 'No Customer Linked',
+        message: 'This conversation is not linked to a customer profile yet.',
+      });
+      return;
+    }
+    setMenuConvoId(null);
+    setCustomerEditTarget(convo);
+    setCustomerEditLoading(true);
+    try {
+      const res = await api.get(`/customers/${convo.customer_id}`);
+      const c = res.data || {};
+      setCustomerEditForm({
+        name: c.name || convo.customer_name || '',
+        email: c.email || '',
+        phone: c.phone || '',
+        company: c.company || '',
+      });
+      setCustomerEditOpen(true);
+    } catch (err) {
+      console.error('Failed to load customer for edit:', err);
+      showToast({
+        type: 'error',
+        title: 'Load Failed',
+        message: 'The customer profile could not be loaded. Refresh and try again.',
+      });
+    } finally {
+      setCustomerEditLoading(false);
+    }
+  };
+
+  const saveCustomerEdit = async () => {
+    if (!customerEditTarget?.customer_id) return;
+    setCustomerEditLoading(true);
+    try {
+      const res = await api.put(`/customers/${customerEditTarget.customer_id}`, {
+        name: customerEditForm.name,
+        email: customerEditForm.email,
+        phone: customerEditForm.phone,
+        company: customerEditForm.company,
+      });
+      const updated = res.data || {};
+      setConversations(prev => prev.map(c => c.customer_id === customerEditTarget.customer_id
+        ? { ...c, customer_name: updated.name || c.customer_name }
+        : c));
+      setSelectedConvo(prev => prev && prev.customer_id === customerEditTarget.customer_id
+        ? { ...prev, customer_name: updated.name || prev.customer_name }
+        : prev);
+      setCustomerInfo(prev => prev && prev.id === customerEditTarget.customer_id
+        ? { ...prev, ...updated }
+        : prev);
+      setCustomerEditOpen(false);
+      showToast({
+        type: 'success',
+        title: 'Customer Saved',
+        message: `${updated.name || customerEditForm.name || 'The customer'} was updated.`,
+      });
+    } catch (err) {
+      console.error('Failed to save customer:', err);
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save the customer details.'),
+      });
+    } finally {
+      setCustomerEditLoading(false);
+    }
+  };
+
+  const deleteFullConversation = async (convo) => {
+    setMenuConvoId(null);
+    requestConfirmation({
+      title: 'Delete Conversation',
+      description: `Delete the full chat for ${convo.customer_name || 'this contact'}. All messages in this conversation will be removed.`,
+      confirmLabel: 'Delete chat',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/conversations/${convo.id}`);
+          setConversations(prev => prev.filter(c => c.id !== convo.id));
+          if (selectedConvo?.id === convo.id) {
+            setSelectedConvo(null);
+            setMessages([]);
+            setCustomerInfo(null);
+            setMaximized(false);
+          }
+          await loadConversations();
+          showToast({
+            type: 'success',
+            title: 'Chat Deleted',
+            message: `${convo.customer_name || 'The conversation'} was removed.`,
+          });
+        } catch (err) {
+          console.error('Failed to delete conversation:', err);
+          showToast({
+            type: 'error',
+            title: 'Delete Failed',
+            message: getErrorMessage(err, 'We could not delete that conversation.'),
+          });
+        }
+      },
+    });
+  };
+
+  const grouped = {};
+  CHANNELS.forEach(ch => { grouped[ch.key] = []; });
+  conversations.forEach(c => {
+    if (grouped[c.channel]) grouped[c.channel].push(c);
+    else if (grouped.web_chat) grouped.web_chat.push(c);
+  });
+
+  const isEscalationSystemMessage = (content) => /conversation escalated|ai service unavailable|please respond manually/i.test(content || '');
+
+  const chInfo = selectedConvo
+    ? CHANNELS.find(c => c.key === selectedConvo.channel) || CHANNELS.find(c => c.key === 'web_chat')
+    : null;
+  const selectedConvoSentiment = getSentimentMeta(selectedConvo?.sentiment_score, selectedConvo?.sentiment_label);
+
+  // Get filtered conversations for mobile
+  const displayChannel = platformView || activeChannel;
+  const filteredConvos = displayChannel ? grouped[displayChannel] || [] : conversations;
+  const desktopChannels = platformView ? CHANNELS.filter((ch) => ch.key === platformView) : CHANNELS;
+
+  return (
+    <>
+    <div className="flex h-[calc(100vh-3.5rem)]" data-testid="inbox-page">
+      {platformView && (
+        <div className="absolute top-2 right-4 z-20 bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
+          Viewing: {CHANNELS.find((c) => c.key === platformView)?.label}
+          <button
+            onClick={() => navigate('/inbox')}
+            className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
+          >
+            Show all
+          </button>
+        </div>
+      )}
+      {/* Mobile: Channel Tabs + Conversation List */}
+      {!maximized && (
+        <div className="flex-1 flex flex-col lg:hidden">
+          {/* Mobile Channel Tabs */}
+          <div className="flex border-b border-slate-100 bg-white overflow-x-auto">
+            <button
+              onClick={() => setActiveChannel(null)}
+              className={`flex-shrink-0 px-4 py-3 text-xs font-medium border-b-2 transition-colors ${!activeChannel ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-500'}`}
+            >
+              All ({conversations.length})
+            </button>
+            {CHANNELS.map(ch => (
+              <button
+                key={ch.key}
+                onClick={() => setActiveChannel(ch.key)}
+                className={`flex-shrink-0 px-4 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 ${activeChannel === ch.key ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-500'}`}
+              >
+                <ChannelLogo channelKey={ch.key} size={14} />
+                {ch.label} ({grouped[ch.key]?.length || 0})
+              </button>
+            ))}
+          </div>
+
+          {/* Mobile section-level new button */}
+          {(activeChannel === 'whatsapp' || activeChannel === 'facebook' || activeChannel === 'instagram' || activeChannel === 'email') && (
+            <div className="px-3 py-2 bg-white border-b border-slate-100 flex items-center justify-end">
+              <button
+                onClick={() => openOutboundComposer(activeChannel)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
+                data-testid={`mobile-new-${activeChannel}`}
+              >
+                <Plus size={14} /> New
+              </button>
+            </div>
+          )}
+          
+          {/* Mobile Conversation List */}
+          <div className="flex-1 overflow-y-auto p-3 space-y-2 bg-slate-50">
+            {filteredConvos.map(convo => {
+              const ch = CHANNELS.find(c => c.key === convo.channel) || CHANNELS.find(c => c.key === 'web_chat') || CHANNELS[0];
+              const convoSentiment = getSentimentMeta(convo.sentiment_score, convo.sentiment_label);
+              return (
+                <div
+                  key={convo.id}
+                  onClick={() => handleSelectConvo(convo)}
+                  className="bg-white rounded-xl p-3.5 border border-slate-100 cursor-pointer transition-all hover:shadow-md active:scale-[0.98]"
+                  data-testid={`convo-card-${convo.id}`}
+                >
+                  <div className="flex items-start gap-3">
+                    <div className={`w-10 h-10 rounded-full ${ch.lightBg} flex items-center justify-center text-sm font-bold ${ch.text} flex-shrink-0`}>
+                      {convo.customer_name?.charAt(0)}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-sm font-semibold text-slate-800 truncate">{convo.customer_name}</span>
+                        <div className="flex items-center gap-1.5">
+                          <div className="relative" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              type="button"
+                              onClick={() => setMenuConvoId(prev => prev === convo.id ? null : convo.id)}
+                              className="p-1 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+                              title="More actions"
+                            >
+                              <MoreVertical size={14} />
+                            </button>
+                            {menuConvoId === convo.id && (
+                              <div className="absolute right-0 top-full mt-1 w-40 bg-white border border-slate-200 rounded-lg shadow-lg z-30 overflow-hidden">
+                                <button
+                                  type="button"
+                                  onClick={() => openCustomerEdit(convo)}
+                                  className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50"
+                                >
+                                  Edit customer
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteFullConversation(convo)}
+                                  className="w-full text-left px-3 py-2 text-xs text-red-600 hover:bg-red-50"
+                                >
+                                  Delete chat
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                          {convo.unread_count > 0 && <span className="min-w-[20px] h-5 rounded-full bg-blue-500 text-[10px] font-bold text-white flex items-center justify-center px-1.5">{convo.unread_count}</span>}
+                          <ChevronRight size={16} className="text-slate-300" />
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${ch.lightBg} ${ch.text} font-medium inline-flex items-center gap-1`}><ChannelLogo channelKey={ch.key} size={11} />{ch.label}</span>
+                        <span className="text-[11px] text-slate-400">{new Date(convo.last_message_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        {convoSentiment && (
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${convoSentiment.accentClass}`}>
+                            {convoSentiment.percentage}%
+                          </span>
+                        )}
+                      </div>
+                      {convo.escalation_notice && (
+                        <div className="mb-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg flex items-center gap-1.5">
+                          <AlertTriangle size={10} className="text-red-500 flex-shrink-0" />
+                          <span className="text-[10px] text-red-700 font-semibold uppercase tracking-wide truncate">{convo.escalation_notice}</span>
+                        </div>
+                      )}
+                      <p className="text-xs text-slate-500 line-clamp-1">{convo.last_message}</p>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {filteredConvos.length === 0 && (
+              <div className="text-center py-12 text-slate-300">
+                <MessageSquare size={32} className="mx-auto mb-2 opacity-40" />
+                <p className="text-sm">No conversations</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Outbound Conversation Modal */}
+      {outboundComposerOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setOutboundComposerOpen(false)} />
+          <div className="relative w-full max-w-md bg-white rounded-xl shadow-xl p-5 z-10">
+            <h3 className="text-lg font-semibold mb-1 flex items-center gap-2"><ChannelLogo channelKey={outboundChannel} size={20} />New {CHANNELS.find((c) => c.key === outboundChannel)?.label} Conversation</h3>
+            <p className="text-xs text-slate-500 mb-3">Contact will be saved and outbound message will be sent immediately.</p>
+            <div className="space-y-3">
+              <input value={outboundName} onChange={(e) => setOutboundName(e.target.value)} placeholder="Contact name" className="w-full px-3 py-2 border rounded-lg" data-testid="outbound-name-input" />
+              {outboundChannel === 'whatsapp' ? (
+                <input value={outboundPhone} onChange={(e) => setOutboundPhone(e.target.value)} placeholder="Phone number (e.g. +15551234567)" className="w-full px-3 py-2 border rounded-lg" data-testid="outbound-phone-input" />
+              ) : outboundChannel === 'email' ? (
+                <input
+                  type="email"
+                  value={outboundRecipientId}
+                  onChange={(e) => setOutboundRecipientId(e.target.value)}
+                  placeholder="Recipient email (e.g. user@example.com)"
+                  className="w-full px-3 py-2 border rounded-lg"
+                  data-testid="outbound-recipient-id-input"
+                />
+              ) : (
+                <input
+                  value={outboundRecipientId}
+                  onChange={(e) => setOutboundRecipientId(e.target.value)}
+                  placeholder={outboundChannel === 'facebook' ? 'Facebook recipient ID (PSID)' : 'Instagram recipient ID'}
+                  className="w-full px-3 py-2 border rounded-lg"
+                  data-testid="outbound-recipient-id-input"
+                />
+              )}
+              <textarea value={outboundMessage} onChange={(e) => setOutboundMessage(e.target.value)} placeholder="Initial outbound message" rows={3} className="w-full px-3 py-2 border rounded-lg resize-none" data-testid="outbound-message-input" />
+              <div className="flex items-center justify-end gap-2">
+                <button onClick={() => setOutboundComposerOpen(false)} className="px-3 py-2 rounded-lg border">Cancel</button>
+                <button onClick={submitOutboundConversation} disabled={outboundSubmitting} className="px-3 py-2 rounded-lg bg-blue-600 text-white disabled:opacity-50">
+                  {outboundSubmitting ? 'Sending...' : 'Start & Send'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {customerEditOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setCustomerEditOpen(false)} />
+          <div className="relative w-full max-w-md bg-white rounded-xl shadow-xl p-5 z-10">
+            <h3 className="text-lg font-semibold mb-3">Edit Customer</h3>
+            <div className="space-y-3">
+              <input value={customerEditForm.name} onChange={(e) => setCustomerEditForm(prev => ({ ...prev, name: e.target.value }))} placeholder="Name" className="w-full px-3 py-2 border rounded-lg" />
+              <input value={customerEditForm.email} onChange={(e) => setCustomerEditForm(prev => ({ ...prev, email: e.target.value }))} placeholder="Email" className="w-full px-3 py-2 border rounded-lg" />
+              <input value={customerEditForm.phone} onChange={(e) => setCustomerEditForm(prev => ({ ...prev, phone: e.target.value }))} placeholder="Phone" className="w-full px-3 py-2 border rounded-lg" />
+              <input value={customerEditForm.company} onChange={(e) => setCustomerEditForm(prev => ({ ...prev, company: e.target.value }))} placeholder="Company" className="w-full px-3 py-2 border rounded-lg" />
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button onClick={() => setCustomerEditOpen(false)} className="px-3 py-2 rounded-lg border">Cancel</button>
+                <button onClick={saveCustomerEdit} disabled={customerEditLoading} className="px-3 py-2 rounded-lg bg-blue-600 text-white disabled:opacity-50">
+                  {customerEditLoading ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Desktop: Channel Columns */}
+      {!maximized && (
+        <div className="hidden lg:flex flex-1 overflow-x-auto border-r border-slate-100 bg-slate-50">
+          <div className="flex h-full w-full min-w-[800px]" data-testid="channel-columns">
+            {desktopChannels.map((ch) => {
+              const items = grouped[ch.key] || [];
+              const showNewButton = ch.key === 'whatsapp' || ch.key === 'facebook' || ch.key === 'instagram' || ch.key === 'email';
+              return (
+                <div key={ch.key} className="flex-1 flex flex-col border-r border-slate-100 last:border-r-0 min-w-[200px]" data-testid={`channel-col-${ch.key}`}>
+                  <div className="px-4 py-3 border-b border-slate-100 bg-white flex items-center gap-2">
+                    <ChannelLogo channelKey={ch.key} size={18} />
+                    <span className="text-[13px] font-semibold text-slate-800">{ch.label}</span>
+                    <span className="ml-auto text-[11px] font-medium text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">{items.length}</span>
+                    {showNewButton && (
+                      <div className="relative ml-1">
+                        <button
+                          onClick={(e) => { e.stopPropagation(); openOutboundComposer(ch.key); }}
+                          onMouseEnter={() => {
+                            clearTimeout(tooltipTimerRef.current);
+                            setTooltipChannel(ch.key);
+                            tooltipTimerRef.current = setTimeout(() => setTooltipChannel(null), 2000);
+                          }}
+                          onMouseLeave={() => {
+                            clearTimeout(tooltipTimerRef.current);
+                            setTooltipChannel(null);
+                          }}
+                          className="w-6 h-6 rounded-md border border-blue-300 bg-blue-50 text-blue-500 inline-flex items-center justify-center transition-all duration-200 hover:scale-110 hover:bg-blue-500 hover:text-white hover:border-blue-500 hover:shadow-md hover:shadow-blue-200"
+                          data-testid={`new-${ch.key}-btn`}
+                        >
+                          <Plus size={13} className={`transition-transform duration-200 ${tooltipChannel === ch.key ? 'rotate-90' : ''}`} />
+                        </button>
+                        {tooltipChannel === ch.key && (
+                          <span className="pointer-events-none absolute right-0 top-full mt-1.5 whitespace-nowrap rounded-lg bg-slate-800 text-white text-[10px] font-medium px-2.5 py-1.5 shadow-lg z-50 animate-in fade-in-0 duration-150">
+                            ✦ Start new conversation
+                            <span className="absolute bottom-full right-3 border-4 border-transparent border-b-slate-800" />
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-2 space-y-2">
+                    {items.map(convo => {
+                      const convoSentiment = getSentimentMeta(convo.sentiment_score, convo.sentiment_label);
+                      return (
+                        <div
+                          key={convo.id}
+                          onClick={() => handleSelectConvo(convo)}
+                          className="bg-white rounded-xl p-3.5 border border-slate-100 cursor-pointer transition-all duration-150 hover:shadow-md hover:border-slate-200"
+                          data-testid={`convo-card-${convo.id}`}
+                        >
+                          <div className="flex items-start gap-2.5 mb-2">
+                            <div className={`w-8 h-8 rounded-full ${ch.lightBg} flex items-center justify-center text-xs font-bold ${ch.text} flex-shrink-0`}>
+                              {convo.customer_name?.charAt(0)}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[13px] font-semibold text-slate-800 truncate">{convo.customer_name}</span>
+                                <div className="flex items-center gap-1">
+                                  <div className="relative" onClick={(e) => e.stopPropagation()}>
+                                    <button
+                                      type="button"
+                                      onClick={() => setMenuConvoId(prev => prev === convo.id ? null : convo.id)}
+                                      className="p-1 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+                                      title="More actions"
+                                    >
+                                      <MoreVertical size={12} />
+                                    </button>
+                                    {menuConvoId === convo.id && (
+                                      <div className="absolute right-0 top-full mt-1 w-40 bg-white border border-slate-200 rounded-lg shadow-lg z-30 overflow-hidden">
+                                        <button
+                                          type="button"
+                                          onClick={() => openCustomerEdit(convo)}
+                                          className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50"
+                                        >
+                                          Edit customer
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => deleteFullConversation(convo)}
+                                          className="w-full text-left px-3 py-2 text-xs text-red-600 hover:bg-red-50"
+                                        >
+                                          Delete chat
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                  {convo.unread_count > 0 && <span className="min-w-[18px] h-[18px] rounded-full bg-blue-500 text-[9px] font-bold text-white flex items-center justify-center">{convo.unread_count}</span>}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                <p className="text-[11px] text-slate-400">{new Date(convo.last_message_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                                {convoSentiment && (
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded-md border font-medium ${convoSentiment.accentClass}`}>
+                                    {convoSentiment.percentage}%
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          {convo.escalation_notice && (
+                            <div className="mb-2 px-2 py-1.5 bg-red-50 border border-red-200 rounded-lg flex items-center gap-1.5">
+                              <AlertTriangle size={11} className="text-red-500 flex-shrink-0" />
+                              <span className="text-[10px] text-red-700 font-semibold uppercase tracking-wide truncate">{convo.escalation_notice}</span>
+                            </div>
+                          )}
+                          <p className="text-xs text-slate-500 line-clamp-2 mb-2 leading-relaxed">{convo.last_message}</p>
+                          <div className="flex flex-wrap gap-1">
+                            {(convo.tags || []).slice(0, 3).map(tag => (
+                              <span key={tag} className={`text-[10px] px-1.5 py-0.5 rounded-md border font-medium ${getTagColor(tag)}`}>{tag}</span>
+                            ))}
+                            {convo.ai_handled && <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-purple-50 text-purple-600 border border-purple-200 font-medium">AI</span>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {items.length === 0 && (
+                      <div className="text-center py-8 text-slate-300">
+                        <MessageSquare size={24} className="mx-auto mb-2 opacity-40" />
+                        <p className="text-xs">No conversations</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Maximized Message View */}
+      {maximized && selectedConvo && (
+        <div className="flex-1 flex min-w-0 bg-white" data-testid="maximized-view">
+          {/* Message Thread */}
+          <div className="flex-1 flex flex-col min-w-0">
+            {/* Header */}
+            <div className="h-14 px-3 sm:px-5 flex items-center justify-between border-b border-slate-100 bg-white">
+              <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+                <button onClick={handleBack} className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 transition-colors flex-shrink-0" data-testid="back-to-inbox-btn">
+                  <ArrowLeft size={18} />
+                </button>
+                <button
+                  type="button"
+                  onClick={openCustomerProfileSidebar}
+                  className="flex items-center gap-2 sm:gap-3 min-w-0 rounded-xl px-1.5 py-1 -mx-1.5 hover:bg-slate-50 transition-colors text-left"
+                >
+                  <div className={`w-8 h-8 sm:w-10 sm:h-10 rounded-full ${chInfo?.lightBg || 'bg-slate-100'} flex items-center justify-center text-xs sm:text-sm font-bold ${chInfo?.text || 'text-slate-600'} flex-shrink-0`}>
+                    {selectedConvo.customer_name?.charAt(0)}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-semibold text-slate-900 truncate">{selectedConvo.customer_name}</h3>
+                      <span className="hidden md:inline-flex items-center text-[10px] text-slate-400">View profile <ChevronRight size={11} className="ml-0.5" /></span>
+                    </div>
+                  </div>
+                </button>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${chInfo?.lightBg} ${chInfo?.text} font-medium inline-flex items-center gap-1`}><ChannelLogo channelKey={chInfo?.key} size={11} />{chInfo?.label}</span>
+                    {selectedConvoSentiment && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${selectedConvoSentiment.accentClass}`}>
+                        Sentiment {selectedConvoSentiment.score.toFixed(2)}
+                      </span>
+                    )}
+                    <span className="text-[11px] text-slate-400 hidden sm:inline truncate">{selectedConvo.subject}</span>
+                    {identityConsentActive && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-50 text-emerald-700 border-emerald-200 font-medium">
+                        Consent active
+                      </span>
+                    )}
+                    {identityResult && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-blue-50 text-blue-700 border-blue-200 font-medium">
+                        Identity {Math.round((identityResult.confidence_score || 0) * 100)}%
+                      </span>
+                    )}
+                    {unificationMatch && (
+                      <button onClick={() => setUnificationPanelOpen(!unificationPanelOpen)}
+                        className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 text-indigo-700 font-semibold hover:from-indigo-100 hover:to-purple-100 transition-all animate-pulse"
+                        title="Cross-platform match found — click to review">
+                        <span>🔗</span>
+                        <span className="hidden sm:inline">Unified ({unificationMatch.members?.length || 0} profiles)</span>
+                        <span className="sm:hidden">Match</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+                {/* Escalation Notice - hidden on mobile, shown on sm+ */}
+                {selectedConvo.escalation_notice && (
+                  <div className="hidden md:flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg">
+                    <AlertTriangle size={12} className="text-red-500" />
+                    <span className="text-[11px] text-red-700 font-semibold uppercase tracking-wide max-w-[240px] truncate">{selectedConvo.escalation_notice}</span>
+                  </div>
+                )}
+
+                {/* AI Toggle Button */}
+                <button
+                  onClick={toggleAIMode}
+                  disabled={aiToggling}
+                  className={`flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 rounded-lg text-[10px] sm:text-[11px] font-medium border transition-all duration-200 ${
+                    selectedConvo.ai_handled
+                      ? 'bg-purple-50 text-purple-600 border-purple-200 hover:bg-purple-100'
+                      : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
+                  } disabled:opacity-50`}
+                  data-testid="ai-toggle-btn"
+                  title={selectedConvo.ai_handled ? 'AI is ON — Click to switch to human agent' : 'AI is OFF — Click to enable AI automation'}
+                >
+                  {aiToggling ? (
+                    <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin"></div>
+                  ) : selectedConvo.ai_handled ? (
+                    <Bot size={14} />
+                  ) : (
+                    <User size={14} />
+                  )}
+                  <span className="hidden sm:inline">{selectedConvo.ai_handled ? 'AI Auto' : 'Human'}</span>
+                  <div className={`relative w-6 sm:w-8 h-3 sm:h-4 rounded-full transition-colors ${selectedConvo.ai_handled ? 'bg-purple-500' : 'bg-slate-300'}`}>
+                    <span className={`absolute top-0.5 left-0.5 w-2 sm:w-3 h-2 sm:h-3 bg-white rounded-full transition-transform ${selectedConvo.ai_handled ? 'translate-x-3 sm:translate-x-4' : ''}`}></span>
+                  </div>
+                </button>
+
+                {/* Customer info button - mobile */}
+                <button 
+                  onClick={() => setShowCustomerSidebar(!showCustomerSidebar)}
+                  className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 lg:hidden"
+                >
+                  <UserCircle size={18} />
+                </button>
+              </div>
+            </div>
+
+            {/* Mobile Escalation Notice */}
+            {selectedConvo.escalation_notice && (
+              <div className="md:hidden px-3 py-2 bg-red-50 border-b border-red-200 flex items-center gap-1.5">
+                <AlertTriangle size={12} className="text-red-500 flex-shrink-0" />
+                <span className="text-[11px] text-red-700 font-semibold uppercase tracking-wide truncate">{selectedConvo.escalation_notice}</span>
+              </div>
+            )}
+
+            {/* Unification Match Banner */}
+            {unificationMatch && unificationPanelOpen && (
+              <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-200">
+                <div className="px-4 py-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm">🔗</span>
+                      <p className="text-xs font-bold text-indigo-800">Cross-Platform Match Found</p>
+                      <span className="text-[9px] text-indigo-500 bg-indigo-100 px-1.5 py-0.5 rounded-full">{unificationMatch.members?.length || 0} linked profiles</span>
+                    </div>
+                    <button onClick={() => setUnificationPanelOpen(false)} className="text-indigo-400 hover:text-indigo-600"><X size={14} /></button>
+                  </div>
+                  <p className="text-[10px] text-indigo-600 mb-3">
+                    This customer has been identified across multiple platforms. All interactions are linked to a unified identity.
+                  </p>
+                  <div className="space-y-2">
+                    {(unificationMatch.members || []).map((m) => (
+                      <div key={m.customer_id} className="flex items-center gap-2 p-2 bg-white rounded-lg border border-indigo-100">
+                        <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center text-xs font-bold text-indigo-600 flex-shrink-0">
+                          {(m.name || '?').charAt(0)}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-semibold text-slate-800 truncate">{m.name || 'Unknown'}</p>
+                          <p className="text-[9px] text-slate-400 truncate">{m.email || m.phone || ''}</p>
+                        </div>
+                        {m.is_primary && <span className="text-[8px] font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded">PRIMARY</span>}
+                        <span className="text-[9px] text-slate-400">{m.match_method?.replace('auto_', '').replace('manual', 'Manual') || 'Match'}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-2 mt-3">
+                    <button onClick={() => navigate('/unification')}
+                      className="flex-1 py-2 text-xs font-medium text-indigo-600 bg-white border border-indigo-200 rounded-lg hover:bg-indigo-50 transition-colors">
+                      Manage Profiles
+                    </button>
+                    <button onClick={() => {
+                      if (unificationMatch?.id) navigate('/unification');
+                    }} className="flex-1 py-2 text-xs font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-500 transition-colors">
+                      View Full History
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 sm:py-5 space-y-3 sm:space-y-4 bg-slate-50/50" data-testid="message-thread">
+              {messages.map((msg) => {
+                const isCustomer = msg.sender_type === 'customer';
+                const isAI = msg.sender_type === 'ai';
+                const isSystem = msg.sender_type === 'system';
+                const messageSentiment = getSentimentMeta(msg.sentiment_score, '', msg.sentiment_emotion);
+                const imageAttachments = Array.isArray(msg.attachments) ? msg.attachments.filter((attachment) => attachment.type === 'image') : [];
+
+                if (isSystem) {
+                  const isEscalationAlert = isEscalationSystemMessage(msg.content) || msg.is_alert;
+                  return (
+                    <div key={msg.id} className="flex justify-center animate-fadeIn" data-testid={`msg-${msg.id}`}>
+                      <div className={`px-3 sm:px-4 py-2 rounded-full border max-w-[90%] sm:max-w-[80%] ${
+                        isEscalationAlert ? 'bg-red-50 border-red-200' : 'bg-slate-100 border-slate-200'
+                      }`}>
+                        <p className={`text-[10px] sm:text-[11px] text-center font-medium ${
+                          isEscalationAlert ? 'text-red-700 uppercase tracking-wide' : 'text-slate-500'
+                        }`}>{msg.content}</p>
+                      </div>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div key={msg.id} className={`flex ${isCustomer ? 'justify-start' : 'justify-end'} animate-fadeIn`} data-testid={`msg-${msg.id}`}>
+                    <div className="max-w-[85%] sm:max-w-[65%]">
+                      <div className={`flex items-center gap-1.5 mb-1 ${isCustomer ? '' : 'justify-end'}`}>
+                        <span className="text-[10px] text-slate-400 font-medium">{msg.sender_name}</span>
+                        <span className="text-[10px] text-slate-300">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        {msg.edited_at && <span className="text-[10px] text-slate-300 italic">(edited)</span>}
+                        {isAI && <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-50 text-purple-500 font-medium">AI {msg.ai_confidence ? `${Math.round(msg.ai_confidence * 100)}%` : ''}</span>}
+                        {!isCustomer && !isAI && getDeliveryStatusMeta(msg.delivery_status) && (
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${getDeliveryStatusMeta(msg.delivery_status).className}`}>
+                            {getDeliveryStatusMeta(msg.delivery_status).label}
+                          </span>
+                        )}
+                        <div className="flex items-center gap-1 ml-1">
+                          <button
+                            type="button"
+                            onClick={() => startEditMessage(msg)}
+                            disabled={messageActionLoadingId === msg.id}
+                            className="p-1 rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 disabled:opacity-50"
+                            title="Edit message"
+                          >
+                            <Pencil size={11} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteConversationMessage(msg)}
+                            disabled={messageActionLoadingId === msg.id}
+                            className="p-1 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 disabled:opacity-50"
+                            title="Delete message"
+                          >
+                            <Trash2 size={11} />
+                          </button>
+                        </div>
+                      </div>
+                      <div className={`rounded-2xl text-sm leading-relaxed overflow-hidden ${
+                        isCustomer ? 'bg-white border border-slate-200 text-slate-700 rounded-bl-sm' :
+                        isAI ? 'bg-purple-100 text-slate-800 border-2 border-purple-300 rounded-br-sm shadow-sm shadow-purple-100' :
+                        'bg-blue-600 text-white rounded-br-sm shadow-sm'
+                      }`}>
+                        {imageAttachments.length > 0 && (
+                          <div className={`grid gap-0.5 ${imageAttachments.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
+                            {imageAttachments.slice(0, 4).map((att, idx) => (
+                              <a key={att.id || idx} href={att.url} target="_blank" rel="noreferrer" className="relative block">
+                                <img
+                                  src={att.url}
+                                  alt={att.name || 'attachment'}
+                                  className={`w-full object-cover ${imageAttachments.length === 1 ? 'max-h-52' : 'h-28'} ${idx === 0 && imageAttachments.length > 1 ? 'rounded-tl-xl' : ''} ${idx === 1 && imageAttachments.length > 1 ? 'rounded-tr-xl' : ''} ${imageAttachments.length === 1 ? 'rounded-t-xl' : ''}`}
+                                />
+                                {att.name && (
+                                  <span className="absolute bottom-1 left-1.5 text-[10px] text-white font-medium bg-black/50 rounded px-1 py-0.5 leading-tight">
+                                    {att.name}
+                                  </span>
+                                )}
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                        <div className="px-3 sm:px-4 py-2.5 sm:py-3">
+                          {editingMessageId === msg.id ? (
+                            <div className="space-y-2">
+                              <textarea
+                                value={editingMessageContent}
+                                onChange={(e) => setEditingMessageContent(e.target.value)}
+                                rows={2}
+                                className="w-full px-2.5 py-2 text-sm rounded-lg border border-slate-300 text-slate-700 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+                              />
+                              <div className="flex items-center justify-end gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={cancelEditMessage}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-slate-100 text-slate-600 hover:bg-slate-200"
+                                >
+                                  <X size={11} /> Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => saveEditedMessage(msg)}
+                                  disabled={!editingMessageContent.trim() || messageActionLoadingId === msg.id}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                                >
+                                  <Check size={11} /> Save
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              {isAI && <Sparkles size={12} className="inline-block text-purple-400 mr-1" />}
+                              {msg.content}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                      {messageSentiment && (
+                          <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border font-medium ${messageSentiment.accentClass}`}>
+                            {messageSentiment.percentage}%
+                          </span>
+                        )}
+                    </div>
+                  </div>
+                );
+              })}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Compose */}
+            <div className="px-3 sm:px-5 py-3 border-t border-slate-100 bg-white">
+              {composerAttachments.length > 0 && (
+                <div className="mb-3 flex flex-wrap gap-2">
+                  {composerAttachments.map((attachment, index) => (
+                    <div key={`${attachment.name || 'attachment'}-${index}`} className="relative w-16 h-16 rounded-xl overflow-hidden border border-slate-200 bg-slate-50">
+                      <img src={attachment.url} alt={attachment.name || 'attachment'} className="w-full h-full object-cover" />
+                      <button
+                        type="button"
+                        onClick={() => setComposerAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index))}
+                        className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/60 text-white flex items-center justify-center"
+                      >
+                        <X size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {composerError && (
+                <Alert variant="destructive" className="mb-3 border-red-200 bg-red-50 text-red-700">
+                  <AlertDescription>{composerError}</AlertDescription>
+                </Alert>
+              )}
+              <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+                <div className="flex items-start gap-2.5 sm:items-center">
+                  <input
+                    type="checkbox"
+                    checked={identityConsentChecked}
+                    onChange={(e) => {
+                      setIdentityConsentChecked(e.target.checked);
+                      if (!e.target.checked) {
+                        setIdentityConsentActive(false);
+                        setIdentityConsentToken('');
+                        setIdentityResult(null);
+                      }
+                    }}
+                    className="mt-0.5 sm:mt-0"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[11px] font-medium text-slate-700">
+                      Consent required for cross-platform identity linking.
+                    </p>
+                    <p className="text-[10px] text-slate-500">
+                      Verify once per conversation before sending identity-aware replies.
+                    </p>
+                    {identityResult && (
+                      <p className="text-[10px] text-blue-600 mt-1">
+                        Linked profile {identityResult.customer_id} at {Math.round((identityResult.confidence_score || 0) * 100)}% confidence.
+                      </p>
+                    )}
+                    {identityError && (
+                      <Alert variant="destructive" className="mt-2 border-red-200 bg-red-50 text-red-700">
+                        <AlertDescription className="text-[10px]">{identityError}</AlertDescription>
+                      </Alert>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => grantConsentAndResolveIdentity(selectedConvo, customerInfo)}
+                    disabled={identityStatusLoading || identityVerifying || !identityConsentChecked}
+                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium border border-blue-200 text-blue-700 bg-white hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {identityStatusLoading ? 'Checking...' : identityVerifying ? 'Verifying...' : identityConsentActive ? 'Re-verify' : 'Grant & Verify'}
+                  </button>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={triggerAI} disabled={aiLoading} className="p-2 sm:p-2.5 rounded-lg bg-purple-50 border border-purple-200 text-purple-500 hover:bg-purple-100 transition-colors disabled:opacity-50 flex-shrink-0" data-testid="ai-respond-btn" title="Generate AI response">
+                  {aiLoading ? <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div> : <Sparkles size={16} />}
+                </button>
+                <input
+                  ref={composerFileRef}
+                  type="file"
+                  accept={CHAT_IMAGE_TYPES.join(',')}
+                  multiple
+                  className="hidden"
+                  onChange={(e) => handleComposerFiles(e.target.files)}
+                />
+                <button
+                  type="button"
+                  onClick={() => composerFileRef.current?.click()}
+                  className="p-2 sm:p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors flex-shrink-0"
+                  title="Attach image"
+                >
+                  <ImageIcon size={16} />
+                </button>
+                <input
+                  value={newMessage}
+                  onChange={(e) => setNewMessage(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                  placeholder="Type a message..."
+                  className="flex-1 px-3 sm:px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
+                  data-testid="message-input"
+                />
+                <button onClick={sendMessage} disabled={(!newMessage.trim() && composerAttachments.length === 0) || sending} className="p-2 sm:p-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50 shadow-sm flex-shrink-0" data-testid="send-message-btn">
+                  {sending ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <Send size={16} />}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Customer Sidebar - Desktop always visible, Mobile as overlay */}
+          {customerInfo && (
+            <>
+              {/* Mobile Overlay */}
+              {showCustomerSidebar && (
+                <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setShowCustomerSidebar(false)} />
+              )}
+              <div className={`
+                fixed lg:relative inset-y-0 right-0 z-50 lg:z-0
+                w-72 flex-shrink-0 border-l border-slate-100 bg-white overflow-y-auto
+                transform transition-transform duration-300 lg:transform-none
+                ${showCustomerSidebar ? 'translate-x-0' : 'translate-x-full lg:translate-x-0'}
+              `} data-testid="customer-sidebar" ref={customerSidebarRef}>
+                {/* Mobile close button */}
+                <div className="lg:hidden h-14 px-4 flex items-center justify-between border-b border-slate-100">
+                  <span className="text-sm font-semibold text-slate-900">Customer Info</span>
+                  <button onClick={() => setShowCustomerSidebar(false)} className="p-1.5 rounded-md hover:bg-slate-100 text-slate-400">
+                    <X size={18} />
+                  </button>
+                </div>
+                <div className="p-5">
+                  <div className="text-center mb-5">
+                    <div className={`w-14 h-14 rounded-full ${chInfo?.lightBg || 'bg-blue-50'} mx-auto flex items-center justify-center text-lg font-bold ${chInfo?.text || 'text-blue-600'} mb-2`}>
+                      {customerInfo.name?.charAt(0)}
+                    </div>
+                    <h4 className="text-sm font-semibold text-slate-900">{customerInfo.name}</h4>
+                    <p className="text-[11px] text-slate-400">{customerInfo.company}</p>
+                    <span className={`inline-block mt-1.5 text-[10px] px-2 py-0.5 rounded-full font-medium border capitalize ${customerInfo.segment === 'vip' ? 'bg-amber-50 text-amber-600 border-amber-200' : customerInfo.segment === 'enterprise' ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-slate-50 text-slate-500 border-slate-200'}`}>
+                      {customerInfo.segment}
+                    </span>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="space-y-1.5">
+                      {customerInfo.email && <p className="text-xs text-slate-600 flex items-center gap-2"><Mail size={12} className="text-slate-400" /> <span className="truncate">{customerInfo.email}</span></p>}
+                      {customerInfo.phone && <p className="text-xs text-slate-600 flex items-center gap-2"><Phone size={12} className="text-slate-400" /> {customerInfo.phone}</p>}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-slate-50 rounded-lg p-2.5 text-center">
+                        <p className="text-base font-bold text-slate-900">{customerInfo.total_conversations}</p>
+                        <p className="text-[10px] text-slate-400">Convos</p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2.5 text-center">
+                        <p className="text-base font-bold text-slate-900">${((customerInfo.lifetime_value || 0) / 1000).toFixed(0)}k</p>
+                        <p className="text-[10px] text-slate-400">LTV</p>
+                      </div>
+                    </div>
+
+                    {customerInfo.churn_risk && (
+                      <div className={`p-3 rounded-lg border ${customerInfo.churn_risk.risk_level === 'critical' || customerInfo.churn_risk.risk_level === 'high' ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[11px] font-medium text-slate-600 capitalize">Churn: {customerInfo.churn_risk.risk_level}</span>
+                          <span className="text-[11px] font-bold text-slate-800">{Math.round(customerInfo.churn_risk.risk_score * 100)}%</span>
+                        </div>
+                        <div className="h-1.5 bg-white rounded-full overflow-hidden">
+                          <div className={`h-full rounded-full ${customerInfo.churn_risk.risk_score > 0.7 ? 'bg-red-500' : customerInfo.churn_risk.risk_score > 0.3 ? 'bg-amber-500' : 'bg-emerald-500'}`} style={{ width: `${customerInfo.churn_risk.risk_score * 100}%` }}></div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div>
+                      <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Lifecycle</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 capitalize">
+                          {customerInfo.lifecycle_stage || 'customer'}
+                        </span>
+                        {(customerInfo.channels || []).map(channel => (
+                          <span key={channel} className="text-[10px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200 capitalize">
+                            {formatInboxChannel(channel)}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    {customerInfo.social_profiles && Object.keys(customerInfo.social_profiles).length > 0 && (
+                      <div>
+                        <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Channel IDs</p>
+                        <div className="space-y-1.5">
+                          {Object.entries(customerInfo.social_profiles).map(([platform, profileId]) => (
+                            <div key={platform} className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                              <p className="text-[10px] font-semibold text-slate-500 capitalize">{platform}</p>
+                              <p className="text-[11px] text-slate-700 break-all">{profileId}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div>
+                      <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Tags</p>
+                      <div className="flex flex-wrap gap-1">
+                        {(customerInfo.tags || []).map(tag => (
+                          <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200"><Tag size={8} className="inline mr-0.5" />{tag}</span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+    {confirmDialog}
+    </>
+  );
+}
