@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Link2, Plus, X } from 'lucide-react';
 
 const normalizeId = (value) => String(value || '').trim();
@@ -36,27 +37,44 @@ export default function MergeModal({
     );
   }, [manualIdInput]);
 
-  const candidateIds = useMemo(() => dedupe([...(selectedIds || []), ...manualIds]), [selectedIds, manualIds]);
+  const candidateIds = useMemo(
+    () => dedupe([...(selectedIds || []), ...manualIds]),
+    [selectedIds, manualIds],
+  );
   const canSubmit = candidateIds.length >= 2 && !actionInFlight;
 
   if (!isOpen) return null;
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
-        <header className="flex items-start justify-between border-b border-slate-100 px-5 py-4">
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-2xl max-h-[90vh] rounded-2xl border border-slate-200 bg-white shadow-2xl flex flex-col overflow-hidden"
+        onClick={(event) => event.stopPropagation()}
+      >
+        {/* HEADER */}
+        <header className="flex-none flex items-start justify-between border-b border-slate-100 px-5 py-4">
           <div>
             <h2 className="text-base font-semibold text-slate-900">Manual Identity Merge</h2>
             <p className="mt-1 text-xs text-slate-500">
               Merge at least two unified profile IDs. This operation requires admin permissions and is audited.
             </p>
           </div>
-          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={actionInFlight}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
+            aria-label="Close"
+          >
             <X size={16} />
           </button>
         </header>
 
-        <div className="space-y-4 px-5 py-4">
+        {/* SCROLLABLE BODY */}
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-4 px-5 py-4">
           <section>
             <div className="mb-2 flex items-center justify-between">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Selected Profiles</p>
@@ -77,8 +95,10 @@ export default function MergeModal({
                   return (
                     <label
                       key={profileId}
-                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-2 text-xs ${
-                        selected ? 'border-blue-300 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors ${
+                        selected
+                          ? 'border-blue-300 bg-blue-50 text-blue-700'
+                          : 'border-slate-200 bg-white text-slate-600'
                       }`}
                     >
                       <input
@@ -87,7 +107,9 @@ export default function MergeModal({
                         onChange={() => onToggleSelected?.(profileId)}
                         className="h-3.5 w-3.5 rounded border-slate-300 text-blue-600"
                       />
-                      <span className="min-w-0 flex-1 truncate font-medium">{profile?.display_name || profileId}</span>
+                      <span className="min-w-0 flex-1 truncate font-medium">
+                        {profile?.display_name || profileId}
+                      </span>
                       <span className="font-mono text-[10px] text-slate-400">{profileId}</span>
                     </label>
                   );
@@ -117,19 +139,29 @@ export default function MergeModal({
             <div className="mt-2 flex flex-wrap gap-1.5">
               {candidateIds.length > 0 ? (
                 candidateIds.map((id) => (
-                  <span key={id} className="rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600">
+                  <span
+                    key={id}
+                    className="rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600"
+                  >
                     {id}
                   </span>
                 ))
               ) : (
-                <span className="text-[11px] text-slate-500">Select or add at least two profile IDs.</span>
+                <span className="text-[11px] text-slate-500">
+                  Select or add at least two profile IDs.
+                </span>
               )}
             </div>
           </section>
         </div>
 
-        <footer className="flex items-center justify-end gap-2 border-t border-slate-100 px-5 py-4">
-          <button type="button" onClick={onClose} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100">
+        {/* FOOTER */}
+        <footer className="flex-none flex items-center justify-end gap-2 border-t border-slate-100 px-5 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100"
+          >
             Cancel
           </button>
           <button
@@ -153,6 +185,7 @@ export default function MergeModal({
           </button>
         </footer>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

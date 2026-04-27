@@ -1103,8 +1103,6 @@ def _schedule_unprocessed_retry(db, channel: str, *, delay_seconds: float = 0.0)
         name=retry_job_name,
         job_id=retry_job_id,
         timeout_seconds=timeout_seconds,
-        channel=channel,
-        source_queue="unprocessed_event_retry",
     )
 
 

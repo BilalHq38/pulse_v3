@@ -1532,30 +1532,6 @@ export default function SettingsPage() {
     if (waStatusPollRef.current) clearInterval(waStatusPollRef.current);
   }, []);
 
-  // #region agent log
-  useEffect(() => {
-    const main = document.querySelector('[data-testid="main-content"]');
-    const sidebar = settingsSidebarRef.current;
-    if (!main || !sidebar) return undefined;
-
-    let raf = 0;
-    const onScroll = () => {
-      if (raf) return;
-      raf = window.requestAnimationFrame(() => {
-        raf = 0;
-        const rect = sidebar.getBoundingClientRect();
-        fetch('http://127.0.0.1:7649/ingest/e979188b-c6e0-4acc-966c-d0f2bc7abd6b',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'3ceefc'},body:JSON.stringify({sessionId:'3ceefc',runId:'pre-fix',hypothesisId:'S1',location:'SettingsPage.js:sidebarScroll',message:'Settings sidebar position on scroll',data:{mainScrollTop:Number(main.scrollTop||0),sidebarTop:Math.round(rect.top),sidebarLeft:Math.round(rect.left),sidebarHeight:Math.round(rect.height)},timestamp:Date.now()})}).catch(()=>{});
-      });
-    };
-
-    onScroll();
-    main.addEventListener('scroll', onScroll, { passive: true });
-    return () => {
-      main.removeEventListener('scroll', onScroll);
-      if (raf) window.cancelAnimationFrame(raf);
-    };
-  }, []);
-  // #endregion agent log
 
   const tabs = [
     { id: 'personal',      label: 'Personal',       icon: Users },
@@ -1576,9 +1552,9 @@ export default function SettingsPage() {
     <div className="p-6 lg:p-8" data-testid="settings-page">
       <h1 className="text-2xl font-bold text-slate-900 mb-6">{standaloneUnification ? 'Unification' : 'Settings'}</h1>
 
-      <div className={`flex ${standaloneUnification ? '' : 'gap-8'}`}>
+      <div className={`flex ${standaloneUnification ? '' : 'gap-8'} h-[calc(100vh-8rem)] overflow-hidden`}>
         {!standaloneUnification && (
-          <div ref={settingsSidebarRef} className="sticky top-24 max-h-[calc(100vh-7rem)] w-48 flex-shrink-0 self-start space-y-0.5 overflow-y-auto pr-1">
+          <div ref={settingsSidebarRef} className="h-full w-48 flex-shrink-0 space-y-0.5 overflow-y-auto pr-1">
             {tabs.map(tab => (
               <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className={`group w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-200 hover:translate-x-1 active:scale-95 ${
@@ -1594,7 +1570,7 @@ export default function SettingsPage() {
           </div>
         )}
 
-        <div className={`${standaloneUnification ? 'w-full' : 'flex-1 min-w-0'}`}>
+        <div className={`${standaloneUnification ? 'w-full' : 'flex-1 min-w-0 overflow-y-auto'}`}>
 
           {/* === PERSONAL SETTINGS === */}
           {activeTab === 'personal' && (

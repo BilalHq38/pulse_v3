@@ -266,7 +266,14 @@ async def _call_gemini(
             )
             return text, model_name, usage
         except Exception as exc:
-            errors.append(f"{model_name}:{exc.__class__.__name__}:{exc}")
+            error_str = str(exc)
+            errors.append(f"{model_name}:{exc.__class__.__name__}:{error_str}")
+            # 429 RESOURCE_EXHAUSTED is a quota/billing limit that applies to
+            # the entire project - retrying with another model candidate will
+            # produce the same error. Break so the provider-level fallback
+            # (OpenAI/Anthropic) can take over immediately.
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str.upper():
+                break
             continue
     raise RuntimeError(
         "Gemini generation failed across models: " + "; ".join(errors)

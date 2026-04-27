@@ -339,8 +339,26 @@ class ProductCreate(BaseModel):
     price_currency: str = "USD"
     category: str = "general"
     product_type: str = "standard"
-    images: list = Field(default_factory=list, max_length=3)
-    features: list = []
+    images: list[str] = Field(default_factory=list, max_length=3)
+    features: list[str] = Field(default_factory=list)
+
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = None
+    product_title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[str] = None
+    price_currency: Optional[str] = None
+    category: Optional[str] = None
+    product_type: Optional[str] = None
+    status: Optional[str] = None
+    images: Optional[list[str]] = Field(default=None, max_length=3)
+    features: Optional[list[str]] = None
+
+
+class ProductBulkUploadRequest(BaseModel):
+    items: List[dict] = Field(default_factory=list)
+    upsert: bool = True
 
 
 class ProductDescriptionRequest(BaseModel):
@@ -350,7 +368,7 @@ class ProductDescriptionRequest(BaseModel):
     category: str = "general"
     price: str = ""
     price_currency: str = "USD"
-    images: List[str] = []
+    images: List[str] = Field(default_factory=list)
 
 
 class FAQCreate(BaseModel):

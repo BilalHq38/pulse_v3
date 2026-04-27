@@ -260,18 +260,12 @@ export default function UnificationPage() {
   };
 
   const handleSplit = async ({ profileId, customerId, mappingIds, fingerprintIds }) => {
-    const selectedSignals = (mappingIds?.length || 0) + (fingerprintIds?.length || 0);
-    requestConfirmation({
-      title: 'Split Identity Signals',
-      description: `This will move ${selectedSignals} selected signal${selectedSignals === 1 ? '' : 's'} into a new unified profile. You can merge them back later if needed.`,
-      confirmLabel: 'Split profile',
-      onConfirm: async () => {
-        const result = await runSplit({ profileId, customerId, mappingIds, fingerprintIds });
-        if (result) {
-          await fetchReviewQueue();
-        }
-      },
-    });
+    // SplitPanel already shows SplitConfirmModal before invoking this handler,
+    // so run the split directly — no second confirmation dialog needed.
+    const result = await runSplit({ profileId, customerId, mappingIds, fingerprintIds });
+    if (result) {
+      await fetchReviewQueue();
+    }
   };
 
   const handleResolveSuggestion = async ({ suggestionId, action, notes }) => {
@@ -305,7 +299,7 @@ export default function UnificationPage() {
 
   return (
     <div className="space-y-6 pb-8">
-      <section className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+      <section className="rounded-3xl border border-slate-200 bg-white shadow-sm">
         <div className="bg-[radial-gradient(circle_at_top_left,_rgba(37,99,235,0.16),_transparent_50%),radial-gradient(circle_at_bottom_right,_rgba(2,132,199,0.2),_transparent_46%)] px-6 py-6">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>

@@ -1,6 +1,7 @@
 """routers/products.py — Products, FAQs, Onboarding Docs — PostgreSQL."""
 
 import base64
+import json
 import logging
 import posixpath
 import re
@@ -8,9 +9,11 @@ import zipfile
 from io import BytesIO
 from typing import Optional
 from xml.etree import ElementTree as ET
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from openpyxl import load_workbook
+from pydantic import ValidationError
+from models.schemas import ProductCreate, ProductDescriptionRequest, ProductUpdate
 from services.ai_service.facade import generate_product_description, get_active_llm_engines
 from core.utils import make_id, now_ts, normalize_product_images
 from services.db_helpers import r, rs, get_current_user_flexible
@@ -284,157 +287,496 @@ def _has_non_empty_image_input(values: list) -> bool:
     return any(str(value or "").strip() for value in values)
 
 
+_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+_SLUG_SANITIZE_RE = re.compile(r"[^a-z0-9_-]+")
+_PRICE_SANITIZE_RE = re.compile(r"[^0-9.-]")
+_ALLOWED_PRODUCT_STATUSES = {"active", "inactive", "archived"}
+
+
+def _normalize_name(value, *, required: bool) -> str:
+    name = str(value or "").strip()
+    if required and not name:
+        raise HTTPException(400, "name is required")
+    if name and len(name) > 255:
+        raise HTTPException(400, "name must be 255 characters or fewer")
+    return name
+
+
+def _normalize_text(value, *, default: str = "", max_len: int = 8000) -> str:
+    text = str(value if value is not None else default).strip()
+    if not text:
+        return str(default or "").strip()
+    return text[:max_len]
+
+
+def _normalize_category(value) -> str:
+    normalized = _SLUG_SANITIZE_RE.sub("_", str(value or "").strip().lower()).strip("_")
+    return normalized or "general"
+
+
+def _normalize_product_type(value) -> str:
+    normalized = _SLUG_SANITIZE_RE.sub("_", str(value or "").strip().lower()).strip("_")
+    return normalized or "standard"
+
+
+def _normalize_status(value) -> str:
+    status = str(value or "").strip().lower()
+    if not status:
+        return "active"
+    if status not in _ALLOWED_PRODUCT_STATUSES:
+        raise HTTPException(400, "status must be one of: active, inactive, archived")
+    return status
+
+
+def _normalize_currency(value) -> str:
+    currency = str(value or "USD").strip().upper() or "USD"
+    if not _CURRENCY_RE.fullmatch(currency):
+        raise HTTPException(400, "price_currency must be a 3-letter ISO code")
+    return currency
+
+
+def _normalize_price(value) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[, ]+", "", raw)
+    normalized = _PRICE_SANITIZE_RE.sub("", normalized)
+    if normalized in {"", ".", "-", "-."}:
+        raise HTTPException(400, "price must be a valid non-negative number")
+    try:
+        parsed = float(normalized)
+    except ValueError as exc:
+        raise HTTPException(400, "price must be a valid non-negative number") from exc
+    if parsed < 0:
+        raise HTTPException(400, "price must be a valid non-negative number")
+    if parsed.is_integer():
+        return str(int(parsed))
+    return f"{parsed:.2f}".rstrip("0").rstrip(".")
+
+
+def _normalize_images(images) -> list[str]:
+    if images is None:
+        return []
+    if not isinstance(images, list):
+        raise HTTPException(400, "images must be an array")
+    return normalize_product_images(images, limit=3)
+
+
+def _normalize_features(features) -> list[str]:
+    if features is None:
+        return []
+    if not isinstance(features, list):
+        raise HTTPException(400, "features must be an array")
+    cleaned: list[str] = []
+    for raw in features:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        cleaned.append(value[:180])
+        if len(cleaned) >= 30:
+            break
+    return cleaned
+
+
+def _normalize_product_payload_for_create(body: dict) -> tuple[dict, list[str], list[str]]:
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid product payload")
+    payload = {
+        "name": _normalize_name(body.get("name"), required=True),
+        "product_title": _normalize_text(body.get("product_title"), max_len=255),
+        "description": _normalize_text(body.get("description"), max_len=8000),
+        "price": _normalize_price(body.get("price")),
+        "price_currency": _normalize_currency(body.get("price_currency")),
+        "category": _normalize_category(body.get("category")),
+        "product_type": _normalize_product_type(body.get("product_type")),
+    }
+    images = _normalize_images(body.get("images", []))
+    features = _normalize_features(body.get("features", []))
+    return payload, images, features
+
+
+def _normalize_product_payload_for_update(body: dict) -> tuple[dict, list[str] | None, list[str] | None]:
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid product payload")
+    payload: dict = {}
+    if "name" in body:
+        payload["name"] = _normalize_name(body.get("name"), required=True)
+    if "product_title" in body:
+        payload["product_title"] = _normalize_text(body.get("product_title"), max_len=255)
+    if "description" in body:
+        payload["description"] = _normalize_text(body.get("description"), max_len=8000)
+    if "price" in body:
+        payload["price"] = _normalize_price(body.get("price"))
+    if "price_currency" in body:
+        payload["price_currency"] = _normalize_currency(body.get("price_currency"))
+    if "category" in body:
+        payload["category"] = _normalize_category(body.get("category"))
+    if "product_type" in body:
+        payload["product_type"] = _normalize_product_type(body.get("product_type"))
+    if "status" in body:
+        payload["status"] = _normalize_status(body.get("status"))
+
+    images = _normalize_images(body.get("images")) if "images" in body else None
+    features = _normalize_features(body.get("features")) if "features" in body else None
+    return payload, images, features
+
+
+def _coerce_json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _hydrate_product_record(product: dict | None) -> dict | None:
+    if not product:
+        return None
+    hydrated = dict(product)
+    hydrated["images"] = _coerce_json_list(hydrated.get("images"))
+    hydrated["features"] = _coerce_json_list(hydrated.get("features"))
+    return hydrated
+
+
+_PRODUCT_SELECT_SQL = (
+    "SELECT p.id,p.company_id,p.name,p.product_title,p.description,p.price,p.price_currency,p.category,p.product_type,p.status,p.created_at,p.updated_at,"  # noqa: E501
+    "COALESCE(img.images, '[]'::json) AS images,"
+    "COALESCE(feat.features, '[]'::json) AS features "
+    "FROM company_products p "
+    "LEFT JOIN LATERAL ("
+    "SELECT json_agg(image_url ORDER BY sort_order) AS images "
+    "FROM product_images WHERE product_id=p.id"
+    ") img ON TRUE "
+    "LEFT JOIN LATERAL ("
+    "SELECT json_agg(feature ORDER BY sort_order) AS features "
+    "FROM product_features WHERE product_id=p.id"
+    ") feat ON TRUE "
+)
+
+
 async def _get_product(db, product_id, cid):
     prod = r(
         await db.fetchrow(
-            "SELECT * FROM company_products WHERE id=$1 AND company_id=$2 LIMIT 1",
+            _PRODUCT_SELECT_SQL + "WHERE p.id=$1 AND p.company_id=$2 LIMIT 1",
             product_id,
             cid,
         )
     )
-    if prod:
-        prod["images"] = rs(
-            await db.fetch(
-                "SELECT image_url FROM product_images WHERE product_id=$1 ORDER BY sort_order",
-                product_id,
-            )
-        )
-        prod["images"] = [row["image_url"] for row in prod["images"]]
-        prod["features"] = [
-            row["feature"]
-            for row in await db.fetch(
-                "SELECT feature FROM product_features WHERE product_id=$1 ORDER BY sort_order",
-                product_id,
-            )
-        ]
-    return prod
+    return _hydrate_product_record(prod)
 
 
-@router.get("/company-data/products")
-async def list_products(request: Request):
-    db = _db(request)
-    cu = await get_current_user_flexible(request)
-    cid = cu.get("company_id", "")
-    prods = rs(
+async def _list_products_page(db, cid: str, page_size: int, offset: int) -> list[dict]:
+    rows = rs(
         await db.fetch(
-            "SELECT * FROM company_products WHERE company_id=$1 ORDER BY created_at DESC LIMIT 200",
+            _PRODUCT_SELECT_SQL + "WHERE p.company_id=$1 ORDER BY p.created_at DESC, p.id DESC LIMIT $2 OFFSET $3",
             cid,
+            page_size,
+            offset,
         )
     )
-    for p in prods:
-        p["images"] = [
-            row["image_url"]
-            for row in await db.fetch(
-                "SELECT image_url FROM product_images WHERE product_id=$1 ORDER BY sort_order",
-                p["id"],
-            )
-        ]
-        p["features"] = [
-            row["feature"]
-            for row in await db.fetch(
-                "SELECT feature FROM product_features WHERE product_id=$1 ORDER BY sort_order",
-                p["id"],
-            )
-        ]
-    return prods
+    return [_hydrate_product_record(row) for row in rows]
 
 
-@router.post("/company-data/products")
-async def create_product(request: Request):
-    db = _db(request)
-    cu = await get_current_user_flexible(request)
-    cid = cu.get("company_id", "")
-    body = await request.json()
-    name = str(body.get("name", "") or "").strip()
-    if not name:
-        raise HTTPException(400, "name is required")
+async def _replace_product_assets(db, product_id: str, images: list[str] | None, features: list[str] | None) -> None:
+    if images is not None:
+        await db.execute("DELETE FROM product_images WHERE product_id=$1", product_id)
+        if images:
+            await db.executemany(
+                "INSERT INTO product_images(id,product_id,image_url,sort_order,created_at) VALUES($1,$2,$3,$4,NOW())",
+                [(make_id(), product_id, url, i) for i, url in enumerate(images)],
+            )
+
+    if features is not None:
+        await db.execute("DELETE FROM product_features WHERE product_id=$1", product_id)
+        if features:
+            await db.executemany(
+                "INSERT INTO product_features(id,product_id,feature,sort_order) VALUES($1,$2,$3,$4)",
+                [(make_id(), product_id, feature, i) for i, feature in enumerate(features)],
+            )
+
+
+async def _create_product_row(db, cid: str, payload: dict, images: list[str], features: list[str]) -> str:
     pid = make_id()
     await db.execute(
         "INSERT INTO company_products(id,company_id,name,product_title,description,price,price_currency,category,product_type,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())",  # noqa: E501
         pid,
         cid,
-        name,
-        body.get("product_title", ""),
-        body.get("description", ""),
-        body.get("price", ""),
-        body.get("price_currency", "USD"),
-        body.get("category", "general"),
-        body.get("product_type", "standard"),
+        payload["name"],
+        payload.get("product_title", ""),
+        payload.get("description", ""),
+        payload.get("price", ""),
+        payload.get("price_currency", "USD"),
+        payload.get("category", "general"),
+        payload.get("product_type", "standard"),
     )
-    images = normalize_product_images(body.get("images", []))
-    if images:
-        await db.executemany(
-            "INSERT INTO product_images(id,product_id,image_url,sort_order,created_at) VALUES($1,$2,$3,$4,NOW())",
-            [(make_id(), pid, url, i) for i, url in enumerate(images)],
-        )
-    features = body.get("features", []) or []
-    if features:
-        await db.executemany(
-            "INSERT INTO product_features(id,product_id,feature,sort_order) VALUES($1,$2,$3,$4)",
-            [(make_id(), pid, f, i) for i, f in enumerate(features)],
-        )
-    return await _get_product(db, pid, cid)
+    await _replace_product_assets(db, pid, images=images, features=features)
+    return pid
 
 
-@router.post("/company-data/products/generate-description")
-async def generate_product_desc_endpoint(request: Request):
+async def _update_product_row(
+    db,
+    product_id: str,
+    cid: str,
+    payload: dict,
+    images: list[str] | None,
+    features: list[str] | None,
+) -> None:
+    update_payload = dict(payload)
+    if update_payload or images is not None or features is not None:
+        update_payload["updated_at"] = now_ts()
+        set_parts = ", ".join(f"{column}=${index + 2}" for index, column in enumerate(update_payload))
+        await db.execute(
+            f"UPDATE company_products SET {set_parts} WHERE id=$1 AND company_id=${len(update_payload) + 2}",
+            product_id,
+            *update_payload.values(),
+            cid,
+        )
+
+    await _replace_product_assets(db, product_id, images=images, features=features)
+
+
+async def _find_bulk_match_product_id(db, cid: str, payload: dict) -> str | None:
+    product_title = str(payload.get("product_title") or "").strip()
+    if product_title:
+        existing_id = await db.fetchval(
+            "SELECT id FROM company_products WHERE company_id=$1 AND product_title=$2 ORDER BY updated_at DESC LIMIT 1",
+            cid,
+            product_title,
+        )
+        if existing_id:
+            return str(existing_id)
+
+    existing_id = await db.fetchval(
+        "SELECT id FROM company_products WHERE company_id=$1 AND LOWER(name)=LOWER($2) AND category=$3 ORDER BY updated_at DESC LIMIT 1",  # noqa: E501
+        cid,
+        payload["name"],
+        payload.get("category", "general"),
+    )
+    return str(existing_id) if existing_id else None
+
+
+def _validation_error_message(exc: ValidationError) -> str:
+    pieces: list[str] = []
+    for issue in exc.errors():
+        loc = ".".join(str(item) for item in issue.get("loc", []))
+        msg = str(issue.get("msg") or "Invalid value")
+        pieces.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(pieces) or "Invalid row payload"
+
+
+def _coerce_row_number(value, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+@router.get("/products")
+@router.get("/company-data/products")
+async def list_products(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
+):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
-    body = await request.json()
-    name = str(body.get("name", "") or "").strip()
+    legacy_mode = request.url.path.startswith("/company-data/")
+    effective_page_size = page_size
+    if legacy_mode and "page_size" not in request.query_params:
+        effective_page_size = 200
+
+    offset = (page - 1) * effective_page_size
+    total = int(await db.fetchval("SELECT COUNT(*) FROM company_products WHERE company_id=$1", cid) or 0)
+    products = await _list_products_page(db, cid, effective_page_size, offset)
+
+    if legacy_mode:
+        return products
+
+    return {
+        "items": products,
+        "page": page,
+        "page_size": effective_page_size,
+        "total": total,
+        "has_more": (offset + len(products)) < total,
+    }
+
+
+@router.post("/products")
+@router.post("/company-data/products")
+async def create_product(body: ProductCreate, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
+    normalized_body, images, features = _normalize_product_payload_for_create(body.model_dump())
+    pid = await _create_product_row(db, cid, normalized_body, images, features)
+    return await _get_product(db, pid, cid)
+
+
+@router.post("/products/generate-description")
+@router.post("/company-data/products/generate-description")
+async def generate_product_desc_endpoint(body: ProductDescriptionRequest, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
+    payload = body.model_dump()
+    name = str(payload.get("name", "") or "").strip()
     if not name:
         raise HTTPException(400, "name is required")
     active_engines = await get_active_llm_engines(db, company_id=cid)
     desc = await generate_product_description(
         name=name,
-        product_title=body.get("product_title", ""),
-        product_type=body.get("product_type", ""),
-        category=body.get("category", "general"),
-        price=body.get("price", ""),
-        price_currency=body.get("price_currency", "USD"),
-        images=body.get("images", []),
+        product_title=payload.get("product_title", ""),
+        product_type=payload.get("product_type", ""),
+        category=payload.get("category", "general"),
+        price=payload.get("price", ""),
+        price_currency=payload.get("price_currency", "USD"),
+        images=payload.get("images", []),
         engines=active_engines,
         company_id=cid,
     )
     return {"description": desc}
 
 
-@router.put("/company-data/products/{product_id}")
-async def update_product(product_id: str, request: Request):
+@router.post("/products/bulk-upload")
+@router.post("/company-data/products/bulk-upload")
+async def bulk_upload_products(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
-    body = await request.json()
-    body.pop("_id", None)
-    images = body.pop("images", None)
-    features = body.pop("features", None)
-    body["updated_at"] = now_ts()
-    set_parts = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(body))
-    await db.execute(
-        f"UPDATE company_products SET {set_parts} WHERE id=$1 AND company_id=${len(body) + 2}",
-        product_id,
-        *body.values(),
-        cid,
-    )
-    if images is not None:
-        await db.execute("DELETE FROM product_images WHERE product_id=$1", product_id)
-        clean = normalize_product_images(images)
-        if clean:
-            await db.executemany(
-                "INSERT INTO product_images(id,product_id,image_url,sort_order,created_at) VALUES($1,$2,$3,$4,NOW())",
-                [(make_id(), product_id, url, i) for i, url in enumerate(clean)],
-            )
-    if features is not None:
-        await db.execute("DELETE FROM product_features WHERE product_id=$1", product_id)
-        if features:
-            await db.executemany(
-                "INSERT INTO product_features(id,product_id,feature,sort_order) VALUES($1,$2,$3,$4)",
-                [(make_id(), product_id, f, i) for i, f in enumerate(features)],
-            )
-    return await _get_product(db, product_id, cid)
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+
+    upsert = True
+    if isinstance(body, dict):
+        raw_items = body.get("items", [])
+        upsert = bool(body.get("upsert", True))
+    elif isinstance(body, list):
+        raw_items = body
+    else:
+        raise HTTPException(400, "payload must be an array or an object containing items")
+
+    if not isinstance(raw_items, list):
+        raise HTTPException(400, "items must be an array")
+    if not raw_items:
+        raise HTTPException(400, "items must contain at least one row")
+    if len(raw_items) > 1000:
+        raise HTTPException(400, "items cannot exceed 1000 rows")
+
+    created = 0
+    updated = 0
+    errors: list[dict] = []
+    results: list[dict] = []
+
+    for index, raw_item in enumerate(raw_items):
+        fallback_row = index + 2
+        row_number = fallback_row
+        row_payload = raw_item
+
+        if isinstance(raw_item, dict) and isinstance(raw_item.get("payload"), dict):
+            row_payload = raw_item.get("payload") or {}
+            row_number = _coerce_row_number(raw_item.get("rowNumber"), fallback_row)
+        elif isinstance(raw_item, dict):
+            row_number = _coerce_row_number(raw_item.get("rowNumber"), fallback_row)
+            row_payload = dict(raw_item)
+            row_payload.pop("rowNumber", None)
+
+        if not isinstance(row_payload, dict):
+            errors.append({"row": row_number, "error": "Row payload must be an object"})
+            continue
+
+        try:
+            validated = ProductCreate.model_validate(row_payload)
+            normalized_body, images, features = _normalize_product_payload_for_create(validated.model_dump())
+            has_images = "images" in row_payload
+            has_features = "features" in row_payload
+
+            existing_id = await _find_bulk_match_product_id(db, cid, normalized_body) if upsert else None
+            if existing_id:
+                await _update_product_row(
+                    db,
+                    existing_id,
+                    cid,
+                    normalized_body,
+                    images if has_images else None,
+                    features if has_features else None,
+                )
+                updated += 1
+                results.append({"row": row_number, "status": "updated", "id": existing_id})
+            else:
+                pid = await _create_product_row(db, cid, normalized_body, images, features)
+                created += 1
+                results.append({"row": row_number, "status": "created", "id": pid})
+        except ValidationError as exc:
+            errors.append({"row": row_number, "error": _validation_error_message(exc)})
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else "Invalid row payload"
+            errors.append({"row": row_number, "error": str(detail)})
+        except Exception:
+            logger.exception("Product bulk upload row failed row=%s company_id=%s", row_number, cid)
+            errors.append({"row": row_number, "error": "Unexpected server error while processing row"})
+
+    return {
+        "success": len(errors) == 0,
+        "created": created,
+        "updated": updated,
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+    }
 
 
+@router.get("/products/{product_id}")
+@router.get("/company-data/products/{product_id}")
+async def get_product(product_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
+    product = await _get_product(db, product_id, cid)
+    if not product:
+        raise HTTPException(404, "product not found")
+    return product
+
+
+@router.put("/products/{product_id}")
+@router.put("/company-data/products/{product_id}")
+async def update_product(product_id: str, body: ProductUpdate, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
+    body_payload = body.model_dump(exclude_unset=True)
+    body_payload.pop("_id", None)
+    normalized_body, images, features = _normalize_product_payload_for_update(body_payload)
+
+    if not normalized_body and images is None and features is None:
+        existing = await _get_product(db, product_id, cid)
+        if not existing:
+            raise HTTPException(404, "product not found")
+        return existing
+
+    await _update_product_row(db, product_id, cid, normalized_body, images, features)
+    product = await _get_product(db, product_id, cid)
+    if not product:
+        raise HTTPException(404, "product not found")
+    return product
+
+
+@router.delete("/products/{product_id}")
 @router.delete("/company-data/products/{product_id}")
 async def delete_product(product_id: str, request: Request):
     db = _db(request)

@@ -144,6 +144,7 @@ ROUTE_TABLE: list[tuple[str, str]] = [
     ("/api/orchestrator", "orchestrator"),
     ("/api/mcp", "ai"),
     ("/api/social", "ai"),
+    ("/api/products", "product"),
     ("/api/company-data", "product"),
     ("/api/onboarding-docs", "product"),
     ("/api/analytics", "analytics"),

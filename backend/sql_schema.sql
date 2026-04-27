@@ -907,6 +907,9 @@ CREATE TABLE IF NOT EXISTS company_products (
 CREATE INDEX IF NOT EXISTS idx_company_products_company_id ON company_products(company_id);
 CREATE INDEX IF NOT EXISTS idx_company_products_company_status ON company_products(company_id, status);
 CREATE INDEX IF NOT EXISTS idx_company_products_company_created_at ON company_products(company_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_company_products_company_name ON company_products(company_id, name);
+CREATE INDEX IF NOT EXISTS idx_company_products_company_name_lower ON company_products(company_id, LOWER(name));
+CREATE INDEX IF NOT EXISTS idx_company_products_company_category ON company_products(company_id, category);
 
 CREATE TABLE IF NOT EXISTS product_images (
     id         TEXT PRIMARY KEY,

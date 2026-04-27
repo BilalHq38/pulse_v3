@@ -237,8 +237,10 @@ export default function ProductsPage() {
   const loadProducts = async () => {
     setLoading(true);
     try {
-      const res = await api.get('/company-data/products');
-      setProducts(res.data || []);
+      const res = await api.get('/products', { params: { page: 1, page_size: 200 } });
+      const payload = res?.data;
+      const items = Array.isArray(payload) ? payload : Array.isArray(payload?.items) ? payload.items : [];
+      setProducts(items);
     } catch (err) { console.error(err); }
     finally { setLoading(false); }
   };
@@ -340,7 +342,7 @@ export default function ProductsPage() {
     if (generatingDesc) return;
     setGeneratingDesc(true);
     try {
-      const res = await api.post('/company-data/products/generate-description', {
+      const res = await api.post('/products/generate-description', {
         name: form.name.trim(),
         product_title: form.product_title || '',
         product_type: form.product_type || '',
@@ -369,9 +371,9 @@ export default function ProductsPage() {
         features: [],
       };
       if (editingProduct?.id) {
-        await api.put(`/company-data/products/${editingProduct.id}`, payload);
+        await api.put(`/products/${editingProduct.id}`, payload);
       } else {
-        await api.post('/company-data/products', payload);
+        await api.post('/products', payload);
       }
       resetForm();
       await loadProducts();
@@ -393,22 +395,20 @@ export default function ProductsPage() {
         return;
       }
 
-      const uploadErrors = [...parseErrors];
-      let created = 0;
+      const response = await api.post('/products/bulk-upload', {
+        upsert: true,
+        items: items.map((item) => ({
+          rowNumber: item.rowNumber,
+          payload: item.payload,
+        })),
+      });
 
-      for (const item of items) {
-        try {
-          await api.post('/company-data/products', item.payload);
-          created += 1;
-        } catch (err) {
-          uploadErrors.push({
-            row: item.rowNumber,
-            error: err?.response?.data?.detail || getErrorMessage(err, 'Create request failed.'),
-          });
-        }
-      }
+      const created = Number(response?.data?.created || 0);
+      const updated = Number(response?.data?.updated || 0);
+      const apiErrors = Array.isArray(response?.data?.errors) ? response.data.errors : [];
+      const uploadErrors = [...parseErrors, ...apiErrors];
 
-      if (created > 0) {
+      if (created + updated > 0) {
         await loadProducts();
         setShowBulkUpload(false);
       }
@@ -416,15 +416,15 @@ export default function ProductsPage() {
       if (uploadErrors.length > 0) {
         const firstError = uploadErrors[0];
         showToast({
-          type: created > 0 ? 'warning' : 'error',
-          title: created > 0 ? 'Products Imported with Warnings' : 'Product Import Failed',
-          message: `Created ${created}, skipped ${uploadErrors.length}. First issue: row ${firstError.row} - ${firstError.error}`,
+          type: created + updated > 0 ? 'warning' : 'error',
+          title: created + updated > 0 ? 'Products Imported with Warnings' : 'Product Import Failed',
+          message: `Created ${created}, updated ${updated}, skipped ${uploadErrors.length}. First issue: row ${firstError.row} - ${firstError.error}`,
         });
       } else {
         showToast({
           type: 'success',
           title: 'Product Import Complete',
-          message: `Created ${created} product${created === 1 ? '' : 's'}.`,
+          message: `Created ${created} product${created === 1 ? '' : 's'}${updated > 0 ? ` and updated ${updated}` : ''}.`,
         });
       }
     } catch (err) {
@@ -448,7 +448,7 @@ export default function ProductsPage() {
     if (!deleteTarget) return;
     setDeletingBulk(true);
     try {
-      await Promise.all(deleteTarget.products.map(p => api.delete(`/company-data/products/${p.id}`)));
+      await Promise.all(deleteTarget.products.map(p => api.delete(`/products/${p.id}`)));
       const ids = new Set(deleteTarget.products.map(p => p.id));
       setProducts(prev => prev.filter(p => !ids.has(p.id)));
       setSelectedIds(prev => { const next = new Set(prev); ids.forEach(id => next.delete(id)); return next; });

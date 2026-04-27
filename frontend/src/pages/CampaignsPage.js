@@ -388,21 +388,21 @@ export default function CampaignsPage() {
       </div>
 
       {showForm && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/35 p-4 backdrop-blur-sm sm:items-center">
-          <div className="my-6 w-full max-w-2xl rounded-xl border border-slate-100 bg-white shadow-xl shadow-slate-900/10">
-            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-2xl max-h-[90vh] rounded-xl border border-slate-100 bg-white shadow-xl shadow-slate-900/10 flex flex-col overflow-hidden">
+            <div className="flex-none flex items-center justify-between border-b border-slate-100 px-5 py-3.5">
               <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800">
                 <Mail size={16} className="text-sky-500" /> New email campaign
               </h2>
               <button
                 onClick={() => setShowForm(false)}
-                className="rounded-lg p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+                className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-red-500"
                 aria-label="Close"
               >
                 <X size={18} />
               </button>
             </div>
-            <form onSubmit={submit} className="p-5 space-y-4">
+            <form onSubmit={submit} className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <Field label="Internal name (optional)">
                   <input
@@ -665,7 +665,7 @@ export default function CampaignsPage() {
                 Start sending immediately after save
               </label>
 
-              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 sticky bottom-0 bg-white">
                 <button
                   type="button"
                   onClick={() => setShowForm(false)}
