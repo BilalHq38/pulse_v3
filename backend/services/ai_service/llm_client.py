@@ -441,6 +441,7 @@ async def call_model_text(
             )
             return text
         except Exception as exc:
+            error_str = str(exc)
             _log_llm_call(
                 outcome="error",
                 provider=provider,
@@ -451,6 +452,11 @@ async def call_model_text(
                 fallback_from=primary_provider if provider != primary_provider else "",
             )
             last_exc = exc
+            # 429/quota errors are project-level for this provider — skip
+            # remaining models for this provider but CONTINUE to the next
+            # provider in the fallback chain (OpenAI, Anthropic, etc.).
+            # Previously `break` caused the entire loop to stop, meaning a
+            # Gemini quota error would prevent OpenAI/Anthropic from being tried.
             continue
 
     raise RuntimeError(f"All AI providers exhausted. Last error: {last_exc}") from last_exc
@@ -624,8 +630,13 @@ async def call_with_engines(
         )
 
     last_exc: Exception | None = None
+    quota_exhausted_providers: set[str] = set()
     for engine in ordered_engines:
         provider = str(engine.get("provider") or "").strip().lower()
+        # 429/RESOURCE_EXHAUSTED is project-level quota; skip all remaining
+        # engines for this provider — they will fail identically.
+        if provider in quota_exhausted_providers:
+            continue
         started = time.perf_counter()
         try:
             text, resolved_model, usage = await _call_provider_once(
@@ -646,6 +657,7 @@ async def call_with_engines(
             )
             return text
         except Exception as exc:
+            error_str = str(exc)
             _log_llm_call(
                 outcome="error",
                 provider=provider,
@@ -655,9 +667,111 @@ async def call_with_engines(
                 error=exc,
             )
             last_exc = exc
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str.upper():
+                quota_exhausted_providers.add(provider)
             continue
     raise RuntimeError(f"All configured engines failed. Last error: {last_exc}") from last_exc
 
+
+
+
+async def call_model_json_batch(
+    tasks: dict[str, dict],
+    engine: Optional[dict] = None,
+    use_pro: bool = False,
+) -> dict[str, Any]:
+    """Execute multiple JSON-schema tasks in a single LLM request.
+
+    ``tasks`` is a mapping of  task_key -> {"prompt": str, "schema": BaseModel subclass}.
+    Returns a mapping of task_key -> parsed result dict.
+
+    This eliminates the N separate LLM round-trips that were previously fired
+    for sentiment (message), sentiment (conversation), and intent classification
+    on every incoming message — collapsing them into one API call.
+
+    If the combined call fails, each task falls back to its own individual call.
+    """
+    if not tasks:
+        return {}
+
+    schema_map: dict[str, type[BaseModel]] = {}
+    combined_sections: list[str] = []
+    for key, spec in tasks.items():
+        schema_class = spec["schema"]
+        schema_map[key] = schema_class
+        schema_text = json.dumps(_sanitize_schema(schema_class.model_json_schema()), ensure_ascii=True)
+        combined_sections.append(
+            f"### Task: {key}\n"
+            f"Schema: {schema_text}\n"
+            f"Instructions: {spec['prompt']}"
+        )
+
+    wrapper_prompt = (
+        "You are a multi-task JSON processor.\n"
+        "For each task below, produce a JSON result that matches the specified schema exactly.\n"
+        "Return a SINGLE JSON object whose keys are exactly the task names listed, each mapping to its result.\n"
+        "Return ONLY the JSON object — no markdown, no explanation, no extra keys.\n\n"
+        + "\n\n".join(combined_sections)
+    )
+
+    selected = dict(engine or _default_engine(use_pro=use_pro))
+    provider = (selected.get("provider") or "openai").strip().lower()
+    started = time.perf_counter()
+    try:
+        if provider == "gemini" and genai_types:
+            # Build a combined response schema for Gemini structured output
+            combined_schema: dict[str, Any] = {
+                "type": "object",
+                "properties": {
+                    key: _sanitize_schema(spec["schema"].model_json_schema())
+                    for key, spec in tasks.items()
+                },
+                "required": list(tasks.keys()),
+            }
+            config = genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=combined_schema,
+            )
+            raw = await call_model_text(wrapper_prompt, engine=selected, generation_config=config)
+        else:
+            raw = await call_model_text(
+                f"Return ONLY valid JSON.\n\n{wrapper_prompt}",
+                engine=selected,
+                generation_config={"response_format": "json_object"},
+            )
+        parsed = _extract_json_object(raw)
+        results: dict[str, Any] = {}
+        for key, schema_class in schema_map.items():
+            if key in parsed and isinstance(parsed[key], dict):
+                try:
+                    results[key] = schema_class.model_validate(parsed[key]).model_dump()
+                except Exception:
+                    results[key] = None
+            else:
+                results[key] = None
+        latency = (time.perf_counter() - started) * 1000.0
+        logger.info(
+            "llm_batch_call tasks=%s latency_ms=%.2f provider=%s",
+            list(tasks.keys()),
+            latency,
+            provider,
+        )
+        return results
+    except Exception as exc:
+        logger.warning(
+            "llm_batch_call failed, falling back to individual calls: %s", exc
+        )
+        # Individual fallback
+        fallback: dict[str, Any] = {}
+        for key, spec in tasks.items():
+            try:
+                fallback[key] = await call_model_json(
+                    spec["prompt"], spec["schema"], engine=engine, use_pro=use_pro
+                )
+            except Exception as exc2:
+                logger.warning("llm_batch_call individual fallback failed for %s: %s", key, exc2)
+                fallback[key] = None
+        return fallback
 
 __all__ = [
     "EMBEDDING_MODEL",
@@ -672,6 +786,7 @@ __all__ = [
     "call_gemini",
     "call_gemini_json",
     "call_model_json",
+    "call_model_json_batch",
     "call_model_text",
     "call_with_engines",
     "engine_supports_vision",

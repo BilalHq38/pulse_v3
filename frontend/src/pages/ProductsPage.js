@@ -26,8 +26,8 @@ const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_PRODUCT_IMAGES = 3;
 const MAX_PRODUCT_IMAGE_SIZE_MB = 5;
 const DEFAULT_CATEGORIES = ['general','software','service','hardware','subscription','consulting','support','training','integration'];
-const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type'];
-const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard'];
+const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type', 'image_url'];
+const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard', 'https://example.com/image.png'];
 const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'name', help: 'Required product name.' },
   { column: 'product_title', help: 'Optional SKU, short code, or public title.' },
@@ -36,6 +36,7 @@ const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'price_currency', help: 'Optional currency code such as USD, EUR, or GBP. Defaults to USD.' },
   { column: 'category', help: 'Optional category such as software, service, subscription, or support.' },
   { column: 'product_type', help: 'Optional type or variant. Defaults to standard.' },
+  { column: 'image_url', help: 'Optional public image URL (JPG, PNG, WEBP). Up to 3 URLs separated by | or use columns image_url_1, image_url_2, image_url_3.' },
 ];
 
 const EMPTY_FORM = {
@@ -118,6 +119,22 @@ function parseProductRowsFromSheet(rows) {
     const priceCurrency = String(readCell('price_currency', 'currency')).trim().toUpperCase() || 'USD';
     const productType = String(readCell('product_type', 'type')).trim() || 'standard';
 
+    // Collect image URLs from:
+    //   - `image_url` column (pipe-separated for multiple)
+    //   - `image_url_1`, `image_url_2`, `image_url_3` individual columns
+    //   - `image` as an alias for `image_url`
+    const rawImageUrl = String(readCell('image_url', 'image_url_1', 'image') ?? '').trim();
+    const rawImageUrls = rawImageUrl
+      ? rawImageUrl.split('|').map((u) => u.trim()).filter(Boolean)
+      : [];
+    // Additional numbered columns
+    for (const col of ['image_url_2', 'image_url_3']) {
+      const extra = String(readCell(col) ?? '').trim();
+      if (extra) rawImageUrls.push(extra);
+    }
+    // Deduplicate and cap at MAX_PRODUCT_IMAGES (3)
+    const imageUrls = [...new Set(rawImageUrls)].slice(0, 3);
+
     items.push({
       rowNumber,
       payload: {
@@ -128,7 +145,9 @@ function parseProductRowsFromSheet(rows) {
         price_currency: priceCurrency,
         category,
         product_type: productType,
-        images: [],
+        // Pass raw URLs — the backend stores them directly as image URLs.
+        // The card's ImageGrid already renders string URLs, so no conversion needed.
+        images: imageUrls,
         features: [],
       },
     });

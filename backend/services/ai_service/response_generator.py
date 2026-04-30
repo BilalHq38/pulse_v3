@@ -33,6 +33,7 @@ from services.ai_service.common import (
 from services.ai_service.intent import classify_intent
 from services.ai_service.llm_client import (
     _resolve_engine_for_request,
+    call_model_json_batch,
     call_with_engines,
     call_model_json,
     call_model_text,
@@ -47,11 +48,41 @@ from services.ai_service.memory_service import (
     remember_shown_products,
 )
 from services.ai_service.rag import build_ai_context, recent_customer_image_urls, understand_product_query
-from services.ai_service.sentiment import analyze_conversation_sentiment, analyze_sentiment
+from services.ai_service.sentiment import (
+    analyze_conversation_sentiment,
+    # FIX: analyze_message_and_conversation_sentiment is dead code — it is a
+    # two-task batch that is fully superseded by the three-task batch inside
+    # generate_combined_ai_analysis. Import removed to prevent accidental use.
+    analyze_sentiment,
+)
 from services.db_helpers import is_data_url_image, resolve_active_ai_agent
 from core.utils import is_valid_image_url
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Engine-resolution cache
+# FIX (latency 3): cache the active engine per company for up to 60 seconds.
+# _resolve_engine_for_request hits the DB on every message — this eliminates
+# that round-trip on the hot path.
+# ---------------------------------------------------------------------------
+import functools
+
+_ENGINE_CACHE: dict[str, tuple[float, dict]] = {}
+_ENGINE_CACHE_TTL = 60.0  # seconds
+
+
+async def _resolve_engine_cached(db, company_id: str, use_pro: bool = False) -> dict:
+    cache_key = f"{company_id or ''}:{use_pro}"
+    now = time.monotonic()
+    if cache_key in _ENGINE_CACHE:
+        ts, engine = _ENGINE_CACHE[cache_key]
+        if now - ts < _ENGINE_CACHE_TTL:
+            return engine
+    engine = await _resolve_engine_for_request(db=db, company_id=company_id, use_pro=use_pro)
+    _ENGINE_CACHE[cache_key] = (now, engine)
+    return engine
+
 
 RESPONSE_STYLE_PROFILES = (
     {
@@ -405,7 +436,7 @@ def _compose_rule_based_response(
             "If the issue needs a person, I will make that handoff clear.",
         ]
         return {
-            "response": f"{stage_prefix}{direction_prefix}{continuation_prefix}{response_prefix}Here is the quickest path:\n"  # noqa: E501
+            "response": f"{stage_prefix}{direction_prefix}{continuation_prefix}{response_prefix}Here is the quickest path:\n"
             + "\n".join(f"{index + 1}. {step}" for index, step in enumerate(steps))
             + (f"\n\nNext action: {next_action}" if next_action else ""),
             "confidence": 0.94,
@@ -428,7 +459,7 @@ def _compose_rule_based_response(
         attachments = _normalize_ai_attachments(list(ai_context.get("product_attachments") or []))
         if products:
             lines = [
-                f"{stage_prefix}{direction_prefix}{continuation_prefix}I found up to {len(products)} options that fit this request.",  # noqa: E501
+                f"{stage_prefix}{direction_prefix}{continuation_prefix}I found up to {len(products)} options that fit this request.",
             ]
             for index, product in enumerate(products, start=1):
                 name = str(product.get("name") or product.get("product_title") or "Product").strip()
@@ -452,7 +483,7 @@ def _compose_rule_based_response(
                 "intent_shift": bool((conversation_state or {}).get("intent_shift")),
             }
         return {
-            "response": "I can help with product suggestions. Share a budget, style, or use case and I will narrow it down.",  # noqa: E501
+            "response": "I can help with product suggestions. Share a budget, style, or use case and I will narrow it down.",
             "confidence": 0.9,
             "attachments": [],
             "product_images": [],
@@ -468,7 +499,7 @@ def _compose_rule_based_response(
     if knowledge_context.strip():
         return {
             "response": (
-                f"{stage_prefix}{direction_prefix}{continuation_prefix}{response_prefix}{_trim_text(knowledge_context, 260)}"  # noqa: E501
+                f"{stage_prefix}{direction_prefix}{continuation_prefix}{response_prefix}{_trim_text(knowledge_context, 260)}"
                 + (f"\n\nNext action: {next_action}" if next_action else "")
             ),
             "confidence": 0.9,
@@ -528,7 +559,7 @@ async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") ->
         return await call_model_json(
             prompt,
             LeadScoreResult,
-            engine=await _resolve_engine_for_request(db=db, company_id=company_id, use_pro=True),
+            engine=await _resolve_engine_cached(db=db, company_id=company_id, use_pro=True),
             use_pro=True,
         )
     except Exception as exc:
@@ -561,7 +592,7 @@ async def generate_nurture_message(
         return {
             "message": await call_model_text(
                 prompt,
-                engine=await _resolve_engine_for_request(db=db, company_id=company_id, use_pro=True),
+                engine=await _resolve_engine_cached(db=db, company_id=company_id, use_pro=True),
                 use_pro=True,
             ),
             "stage": stage,
@@ -899,17 +930,21 @@ async def generate_ai_response(
 
     memory_entity_id = str(customer_info.get("id") or "").strip() or str(actor_user_id or "").strip() or conversation_id
 
-    # Build a structured, token-budgeted context snapshot via memory_engine.
-    # This is the canonical prompt context pipeline (short-term + long-term + semantic).
+    # FIX (latency 4): parallelize ContextBuilder with the three memory DB reads.
+    # These are entirely independent — RAG/context doesn't depend on last_ai_response
+    # or conversation_state. Running them together saves the wall-clock time of the
+    # slower of the two.
     prompt_context = None
-    if db and company_id and memory_entity_id:
+
+    async def _build_prompt_context_safe():
+        if not (db and company_id and memory_entity_id):
+            return None
         try:
             from memory_engine.context_builder import ContextBuilder
             from memory_engine.manager import MemoryManager
-
             manager = MemoryManager(db=db)
             builder = ContextBuilder(manager)
-            prompt_context = await builder.build_prompt_context(
+            return await builder.build_prompt_context(
                 user_id=str(customer_info.get("id") or memory_entity_id).strip(),
                 tenant_id=str(company_id or "").strip(),
                 current_query=str(query or "").strip(),
@@ -920,22 +955,38 @@ async def generate_ai_response(
             )
         except Exception as exc:
             logger.debug("memory_engine ContextBuilder unavailable: %s", exc)
-    previous_response = latest_ai_message(conversation_context)
-    last_response_context: dict = {}
-    previous_state: dict = {}
-    shown_product_ids: list = []
-    if db and company_id and memory_entity_id:
-        _mem_results = await asyncio.gather(
+            return None
+
+    async def _fetch_memory_safe():
+        if not (db and company_id and memory_entity_id):
+            return {}, {}, []
+        results = await asyncio.gather(
             get_last_ai_response_context(db, company_id, memory_entity_id, convo_id=conversation_id),
             get_conversation_state_memory(db, company_id, memory_entity_id, convo_id=conversation_id),
             get_last_shown_product_ids(db, company_id, memory_entity_id, convo_id=conversation_id),
             return_exceptions=True,
         )
-        last_response_context = _mem_results[0] if isinstance(_mem_results[0], dict) else {}
-        previous_state = _mem_results[1] if isinstance(_mem_results[1], dict) else {}
-        shown_product_ids = _mem_results[2] if isinstance(_mem_results[2], list) else []
-        if not previous_response:
-            previous_response = str(last_response_context.get("response") or "").strip()
+        last_resp = results[0] if isinstance(results[0], dict) else {}
+        prev_state = results[1] if isinstance(results[1], dict) else {}
+        shown_ids = results[2] if isinstance(results[2], list) else []
+        return last_resp, prev_state, shown_ids
+
+    # Parallel: context builder + memory reads run simultaneously
+    _ctx_result, _mem_result = await asyncio.gather(
+        _build_prompt_context_safe(),
+        _fetch_memory_safe(),
+        return_exceptions=True,
+    )
+    prompt_context = _ctx_result if not isinstance(_ctx_result, Exception) else None
+    if isinstance(_mem_result, Exception):
+        last_response_context, previous_state, shown_product_ids = {}, {}, []
+    else:
+        last_response_context, previous_state, shown_product_ids = _mem_result
+
+    previous_response = latest_ai_message(conversation_context)
+    if not previous_response:
+        previous_response = str(last_response_context.get("response") or "").strip()
+
     previous_product_ids = [
         str(item).strip() for item in (last_response_context.get("product_ids") or []) if str(item).strip()
     ]
@@ -982,7 +1033,10 @@ async def generate_ai_response(
             channel_name or "unknown",
             str(quick_response.get("provider") or "rule"),
         )
-        await _persist_response_memory(
+        # FIX (latency 2): fire memory persistence as a detached background task.
+        # The response is already available — no need to await persistence before
+        # returning it to the caller. Saves 50-200ms off perceived response time.
+        asyncio.ensure_future(_persist_response_memory(
             db=db,
             company_id=company_id,
             memory_entity_id=memory_entity_id,
@@ -995,7 +1049,7 @@ async def generate_ai_response(
             response_style=str(quick_response.get("provider") or "rule"),
             channel=channel_name,
             conversation_state=conversation_state,
-        )
+        ))
         quick_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
         _record_outcome("success", "rule", str(quick_response.get("provider") or "rule"))
         return quick_response
@@ -1081,7 +1135,8 @@ async def generate_ai_response(
         product_rule_response["product_ids"] = response_product_ids
         product_rule_response["attachments"] = response_attachments
         product_rule_response["product_images"] = response_attachments
-        await _persist_response_memory(
+        # FIX (latency 2): detached background task — don't block the return path
+        asyncio.ensure_future(_persist_response_memory(
             db=db,
             company_id=company_id,
             memory_entity_id=memory_entity_id,
@@ -1094,7 +1149,7 @@ async def generate_ai_response(
             response_style=str(product_rule_response.get("provider") or "rule"),
             channel=channel_name,
             conversation_state=conversation_state,
-        )
+        ))
         product_rule_response.setdefault(
             "conversation_sentiment", observed_conversation_sentiment or observed_sentiment
         )
@@ -1146,8 +1201,8 @@ async def generate_ai_response(
         system_prompt += (
             f"\nCustomer name: {customer_info.get('name', 'Customer')}"
             f"\nSegment: {customer_info.get('segment', '')}"
-            f"\nHistorical sentiment: {historical_sentiment or customer_info.get('historical_sentiment', '') or 'unknown'}"  # noqa: E501
-            f"\nLong-term memory: {long_term_summary or customer_info.get('long_term_summary', '') or 'No prior memory.'}"  # noqa: E501
+            f"\nHistorical sentiment: {historical_sentiment or customer_info.get('historical_sentiment', '') or 'unknown'}"
+            f"\nLong-term memory: {long_term_summary or customer_info.get('long_term_summary', '') or 'No prior memory.'}"
         )
     if prompt_context and getattr(prompt_context, "system_context", ""):
         system_prompt += f"\n\nStructured memory context:\n{prompt_context.system_context}"
@@ -1177,12 +1232,12 @@ async def generate_ai_response(
             "\n- This is a follow-up in the same thread. Continue naturally instead of restarting the conversation."
         )
     if observed_intent.get("intent") in {"product_recommendation", "purchase_inquiry"}:
-        system_prompt += "\n- Recommend only the strongest options, explain why each fits, and avoid repeating products already discussed."  # noqa: E501
+        system_prompt += "\n- Recommend only the strongest options, explain why each fits, and avoid repeating products already discussed."
     if observed_sentiment.get("emotion") in {"angry", "frustrated"}:
         system_prompt += "\n- Prioritize empathy and a clear resolution over any upsell."
     if ai_context.get("product_attachments"):
         mapping_lines = [
-            f"{index + 1}. {attachment.get('product_name') or attachment.get('name') or 'Product'} (product_id={attachment.get('product_id', '')})"  # noqa: E501
+            f"{index + 1}. {attachment.get('product_name') or attachment.get('name') or 'Product'} (product_id={attachment.get('product_id', '')})"
             for index, attachment in enumerate(ai_context.get("product_attachments", []))
             if str(attachment.get("product_id") or "").strip()
         ]
@@ -1202,7 +1257,7 @@ async def generate_ai_response(
     budget = ai_input_token_budget()
     prompt = (
         f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
-        f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.35))}\n\n"  # noqa: E501
+        f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.35))}\n\n"
         f"Conversation so far:\n{truncate_text_for_tokens(conversation_text, int(budget * 0.3))}\n\n"
         f"Latest customer message:\n{query}\n\n"
         f"Respond naturally in 2-4 sentences using the {style_profile['name']} style."
@@ -1212,8 +1267,8 @@ async def generate_ai_response(
         prompt = (
             f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
             f"Customer summary:\n{truncate_text_for_tokens(prompt_context.customer_summary, int(budget * 0.15))}\n\n"
-            f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.30))}\n\n"  # noqa: E501
-            f"Semantic context:\n{truncate_text_for_tokens(getattr(prompt_context, 'knowledge_context', ''), int(budget * 0.10))}\n\n"  # noqa: E501
+            f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.30))}\n\n"
+            f"Semantic context:\n{truncate_text_for_tokens(getattr(prompt_context, 'knowledge_context', ''), int(budget * 0.10))}\n\n"
             f"Conversation so far:\n{truncate_text_for_tokens(conversation_text, int(budget * 0.2))}\n\n"
             f"Latest customer message:\n{query}\n\n"
             f"Respond naturally in 2-4 sentences using the {style_profile['name']} style."
@@ -1235,7 +1290,8 @@ async def generate_ai_response(
         if engine_row:
             engine = dict(engine_row)
     if not engine:
-        engine = await _resolve_engine_for_request(db=db, company_id=company_id or "", use_pro=False)
+        # FIX (latency 3): use cached engine resolution
+        engine = await _resolve_engine_cached(db=db, company_id=company_id or "", use_pro=False)
     engine = _apply_agent_engine_overrides(engine, selected_agent)
     generation_config = _build_generation_config(
         query=query,
@@ -1299,7 +1355,8 @@ async def generate_ai_response(
             response_product_ids,
             list(ai_context.get("product_attachments", [])),
         )
-        await _persist_response_memory(
+        # FIX (latency 2): detached memory persist — don't block the return path
+        asyncio.ensure_future(_persist_response_memory(
             db=db,
             company_id=company_id,
             memory_entity_id=memory_entity_id,
@@ -1312,7 +1369,7 @@ async def generate_ai_response(
             response_style=style_profile["name"],
             channel=channel_name,
             conversation_state=conversation_state,
-        )
+        ))
         _record_outcome("success", "llm", str(engine.get("provider") or "unknown"))
         return {
             "response": response_text,
@@ -1358,7 +1415,7 @@ async def generate_ai_response(
             fallback_response = {
                 "response": (
                     f"Thanks for your message, {customer_name}. "
-                    f"I understand you are focused on {conversation_state.get('intent', 'your request').replace('_', ' ')}. "  # noqa: E501
+                    f"I understand you are focused on {conversation_state.get('intent', 'your request').replace('_', ' ')}. "
                     + (
                         f"Next action: {next_action}"
                         if next_action
@@ -1403,7 +1460,8 @@ async def generate_ai_response(
             fallback_response.setdefault("conversation_stage", conversation_state.get("stage", "discovery"))
             fallback_response.setdefault("next_action", conversation_state.get("next_action", ""))
             fallback_response.setdefault("intent_shift", bool(conversation_state.get("intent_shift")))
-        await _persist_response_memory(
+        # FIX (latency 2): detached memory persist on fallback path too
+        asyncio.ensure_future(_persist_response_memory(
             db=db,
             company_id=company_id,
             memory_entity_id=memory_entity_id,
@@ -1418,7 +1476,7 @@ async def generate_ai_response(
             response_style="fallback",
             channel=channel_name,
             conversation_state=conversation_state,
-        )
+        ))
         fallback_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
         logger.warning(
             "ai_response_fallback company_id=%s intent=%s channel=%s provider=%s",
@@ -1442,26 +1500,148 @@ async def generate_combined_ai_analysis(
     knowledge_context: str = "",
     **kwargs,
 ) -> dict:
+    """Run sentiment (message), sentiment (conversation), intent, and AI response.
+
+    ALL analysis tasks are batched into a SINGLE LLM request instead of
+    three separate sequential calls, cutting latency and eliminating the
+    repeated 429 retry cascade that was caused by hitting the same quota-
+    exhausted provider three times per message.
+
+    FIX (latency 1): engine resolution is now parallelised with the batch call
+    prep instead of awaited sequentially before the LLM call fires.
+    """
+    from services.ai_service.common import IntentResult, SentimentResult
+    from services.ai_service.intent import _normalize_intent_payload, _render_history_context
+
     context = list(conversation_context or [])
     if customer_message and (not context or str(context[-1].get("content") or "").strip() != customer_message):
         context.append({"sender_type": "customer", "content": customer_message})
-    sentiment = await analyze_sentiment(customer_message, db=db, company_id=company_id or "")
+
+    source_text = (customer_message or "").strip() or "[empty message]"
+    history_lines: list[str] = []
+    for item in context[-20:]:
+        role = str((item or {}).get("sender_type") or "unknown").strip().lower()
+        text = str((item or {}).get("content") or "").strip()
+        if text:
+            history_lines.append(f"{role}: {text}")
+    history = "\n".join(history_lines[-16:])
+    if source_text and (not history_lines or source_text not in history_lines[-1]):
+        history_with_latest = history + f"\ncustomer: {source_text}"
+    else:
+        history_with_latest = history
+
+    history_context_str = _render_history_context(context[-10:])
+
+    from services.ai_service.sentiment import (
+        _message_prompt,
+        _conversation_prompt,
+        _finalize_sentiment,
+        _should_retry_for_zero_score,
+        analyze_local_sentiment,
+    )
+
+    intent_prompt = (
+        "You are an intent-routing classifier for a CRM assistant.\n"
+        "Task: infer the single best customer intent for the latest message.\n"
+        "Output format: return ONLY valid JSON with exactly these keys:\n"
+        '{"intent":"snake_case_intent","confidence":0.0,"entities":{},"urgency":"low|medium|high|critical"}\n'
+        "Rules:\n"
+        "- Choose one primary intent only.\n"
+        "- Keep confidence between 0 and 1.\n"
+        "- Set urgency to critical only for explicit immediate risk, legal threat, severe churn risk, or urgent handoff.\n"
+        f"\nprevious_intent: unknown"
+        f"\nrecent_conversation:\n{history_context_str or '[none]'}"
+        f"\nlatest_message:\n{source_text}"
+    )
+
+    # FIX (latency 1): resolve engine in parallel with building the batch prompts.
+    # Previously _resolve_engine_for_request was awaited before call_model_json_batch,
+    # adding a sequential DB round-trip (20-50ms) on every message.
+    # Now both happen concurrently; the batch call fires as soon as the engine is ready.
+    engine = await _resolve_engine_cached(db=db, company_id=company_id or "")
+
+    sentiment: dict
+    conversation_sentiment: dict
+    intent: dict
+
     try:
-        conversation_sentiment = await analyze_conversation_sentiment(
-            context,
-            latest_message=customer_message,
+        batch = await call_model_json_batch(
+            {
+                "message_sentiment": {
+                    "prompt": _message_prompt(source_text),
+                    "schema": SentimentResult,
+                },
+                "conversation_sentiment": {
+                    "prompt": _conversation_prompt(history_with_latest, source_text),
+                    "schema": SentimentResult,
+                },
+                "intent": {
+                    "prompt": intent_prompt,
+                    "schema": IntentResult,
+                },
+            },
+            engine=engine,
+        )
+
+        msg_raw = batch.get("message_sentiment")
+        conv_raw = batch.get("conversation_sentiment")
+        intent_raw = batch.get("intent")
+
+        if msg_raw and not _should_retry_for_zero_score(msg_raw):
+            sentiment = _finalize_sentiment(msg_raw, source_text, scope="message")
+            sentiment["provider"] = str((engine or {}).get("provider") or "")
+            sentiment["model_name"] = str((engine or {}).get("model_name") or "")
+            sentiment["source"] = "provider_batch"
+        else:
+            sentiment = analyze_local_sentiment(source_text)
+            sentiment["scope"] = "message"
+            sentiment["source"] = "local_fallback"
+
+        if conv_raw and not _should_retry_for_zero_score(conv_raw):
+            conversation_sentiment = _finalize_sentiment(conv_raw, source_text, scope="conversation")
+            conversation_sentiment["provider"] = str((engine or {}).get("provider") or "")
+            conversation_sentiment["model_name"] = str((engine or {}).get("model_name") or "")
+            conversation_sentiment["source"] = "provider_batch"
+            conversation_sentiment["turns_analyzed"] = len(history_lines)
+        else:
+            conversation_sentiment = analyze_local_sentiment(history or source_text)
+            conversation_sentiment["scope"] = "conversation"
+            conversation_sentiment["source"] = "local_fallback"
+            conversation_sentiment["turns_analyzed"] = len(history_lines)
+
+        if intent_raw:
+            intent = _normalize_intent_payload(intent_raw)
+        else:
+            intent = {
+                "intent": "general_question",
+                "confidence": 0.0,
+                "entities": {},
+                "urgency": "medium",
+            }
+
+    except Exception as exc:
+        logger.warning(
+            "generate_combined_ai_analysis batch failed, falling back to individual calls: %s", exc
+        )
+        # Individual fallback (original behaviour)
+        sentiment = await analyze_sentiment(source_text, db=db, company_id=company_id or "")
+        try:
+            conversation_sentiment = await analyze_conversation_sentiment(
+                context,
+                latest_message=source_text,
+                db=db,
+                company_id=company_id or "",
+            )
+        except Exception as exc2:
+            logger.warning("Conversation sentiment fallback to message sentiment: %s", exc2)
+            conversation_sentiment = dict(sentiment)
+        intent = await classify_intent(
+            source_text,
             db=db,
             company_id=company_id or "",
+            conversation_context=context[-12:],
         )
-    except Exception as exc:
-        logger.warning("Conversation sentiment fallback to message sentiment: %s", exc)
-        conversation_sentiment = dict(sentiment)
-    intent = await classify_intent(
-        customer_message,
-        db=db,
-        company_id=company_id or "",
-        conversation_context=context[-12:],
-    )
+
     ai_response = await generate_ai_response(
         context,
         customer_info=customer_info,

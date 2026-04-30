@@ -124,23 +124,18 @@ async def _dispatch_detached_task(
                 idempotency_key=idempotency_key,
                 timeout_seconds=timeout_seconds,
             )
-            # enqueue_coroutine serialises the coroutine but does NOT await it;
-            # close it here so Python never emits "coroutine was never awaited".
-            try:
-                coro.close()
-            except Exception:
-                pass
+            # enqueue_coroutine serialised the coroutine object; do NOT call
+            # coro.close() here — closing a never-started coroutine is exactly
+            # what triggers "coroutine was never awaited" RuntimeWarning.
+            # Just return; the GC will collect the coroutine naturally.
             return
         except Exception as exc:
             logger.warning("Background queue enqueue failed, falling back locally: %s", exc)
             enqueue_failed = True
 
-    # Local fallback: if enqueue failed the coroutine was never started, so we
-    # can safely await it here.  If the queue path succeeded we already returned
-    # above, so we never reach this branch with a closed coroutine.
-    if not enqueue_failed:
-        # No queue configured – run inline directly.
-        pass
+    # Local fallback — reached only when (a) no queue is configured (queue is None)
+    # or (b) enqueue raised. The coroutine was never started in either case, so
+    # awaiting it here is safe.
     try:
         if timeout_seconds:
             await asyncio.wait_for(coro, timeout=timeout_seconds)

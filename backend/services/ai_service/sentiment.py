@@ -13,6 +13,7 @@ from services.ai_service.llm_client import (
     _provider_default_model,
     _resolve_engine_for_request,
     call_model_json,
+    call_model_json_batch,
     get_provider_runtime_info,
 )
 
@@ -394,12 +395,17 @@ async def _call_sentiment_api(
         _default_engine(use_pro=True),
     ]
     errors: list[str] = []
+    quota_exhausted_providers: set[str] = set()
     for pass_index in range(2):
         attempted: set[str] = set()
         for engine in candidates:
             provider = str((engine or {}).get("provider") or "").strip().lower()
             model = str((engine or {}).get("model_name") or "").strip().lower()
             if not provider:
+                continue
+            # Skip providers whose quota is already exhausted this request.
+            if provider in quota_exhausted_providers:
+                errors.append(f"{provider}:{model}: skipped (quota exhausted)")
                 continue
             signature = f"{provider}:{model}"
             if signature in attempted:
@@ -413,8 +419,13 @@ async def _call_sentiment_api(
                 payload = await call_model_json(prompt, SentimentResult, engine=engine)
                 return payload, engine
             except Exception as exc:
-                detail = str(exc).splitlines()[0][:120]
+                error_str = str(exc)
+                detail = error_str.splitlines()[0][:120]
                 errors.append(f"{signature}: {exc.__class__.__name__} ({detail})")
+                # 429 / RESOURCE_EXHAUSTED is project-level — mark provider and
+                # skip all remaining candidates for it without retrying.
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str.upper():
+                    quota_exhausted_providers.add(provider)
                 continue
         if pass_index == 0:
             await asyncio.sleep(0.2)
@@ -665,8 +676,101 @@ async def analyze_conversation_sentiment(
         return result
 
 
+
+
+async def analyze_message_and_conversation_sentiment(
+    message_text: str,
+    conversation_context: list[dict] | None = None,
+    *,
+    db=None,
+    company_id: str = "",
+) -> tuple[dict, dict]:
+    """Analyze message sentiment AND conversation sentiment in a single LLM call.
+
+    Returns ``(message_sentiment, conversation_sentiment)``.
+
+    Replaces the two separate ``analyze_sentiment`` + ``analyze_conversation_sentiment``
+    calls that were previously made serially, cutting LLM round-trips by 50%.
+    Falls back to individual calls if the batch call fails.
+    """
+    source_text = (message_text or "").strip() or "[empty message]"
+
+    # Build conversation history for the conversation prompt
+    turns: list[str] = []
+    for item in (conversation_context or [])[-20:]:
+        role = str((item or {}).get("sender_type") or "unknown").strip().lower()
+        content_text = str((item or {}).get("content") or "").strip()
+        if not content_text:
+            continue
+        turns.append(f"{role}: {content_text}")
+    if source_text and (not turns or source_text.strip() not in turns[-1]):
+        turns.append(f"customer: {source_text}")
+    history = "\n".join(turns[-16:])
+
+    tasks = {
+        "message_sentiment": {
+            "prompt": _message_prompt(source_text),
+            "schema": SentimentResult,
+        },
+        "conversation_sentiment": {
+            "prompt": _conversation_prompt(history, source_text),
+            "schema": SentimentResult,
+        },
+    }
+
+    engine = await _resolve_engine_for_request(db=db, company_id=company_id)
+    try:
+        batch_result = await call_model_json_batch(tasks, engine=engine)
+        msg_raw = batch_result.get("message_sentiment")
+        conv_raw = batch_result.get("conversation_sentiment")
+
+        msg_sentiment: dict
+        conv_sentiment: dict
+
+        if msg_raw and not _should_retry_for_zero_score(msg_raw):
+            msg_sentiment = _finalize_sentiment(msg_raw, source_text, scope="message")
+            msg_sentiment["provider"] = str((engine or {}).get("provider") or "")
+            msg_sentiment["model_name"] = str((engine or {}).get("model_name") or "")
+            msg_sentiment["source"] = "provider_batch"
+        else:
+            msg_sentiment = analyze_local_sentiment(source_text)
+            msg_sentiment["scope"] = "message"
+            msg_sentiment["source"] = "local_fallback"
+
+        if conv_raw and not _should_retry_for_zero_score(conv_raw):
+            conv_sentiment = _finalize_sentiment(conv_raw, source_text, scope="conversation")
+            conv_sentiment["provider"] = str((engine or {}).get("provider") or "")
+            conv_sentiment["model_name"] = str((engine or {}).get("model_name") or "")
+            conv_sentiment["source"] = "provider_batch"
+            conv_sentiment["turns_analyzed"] = len(turns)
+        else:
+            conv_sentiment = analyze_local_sentiment(history or source_text)
+            conv_sentiment["scope"] = "conversation"
+            conv_sentiment["source"] = "local_fallback"
+            conv_sentiment["turns_analyzed"] = len(turns)
+
+        return msg_sentiment, conv_sentiment
+
+    except Exception as exc:
+        logger.warning(
+            "analyze_message_and_conversation_sentiment batch failed, running individually: %s", exc
+        )
+        msg_sentiment = await analyze_sentiment(source_text, db=db, company_id=company_id)
+        try:
+            conv_sentiment = await analyze_conversation_sentiment(
+                conversation_context,
+                latest_message=source_text,
+                db=db,
+                company_id=company_id,
+            )
+        except Exception:
+            conv_sentiment = dict(msg_sentiment)
+            conv_sentiment["scope"] = "conversation"
+        return msg_sentiment, conv_sentiment
+
 __all__ = [
     "analyze_local_sentiment",
+    "analyze_message_and_conversation_sentiment",
     "analyze_sentiment",
     "analyze_conversation_sentiment",
     "build_sentiment_gate",

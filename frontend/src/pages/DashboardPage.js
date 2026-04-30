@@ -89,6 +89,16 @@ function TinyBars({ items, color = '#2563eb' }) {
   );
 }
 
+// FIX: derive channel online status from `enabled` alone.
+// The `configured` field returned by /dashboard/live-summary is unreliable —
+// the backend may not set it (undefined → falsy) even for fully-set-up channels.
+// Using `enabled` as the single source of truth matches the backend's persisted state.
+// If the backend is later fixed to reliably populate `configured`, you can restore
+// the conjunction: channel.enabled && channel.configured
+function isChannelOnline(channel) {
+  return Boolean(channel.enabled);
+}
+
 export default function DashboardPage() {
   const navigate = useNavigate();
   const [data, setData] = useState(DEFAULT_DATA);
@@ -148,155 +158,35 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-xl sm:text-2xl font-bold text-slate-900 flex items-center gap-2">
             <Zap size={20} className="text-blue-500" />
-            Live Control Center
+            Live Dashboard
           </h1>
-          <p className="text-xs sm:text-sm text-slate-500 mt-1">Monitor, prioritize, and act in real time.</p>
         </div>
-        <div className="flex items-center gap-3">
-          <span className="pe-status-dot pe-status-online" />
-          <span className="text-[11px] text-slate-500">Live</span>
-          <button
-            onClick={() => fetchLive()}
-            className="inline-flex items-center gap-2 px-3 sm:px-4 py-2 sm:py-2.5 rounded-xl border border-slate-200 bg-white text-xs sm:text-sm font-medium text-slate-700 hover:bg-slate-50 transition-all hover:shadow-sm"
-          >
-            <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
-            Refresh
-          </button>
-        </div>
+        <button
+          onClick={() => fetchLive(false)}
+          disabled={refreshing}
+          className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-700 border border-slate-200 rounded-xl px-3 py-1.5 bg-white disabled:opacity-50"
+        >
+          <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
+          Refresh
+        </button>
       </div>
 
-      {/* Metric Cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4">
-        <MetricCard label="Incoming Messages" value={data.real_time_activity.incoming_messages} sub="today across all channels" icon={MessageSquare} tone="text-blue-500" />
-        <MetricCard label="Active Conversations" value={data.real_time_activity.active_conversations} sub="open right now" icon={Users} tone="text-cyan-500" />
-        <MetricCard label="Pending Replies" value={data.real_time_activity.pending_replies} sub="waiting for response" icon={Clock} tone="text-amber-500" />
-        <MetricCard label="AI Active Chats" value={data.real_time_activity.ai_active_chats} sub="automation live" icon={Bot} tone="text-violet-500" />
-        <MetricCard label="Human Active Chats" value={data.real_time_activity.human_active_chats} sub="manual handling" icon={HeartHandshake} tone="text-emerald-500" />
+      {/* Real-time activity metrics */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
+        <MetricCard label="Incoming" value={data.real_time_activity.incoming_messages} sub="messages right now" icon={MessageSquare} tone="text-blue-500" />
+        <MetricCard label="Active Convos" value={data.real_time_activity.active_conversations} sub="open conversations" icon={Activity} tone="text-cyan-500" />
+        <MetricCard label="Pending Replies" value={data.real_time_activity.pending_replies} sub="awaiting response" icon={Clock} tone="text-amber-500" />
+        <MetricCard label="AI Chats" value={data.real_time_activity.ai_active_chats} sub="handled by AI" icon={Bot} tone="text-violet-500" />
+        <MetricCard label="Human Chats" value={data.real_time_activity.human_active_chats} sub="handled by agents" icon={HeartHandshake} tone="text-emerald-500" />
+        <MetricCard label="Unread" value={data.inbox_summary.total_unread} sub="in inbox" icon={AlertCircle} tone="text-blue-500" />
       </div>
 
-      {/* Main Grid */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 sm:gap-6">
-        <div className="xl:col-span-5 bg-white border border-slate-100 rounded-2xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <Activity size={16} className="text-blue-500" />
-            <h2 className="text-sm font-semibold text-slate-900">Real-Time Activity</h2>
-          </div>
-          <div className="space-y-2">
-            {(data.real_time_activity.live_feed || []).map((item) => (
-              <button
-                key={item.id}
-                onClick={() => navigate(`/inbox?conversation=${encodeURIComponent(item.id)}`)}
-                className="w-full text-left rounded-xl border border-slate-100 p-3 hover:border-blue-200 hover:bg-blue-50/30 transition-colors"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-sm font-medium text-slate-800 truncate">{item.customer_name || 'Conversation'}</p>
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 capitalize">{item.channel?.replace('_', ' ')}</span>
-                </div>
-                <p className="text-xs text-slate-500 truncate mt-1">{item.last_message || 'No recent message'}</p>
-              </button>
-            ))}
-            {!loading && (data.real_time_activity.live_feed || []).length === 0 && <p className="text-sm text-slate-400">No live conversation activity yet.</p>}
-          </div>
-        </div>
-
-        <div className="xl:col-span-3 bg-white border border-slate-100 rounded-2xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <WalletCards size={16} className="text-cyan-500" />
-            <h2 className="text-sm font-semibold text-slate-900">Inbox Summary</h2>
-          </div>
-          <div className="space-y-3">
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">Total Unread</p>
-              <p className="text-2xl font-bold text-slate-900">{data.inbox_summary.total_unread}</p>
-            </div>
-            {Object.entries(data.inbox_summary.platform_counts || {}).map(([key, value]) => {
-              const meta = channelMeta[key] || channelMeta.web_chat;
-              const Icon = meta.icon;
-              return (
-                <div key={key} className="flex items-center justify-between">
-                  <span className="inline-flex items-center gap-2 text-sm text-slate-700"><Icon size={14} /> {meta.label}</span>
-                  <span className="text-sm font-semibold text-slate-900">{value}</span>
-                </div>
-              );
-            })}
-            <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
-              <span className="text-sm text-red-600 font-medium">Urgent chats</span>
-              <span className="text-sm font-bold text-red-600">{data.inbox_summary.urgent_chats}</span>
-            </div>
-          </div>
-        </div>
-
-        <div className="xl:col-span-4 bg-white border border-slate-100 rounded-2xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <Bot size={16} className="text-violet-500" />
-            <h2 className="text-sm font-semibold text-slate-900">AI Performance Snapshot</h2>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">AI success today</p>
-              <p className="text-xl font-bold text-slate-900">{data.ai_performance.ai_response_success_rate_today}%</p>
-            </div>
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">Blocked / flagged</p>
-              <p className="text-xl font-bold text-slate-900">{data.ai_performance.blocked_or_flagged_conversations}</p>
-            </div>
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">AI avg response</p>
-              <p className="text-xl font-bold text-slate-900">{data.ai_performance.avg_response_time_ai}</p>
-            </div>
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">Human avg response</p>
-              <p className="text-xl font-bold text-slate-900">{data.ai_performance.avg_response_time_human}</p>
-            </div>
-          </div>
-          <div className="mt-4">
-            <p className="text-xs text-slate-500 mb-2">Suggested replies pending approval</p>
-            <p className="text-lg font-semibold text-slate-800">{data.ai_performance.suggested_replies_pending}</p>
-          </div>
-        </div>
-      </div>
-
+      {/* Alerts + System Health */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-        <div className="xl:col-span-4 bg-white border border-slate-100 rounded-2xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <Zap size={16} className="text-amber-500" />
-            <h2 className="text-sm font-semibold text-slate-900">Leads Quick View</h2>
-          </div>
-          <div className="grid grid-cols-3 gap-3 mb-4">
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">New</p>
-              <p className="text-xl font-bold text-slate-900">{data.leads_quick_view.new_leads_today}</p>
-            </div>
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">Converted</p>
-              <p className="text-xl font-bold text-slate-900">{data.leads_quick_view.converted_leads_today}</p>
-            </div>
-            <div className="rounded-xl bg-slate-50 p-3">
-              <p className="text-[11px] text-slate-400">Hot</p>
-              <p className="text-xl font-bold text-slate-900">{data.leads_quick_view.hot_leads}</p>
-            </div>
-          </div>
-          <div className="space-y-2">
-            {(data.leads_quick_view.recent_lead_activity || []).map((lead) => (
-              <button
-                key={lead.id}
-                onClick={() => navigate('/leads')}
-                className="w-full text-left rounded-xl border border-slate-100 p-3 hover:border-amber-200 hover:bg-amber-50/30 transition-colors"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-sm font-medium text-slate-800 truncate">{lead.name}</p>
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 uppercase">{lead.grade}</span>
-                </div>
-                <p className="text-xs text-slate-500 mt-1 truncate">{lead.company || lead.status || 'Lead activity'}</p>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="xl:col-span-5 bg-white border border-slate-100 rounded-2xl p-5">
+        <div className="xl:col-span-9 bg-white border border-slate-100 rounded-2xl p-5">
           <div className="flex items-center gap-2 mb-4">
             <AlertCircle size={16} className="text-red-500" />
-            <h2 className="text-sm font-semibold text-slate-900">Alerts & Actions</h2>
+            <h2 className="text-sm font-semibold text-slate-900">Alerts</h2>
           </div>
           <div className="space-y-3">
             {(data.alerts || []).map((alert) => (
@@ -326,14 +216,20 @@ export default function DashboardPage() {
             <h2 className="text-sm font-semibold text-slate-900">System Health</h2>
           </div>
           <div className="space-y-3">
-            {(data.system_health.channels || []).map((channel) => (
-              <div key={channel.channel} className="flex items-center justify-between">
-                <span className="text-sm text-slate-700">{channelMeta[channel.channel]?.label || channel.channel}</span>
-                <span className={`text-xs px-2 py-1 rounded-full ${channel.enabled && channel.configured ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-600'}`}>
-                  {channel.enabled && channel.configured ? 'online' : 'needs setup'}
-                </span>
-              </div>
-            ))}
+            {(data.system_health.channels || []).map((channel) => {
+              // FIX (line 332-333): was `channel.enabled && channel.configured` which always
+              // evaluates to false when backend omits `configured` (undefined is falsy).
+              // Now derived via isChannelOnline() which uses `enabled` only as the source of truth.
+              const online = isChannelOnline(channel);
+              return (
+                <div key={channel.channel} className="flex items-center justify-between">
+                  <span className="text-sm text-slate-700">{channelMeta[channel.channel]?.label || channel.channel}</span>
+                  <span className={`text-xs px-2 py-1 rounded-full ${online ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-600'}`}>
+                    {online ? 'online' : 'needs setup'}
+                  </span>
+                </div>
+              );
+            })}
             {!loading && (data.system_health.channels || []).length === 0 && (
               <p className="text-sm text-slate-400">No channel health data yet.</p>
             )}

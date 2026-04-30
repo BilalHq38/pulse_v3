@@ -13,11 +13,12 @@
 #>
 
 param(
-  [string]$PostgresBin = "C:\Program Files\PostgreSQL\15\bin",
+  [string]$PostgresBin = "C:\Program Files\PostgreSQL\18\bin",
   [switch]$SkipDbBootstrap,
   [switch]$SkipFrontend,
   [switch]$SkipRedis,
   [switch]$SkipHealthCheck,
+  [switch]$SkipInstall,
   [int]$HealthWaitSeconds = 18,
   [int]$HealthRetryRounds = 3,
   [int]$HealthRetrySleepSeconds = 4,
@@ -167,10 +168,27 @@ function Resolve-LocalRedisUrls() {
   }
   $containerName = "pulse-engine-local-redis"
   Write-Step "Starting Redis ($containerName on port 6379)"
-  docker start $containerName 2>$null | Out-Null
-  $running = docker ps --filter "name=$containerName" --format "{{.Names}}" 2>$null
+  try {
+    docker start $containerName 2>$null | Out-Null
+  } catch {
+    # Ignore: container may not exist yet.
+  }
+  $running = ""
+  try {
+    $running = docker ps --filter "name=$containerName" --format "{{.Names}}" 2>$null
+  } catch {
+    $running = ""
+  }
   if (-not $running) {
-    docker run -d --restart unless-stopped --name $containerName -p "6379:6379" redis:7-alpine 2>$null | Out-Null
+    try {
+      docker run -d --restart unless-stopped --name $containerName -p "6379:6379" redis:7-alpine 2>$null | Out-Null
+    } catch {
+      Write-Warn "Redis container could not be started; continuing with queue/cache fallbacks."
+      return @{
+        RedisBase = ""
+        BackgroundEnabled = "false"
+      }
+    }
   }
   if (-not (Wait-Port -Port 6379 -TimeoutSeconds 25)) {
     Write-Warn "Redis did not open port 6379; continuing with queue/cache fallbacks."
@@ -213,6 +231,24 @@ if (-not (Test-Path -LiteralPath $backendDir)) {
 }
 if ((-not $SkipFrontend) -and (-not (Test-Path -LiteralPath $frontendDir))) {
   throw "Frontend folder not found at $frontendDir"
+}
+
+if (-not $SkipInstall) {
+  Write-Step "Installing Python dependencies (.venv)"
+  $requirementsPath = Join-Path $root "requirements.txt"
+  if (-not (Test-Path -LiteralPath $requirementsPath)) {
+    throw "Missing requirements.txt at $requirementsPath"
+  }
+  & $pythonExe -m pip install --upgrade pip
+  if ($LASTEXITCODE -ne 0) {
+    throw "pip upgrade failed with exit code $LASTEXITCODE"
+  }
+  & $pythonExe -m pip install -r $requirementsPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "pip install -r requirements.txt failed with exit code $LASTEXITCODE"
+  }
+} else {
+  Write-Info "Skipping dependency installs (-SkipInstall provided)"
 }
 
 $dotenv = Read-DotEnv -Path $envPath
@@ -396,8 +432,7 @@ if (-not $SkipFrontend) {
   if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     throw "npm not found on PATH. Install Node.js LTS so the frontend can run."
   }
-  $nodeModules = Join-Path $frontendDir "node_modules"
-  if (-not (Test-Path -LiteralPath $nodeModules)) {
+  if (-not $SkipInstall) {
     Write-Step "Installing frontend dependencies (npm install)"
     Push-Location $frontendDir
     try {

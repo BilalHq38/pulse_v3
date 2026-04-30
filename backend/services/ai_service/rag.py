@@ -163,7 +163,7 @@ async def _load_product_catalog(db, company_id: str, limit: int = 120) -> list[d
     started = time.perf_counter()
     rows = await db.fetch(
         "SELECT id, company_id, name, product_title, description, category, product_type, "
-        "       price, currency, status, tags, sku, stock_quantity, created_at, updated_at "
+        "       price, price_currency, status, tags, sku, stock_quantity, created_at, updated_at "
         "FROM company_products "
         "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
         "ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT $2",

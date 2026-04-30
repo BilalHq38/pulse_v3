@@ -832,6 +832,10 @@ function buildClient(session) {
       "--no-first-run",
       "--no-default-browser-check",
       "--window-size=1280,900",
+      // Prevent Chromium from OOM-killing the renderer under memory pressure,
+      // which causes TargetCloseError during whatsapp-web.js script injection.
+      "--memory-pressure-off",
+      "--disable-features=MemoryPressureBasedSourceBufferGC",
     ],
   };
   if (chromeExecutablePath) {
@@ -1077,7 +1081,9 @@ async function initializeSessionSequentially(session) {
     user_id: session.userId || "",
   });
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  // Allow up to 3 attempts: the first crash is almost always a transient
+  // TargetCloseError during WhatsApp Web script injection (OOM / slow start).
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
     session.lastInitError = "";
     try {
       await withTimeout(
@@ -1134,7 +1140,7 @@ async function initializeSessionSequentially(session) {
       });
       console.error(`[${session.scopeKey}] Initialize failed: ${err.message || err}`);
 
-      if (attempt >= 2 || !isTransientPuppeteerError(err)) {
+      if (attempt >= 3 || !isTransientPuppeteerError(err)) {
         throw err;
       }
 
