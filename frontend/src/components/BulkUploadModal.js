@@ -69,10 +69,10 @@ export default function BulkUploadModal({
       onClick={handleBackdropClick}
     >
       <div
-        className="relative w-full max-w-4xl max-h-[92vh] rounded-xl border border-slate-200 bg-white shadow-2xl flex flex-col overflow-hidden"
+        className="relative w-full max-w-4xl max-h-[92vh] rounded-xl border border-slate-100 bg-white shadow-2xl flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* HEADER — fixed, never scrolls */}
+        {/* Header */}
         <div className="flex-none flex items-start justify-between gap-4 border-b border-slate-100 px-6 py-4">
           <div>
             <p className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-wider text-blue-700">
@@ -92,13 +92,10 @@ export default function BulkUploadModal({
           </button>
         </div>
 
-        {/* SCROLLABLE CONTENT */}
         <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
           <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
-
-            {/* LEFT — Spreadsheet guide */}
             <div className="space-y-5">
-              <div className="rounded-xl border border-slate-100 bg-slate-50/80 p-5 hover:border-blue-200 transition-colors">
+              <div className="rounded-xl border border-slate-100 bg-slate-50/80 p-5 transition-colors hover:border-blue-200">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h4 className="text-sm font-semibold text-slate-900">Spreadsheet Guide</h4>
@@ -109,15 +106,15 @@ export default function BulkUploadModal({
                   <button
                     type="button"
                     onClick={downloadTemplate}
-                    className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:border-blue-200 hover:text-blue-700 transition-colors"
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-100 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition-colors hover:border-blue-200 hover:text-blue-700"
                   >
                     <Download size={14} /> Download Template
                   </button>
                 </div>
 
-                <div className="mt-4 rounded-xl border border-slate-200 bg-white overflow-hidden">
+                <div className="mt-4 rounded-xl border border-slate-100 bg-white overflow-hidden">
                   <table className="w-full text-left text-sm">
-                    <thead className="bg-slate-50 border-b border-slate-200">
+                    <thead className="bg-slate-50 border-b border-slate-100">
                       <tr>
                         <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Column</th>
                         <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-wide text-slate-500">What to enter</th>
@@ -138,30 +135,26 @@ export default function BulkUploadModal({
               <div className="rounded-xl border border-emerald-100 bg-emerald-50/60 p-5">
                 <h4 className="text-sm font-semibold text-emerald-900">What happens on upload</h4>
                 <p className="mt-2 text-sm text-emerald-800">
-                  Existing {entityLabel.toLowerCase()}s are matched by phone first, then email.
-                  Matching rows update instead of creating duplicates.
+                  Existing {entityLabel.toLowerCase()}s are matched by phone first, then email. Matching rows update the current record instead of creating a duplicate.
                 </p>
               </div>
             </div>
 
-            {/* RIGHT — File picker */}
             <div className="space-y-5">
-              <div className="rounded-xl border border-slate-200 bg-white p-5 hover:border-blue-200 transition-colors">
+              <div className="rounded-xl border border-slate-100 bg-white p-5 transition-colors hover:border-blue-200">
                 <h4 className="text-sm font-semibold text-slate-900">Choose File</h4>
 
-                <label className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-5 py-10 text-center hover:border-blue-300 hover:bg-blue-50/40 transition-colors">
+                <label className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-5 py-10 text-center transition-colors hover:border-blue-200 hover:bg-blue-50/40">
                   <Upload size={28} className="text-slate-400" />
                   <span className="mt-3 text-sm font-medium text-slate-700">
                     {selectedFile ? selectedFile.name : 'Select an Excel or CSV file'}
                   </span>
-                  <span className="mt-1 text-xs text-slate-500">
-                    Supported formats: .xlsx, .xls, .csv
-                  </span>
+                  <span className="mt-1 text-xs text-slate-500">Supported formats: .xlsx, .xls, .csv</span>
                   <input
                     type="file"
                     accept=".xlsx,.xls,.csv"
                     className="hidden"
-                    onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+                    onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
                   />
                 </label>
 
@@ -174,7 +167,7 @@ export default function BulkUploadModal({
                     type="button"
                     onClick={onClose}
                     disabled={uploading}
-                    className="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:border-blue-200 hover:text-blue-700 disabled:opacity-50 transition-colors"
+                    className="flex-1 rounded-lg border border-slate-100 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition-colors hover:border-blue-200 hover:text-blue-700 disabled:opacity-50"
                   >
                     Cancel
                   </button>
@@ -182,7 +175,7 @@ export default function BulkUploadModal({
                     type="button"
                     onClick={submitUpload}
                     disabled={!selectedFile || uploading}
-                    className="flex-1 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60 transition-colors"
+                    className="flex-1 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {uploading ? 'Uploading...' : `Upload ${entityLabel}s`}
                   </button>

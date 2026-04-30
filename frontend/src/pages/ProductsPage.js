@@ -26,8 +26,8 @@ const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_PRODUCT_IMAGES = 3;
 const MAX_PRODUCT_IMAGE_SIZE_MB = 5;
 const DEFAULT_CATEGORIES = ['general','software','service','hardware','subscription','consulting','support','training','integration'];
-const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type', 'image_url'];
-const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard', 'https://example.com/image.png'];
+const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type'];
+const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard'];
 const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'name', help: 'Required product name.' },
   { column: 'product_title', help: 'Optional SKU, short code, or public title.' },

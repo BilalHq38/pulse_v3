@@ -396,7 +396,7 @@ export default function CampaignsPage() {
               </h2>
               <button
                 onClick={() => setShowForm(false)}
-                className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-red-500"
+                className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
                 aria-label="Close"
               >
                 <X size={18} />

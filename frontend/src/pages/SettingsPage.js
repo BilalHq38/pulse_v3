@@ -1532,7 +1532,6 @@ export default function SettingsPage() {
     if (waStatusPollRef.current) clearInterval(waStatusPollRef.current);
   }, []);
 
-
   const tabs = [
     { id: 'personal',      label: 'Personal',       icon: Users },
     { id: 'company',       label: 'Company',        icon: Globe },
