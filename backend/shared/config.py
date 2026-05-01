@@ -60,6 +60,9 @@ PUBLIC_GATEWAY_PREFIXES = (
     "/api/webhook/meta/",
     "/api/webhooks/web-chat",
     "/api/webhooks/external/purchases",
+    "/api/products/media/",
+    "/api/company-data/products/media/",
+    "/api/conversations/attachments/media/",
 )
 
 
@@ -506,6 +509,52 @@ def ai_service_circuit_breaker_failures(default: int = 5) -> int:
 def ai_service_circuit_breaker_recovery_seconds(default: float = 30.0) -> float:
     try:
         return float(os.environ.get("AI_SERVICE_CIRCUIT_BREAKER_RECOVERY_SECONDS", str(default)))
+    except ValueError:
+        return default
+
+
+def ai_enable_provider_fallback() -> bool:
+    return os.environ.get("AI_ENABLE_PROVIDER_FALLBACK", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def ai_max_provider_attempts(default: int = 1) -> int:
+    try:
+        return max(1, int(os.environ.get("AI_MAX_PROVIDER_ATTEMPTS", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def ai_max_llm_calls_per_message(default: int = 2) -> int:
+    try:
+        return max(1, int(os.environ.get("AI_MAX_LLM_CALLS_PER_MESSAGE", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def ai_max_embedding_calls_per_message(default: int = 1) -> int:
+    try:
+        return max(0, int(os.environ.get("AI_MAX_EMBEDDING_CALLS_PER_MESSAGE", str(default)) or default))
+    except ValueError:
+        return default
+
+
+def ai_analytics_llm_enabled() -> bool:
+    return os.environ.get("AI_ANALYTICS_LLM_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def ai_analytics_summary_min_messages(default: int = 12) -> int:
+    try:
+        return max(1, int(os.environ.get("AI_ANALYTICS_SUMMARY_MIN_MESSAGES", str(default)) or default))
     except ValueError:
         return default
 

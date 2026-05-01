@@ -4,6 +4,7 @@ import json
 import logging
 
 from core.utils import make_id
+from shared.cache import get_cache_client
 from services.ai_service.common import (
     DailySummaryResult,
     InteractionSummaryResult,
@@ -15,6 +16,8 @@ from services.ai_service.common import (
 from services.ai_service.llm_client import _resolve_engine_for_request, call_model_json, call_model_text
 
 logger = logging.getLogger(__name__)
+_MEMORY_DEDUP_CACHE = get_cache_client(namespace="ai-memory-dedup")
+_MEMORY_DEDUP_TABLE_READY = False
 
 
 def _render_messages(messages: list) -> str:
@@ -82,10 +85,124 @@ async def store_context_memory(
     convo_id: str = "",
     relevance_score: float = 0.8,
 ) -> str:
+    global _MEMORY_DEDUP_TABLE_READY
     if not db or not company_id or not entity_id:
         return ""
-    payload = json.dumps(_json_safe(content), ensure_ascii=True)
     memory_id = make_id()
+    message_id = str((content or {}).get("message_id") or "").strip()
+    if message_id:
+        dedupe_key = f"{company_id}:{convo_id}:{message_id}:{memory_type}"
+        if not _MEMORY_DEDUP_TABLE_READY:
+            try:
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS context_memory_dedup ("
+                    "company_id TEXT NOT NULL, convo_id TEXT NOT NULL DEFAULT '', "
+                    "message_id TEXT NOT NULL, memory_type TEXT NOT NULL, memory_id TEXT NOT NULL DEFAULT '', "
+                    "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                    "PRIMARY KEY(company_id, convo_id, message_id, memory_type))"
+                )
+                _MEMORY_DEDUP_TABLE_READY = True
+            except Exception as exc:
+                logger.debug("memory dedupe table bootstrap skipped: %s", exc)
+        if _MEMORY_DEDUP_TABLE_READY:
+            existing_dedupe_id = await db.fetchval(
+                "SELECT memory_id FROM context_memory_dedup "
+                "WHERE company_id=$1 AND convo_id=$2 AND message_id=$3 AND memory_type=$4 LIMIT 1",
+                company_id,
+                convo_id,
+                message_id,
+                memory_type,
+            )
+            if existing_dedupe_id:
+                logger.debug(
+                    "memory_write_skipped_duplicate company_id=%s convo_id=%s message_id=%s memory_type=%s existing_memory_id=%s source=dedup_table",
+                    company_id,
+                    convo_id or "-",
+                    message_id,
+                    memory_type,
+                    str(existing_dedupe_id),
+                )
+                return str(existing_dedupe_id)
+            claimed_id = await db.fetchval(
+                "INSERT INTO context_memory_dedup(company_id,convo_id,message_id,memory_type,memory_id,created_at) "
+                "VALUES($1,$2,$3,$4,$5,NOW()) "
+                "ON CONFLICT(company_id,convo_id,message_id,memory_type) DO NOTHING RETURNING memory_id",
+                company_id,
+                convo_id,
+                message_id,
+                memory_type,
+                memory_id,
+            )
+            if not claimed_id:
+                existing_dedupe_id = await db.fetchval(
+                    "SELECT memory_id FROM context_memory_dedup "
+                    "WHERE company_id=$1 AND convo_id=$2 AND message_id=$3 AND memory_type=$4 LIMIT 1",
+                    company_id,
+                    convo_id,
+                    message_id,
+                    memory_type,
+                )
+                if existing_dedupe_id:
+                    logger.debug(
+                        "memory_write_skipped_duplicate company_id=%s convo_id=%s message_id=%s memory_type=%s existing_memory_id=%s source=dedup_table_race",
+                        company_id,
+                        convo_id or "-",
+                        message_id,
+                        memory_type,
+                        str(existing_dedupe_id),
+                    )
+                    return str(existing_dedupe_id)
+        try:
+            existing_id = await db.fetchval(
+                "SELECT id FROM context_memories "
+                "WHERE company_id=$1 AND convo_id=$2 AND memory_type=$3 "
+                "AND (memory_content::jsonb ->> 'message_id')=$4 "
+                "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+                company_id,
+                convo_id,
+                memory_type,
+                message_id,
+            )
+        except Exception as exc:
+            logger.debug("memory persistent dedupe lookup skipped: %s", exc)
+            existing_id = ""
+        if existing_id:
+            if _MEMORY_DEDUP_TABLE_READY:
+                await db.execute(
+                    "UPDATE context_memory_dedup SET memory_id=$5 "
+                    "WHERE company_id=$1 AND convo_id=$2 AND message_id=$3 AND memory_type=$4",
+                    company_id,
+                    convo_id,
+                    message_id,
+                    memory_type,
+                    str(existing_id),
+                )
+            await _MEMORY_DEDUP_CACHE.set_json(
+                dedupe_key,
+                {"seen": True, "memory_id": str(existing_id)},
+                ttl_seconds=86400,
+            )
+            logger.debug(
+                "memory_write_skipped_duplicate company_id=%s convo_id=%s message_id=%s memory_type=%s existing_memory_id=%s source=db",
+                company_id,
+                convo_id or "-",
+                message_id,
+                memory_type,
+                str(existing_id),
+            )
+            return str(existing_id)
+        cached_duplicate = await _MEMORY_DEDUP_CACHE.get_json(dedupe_key)
+        if isinstance(cached_duplicate, dict):
+            logger.debug(
+                "memory_write_skipped_duplicate company_id=%s convo_id=%s message_id=%s memory_type=%s existing_memory_id=%s source=cache",
+                company_id,
+                convo_id or "-",
+                message_id,
+                memory_type,
+                str(cached_duplicate.get("memory_id") or ""),
+            )
+            return str(cached_duplicate.get("memory_id") or "")
+    payload = json.dumps(_json_safe(content), ensure_ascii=True)
     result_id = await db.fetchval(
         "INSERT INTO context_memories "
         "(id, company_id, convo_id, entity_id, entity_type, memory_content, memory_type, relevance_score, created_at, updated_at) "  # noqa: E501
@@ -114,6 +231,23 @@ async def store_context_memory(
         convo_id or "-",
         str(result_id or memory_id),
     )
+    if message_id:
+        if _MEMORY_DEDUP_TABLE_READY:
+            await db.execute(
+                "INSERT INTO context_memory_dedup(company_id,convo_id,message_id,memory_type,memory_id,created_at) "
+                "VALUES($1,$2,$3,$4,$5,NOW()) "
+                "ON CONFLICT(company_id,convo_id,message_id,memory_type) DO UPDATE SET memory_id=EXCLUDED.memory_id",
+                company_id,
+                convo_id,
+                message_id,
+                memory_type,
+                str(result_id or memory_id),
+            )
+        await _MEMORY_DEDUP_CACHE.set_json(
+            dedupe_key,
+            {"seen": True, "memory_id": str(result_id or memory_id)},
+            ttl_seconds=86400,
+        )
     return str(result_id) if result_id else memory_id
 
 
@@ -141,6 +275,7 @@ async def remember_ai_response(
     sentiment: dict | None = None,
     product_ids: list[str] | None = None,
     response_style: str = "",
+    message_id: str = "",
 ) -> str:
     return await store_context_memory(
         db,
@@ -155,6 +290,7 @@ async def remember_ai_response(
             "sentiment": sentiment or {},
             "product_ids": [str(item).strip() for item in (product_ids or []) if str(item).strip()],
             "response_style": response_style,
+            "message_id": message_id,
             "created_at": utc_now_iso(),
         },
     )
@@ -173,6 +309,7 @@ async def remember_shown_products(
     product_ids: list[str],
     *,
     convo_id: str = "",
+    message_id: str = "",
 ) -> str:
     if not product_ids:
         return ""
@@ -193,6 +330,7 @@ async def remember_shown_products(
         convo_id=convo_id,
         content={
             "product_ids": merged_ids,
+            "message_id": message_id,
             "created_at": utc_now_iso(),
         },
     )
@@ -216,8 +354,11 @@ async def remember_conversation_state(
     state: dict,
     *,
     convo_id: str = "",
+    message_id: str = "",
 ) -> str:
     safe_state = dict(state or {})
+    if message_id:
+        safe_state["message_id"] = message_id
     safe_state["updated_at"] = utc_now_iso()
     return await store_context_memory(
         db,
@@ -308,6 +449,11 @@ async def summarize_conversation(messages: list, db=None, company_id: str = "") 
             "Output format: return plain text only in 2-3 sentences.\n"
             f"\nconversation:\n{text}",
             engine=await _resolve_engine_for_request(db=db, company_id=company_id),
+            call_purpose="conversation_summary",
+            function_name="summarize_conversation",
+            agent_name="analytics",
+            max_provider_attempts=1,
+            allow_provider_fallback=False,
         )
     except Exception:
         return "Unable to summarize."
@@ -340,6 +486,11 @@ async def summarize_customer_interaction(
             prompt,
             InteractionSummaryResult,
             engine=await _resolve_engine_for_request(db=db, company_id=company_id),
+            call_purpose="customer_interaction_summary",
+            function_name="summarize_customer_interaction",
+            agent_name="analytics",
+            max_provider_attempts=1,
+            allow_provider_fallback=False,
         )
     except Exception:
         return InteractionSummaryResult(
@@ -384,6 +535,11 @@ async def generate_daily_ai_summary(date_str: str, interactions: list, db=None, 
                 DailySummaryResult,
                 engine=await _resolve_engine_for_request(db=db, company_id=company_id, use_pro=True),
                 use_pro=True,
+                call_purpose="daily_summary",
+                function_name="generate_daily_ai_summary",
+                agent_name="analytics",
+                max_provider_attempts=1,
+                allow_provider_fallback=False,
             ),
             "date": date_str,
         }

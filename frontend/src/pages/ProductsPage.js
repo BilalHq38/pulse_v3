@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import api from '@/lib/api';
+import { resolveMediaUrl } from '@/lib/backend-url';
 import BulkUploadModal from '@/components/BulkUploadModal';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import * as XLSX from 'xlsx';
@@ -22,12 +23,12 @@ import {
   Eye,
 } from 'lucide-react';
 
-const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const MAX_PRODUCT_IMAGES = 3;
 const MAX_PRODUCT_IMAGE_SIZE_MB = 5;
 const DEFAULT_CATEGORIES = ['general','software','service','hardware','subscription','consulting','support','training','integration'];
-const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type'];
-const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard'];
+const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type', 'image_url'];
+const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard', 'https://example.com/product.jpg'];
 const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'name', help: 'Required product name.' },
   { column: 'product_title', help: 'Optional SKU, short code, or public title.' },
@@ -36,7 +37,7 @@ const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'price_currency', help: 'Optional currency code such as USD, EUR, or GBP. Defaults to USD.' },
   { column: 'category', help: 'Optional category such as software, service, subscription, or support.' },
   { column: 'product_type', help: 'Optional type or variant. Defaults to standard.' },
-  { column: 'image_url', help: 'Optional public image URL (JPG, PNG, WEBP). Up to 3 URLs separated by | or use columns image_url_1, image_url_2, image_url_3.' },
+  { column: 'image_url', help: 'Optional public image URL (JPG, PNG, WEBP, GIF). Up to 3 URLs separated by |, use columns image_url_1, image_url_2, image_url_3, or embed images in XLSX rows.' },
 ];
 
 const EMPTY_FORM = {
@@ -187,7 +188,7 @@ function ImageGrid({ images, onClickImage }) {
       {images.map((img, i) => (
         <div key={i} className="relative overflow-hidden h-36">
           <img
-            src={img}
+            src={resolveMediaUrl(img)}
             alt="product"
             className={`w-full h-full object-cover${clickable ? ' cursor-zoom-in' : ''}`}
             onClick={() => clickable && onClickImage(i)}
@@ -336,7 +337,7 @@ export default function ProductsPage() {
     const accepted = files.slice(0, slots);
     const next = [];
     for (const file of accepted) {
-      if (!PRODUCT_IMAGE_TYPES.includes(file.type)) { setImageError('Only JPG, PNG, WEBP'); continue; }
+      if (!PRODUCT_IMAGE_TYPES.includes(file.type)) { setImageError('Only JPG, PNG, WEBP, GIF'); continue; }
       if (file.size > MAX_PRODUCT_IMAGE_SIZE_MB * 1024 * 1024) { setImageError(`Max ${MAX_PRODUCT_IMAGE_SIZE_MB}MB each`); continue; }
       try {
         const dataUrl = await readAsDataUrl(file);
@@ -403,29 +404,17 @@ export default function ProductsPage() {
   const handleBulkUpload = async (file) => {
     setBulkUploading(true);
     try {
-      const { items, errors: parseErrors } = await parseProductSpreadsheet(file);
-      if (items.length === 0) {
-        const firstError = parseErrors[0];
-        showToast({
-          type: 'error',
-          title: 'Product Import Failed',
-          message: firstError ? `Row ${firstError.row}: ${firstError.error}` : 'No valid product rows found.',
-        });
-        return;
-      }
-
-      const response = await api.post('/products/bulk-upload', {
-        upsert: true,
-        items: items.map((item) => ({
-          rowNumber: item.rowNumber,
-          payload: item.payload,
-        })),
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('upsert', 'true');
+      const response = await api.post('/products/bulk-upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
       });
 
       const created = Number(response?.data?.created || 0);
       const updated = Number(response?.data?.updated || 0);
       const apiErrors = Array.isArray(response?.data?.errors) ? response.data.errors : [];
-      const uploadErrors = [...parseErrors, ...apiErrors];
+      const uploadErrors = apiErrors;
 
       if (created + updated > 0) {
         await loadProducts();
@@ -619,7 +608,7 @@ export default function ProductsPage() {
                     <td className="px-4 py-3">
                       {Array.isArray(p.images) && p.images.length > 0 ? (
                         <div className="w-10 h-10 rounded-lg overflow-hidden border border-slate-100 flex-shrink-0">
-                          <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
+                          <img src={resolveMediaUrl(p.images[0])} alt={p.name} className="w-full h-full object-cover" />
                         </div>
                       ) : (
                         <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-50 to-slate-100 flex items-center justify-center flex-shrink-0">
@@ -767,7 +756,7 @@ export default function ProductsPage() {
                   {selectedProduct.images.map((img, i) => (
                     <div key={i} className="overflow-hidden h-56">
                       <img
-                        src={img}
+                        src={resolveMediaUrl(img)}
                         alt={selectedProduct.name}
                         className="w-full h-full object-cover cursor-pointer hover:scale-105 transition-transform duration-200"
                         onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, i); }}
@@ -860,7 +849,7 @@ export default function ProductsPage() {
             <ChevronLeft size={22} />
           </button>
           <img
-            src={lightboxImages[lightboxIndex]}
+            src={resolveMediaUrl(lightboxImages[lightboxIndex])}
             alt={`Attachment ${lightboxIndex + 1}`}
             className="max-h-[82vh] max-w-[88vw] object-contain rounded-2xl shadow-2xl"
             onClick={(e) => e.stopPropagation()}
@@ -1067,7 +1056,7 @@ export default function ProductsPage() {
                 <div className="grid grid-cols-3 gap-3">
                   {form.images.map(img => (
                     <div key={img.id} className="relative rounded-lg overflow-hidden border border-slate-200 bg-white">
-                      <img src={img.dataUrl} alt={img.name} className="w-full h-24 object-cover" />
+                      <img src={resolveMediaUrl(img.dataUrl)} alt={img.name} className="w-full h-24 object-cover" />
                       <button onClick={() => removeImage(img.id)} className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/60 text-white text-xs flex items-center justify-center">×</button>
                     </div>
                   ))}

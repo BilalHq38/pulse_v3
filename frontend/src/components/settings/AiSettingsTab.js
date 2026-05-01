@@ -9,6 +9,7 @@ import {
 const LLM_MODELS = {
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o3-mini'],
   anthropic: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
+  gemini: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'],
 };
 const DEFAULT_LLM_PROVIDER = 'openai';
 const DEFAULT_LLM_MODEL = LLM_MODELS[DEFAULT_LLM_PROVIDER][0];
@@ -19,6 +20,7 @@ const MODEL_MAX_TOKENS = {
   'o1': 32768, 'o1-mini': 65536, 'o3-mini': 100000,
   'claude-3-7-sonnet-20250219': 8192, 'claude-3-5-sonnet-20241022': 8192,
   'claude-3-5-haiku-20241022': 8192, 'claude-3-opus-20240229': 4096, 'claude-3-haiku-20240307': 4096,
+  'gemini-2.5-flash': 8192, 'gemini-2.5-pro': 8192, 'gemini-2.5-flash-lite': 8192,
 };
 
 const AGENT_RUNTIME_PROFILES = {
@@ -49,10 +51,25 @@ function agentRuntimeProfile(type) {
   return AGENT_RUNTIME_PROFILES[key] || AGENT_RUNTIME_PROFILES.generic;
 }
 
+function providerStatusMeta(engine) {
+  const status = String(engine?.provider_status || '').trim().toLowerCase();
+  if (engine?.provider_ready || status === 'configured') {
+    return { label: 'Configured', className: 'bg-blue-50 text-blue-700' };
+  }
+  if (status === 'disabled' || engine?.is_active === false) {
+    return { label: 'Disabled', className: 'bg-slate-100 text-slate-600' };
+  }
+  if (status === 'unavailable') {
+    return { label: 'Unavailable', className: 'bg-red-50 text-red-700' };
+  }
+  return { label: 'Missing API key', className: 'bg-amber-50 text-amber-700' };
+}
+
 export default function AiSettingsTab({
   company, setCompany, saveCompany,
   saving, setSaving,
   llmEngines, selectedLlmEngine, refreshAiConfig,
+  aiConfigError = '',
   aiAgents, setAiAgents,
   editingLlmId, setEditingLlmId, llmDraft, setLlmDraft,
   showAddLlmForm, setShowAddLlmForm, addLlmForm, setAddLlmForm,
@@ -138,6 +155,11 @@ export default function AiSettingsTab({
   return (
     <div className="space-y-6">
       <h2 className="text-lg font-semibold text-slate-900">AI Configuration</h2>
+      {aiConfigError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {aiConfigError}
+        </div>
+      )}
 
       {/* Core AI Settings */}
       <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
@@ -356,10 +378,16 @@ export default function AiSettingsTab({
         </div>
 
         {llmEngines.length === 0 ? (
-          <p className="text-xs text-slate-400 py-3">No LLM engines configured yet. They are auto-provisioned on first AI interaction.</p>
+          <p className="text-xs text-slate-400 py-3">
+            {aiConfigError
+              ? 'LLM engines could not be loaded. The error above is from the AI service.'
+              : 'No LLM engines were returned. Add a workspace engine or check the AI service bootstrap/default model configuration.'}
+          </p>
         ) : (
           <div className="space-y-3">
-            {llmEngines.map(e => (
+            {llmEngines.map(e => {
+              const providerStatus = providerStatusMeta(e);
+              return (
               <div key={e.id} className="border border-slate-200 rounded-lg overflow-hidden">
                 <div className="flex items-center justify-between p-3 bg-slate-50">
                   <div className="min-w-0 flex-1">
@@ -367,7 +395,7 @@ export default function AiSettingsTab({
                     <p className="text-[10px] text-slate-400">Temp: {e.temperature ?? 0.7} | Max tokens: {e.max_tokens ?? 2048}</p>
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.is_selected ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{e.is_selected ? 'Live now' : 'Catalog only'}</span>
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.provider_ready ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'}`}>{e.provider_ready ? 'Provider ready' : 'Provider missing key'}</span>
+                      <span title={e.provider_status_detail || ''} className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${providerStatus.className}`}>{providerStatus.label}</span>
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.supports_vision ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-500'}`}>{e.supports_vision ? 'Vision capable' : 'Text only'}</span>
                     </div>
                   </div>
@@ -441,7 +469,7 @@ export default function AiSettingsTab({
                         <select value={llmDraft.provider}
                           onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setLlmDraft(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option>
                         </select>
                       </div>
                       <div>
@@ -468,7 +496,8 @@ export default function AiSettingsTab({
                   </div>
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -481,7 +510,7 @@ export default function AiSettingsTab({
                 <select value={addLlmForm.provider}
                   onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
                   className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option>
                 </select>
               </div>
               <div>

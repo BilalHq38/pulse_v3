@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useDeferredValue, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
+import { resolveMediaUrl } from '@/lib/backend-url';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import BulkUploadModal from '@/components/BulkUploadModal';
@@ -16,11 +17,12 @@ import {
   MessageSquare,
   Trash2,
   AlertCircle,
+  UserCheck,
 } from 'lucide-react';
 import { buildLeadMethods, CHANNEL_META } from '@/lib/channelUtils';
 
 const GRADE_COLORS = { hot: 'bg-red-50 text-red-500 border-red-500/30', warm: 'bg-amber-50 text-amber-600 border-amber-500/30', cold: 'bg-blue-50 text-blue-600 border-blue-500/30' };
-const STATUS_COLORS = { new: 'bg-blue-50 text-blue-600', contacted: 'bg-cyan-50 text-cyan-600', qualified: 'bg-emerald-50 text-emerald-600', proposal: 'bg-amber-50 text-amber-600', negotiation: 'bg-fuchsia-50 text-fuchsia-600', won: 'bg-green-500/10 text-green-400', lost: 'bg-red-50 text-red-500' };
+const STATUS_COLORS = { new: 'bg-blue-50 text-blue-600', contacted: 'bg-cyan-50 text-cyan-600', qualified: 'bg-emerald-50 text-emerald-600', proposal: 'bg-amber-50 text-amber-600', negotiation: 'bg-fuchsia-50 text-fuchsia-600', converted: 'bg-indigo-50 text-indigo-600', won: 'bg-green-500/10 text-green-600', lost: 'bg-red-50 text-red-500' };
 const LEAD_BULK_TEMPLATE_HEADERS = ['name', 'email', 'phone', 'company', 'source', 'status', 'notes', 'tags', 'channels'];
 const LEAD_BULK_TEMPLATE_SAMPLE = ['Avery Stone', 'avery@northstar.io', '+1 415 555 0188', 'Northstar Labs', 'whatsapp', 'new', 'Requested a pricing follow-up', 'hot_lead, interested', 'whatsapp, email'];
 const LEAD_BULK_GUIDE_ROWS = [
@@ -34,6 +36,44 @@ const LEAD_BULK_GUIDE_ROWS = [
   { column: 'tags', help: 'Optional comma-separated tags.' },
   { column: 'channels', help: 'Optional comma-separated channels such as whatsapp, email, or instagram.' },
 ];
+
+function LeadAvatar({ lead, className = 'w-8 h-8', textClass = 'text-xs' }) {
+  const [failed, setFailed] = useState(false);
+  const url = resolveMediaUrl(lead?.avatar || '');
+  const initial = (lead?.name || '?').charAt(0);
+  return (
+    <div className={`${className} rounded-full bg-blue-50 text-blue-600 flex items-center justify-center ${textClass} font-bold overflow-hidden flex-shrink-0`}>
+      {url && !failed ? (
+        <img src={url} alt="" referrerPolicy="no-referrer" className="h-full w-full object-cover" onError={() => setFailed(true)} />
+      ) : initial}
+    </div>
+  );
+}
+
+function formatStageLabel(status) {
+  return String(status || 'new').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function parseLeadStageActivity(activity) {
+  if (!activity || activity.type !== 'stage_changed') return null;
+  try {
+    const parsed = JSON.parse(activity.content || '{}');
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch {
+    return { reason: activity.content || '' };
+  }
+  return null;
+}
+
+function getLatestLeadStageUpdate(lead) {
+  if (lead?.last_stage_update) return lead.last_stage_update;
+  const activities = Array.isArray(lead?.activities) ? lead.activities : [];
+  for (let index = activities.length - 1; index >= 0; index -= 1) {
+    const parsed = parseLeadStageActivity(activities[index]);
+    if (parsed) return parsed;
+  }
+  return null;
+}
 
 function LeadCardSkeleton() {
   return (
@@ -75,6 +115,12 @@ export default function LeadsPage() {
   const [nurturingLead, setNurturingLead] = useState(false);
   const [sendingNurtureId, setSendingNurtureId] = useState('');
   const [deletingLeadId, setDeletingLeadId] = useState(null);
+  const [convertingLeadId, setConvertingLeadId] = useState('');
+  const [editingNurtureId, setEditingNurtureId] = useState('');
+  const [nurtureEditText, setNurtureEditText] = useState('');
+  const [nurtureEditError, setNurtureEditError] = useState('');
+  const [savingNurtureId, setSavingNurtureId] = useState('');
+  const [deletingNurtureId, setDeletingNurtureId] = useState('');
 
   const [showMethodPicker, setShowMethodPicker] = useState(false);
   const [messageMethods, setMessageMethods] = useState([]);
@@ -96,6 +142,9 @@ export default function LeadsPage() {
   const closeLeadDetail = useCallback(() => {
     dismissedLeadIdRef.current = selectedLead?.id || searchParams.get('lead') || '';
     setSelectedLead(null);
+    setEditingNurtureId('');
+    setNurtureEditText('');
+    setNurtureEditError('');
     if (searchParams.get('lead')) {
       const nextParams = new URLSearchParams(searchParams);
       nextParams.delete('lead');
@@ -278,10 +327,22 @@ export default function LeadsPage() {
 
   const updateStatus = async (leadId, status) => {
     try {
-      const res = await api.put(`/leads/${leadId}`, { status });
-      upsertLeadState(res.data);
+      const res = await api.put(`/leads/${leadId}/stage`, { stage: status, reason: 'Manual stage update' });
+      upsertLeadState(res.data?.lead || res.data);
       loadLeads();
-    } catch (err) { console.error(err); }
+      showToast({
+        type: 'success',
+        title: 'Stage Updated',
+        message: `Lead moved to ${formatStageLabel(status)}.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Stage Update Failed',
+        message: getErrorMessage(err, 'We could not update that lead stage.'),
+      });
+    }
   };
 
   const deleteLead = async (lead, event) => {
@@ -614,15 +675,129 @@ export default function LeadsPage() {
         type: 'error',
         title: 'Message Failed',
         message: getErrorMessage(err, 'We could not send that nurture message.'),
+        dedupeKey: `lead-message-failed:${lead.id}:${selectedChannel}`,
       });
     } finally {
       setSendingNurtureId('');
     }
   };
 
+  const startNurtureEdit = (nurtureMessage, event) => {
+    if (event) event.stopPropagation();
+    setEditingNurtureId(nurtureMessage.id);
+    setNurtureEditText(nurtureMessage.message || '');
+    setNurtureEditError('');
+  };
+
+  const cancelNurtureEdit = (event) => {
+    if (event) event.stopPropagation();
+    setEditingNurtureId('');
+    setNurtureEditText('');
+    setNurtureEditError('');
+  };
+
+  const saveNurtureEdit = async (lead, nurtureMessage, event) => {
+    if (event) event.stopPropagation();
+    const nextMessage = nurtureEditText.trim();
+    if (!nextMessage) {
+      setNurtureEditError('Message cannot be empty.');
+      return;
+    }
+    setSavingNurtureId(nurtureMessage.id);
+    setNurtureEditError('');
+    try {
+      const res = await api.put(`/leads/${lead.id}/nurture-messages/${nurtureMessage.id}`, {
+        message: nextMessage,
+        phase: nurtureMessage.phase,
+      });
+      const updatedLead = res.data?.lead;
+      if (updatedLead) {
+        upsertLeadState(updatedLead);
+      } else {
+        upsertLeadState({
+          ...lead,
+          nurture_messages: (lead.nurture_messages || []).map((item) => (
+            item.id === nurtureMessage.id ? { ...item, message: nextMessage } : item
+          )),
+        });
+      }
+      setEditingNurtureId('');
+      setNurtureEditText('');
+      showToast({
+        type: 'success',
+        title: 'Draft Saved',
+        message: 'The nurture message was updated.',
+      });
+    } catch (err) {
+      console.error(err);
+      setNurtureEditError(getErrorMessage(err, 'We could not save that nurture message.'));
+      showToast({
+        type: 'error',
+        title: 'Save Failed',
+        message: getErrorMessage(err, 'We could not save that nurture message.'),
+      });
+    } finally {
+      setSavingNurtureId('');
+    }
+  };
+
+  const deleteNurtureMessage = async (lead, nurtureMessage, event) => {
+    if (event) event.stopPropagation();
+    if (!lead?.id || !nurtureMessage?.id || deletingNurtureId) return;
+    setDeletingNurtureId(nurtureMessage.id);
+    try {
+      const res = await api.delete(`/leads/${lead.id}/nurture-messages/${nurtureMessage.id}`);
+      const updatedLead = res.data?.lead || {
+        ...lead,
+        nurture_messages: (lead.nurture_messages || []).filter((item) => item.id !== nurtureMessage.id),
+      };
+      upsertLeadState(updatedLead);
+      if (editingNurtureId === nurtureMessage.id) cancelNurtureEdit();
+      showToast({
+        type: 'success',
+        title: 'Draft Deleted',
+        message: 'The selected nurture message was removed.',
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: getErrorMessage(err, 'We could not delete that nurture message.'),
+      });
+    } finally {
+      setDeletingNurtureId('');
+    }
+  };
+
+  const convertLeadToCustomer = async (lead) => {
+    if (!lead?.id || convertingLeadId) return;
+    setConvertingLeadId(lead.id);
+    try {
+      const res = await api.post(`/leads/${lead.id}/convert-to-customer`);
+      const updatedLead = res.data?.lead ? { ...res.data.lead, status: res.data.lead.status || 'converted' } : { ...lead, status: 'converted' };
+      upsertLeadState(updatedLead);
+      await loadLeads();
+      showToast({
+        type: 'success',
+        title: 'Lead Converted',
+        message: `${lead.name || 'This lead'} is now linked to a customer profile.`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Conversion Failed',
+        message: getErrorMessage(err, 'We could not convert that lead.'),
+      });
+    } finally {
+      setConvertingLeadId('');
+    }
+  };
+
   const availableLeadStatuses = leadStatuses.length
     ? leadStatuses.map((item) => item.status_name)
-    : ['new', 'contacted', 'qualified', 'proposal', 'negotiation', 'converted', 'lost'];
+    : ['new', 'contacted', 'qualified', 'proposal', 'negotiation', 'converted', 'won', 'lost'];
   const availableLeadSources = leadSources.length
     ? leadSources.map((item) => item.source_name)
     : ['web_chat', 'whatsapp', 'instagram', 'facebook', 'referral', 'organic'];
@@ -790,6 +965,7 @@ export default function LeadsPage() {
                       >
                         <Trash2 size={12} />
                       </button>
+                      <LeadAvatar lead={lead} />
                       <h4 className="text-sm font-semibold text-slate-700 truncate">{lead.name}</h4>
                     </div>
                     <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${GRADE_COLORS[lead.grade] || GRADE_COLORS.warm}`}>{lead.grade}</span>
@@ -841,9 +1017,12 @@ export default function LeadsPage() {
           >
             <div className="p-6">
               <div className="flex items-start justify-between mb-6">
-                <div>
-                  <h3 className="text-xl font-bold text-slate-900">{selectedLead.name}</h3>
-                  <p className="text-sm text-slate-400">{selectedLead.company}</p>
+                <div className="flex items-center gap-3 min-w-0">
+                  <LeadAvatar lead={selectedLead} className="w-12 h-12" textClass="text-lg" />
+                  <div className="min-w-0">
+                    <h3 className="text-xl font-bold text-slate-900 truncate">{selectedLead.name}</h3>
+                    <p className="text-sm text-slate-400 truncate">{selectedLead.company}</p>
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
@@ -897,48 +1076,87 @@ export default function LeadsPage() {
                 <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-6">
                   <p className="text-[10px] text-blue-600 uppercase tracking-wider mb-2 flex items-center gap-1"><Sparkles size={10} /> AI Nurture Messages</p>
                   <div className="space-y-2">
-                    {selectedLead.nurture_messages.slice(-3).map((nm, idx) => (
-                      <div key={idx} className="bg-white rounded-lg p-2.5 border border-blue-100">
-                        <p className="text-xs text-slate-600">{nm.message}</p>
+                    {selectedLead.nurture_messages.slice(-3).map((nm) => (
+                      <div key={nm.id} className="bg-white rounded-lg p-2.5 border border-blue-100">
+                        {editingNurtureId === nm.id ? (
+                          <div className="space-y-2">
+                            <textarea
+                              value={nurtureEditText}
+                              onChange={(e) => {
+                                setNurtureEditText(e.target.value);
+                                if (nurtureEditError) setNurtureEditError('');
+                              }}
+                              rows={4}
+                              className={`w-full resize-none rounded-lg border px-2.5 py-2 text-xs text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500/20 ${nurtureEditError ? 'border-red-300 bg-red-50' : 'border-slate-200 bg-slate-50'}`}
+                              data-testid={`edit-nurture-text-${nm.id}`}
+                            />
+                            {nurtureEditError && (
+                              <p className="text-[10px] font-medium text-red-600">{nurtureEditError}</p>
+                            )}
+                            <div className="flex justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={(e) => cancelNurtureEdit(e)}
+                                disabled={savingNurtureId === nm.id}
+                                className="px-2 py-1 text-[10px] font-medium rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                                data-testid={`cancel-nurture-edit-${nm.id}`}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => saveNurtureEdit(selectedLead, nm, e)}
+                                disabled={savingNurtureId === nm.id}
+                                className="px-2 py-1 text-[10px] font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+                                data-testid={`save-nurture-edit-${nm.id}`}
+                              >
+                                {savingNurtureId === nm.id ? 'Saving...' : 'Save'}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-slate-600">{nm.message}</p>
+                        )}
                         <div className="flex items-center justify-between gap-2 mt-1">
                           <div className="flex items-center gap-2">
                             <span className="text-[10px] text-blue-500 capitalize">{nm.phase}</span>
                             <span className="text-[10px] text-slate-400">{new Date(nm.created_at).toLocaleDateString()}</span>
                             <span className={`text-[10px] px-1 py-0.5 rounded ${nm.sent ? 'bg-green-50 text-green-600' : 'bg-amber-50 text-amber-600'}`}>{nm.sent ? 'Sent' : 'Draft'}</span>
                           </div>
-                          {!nm.sent && (
+                          <div className="flex items-center gap-1">
                             <button
                               onClick={(e) => openNurtureComposer(selectedLead, nm, e)}
                               disabled={sendingNurtureId === nm.id}
                               className="px-2 py-1 text-[10px] font-medium rounded-md bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 disabled:opacity-60"
                               data-testid={`send-nurture-detail-${nm.id}`}
                             >
-                              {sendingNurtureId === nm.id ? 'Sending...' : 'Send'}
+                              {sendingNurtureId === nm.id ? 'Sending...' : nm.sent ? 'Send Again' : 'Send'}
                             </button>
-                          )}
+                            <button
+                              type="button"
+                              onClick={(e) => startNurtureEdit(nm, e)}
+                              disabled={editingNurtureId === nm.id || savingNurtureId === nm.id}
+                              className="px-2 py-1 text-[10px] font-medium rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                              data-testid={`edit-nurture-${nm.id}`}
+                            >
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => deleteNurtureMessage(selectedLead, nm, e)}
+                              disabled={deletingNurtureId === nm.id}
+                              className="px-2 py-1 text-[10px] font-medium rounded-md border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-60"
+                              data-testid={`delete-nurture-${nm.id}`}
+                            >
+                              {deletingNurtureId === nm.id ? 'Deleting...' : 'Delete'}
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
-
-              <div className="grid grid-cols-2 gap-2 mb-2">
-                <button
-                  onClick={() => openMessagePicker(selectedLead)}
-                  className="px-3 py-2.5 bg-blue-50 border border-blue-200 text-blue-600 rounded-xl text-sm font-medium hover:bg-blue-100 transition-colors"
-                  data-testid="message-lead-btn"
-                >
-                  <span className="inline-flex items-center gap-1"><MessageSquare size={14} /> Message</span>
-                </button>
-                <button
-                  onClick={() => handleEmailLead(selectedLead)}
-                  className="px-3 py-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl text-sm font-medium hover:bg-emerald-100 transition-colors"
-                  data-testid="email-lead-btn"
-                >
-                  <span className="inline-flex items-center gap-1"><Mail size={14} /> Email</span>
-                </button>
-              </div>
 
               <div className="grid grid-cols-2 gap-2 mb-4">
                 <button
@@ -959,14 +1177,38 @@ export default function LeadsPage() {
                 </button>
               </div>
 
-              <button
-                onClick={() => deleteLead(selectedLead)}
-                disabled={deletingLeadId === selectedLead.id}
-                className="w-full mb-4 px-3 py-2.5 bg-red-50 border border-red-200 text-red-700 rounded-xl text-sm font-medium hover:bg-red-100 transition-colors disabled:opacity-60"
-                data-testid="delete-lead-detail-btn"
-              >
-                <span className="inline-flex items-center gap-1"><Trash2 size={14} /> {deletingLeadId === selectedLead.id ? 'Deleting...' : 'Delete Lead'}</span>
-              </button>
+              <div className="grid grid-cols-2 gap-2 mb-4">
+                <button
+                  onClick={() => openMessagePicker(selectedLead)}
+                  className="px-3 py-2.5 bg-blue-50 border border-blue-200 text-blue-600 rounded-xl text-sm font-medium hover:bg-blue-100 transition-colors"
+                  data-testid="message-lead-btn"
+                >
+                  <span className="inline-flex items-center gap-1"><MessageSquare size={14} /> Message</span>
+                </button>
+                <button
+                  onClick={() => handleEmailLead(selectedLead)}
+                  className="px-3 py-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl text-sm font-medium hover:bg-emerald-100 transition-colors"
+                  data-testid="email-lead-btn"
+                >
+                  <span className="inline-flex items-center gap-1"><Mail size={14} /> Email</span>
+                </button>
+                <button
+                  onClick={() => convertLeadToCustomer(selectedLead)}
+                  disabled={convertingLeadId === selectedLead.id || ['converted', 'won'].includes(selectedLead.status)}
+                  className="px-3 py-2.5 bg-indigo-50 border border-indigo-200 text-indigo-700 rounded-xl text-sm font-medium hover:bg-indigo-100 transition-colors disabled:opacity-60"
+                  data-testid="convert-lead-btn"
+                >
+                  <span className="inline-flex items-center gap-1"><UserCheck size={14} /> {convertingLeadId === selectedLead.id ? 'Converting...' : 'Convert to Customer'}</span>
+                </button>
+                <button
+                  onClick={() => deleteLead(selectedLead)}
+                  disabled={deletingLeadId === selectedLead.id}
+                  className="px-3 py-2.5 bg-red-50 border border-red-200 text-red-700 rounded-xl text-sm font-medium hover:bg-red-100 transition-colors disabled:opacity-60"
+                  data-testid="delete-lead-detail-btn"
+                >
+                  <span className="inline-flex items-center gap-1"><Trash2 size={14} /> {deletingLeadId === selectedLead.id ? 'Deleting...' : 'Delete Lead'}</span>
+                </button>
+              </div>
 
               <select
                 value={selectedLead.status}
@@ -975,9 +1217,18 @@ export default function LeadsPage() {
                 data-testid="lead-status-select"
               >
                 {availableLeadStatuses.map((s) => (
-                  <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>
+                  <option key={s} value={s}>{formatStageLabel(s)}</option>
                 ))}
               </select>
+              {getLatestLeadStageUpdate(selectedLead)?.reason && (
+                <p
+                  className="mt-2 text-[11px] text-slate-500"
+                  title={getLatestLeadStageUpdate(selectedLead).reason}
+                  data-testid="lead-stage-reason"
+                >
+                  {getLatestLeadStageUpdate(selectedLead).source === 'manual_update' ? 'Manual update' : 'Auto-updated'}: {getLatestLeadStageUpdate(selectedLead).reason}
+                </p>
+              )}
             </div>
           </div>
         </div>

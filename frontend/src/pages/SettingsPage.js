@@ -2,8 +2,15 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
+import { resolveMediaUrl } from '@/lib/backend-url';
 import { normalizeAvatarUrl, displayNameInitial } from '@/lib/avatar';
 import { PHONE_COUNTRIES } from '@/lib/phoneCountries';
+import {
+  getWhatsAppBridgeMessage,
+  getWhatsAppBridgeProgress,
+  isWhatsAppBridgeConnecting,
+  normalizeWhatsAppBridgeState,
+} from '@/lib/whatsappBridgeStatus';
 import AiSettingsTab from '@/components/settings/AiSettingsTab';
 import UnificationTab from '@/components/settings/UnificationTab';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
@@ -57,6 +64,17 @@ const META_CHANNELS = ['whatsapp', 'instagram', 'facebook'];
 
 /** Order shown in Settings → Channels; fills gaps if API omits a row (e.g. legacy DB). */
 const CHANNEL_LIST_ORDER = ['whatsapp', 'instagram', 'facebook', 'email', 'web_chat'];
+
+function normalizeListPayload(payload, keys = []) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+  for (const key of keys) {
+    if (Array.isArray(payload[key])) return payload[key];
+  }
+  if (Array.isArray(payload.data)) return payload.data;
+  return [];
+}
+
 const MCP_PRESETS = [
   {
     id: 'claude-desktop',
@@ -251,6 +269,7 @@ export default function SettingsPage() {
   // AI / MCP / Social / Logs state
   const [llmEngines, setLlmEngines] = useState([]);
   const [aiAgents, setAiAgents] = useState([]);
+  const [aiConfigError, setAiConfigError] = useState('');
   const [mcpServers, setMcpServers] = useState([]);
   const [socialAccounts, setSocialAccounts] = useState([]);
   const [systemLogs, setSystemLogs] = useState([]);
@@ -267,6 +286,10 @@ export default function SettingsPage() {
   const [waQrLoading, setWaQrLoading] = useState(false);
   const [waQrImageSrc, setWaQrImageSrc] = useState('');
   const [waQrStatus, setWaQrStatus] = useState('');
+  const [waQrProgress, setWaQrProgress] = useState(0);
+  const [waQrMessage, setWaQrMessage] = useState('Starting WhatsApp session');
+  const [waQrRetrying, setWaQrRetrying] = useState(false);
+  const [waQrUpdatedAt, setWaQrUpdatedAt] = useState('');
   const [waQrError, setWaQrError] = useState('');
   const [waDisconnecting, setWaDisconnecting] = useState(false);
   const waQrPollRef = useRef(null);
@@ -296,6 +319,9 @@ export default function SettingsPage() {
     String(waChannelRow?.phone_number_id || '').trim() && String(waChannelRow?.access_token || '').trim()
   );
   const waQrBlocksMeta = waQrStatus === 'ready';
+  const waQrNormalizedStatus = normalizeWhatsAppBridgeState(waQrStatus);
+  const waQrIsConnecting = isWhatsAppBridgeConnecting(waQrNormalizedStatus);
+  const waQrShowProgress = waQrPanelOpen && waQrNormalizedStatus && waQrNormalizedStatus !== 'qr_required';
 
   const isAdmin = user?.role === 'admin';
   const selectedLlmEngine = llmEngines.find((engine) => engine.is_selected) || null;
@@ -303,12 +329,33 @@ export default function SettingsPage() {
   const getAvailableEditRoles = () => ROLE_OPTIONS;
 
   const refreshAiConfig = useCallback(async () => {
-    const [le, ag] = await Promise.all([
-      api.get('/ai/llm-engines').catch(() => ({ data: [] })),
-      api.get('/ai/agents').catch(() => ({ data: [] })),
+    setAiConfigError('');
+    const [le, ag] = await Promise.allSettled([
+      api.get('/ai/llm-engines'),
+      api.get('/ai/agents'),
     ]);
-    setLlmEngines(le.data || []);
-    setAiAgents(ag.data || []);
+
+    const errors = [];
+    if (le.status === 'fulfilled') {
+      setLlmEngines(normalizeListPayload(le.value.data, ['engines', 'models']));
+    } else {
+      errors.push(`LLM engines: ${getErrorMessage(le.reason, 'failed to load')}`);
+    }
+    if (ag.status === 'fulfilled') {
+      setAiAgents(normalizeListPayload(ag.value.data, ['agents']));
+    } else {
+      errors.push(`AI agents: ${getErrorMessage(ag.reason, 'failed to load')}`);
+    }
+    if (errors.length) {
+      const message = errors.join(' | ');
+      setAiConfigError(message);
+      showToast({
+        type: 'error',
+        title: 'AI Settings Load Failed',
+        message,
+        dedupeKey: 'ai-config-load',
+      });
+    }
   }, []);
 
   const loadUnificationData = useCallback(async () => {
@@ -1430,10 +1477,22 @@ export default function SettingsPage() {
     try {
       const res = await api.get('/settings/channels/whatsapp/bridge-qr');
       const d = res.data || {};
-      const st = d.bridge_status || d.status || '';
+      const st = normalizeWhatsAppBridgeState(d.state || d.bridge_status || d.status || '');
+      const progress = getWhatsAppBridgeProgress(st, d.progress);
+      const retrying = Boolean(d.retrying);
+      const statusMessage = getWhatsAppBridgeMessage(st, {
+        message: d.message,
+        retrying,
+      });
       setWaQrStatus(st);
+      setWaQrProgress(progress);
+      setWaQrRetrying(retrying);
+      setWaQrMessage(statusMessage);
+      setWaQrUpdatedAt(String(d.updated_at || ''));
       if (d.detail && !d.qr_data_url && !d.qr_png_base64 && st !== 'ready') {
         setWaQrError(String(d.detail));
+      } else if (d.last_error && st === 'failed' && !retrying) {
+        setWaQrError(String(d.last_error));
       } else {
         setWaQrError('');
       }
@@ -1442,12 +1501,16 @@ export default function SettingsPage() {
           setWaQrImageSrc(d.qr_data_url);
         } else if (d.qr_png_base64) {
           setWaQrImageSrc(`data:image/png;base64,${d.qr_png_base64}`);
-        } else if (st === 'ready') {
+        } else if (st === 'ready' || st === 'authenticated' || st === 'initializing' || st === 'qr_scanned' || st === 'reconnecting') {
           setWaQrImageSrc('');
         } else {
           setWaQrImageSrc('');
         }
         setWaQrLoading(false);
+      }
+      if (st === 'ready' && waQrPollRef.current) {
+        clearInterval(waQrPollRef.current);
+        waQrPollRef.current = null;
       }
       return d;
     } catch (err) {
@@ -1456,6 +1519,8 @@ export default function SettingsPage() {
       if (!silent) {
         setWaQrError(String(msg));
         setWaQrImageSrc('');
+        setWaQrProgress(0);
+        setWaQrMessage('Failed to connect, please scan again');
         setWaQrLoading(false);
       }
       return null;
@@ -1477,6 +1542,10 @@ export default function SettingsPage() {
     try {
       await api.post('/settings/channels/whatsapp/bridge-disconnect', {});
       setWaQrStatus('disconnected');
+      setWaQrProgress(0);
+      setWaQrMessage('Disconnected');
+      setWaQrRetrying(false);
+      setWaQrUpdatedAt('');
       setWaQrImageSrc('');
       setWaQrPanelOpen(false);
       if (waQrPollRef.current) {
@@ -1499,6 +1568,10 @@ export default function SettingsPage() {
     setWaQrError('');
     setWaQrImageSrc('');
     setWaQrStatus('');
+    setWaQrProgress(0);
+    setWaQrMessage('Starting WhatsApp session');
+    setWaQrRetrying(false);
+    setWaQrUpdatedAt('');
     fetchWaBridgeQr();
     if (waQrPollRef.current) clearInterval(waQrPollRef.current);
     waQrPollRef.current = setInterval(() => {
@@ -1778,17 +1851,48 @@ export default function SettingsPage() {
                                     <div className="flex items-start gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900">{waQrError}</div>
                                   )}
                                   {waQrStatus && waQrStatus !== 'ready' && (
-                                    <p className="text-xs font-medium text-slate-600">
-                                      Status: <span className="text-emerald-800">{waQrStatus}</span>
-                                    </p>
+                                    <div className="space-y-2 rounded-lg border border-slate-200 bg-white px-3 py-3" data-testid="whatsapp-bridge-progress">
+                                      <div className="flex items-center justify-between gap-3">
+                                        <div className="min-w-0">
+                                          <p className="text-xs font-semibold text-slate-800">{waQrMessage}</p>
+                                          <p className="text-[11px] text-slate-500">
+                                            Status: <span className="font-medium text-emerald-800">{waQrStatus}</span>
+                                            {waQrRetrying ? <span className="ml-1 text-amber-700">retrying</span> : null}
+                                          </p>
+                                        </div>
+                                        <span className="text-xs font-semibold tabular-nums text-slate-600">{waQrProgress}%</span>
+                                      </div>
+                                      <div
+                                        className="h-2 w-full overflow-hidden rounded-full bg-slate-100"
+                                        role="progressbar"
+                                        aria-label="WhatsApp connection progress"
+                                        aria-valuemin={0}
+                                        aria-valuemax={100}
+                                        aria-valuenow={waQrProgress}
+                                      >
+                                        <div
+                                          className={`h-full rounded-full transition-all duration-700 ${waQrRetrying || waQrNormalizedStatus === 'reconnecting' ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                                          style={{ width: `${Math.max(0, Math.min(100, waQrProgress))}%` }}
+                                        />
+                                      </div>
+                                      {waQrUpdatedAt && (
+                                        <p className="text-[10px] text-slate-400">Updated {waQrUpdatedAt.replace('T', ' ').slice(0, 19)}</p>
+                                      )}
+                                    </div>
                                   )}
                                   <div className="flex min-h-[200px] items-center justify-center rounded-lg border border-slate-200 bg-slate-50/80 p-4">
                                     {waQrImageSrc ? (
                                       <img src={waQrImageSrc} alt="WhatsApp QR" className="max-w-[260px] max-h-[260px] w-full h-auto" />
+                                    ) : waQrShowProgress || waQrIsConnecting ? (
+                                      <div className="w-full max-w-sm text-center" aria-live="polite">
+                                        <div className="mx-auto mb-3 h-9 w-9 animate-spin rounded-full border-2 border-emerald-200 border-t-emerald-600" />
+                                        <p className="text-sm font-medium text-slate-700">{waQrMessage}</p>
+                                        <p className="mt-1 text-xs text-slate-500">Keep this page open while WhatsApp finishes linking.</p>
+                                      </div>
                                     ) : (
                                       <div className="text-center text-sm text-slate-500 px-4">
                                         {waQrLoading && !waQrError
-                                          ? 'Starting session… If this is the first run, the QR can take a few seconds.'
+                                          ? 'Starting session... If this is the first run, the QR can take a few seconds.'
                                           : 'No QR yet. Ensure the WhatsApp bridge service is running (included in Docker Compose).'}
                                       </div>
                                     )}
@@ -2197,6 +2301,7 @@ export default function SettingsPage() {
               company={company} setCompany={setCompany} saveCompany={saveCompany}
               saving={saving} setSaving={setSaving}
               llmEngines={llmEngines} selectedLlmEngine={selectedLlmEngine} refreshAiConfig={refreshAiConfig}
+              aiConfigError={aiConfigError}
               aiAgents={aiAgents} setAiAgents={setAiAgents}
               editingLlmId={editingLlmId} setEditingLlmId={setEditingLlmId} llmDraft={llmDraft} setLlmDraft={setLlmDraft}
               showAddLlmForm={showAddLlmForm} setShowAddLlmForm={setShowAddLlmForm} addLlmForm={addLlmForm} setAddLlmForm={setAddLlmForm}
@@ -2830,19 +2935,19 @@ export default function SettingsPage() {
                       <div className="h-32 bg-slate-50 overflow-hidden relative">
                         {Array.isArray(p.images) && p.images.length > 0 ? (
                           p.images.length === 1 ? (
-                            <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
+                            <img src={resolveMediaUrl(p.images[0])} alt={p.name} className="w-full h-full object-cover" />
                           ) : p.images.length === 2 ? (
                             <div className="grid grid-cols-2 h-full gap-0.5">
-                              <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
-                              <img src={p.images[1]} alt={p.name} className="w-full h-full object-cover" />
+                              <img src={resolveMediaUrl(p.images[0])} alt={p.name} className="w-full h-full object-cover" />
+                              <img src={resolveMediaUrl(p.images[1])} alt={p.name} className="w-full h-full object-cover" />
                             </div>
                           ) : (
                             <div className="grid grid-cols-2 h-full gap-0.5">
-                              <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover" />
+                              <img src={resolveMediaUrl(p.images[0])} alt={p.name} className="w-full h-full object-cover" />
                               <div className="grid grid-rows-2 gap-0.5">
-                                <img src={p.images[1]} alt={p.name} className="w-full h-full object-cover" />
+                                <img src={resolveMediaUrl(p.images[1])} alt={p.name} className="w-full h-full object-cover" />
                                 <div className="relative">
-                                  <img src={p.images[2]} alt={p.name} className="w-full h-full object-cover" />
+                                  <img src={resolveMediaUrl(p.images[2])} alt={p.name} className="w-full h-full object-cover" />
                                   {p.images.length > 3 && <div className="absolute inset-0 bg-black/40 flex items-center justify-center"><span className="text-white text-[11px] font-bold">+{p.images.length - 3}</span></div>}
                                 </div>
                               </div>
@@ -3031,7 +3136,7 @@ export default function SettingsPage() {
                         <div className="grid grid-cols-3 gap-3">
                           {productForm.images.map((img) => (
                             <div key={img.id} className="relative rounded-lg overflow-hidden border border-slate-200 bg-white">
-                              <img src={img.dataUrl} alt={img.name} className="w-full h-24 object-cover" />
+                              <img src={resolveMediaUrl(img.dataUrl)} alt={img.name} className="w-full h-24 object-cover" />
                               <button onClick={() => removeProductImage(img.id)} className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/60 text-white text-xs flex items-center justify-center">×</button>
                             </div>
                           ))}
@@ -3050,26 +3155,26 @@ export default function SettingsPage() {
                       <div className="h-52 overflow-hidden rounded-t-2xl bg-slate-100 relative">
                         {selectedProduct.images.length === 1 ? (
                           <img
-                            src={selectedProduct.images[0]} alt={selectedProduct.name}
+                            src={resolveMediaUrl(selectedProduct.images[0])} alt={selectedProduct.name}
                             className="w-full h-full object-cover cursor-zoom-in"
                             onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 0); }}
                           />
                         ) : selectedProduct.images.length === 2 ? (
                           <div className="grid grid-cols-2 h-full gap-0.5">
                             {selectedProduct.images.map((img, idx) => (
-                              <img key={idx} src={img} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
+                              <img key={idx} src={resolveMediaUrl(img)} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
                                 onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, idx); }} />
                             ))}
                           </div>
                         ) : (
                           <div className="grid grid-cols-2 h-full gap-0.5">
-                            <img src={selectedProduct.images[0]} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
+                            <img src={resolveMediaUrl(selectedProduct.images[0])} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
                               onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 0); }} />
                             <div className="grid grid-rows-2 gap-0.5">
-                              <img src={selectedProduct.images[1]} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
+                              <img src={resolveMediaUrl(selectedProduct.images[1])} alt={selectedProduct.name} className="w-full h-full object-cover cursor-zoom-in"
                                 onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 1); }} />
                               <div className="relative cursor-zoom-in" onClick={(e) => { e.stopPropagation(); openLightbox(selectedProduct.images, 2); }}>
-                                <img src={selectedProduct.images[2]} alt={selectedProduct.name} className="w-full h-full object-cover" />
+                                <img src={resolveMediaUrl(selectedProduct.images[2])} alt={selectedProduct.name} className="w-full h-full object-cover" />
                                 {selectedProduct.images.length > 3 && (
                                   <div className="absolute inset-0 bg-black/50 flex items-center justify-center rounded-br-2xl">
                                     <span className="text-white text-sm font-bold">+{selectedProduct.images.length - 3}</span>
@@ -3162,7 +3267,7 @@ export default function SettingsPage() {
                     <ChevronLeft size={22} />
                   </button>
                   <img
-                    src={lightboxImages[lightboxIndex]}
+                    src={resolveMediaUrl(lightboxImages[lightboxIndex])}
                     alt={`Attachment ${lightboxIndex + 1}`}
                     className="max-h-[88vh] max-w-[90vw] object-contain rounded-lg shadow-2xl"
                     onClick={(e) => e.stopPropagation()}

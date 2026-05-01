@@ -277,15 +277,30 @@ async def unified_channel_webhook(
         from agent_orchestrator.engine import build_orchestrator_engine
         from agent_orchestrator.schemas import MessageWorkflowRequest
         engine = build_orchestrator_engine(db)
+        workflow_metadata = dict(message.metadata or {})
+        if not str(workflow_metadata.get("message_id") or "").strip():
+            workflow_metadata["message_id"] = message.message_id
+        if not str(workflow_metadata.get("external_message_id") or "").strip():
+            workflow_metadata["external_message_id"] = message.message_id
+        if not str(workflow_metadata.get("provider_event_id") or "").strip():
+            workflow_metadata["provider_event_id"] = message.message_id
+        if not str(workflow_metadata.get("idempotency_key") or "").strip():
+            workflow_metadata["idempotency_key"] = (
+                f"channel_webhook:{message.tenant_id}:{message.channel_type.value}:{message.message_id}"
+            )
         workflow_request = MessageWorkflowRequest(
             company_id=message.tenant_id,
             conversation_id=message.resolved_conversation_id or "",
             customer_id=message.resolved_customer_id or "",
+            message_id=message.message_id,
+            external_message_id=message.message_id,
+            provider_event_id=message.message_id,
+            idempotency_key=workflow_metadata["idempotency_key"],
             message_text=message.content,
             channel=message.channel_type.value,
             sender_contact=message.external_user_id,
             trace_id=message.trace_id or "",
-            metadata=message.metadata,
+            metadata=workflow_metadata,
         )
         create_safe_detached_task(
             db,

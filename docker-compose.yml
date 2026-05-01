@@ -50,6 +50,7 @@ x-common-env: &common-env
   WHATSAPP_BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:-}
   WHATSAPP_MODE: ${WHATSAPP_MODE:-bridge}
   WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
+  UPLOAD_STORAGE_DIR: ${UPLOAD_STORAGE_DIR:-/app/uploads}
 
 x-service-defaults: &service-defaults
   env_file:
@@ -114,14 +115,21 @@ services:
       WHATSAPP_WEBHOOK_PATH: ${WHATSAPP_WEBHOOK_PATH:-/api/webhook/meta/whatsapp}
       WHATSAPP_BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:?WHATSAPP_BRIDGE_SECRET is required}
       BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:?WHATSAPP_BRIDGE_SECRET is required}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:?WHATSAPP_PHONE_NUMBER_ID is required}
-      WHATSAPP_BUSINESS_ACCOUNT_ID: ${WHATSAPP_BUSINESS_ACCOUNT_ID:?WHATSAPP_BUSINESS_ACCOUNT_ID is required}
+      # Optional for whatsapp-web.js bridge sessions. Meta Cloud webhooks still use real tenant_meta_config/channel_settings IDs.
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_BUSINESS_ACCOUNT_ID: ${WHATSAPP_BUSINESS_ACCOUNT_ID:-}
       META_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
       WHATSAPP_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
       BRIDGE_COMPANY_ID: ${BRIDGE_COMPANY_ID:-${DEFAULT_TENANT_ID}}
       WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
       MY_WHATSAPP_NUMBER: ${MY_WHATSAPP_NUMBER:-}
       WWEBJS_AUTH_TIMEOUT_MS: ${WWEBJS_AUTH_TIMEOUT_MS:-180000}
+      WWEBJS_READY_AFTER_INIT_TIMEOUT_MS: ${WWEBJS_READY_AFTER_INIT_TIMEOUT_MS:-180000}
+      WWEBJS_INIT_MAX_ATTEMPTS: ${WWEBJS_INIT_MAX_ATTEMPTS:-3}
+      WWEBJS_INIT_RETRY_BASE_DELAY_MS: ${WWEBJS_INIT_RETRY_BASE_DELAY_MS:-3000}
+      WWEBJS_INIT_RETRY_MAX_DELAY_MS: ${WWEBJS_INIT_RETRY_MAX_DELAY_MS:-20000}
+      BRIDGE_READY_TIMEOUT_MS: ${BRIDGE_READY_TIMEOUT_MS:-180000}
+      BRIDGE_CHECK_READY_TIMEOUT_MS: ${BRIDGE_CHECK_READY_TIMEOUT_MS:-180000}
       PUPPETEER_PROTOCOL_TIMEOUT_MS: ${PUPPETEER_PROTOCOL_TIMEOUT_MS:-180000}
       PUPPETEER_NAVIGATION_TIMEOUT_MS: ${PUPPETEER_NAVIGATION_TIMEOUT_MS:-180000}
     expose:
@@ -214,6 +222,8 @@ services:
       - "8003:8003"
     expose:
       - "8003"
+    volumes:
+      - uploads-data:/app/uploads
 
   lead:
     <<: *service-defaults
@@ -329,6 +339,8 @@ services:
       retries: 10
     expose:
       - "8007"
+    volumes:
+      - uploads-data:/app/uploads
 
   analytics:
     <<: *service-defaults
@@ -519,6 +531,7 @@ volumes:
   postgres-data:
   redis-data:
   whatsapp-bridge-auth:
+  uploads-data:
 
 networks:
   pulse-network:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class WorkflowKind(str, Enum):
@@ -85,6 +85,11 @@ class MessageWorkflowRequest(BaseModel):
     customer_id: str = ""
     lead_id: str = ""
     message_id: str = ""
+    external_message_id: str = ""
+    provider_event_id: str = ""
+    idempotency_key: str = ""
+    idempotency_strength: str = ""
+    provider_timestamp: str = ""
     channel: str = "web_chat"
     source: str = ""
     message_text: str = ""
@@ -99,6 +104,29 @@ class MessageWorkflowRequest(BaseModel):
     knowledge_context: str = ""
     run_async_analytics: bool = True
     auto_support: bool = True
+
+    @model_validator(mode="after")
+    def _has_idempotency_material(self):
+        metadata = dict(self.metadata or {})
+        has_external = bool(
+            self.message_id
+            or self.idempotency_key
+            or self.external_message_id
+            or self.provider_event_id
+            or metadata.get("external_message_id")
+            or metadata.get("provider_event_id")
+            or metadata.get("idempotency_key")
+            or metadata.get("message_id")
+        )
+        has_legacy_material = bool(self.conversation_id and self.sender_contact)
+        if not has_external and not has_legacy_material:
+            raise ValueError(
+                "Message workflow requires message_id, external/provider id, idempotency_key, "
+                "or legacy conversation_id + sender_contact material"
+            )
+        if not self.idempotency_strength:
+            self.idempotency_strength = "strong" if has_external else "unstable"
+        return self
 
 
 class LeadWorkflowRequest(BaseModel):

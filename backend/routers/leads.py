@@ -32,6 +32,13 @@ from services.db_helpers import (
     get_or_create_customer_from_contact,
     persist_chat_history,
 )
+from services.lead_stage_service import (
+    apply_message_stage_transition,
+    get_lead_stage_history,
+    normalize_lead_stage,
+    parse_stage_activity,
+    transition_lead_stage,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -198,7 +205,58 @@ def _serialize_lead(lead: dict | None) -> dict | None:
     if not lead:
         return lead
     lead["company"] = lead.get("customer_company_name", "")
+    metadata = lead.get("metadata") if isinstance(lead.get("metadata"), dict) else {}
+    lead["avatar"] = str(
+        lead.get("avatar")
+        or metadata.get("avatar")
+        or metadata.get("profile_picture_url")
+        or metadata.get("provider_avatar_url")
+        or ""
+    )
+    activities = lead.get("activities") if isinstance(lead.get("activities"), list) else []
+    for activity in reversed(activities):
+        if activity.get("type") == "stage_changed":
+            latest_stage = parse_stage_activity(activity)
+            lead["last_stage_update"] = latest_stage
+            lead["last_stage_update_reason"] = latest_stage.get("reason", "")
+            lead["last_stage_update_source"] = latest_stage.get("source", "")
+            break
     return lead
+
+
+async def _load_lead_details(db, lead_id: str, company_id: str) -> dict | None:
+    lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, company_id))
+    if not lead:
+        return None
+    lead["activities"] = rs(
+        await db.fetch(
+            "SELECT * FROM lead_activities WHERE lead_id=$1 AND company_id=$2 ORDER BY created_at",
+            lead_id,
+            company_id,
+        )
+    )
+    lead["nurture_messages"] = rs(
+        await db.fetch(
+            "SELECT * FROM lead_nurture_messages WHERE lead_id=$1 AND company_id=$2 ORDER BY created_at",
+            lead_id,
+            company_id,
+        )
+    )
+    lead["channels"] = [
+        row["channel"]
+        for row in await db.fetch(
+            "SELECT channel FROM lead_channels WHERE lead_id=$1",
+            lead_id,
+        )
+    ]
+    lead["tags"] = [
+        row["tag"]
+        for row in await db.fetch(
+            "SELECT tag FROM lead_tags WHERE lead_id=$1",
+            lead_id,
+        )
+    ]
+    return _serialize_lead(lead)
 
 
 def _normalize_lead_channel(lead: dict) -> str:
@@ -352,6 +410,9 @@ async def _resolve_lead_customer(db, lead: dict, current_user: dict, *, channel:
         ):
             updates.append(f"customer_company_name=${len(args) + 1}")
             args.append(lead["customer_company_name"])
+        if lead.get("id") and customer.get("lead_id") != lead.get("id"):
+            updates.append(f"lead_id=${len(args) + 1}")
+            args.append(lead["id"])
         if updates:
             args.append(customer["id"])
             await db.execute(
@@ -368,7 +429,7 @@ async def _resolve_lead_customer(db, lead: dict, current_user: dict, *, channel:
         return customer
     normalized_channel = str(channel or "").strip().lower()
     if phone:
-        return await get_or_create_customer_from_contact(
+        customer = await get_or_create_customer_from_contact(
             db,
             lead.get("name", ""),
             phone,
@@ -376,6 +437,15 @@ async def _resolve_lead_customer(db, lead: dict, current_user: dict, *, channel:
             email=email,
             channel=normalized_channel,
         )
+        if customer and lead.get("id") and customer.get("lead_id") != lead.get("id"):
+            await db.execute(
+                "UPDATE customers SET lead_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                lead["id"],
+                customer["id"],
+                cid,
+            )
+            customer = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 AND company_id=$2", customer["id"], cid))
+        return customer
     if normalized_channel == "email" and email:
         return await _create_email_only_customer(db, lead, current_user)
     raise HTTPException(
@@ -607,25 +677,10 @@ async def get_lead(lead_id: str, request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     cid = get_company_id(cu)
-    lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
+    lead = await _load_lead_details(db, lead_id, cid)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    lead["activities"] = rs(
-        await db.fetch(
-            "SELECT * FROM lead_activities WHERE lead_id=$1 ORDER BY created_at",
-            lead_id,
-        )
-    )
-    lead["nurture_messages"] = rs(
-        await db.fetch(
-            "SELECT * FROM lead_nurture_messages WHERE lead_id=$1 ORDER BY created_at",
-            lead_id,
-        )
-    )
-    lead["channels"] = [
-        row["channel"] for row in await db.fetch("SELECT channel FROM lead_channels WHERE lead_id=$1", lead_id)
-    ]
-    return _serialize_lead(lead)
+    return lead
 
 
 @router.post("/leads")
@@ -650,7 +705,10 @@ async def create_lead(request: Request):
     name = (body.get("name", "") or "").strip()
     if not any([name, email, phone]):
         raise HTTPException(400, "Lead name, email, or phone is required")
-    status = body.get("status", "new")
+    try:
+        status = normalize_lead_stage(body.get("status", "new"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     source = body.get("source", "web_chat")
     status_id = await resolve_company_reference_id(
         db,
@@ -712,18 +770,20 @@ async def update_lead(lead_id: str, request: Request):
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
     body = await request.json()
+    current = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
+    if not current:
+        raise HTTPException(404, "Lead not found")
     if "company" in body and "customer_company_name" not in body:
         body["customer_company_name"] = body.pop("company")
+    requested_status = None
     body.pop("_id", None)
     if "status" in body:
-        body["status_id"] = await resolve_company_reference_id(
-            db,
-            cid,
-            "lead_statuses",
-            "status_name",
-            body["status"],
-            {"description": "Lead status", "order_index": 999},
-        )
+        try:
+            requested_status = normalize_lead_stage(body.get("status", "new"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        body.pop("status", None)
+        body.pop("status_id", None)
     if "source" in body:
         body["source_id"] = await resolve_company_reference_id(
             db,
@@ -737,7 +797,9 @@ async def update_lead(lead_id: str, request: Request):
             },
         )
     safe_body = {k: v for k, v in body.items() if k in LEAD_UPDATE_FIELDS}
-    if body and not safe_body:
+    if body and not safe_body and not requested_status:
+        raise HTTPException(400, "No valid fields provided")
+    if not safe_body and not requested_status:
         raise HTTPException(400, "No valid fields provided")
     if "phone" in safe_body and (safe_body.get("phone") or "").strip():
         _up = str(safe_body["phone"] or "").strip()
@@ -749,24 +811,41 @@ async def update_lead(lead_id: str, request: Request):
                 "or a valid local number for WHATSAPP_DEFAULT_COUNTRY.",
             )
         safe_body["phone"] = out
-    safe_body["updated_at"] = now_ts()
-    columns = list(safe_body.keys())
-    set_parts = ", ".join(f"{k}=${i + 3}" for i, k in enumerate(columns))
-    values = [safe_body[col] for col in columns]
-    await db.execute(
-        f"UPDATE leads SET {set_parts} WHERE id=$1 AND company_id=$2",
-        lead_id,
-        cid,
-        *values,
-    )
+    if safe_body:
+        safe_body["updated_at"] = now_ts()
+        columns = list(safe_body.keys())
+        set_parts = ", ".join(f"{k}=${i + 3}" for i, k in enumerate(columns))
+        values = [safe_body[col] for col in columns]
+        await db.execute(
+            f"UPDATE leads SET {set_parts} WHERE id=$1 AND company_id=$2",
+            lead_id,
+            cid,
+            *values,
+        )
     updated = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid))
+    if requested_status and requested_status != (current.get("status") or "new"):
+        transition = await transition_lead_stage(
+            db,
+            updated or current,
+            requested_status,
+            reason="Manual stage update",
+            source="manual_update",
+            confidence=1.0,
+            changed_by_user_id=cu.get("sub", ""),
+            event_id=f"manual:{lead_id}:{requested_status}",
+            automatic=False,
+        )
+        updated = transition.get("lead") or r(
+            await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)
+        )
     await _capture_lead_snapshot(
         db,
         updated,
         source=str((updated or {}).get("source") or body.get("source") or "lead"),
         action="lead_updated",
     )
-    return _serialize_lead(updated)
+    detailed = await _load_lead_details(db, lead_id, cid)
+    return detailed or _serialize_lead(updated)
 
 
 @router.delete("/leads/{lead_id}")
@@ -776,6 +855,49 @@ async def delete_lead(lead_id: str, request: Request):
     cid = cu.get("company_id", "")
     await db.execute("DELETE FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)
     return {"status": "deleted"}
+
+
+@router.put("/leads/{lead_id}/stage")
+async def update_lead_stage(lead_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    body = await request.json()
+    try:
+        new_stage = normalize_lead_stage(body.get("stage") or body.get("status"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
+    if not lead:
+        raise HTTPException(404, "Lead not found")
+    transition = await transition_lead_stage(
+        db,
+        lead,
+        new_stage,
+        reason=str(body.get("reason") or "Manual stage update"),
+        source="manual_update",
+        confidence=1.0,
+        changed_by_user_id=cu.get("sub", ""),
+        event_id=str(body.get("event_id") or f"manual:{lead_id}:{new_stage}"),
+        automatic=False,
+    )
+    updated = await _load_lead_details(db, lead_id, cid)
+    return {
+        "status": "ok",
+        "changed": bool(transition.get("changed")),
+        "lead": updated,
+        "stage_history": await get_lead_stage_history(db, lead_id, cid),
+    }
+
+
+@router.get("/leads/{lead_id}/stage-history")
+async def lead_stage_history(lead_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not await db.fetchval("SELECT id FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid):
+        raise HTTPException(404, "Lead not found")
+    return await get_lead_stage_history(db, lead_id, cid)
 
 
 @router.post("/leads/bulk-upload")
@@ -844,9 +966,13 @@ async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
                     update_fields["customer_company_name"] = company_name
                 if _row_has_any(row, "notes", "note", "comments"):
                     update_fields["notes"] = notes_value
-                if status_input:
-                    update_fields["status"] = status_input
-                    update_fields["status_id"] = await resolve_company_reference_id(
+            if status_input:
+                try:
+                    status_input = normalize_lead_stage(status_input)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                update_fields["status"] = status_input
+                update_fields["status_id"] = await resolve_company_reference_id(
                         db,
                         cid,
                         "lead_statuses",
@@ -897,7 +1023,10 @@ async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
                 summary["updated"] += 1
                 continue
 
-            status_value = status_input or "new"
+            try:
+                status_value = normalize_lead_stage(status_input or "new")
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
             source_value = source_input or "web_chat"
             status_id = await resolve_company_reference_id(
                 db,
@@ -1104,6 +1233,69 @@ async def open_lead_conversation(lead_id: str, request: Request):
     return {"conversation": conversation, "customer": customer}
 
 
+@router.put("/leads/{lead_id}/nurture-messages/{message_id}")
+async def update_lead_nurture_message(lead_id: str, message_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    body = await request.json()
+    message_text = str(body.get("message") or body.get("content") or "").strip()
+    if not message_text:
+        raise HTTPException(400, "Nurture message cannot be empty")
+    if not await db.fetchval("SELECT id FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid):
+        raise HTTPException(404, "Lead not found")
+    nurture_message = r(
+        await db.fetchrow(
+            "SELECT * FROM lead_nurture_messages WHERE id=$1 AND lead_id=$2 AND company_id=$3 LIMIT 1",
+            message_id,
+            lead_id,
+            cid,
+        )
+    )
+    if not nurture_message:
+        raise HTTPException(404, "Nurture message not found")
+    phase = str(body.get("phase") or nurture_message.get("phase") or "awareness").strip() or "awareness"
+    await db.execute(
+        "UPDATE lead_nurture_messages SET message=$1,phase=$2 WHERE id=$3 AND lead_id=$4 AND company_id=$5",
+        message_text,
+        phase,
+        message_id,
+        lead_id,
+        cid,
+    )
+    updated_message = r(
+        await db.fetchrow(
+            "SELECT * FROM lead_nurture_messages WHERE id=$1 AND lead_id=$2 AND company_id=$3 LIMIT 1",
+            message_id,
+            lead_id,
+            cid,
+        )
+    )
+    return {
+        "status": "updated",
+        "message": updated_message,
+        "lead": await _load_lead_details(db, lead_id, cid),
+    }
+
+
+@router.delete("/leads/{lead_id}/nurture-messages/{message_id}")
+async def delete_lead_nurture_message(lead_id: str, message_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not await db.fetchval("SELECT id FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid):
+        raise HTTPException(404, "Lead not found")
+    result = await db.execute(
+        "DELETE FROM lead_nurture_messages WHERE id=$1 AND lead_id=$2 AND company_id=$3",
+        message_id,
+        lead_id,
+        cid,
+    )
+    if str(result).upper().endswith(" 0"):
+        raise HTTPException(404, "Nurture message not found")
+    return {"status": "deleted", "message_id": message_id, "lead": await _load_lead_details(db, lead_id, cid)}
+
+
 @router.post("/leads/{lead_id}/nurture-messages/{message_id}/send")
 async def send_lead_nurture_message(lead_id: str, message_id: str, request: Request):
     db = _db(request)
@@ -1134,24 +1326,20 @@ async def send_lead_nurture_message(lead_id: str, message_id: str, request: Requ
         cu,
         requested_channel=requested_channel,
     )
-    refreshed = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid))
-    if refreshed:
-        refreshed["activities"] = rs(
-            await db.fetch(
-                "SELECT * FROM lead_activities WHERE lead_id=$1 ORDER BY created_at",
-                lead_id,
-            )
+    try:
+        await apply_message_stage_transition(
+            db,
+            company_id=cid,
+            lead_id=lead_id,
+            message_text=str(nurture_message.get("message") or ""),
+            direction="outbound",
+            source="message_sent",
+            event_id=str((result.get("message") or {}).get("id") or message_id),
+            changed_by_user_id=cu.get("sub", ""),
         )
-        refreshed["nurture_messages"] = rs(
-            await db.fetch(
-                "SELECT * FROM lead_nurture_messages WHERE lead_id=$1 ORDER BY created_at",
-                lead_id,
-            )
-        )
-        refreshed["channels"] = [
-            row["channel"] for row in await db.fetch("SELECT channel FROM lead_channels WHERE lead_id=$1", lead_id)
-        ]
-        _serialize_lead(refreshed)
+    except Exception as exc:
+        logger.warning("lead nurture stage transition failed lead_id=%s message_id=%s: %s", lead_id, message_id, exc)
+    refreshed = await _load_lead_details(db, lead_id, cid)
     return {
         "status": "sent",
         "conversation_id": result["conversation_id"],
@@ -1175,6 +1363,34 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
         action="lead_converted",
         extra_metadata={"is_converted": True},
     )
+    duplicate_customer = None
+    duplicate_filters = []
+    duplicate_args = [cid]
+    if str(lead.get("email") or "").strip():
+        duplicate_filters.append(f"LOWER(email)=${len(duplicate_args) + 1}")
+        duplicate_args.append(str(lead.get("email") or "").strip().lower())
+    if str(lead.get("phone") or "").strip():
+        duplicate_filters.append(f"phone=${len(duplicate_args) + 1}")
+        duplicate_args.append(str(lead.get("phone") or "").strip())
+    if duplicate_filters:
+        duplicate_customer = r(
+            await db.fetchrow(
+                f"SELECT id FROM customers WHERE company_id=$1 AND ({' OR '.join(duplicate_filters)}) LIMIT 1",
+                *duplicate_args,
+            )
+        )
+    transition = await transition_lead_stage(
+        db,
+        lead,
+        "converted",
+        reason="Converted manually by user",
+        source="conversion",
+        confidence=1.0,
+        changed_by_user_id=cu.get("sub", ""),
+        event_id=f"conversion:{lead_id}",
+        automatic=True,
+    )
+    lead = transition.get("lead") or r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)) or lead
     customer = await convert_lead_to_customer_state(db, lead, cu)
     from core.socket import sio, connected_users
 
@@ -1219,7 +1435,14 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
         trace_id=_trace_id_from_context(),
         event_id=lead_id,
     )
-    return {"status": "converted", "customer": customer, "lead_id": lead_id}
+    refreshed = await _load_lead_details(db, lead_id, cid)
+    return {
+        "status": "converted",
+        "customer": customer,
+        "lead_id": lead_id,
+        "lead": refreshed,
+        "conversion_status": "linked_existing_customer" if duplicate_customer else "converted",
+    }
 
 
 @router.post("/leads/auto-nurture-all")

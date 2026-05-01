@@ -12,6 +12,7 @@ from core.utils import is_valid_image_url, normalize_product_images
 from shared.cache import get_cache_client
 from shared.metrics import increment_counter, observe_histogram, timed_metric
 from services.ai_service.embedding_service import search_similar_embeddings, store_embedding
+from services.ai_service.llm_tracking import has_embedding_budget_remaining
 
 _CATALOG_CACHE_TTL_SECONDS = max(
     30,
@@ -61,6 +62,18 @@ STOPWORDS = {
     "your",
 }
 
+_RAG_SKIP_PHRASES = {
+    "hi",
+    "hello",
+    "hey",
+    "thanks",
+    "thank you",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+}
+
 
 def _normalize_term(text: str) -> str:
     normalized = re.sub(r"[^a-z0-9\s-]", " ", str(text or "").lower())
@@ -97,6 +110,52 @@ def _build_dynamic_category_aliases(categories: list[str]) -> dict[str, str]:
 
 def _tokenize(text: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if token]
+
+
+def _should_skip_rag_query(query: str) -> tuple[bool, str]:
+    normalized = _normalize_term(query)
+    if not normalized:
+        return True, "empty_query"
+    if normalized in _RAG_SKIP_PHRASES:
+        return True, "greeting_or_gratitude"
+    tokens = _tokenize(normalized)
+    if len(tokens) <= 2 and not any(
+        term in normalized
+        for term in (
+            "product",
+            "catalog",
+            "price",
+            "buy",
+            "order",
+            "shipping",
+            "refund",
+            "support",
+            "feature",
+            "service",
+        )
+    ):
+        return True, "short_low_value_query"
+    query_info = understand_product_query(normalized)
+    needs_knowledge = any(
+        term in normalized
+        for term in (
+            "product",
+            "catalog",
+            "price",
+            "buy",
+            "order",
+            "shipping",
+            "refund",
+            "policy",
+            "support",
+            "feature",
+            "service",
+            "plan",
+        )
+    )
+    if not (query_info.get("general") or query_info.get("specific") or needs_knowledge):
+        return True, "no_retrieval_intent"
+    return False, ""
 
 
 def understand_product_query(
@@ -375,16 +434,7 @@ async def rank_products_for_query(
 
     with timed_metric("ai.ranking.total_ms"):
         history_terms = _token_set(history_text)
-        vector_rows = await search_similar_embeddings(
-            db,
-            company_id,
-            query,
-            source_type="company_product",
-            top_k=max(limit * 4, 12),
-        )
-        if not vector_rows and query_info["specific"]:
-            increment_counter("ai.ranking.embedding_seeded")
-            await _ensure_product_embeddings(db, company_id, products)
+        if has_embedding_budget_remaining():
             vector_rows = await search_similar_embeddings(
                 db,
                 company_id,
@@ -392,6 +442,20 @@ async def rank_products_for_query(
                 source_type="company_product",
                 top_k=max(limit * 4, 12),
             )
+        else:
+            logger.info("rag_skipped_embedding company_id=%s reason=embedding_budget_exhausted", company_id)
+            vector_rows = []
+        if not vector_rows and query_info["specific"]:
+            increment_counter("ai.ranking.embedding_seeded")
+            if has_embedding_budget_remaining():
+                await _ensure_product_embeddings(db, company_id, products)
+                vector_rows = await search_similar_embeddings(
+                    db,
+                    company_id,
+                    query,
+                    source_type="company_product",
+                    top_k=max(limit * 4, 12),
+                )
         vector_scores = {
             str(row.get("source_id") or ""): float(row.get("similarity") or 0)
             for row in vector_rows
@@ -468,6 +532,21 @@ async def build_ai_context(
             "product_ids": [],
             "product_attachments": [],
             "products": [],
+        }
+    skip_rag, skip_reason = _should_skip_rag_query(current_query)
+    if skip_rag:
+        logger.info(
+            "rag_skipped company_id=%s reason=%s query_len=%s",
+            company_id or "",
+            skip_reason,
+            len(current_query or ""),
+        )
+        return {
+            "knowledge_text": "",
+            "product_ids": [],
+            "product_attachments": [],
+            "products": [],
+            "rag_called": False,
         }
 
     chunks: list[str] = []
@@ -556,6 +635,7 @@ async def build_ai_context(
         "products": selected_products,
         "product_ids": [product["id"] for product in selected_products],
         "product_attachments": product_attachments[:max_products],
+        "rag_called": True,
     }
 
 

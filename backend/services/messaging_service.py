@@ -9,7 +9,7 @@ import httpx
 from fastapi import HTTPException
 
 from core.config import WHATSAPP_PHONE_ID, WHATSAPP_TOKEN
-from core.phone_normalization import normalize_to_e164_digits, strict_normalize_to_e164_digits
+from channel_layer.channel_identity import normalize_whatsapp_phone
 from shared.config import (
     messaging_http_connect_timeout_seconds,
     messaging_http_keepalive_expiry_seconds,
@@ -69,9 +69,26 @@ def _bridge_headers(*, company_id: str = "", user_id: str = "") -> dict[str, str
     return headers
 
 
-async def _bridge_session_status(*, company_id: str = "", user_id: str = "") -> str:
+def _bridge_scope_for(*, company_id: str = "", user_id: str = "") -> str:
+    scoped_company_id = (company_id or "").strip()
+    scoped_user_id = (user_id or "").strip()
+    if scoped_user_id:
+        return f"user-{scoped_company_id or 'global'}-{scoped_user_id}"
+    if scoped_company_id:
+        return f"company-{scoped_company_id}"
+    return "default"
+
+
+async def _bridge_session_snapshot(*, company_id: str = "", user_id: str = "") -> dict[str, Any]:
     if not _BRIDGE_SECRET:
-        return "not_configured"
+        return {
+            "status": "not_configured",
+            "state": "not_configured",
+            "scope": _bridge_scope_for(company_id=company_id, user_id=user_id),
+            "company_id": (company_id or "").strip(),
+            "user_id": (user_id or "").strip(),
+            "phone": "",
+        }
     try:
         resp = await _HTTP_CLIENT.get(
             f"{_BRIDGE_URL}/session",
@@ -79,16 +96,58 @@ async def _bridge_session_status(*, company_id: str = "", user_id: str = "") -> 
             timeout=whatsapp_bridge_session_timeout_seconds(),
         )
         if resp.status_code != 200 or not resp.content:
-            return "error"
+            return {
+                "status": "error",
+                "state": "error",
+                "scope": _bridge_scope_for(company_id=company_id, user_id=user_id),
+                "company_id": (company_id or "").strip(),
+                "user_id": (user_id or "").strip(),
+                "phone": "",
+            }
         payload = resp.json()
         if not isinstance(payload, dict):
-            return "error"
-        return str(payload.get("status") or "").strip().lower() or "unknown"
+            return {
+                "status": "error",
+                "state": "error",
+                "scope": _bridge_scope_for(company_id=company_id, user_id=user_id),
+                "company_id": (company_id or "").strip(),
+                "user_id": (user_id or "").strip(),
+                "phone": "",
+            }
+        state = str(payload.get("state") or payload.get("status") or "").strip().lower() or "unknown"
+        return {
+            **payload,
+            "status": state,
+            "state": state,
+            "scope": str(payload.get("scope") or _bridge_scope_for(company_id=company_id, user_id=user_id)),
+            "company_id": str(payload.get("company_id") or (company_id or "").strip()),
+            "user_id": str(payload.get("user_id") or (user_id or "").strip()),
+            "phone": str(payload.get("phone") or ""),
+        }
     except httpx.ConnectError:
-        return "offline"
+        return {
+            "status": "offline",
+            "state": "offline",
+            "scope": _bridge_scope_for(company_id=company_id, user_id=user_id),
+            "company_id": (company_id or "").strip(),
+            "user_id": (user_id or "").strip(),
+            "phone": "",
+        }
     except Exception as exc:
         logger.debug("[Bridge] Session status lookup failed: %s", exc)
-        return "error"
+        return {
+            "status": "error",
+            "state": "error",
+            "scope": _bridge_scope_for(company_id=company_id, user_id=user_id),
+            "company_id": (company_id or "").strip(),
+            "user_id": (user_id or "").strip(),
+            "phone": "",
+        }
+
+
+async def _bridge_session_status(*, company_id: str = "", user_id: str = "") -> str:
+    snapshot = await _bridge_session_snapshot(company_id=company_id, user_id=user_id)
+    return str(snapshot.get("state") or snapshot.get("status") or "").strip().lower() or "unknown"
 
 
 def _extract_meta_message_id(payload: Any) -> str:
@@ -154,19 +213,9 @@ async def _normalize_outbound_whatsapp_phone(
         return "", "Phone number is required"
 
     fallback_region = await _company_default_phone_region(db, company_id)
-    normalized = strict_normalize_to_e164_digits(raw_phone, fallback_region=fallback_region)
-    if normalized:
-        return normalized, ""
-
-    fallback_digits = normalize_to_e164_digits(raw_phone, fallback_region=fallback_region)
-    if fallback_digits and fallback_region:
-        logger.warning(
-            "Strict WhatsApp phone normalization failed, keeping digit fallback company_id=%s region=%s raw=%s",
-            (company_id or "").strip(),
-            fallback_region,
-            raw_phone,
-        )
-        return fallback_digits, ""
+    identity = normalize_whatsapp_phone(raw_phone, default_region=fallback_region)
+    if identity.is_valid:
+        return identity.canonical_value.lstrip("+"), ""
 
     return (
         "",
@@ -260,6 +309,11 @@ async def _send_via_bridge(
     db=None,
     company_id: str = "",
     user_id: str = "",
+    conversation_id: str = "",
+    customer_id: str = "",
+    db_message_id: str = "",
+    idempotency_key: str = "",
+    send_attempt: int = 1,
 ) -> tuple[bool, str, str]:
     phone, phone_error = await _normalize_outbound_whatsapp_phone(
         to_phone,
@@ -267,7 +321,20 @@ async def _send_via_bridge(
         company_id=company_id,
     )
     if not phone:
-        logger.warning("send_whatsapp_message: invalid bridge phone company_id=%s error=%s", company_id, phone_error)
+        logger.warning(
+            "whatsapp_outbound_bridge_invalid_phone company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s selected_whatsapp_scope=%s recipient_id=%s send_attempt=%s idempotency_key=%s failure_code=%s error=%s",
+            company_id,
+            user_id,
+            conversation_id,
+            customer_id,
+            db_message_id,
+            _bridge_scope_for(company_id=company_id, user_id=user_id),
+            to_phone,
+            send_attempt,
+            idempotency_key,
+            "INVALID_WHATSAPP_PHONE",
+            phone_error,
+        )
         return False, phone_error or "Phone number is required", ""
     if not _BRIDGE_SECRET:
         return False, "WHATSAPP_BRIDGE_SECRET is not configured", ""
@@ -285,10 +352,41 @@ async def _send_via_bridge(
             except ValueError:
                 data = {}
         if resp.status_code == 200 and isinstance(data, dict) and data.get("success"):
-            logger.info("[Bridge] WhatsApp sent to %s", phone)
+            logger.info(
+                "whatsapp_outbound_bridge_sent company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s bridge_scope=%s selected_whatsapp_scope=%s bridge_state=ready bridge_connected_phone=%s recipient_id=%s send_attempt=%s idempotency_key=%s delivery_status=sent attachment_count=%s",
+                company_id,
+                user_id,
+                conversation_id,
+                customer_id,
+                db_message_id,
+                str(data.get("scope") or _bridge_scope_for(company_id=company_id, user_id=user_id)),
+                _bridge_scope_for(company_id=company_id, user_id=user_id),
+                str(data.get("phone") or ""),
+                phone,
+                send_attempt,
+                idempotency_key,
+                len(attachments or []),
+            )
             return True, "", _extract_meta_message_id(data)
         error_text = _extract_bridge_error(data, resp.text[:300])
-        logger.error("[Bridge] Send failed [%s]: %s", resp.status_code, error_text or resp.text[:300])
+        logger.error(
+            "whatsapp_outbound_bridge_failed company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s bridge_scope=%s selected_whatsapp_scope=%s bridge_state=%s bridge_connected_phone=%s recipient_id=%s send_attempt=%s idempotency_key=%s delivery_status=failed failure_code=%s status_code=%s error=%s",
+            company_id,
+            user_id,
+            conversation_id,
+            customer_id,
+            db_message_id,
+            str(data.get("scope") or _bridge_scope_for(company_id=company_id, user_id=user_id)) if isinstance(data, dict) else _bridge_scope_for(company_id=company_id, user_id=user_id),
+            _bridge_scope_for(company_id=company_id, user_id=user_id),
+            str(data.get("state") or data.get("status") or "") if isinstance(data, dict) else "",
+            str(data.get("phone") or "") if isinstance(data, dict) else "",
+            phone,
+            send_attempt,
+            idempotency_key,
+            str(data.get("code") or "WHATSAPP_BRIDGE_SEND_FAILED") if isinstance(data, dict) else "WHATSAPP_BRIDGE_SEND_FAILED",
+            resp.status_code,
+            error_text or resp.text[:300],
+        )
         return False, error_text or "WhatsApp bridge send failed", ""
     except httpx.ConnectError:
         logger.error("[Bridge] Cannot connect to WhatsApp bridge on %s", _BRIDGE_URL)
@@ -482,21 +580,46 @@ async def send_whatsapp_message(
     company_id: str = "",
     db_message_id: str = "",
     user_id: str = "",
+    conversation_id: str = "",
+    customer_id: str = "",
+    idempotency_key: str = "",
 ) -> tuple[bool, str]:
     scoped_company_id = (company_id or "").strip()
     local_message_id = (db_message_id or "").strip()
     scoped_user_id = (user_id or "").strip()
+    scoped_conversation_id = (conversation_id or "").strip()
+    scoped_customer_id = (customer_id or "").strip()
+    scoped_idempotency_key = (idempotency_key or "").strip()
     sent = False
     error = ""
     external_message_id = ""
     bridge_status = ""
+    bridge_snapshot: dict[str, Any] = {}
     bridge_preferred = False
     if db and scoped_company_id:
-        bridge_status = await _bridge_session_status(
+        bridge_snapshot = await _bridge_session_snapshot(
             company_id=scoped_company_id,
             user_id=scoped_user_id,
         )
+        bridge_status = str(bridge_snapshot.get("state") or bridge_snapshot.get("status") or "").strip().lower()
         bridge_preferred = bridge_status in {"ready", "initializing"}
+        logger.info(
+            "whatsapp_outbound_scope_check company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s bridge_scope=%s selected_whatsapp_scope=%s bridge_state=%s bridge_connected_phone=%s recipient_id=%s send_attempt=%s idempotency_key=%s delivery_status=%s failure_code=%s",
+            scoped_company_id,
+            scoped_user_id,
+            scoped_conversation_id,
+            scoped_customer_id,
+            local_message_id,
+            str(bridge_snapshot.get("scope") or _bridge_scope_for(company_id=scoped_company_id, user_id=scoped_user_id)),
+            _bridge_scope_for(company_id=scoped_company_id, user_id=scoped_user_id),
+            bridge_status,
+            str(bridge_snapshot.get("phone") or ""),
+            to_phone,
+            0,
+            scoped_idempotency_key,
+            "pending",
+            "",
+        )
         try:
             sent, error, external_message_id = await _send_via_tenant_meta(
                 db,
@@ -538,6 +661,11 @@ async def send_whatsapp_message(
             db=db,
             company_id=scoped_company_id,
             user_id=scoped_user_id,
+            conversation_id=scoped_conversation_id,
+            customer_id=scoped_customer_id,
+            db_message_id=local_message_id,
+            idempotency_key=scoped_idempotency_key,
+            send_attempt=1,
         )
     else:
         sent, error, external_message_id = await _send_via_meta(

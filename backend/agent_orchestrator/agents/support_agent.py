@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from agent_orchestrator.agents.base import BaseAgent, WorkflowContextProtocol
 from agent_orchestrator.repository import (
@@ -14,6 +15,44 @@ from services.ai_service.facade import (
     get_company_knowledge,
     should_auto_escalate,
 )
+from services.ai_service.llm_tracking import log_llm_reuse
+from services.ai_service.llm_tracking import has_llm_budget_remaining
+
+logger = logging.getLogger(__name__)
+
+
+def _deterministic_budget_fallback(message_text: str, intent: dict, customer: dict) -> dict:
+    text = str(message_text or "").lower()
+    name = str(customer.get("name") or "there").strip() or "there"
+    intent_name = str((intent or {}).get("intent") or "").lower()
+    if any(token in text for token in ("refund", "complaint", "cancel", "issue", "problem", "support")):
+        response = (
+            f"I can help, {name}. Please share the order/account reference and the one detail that best describes "
+            "what went wrong, and I can route this to a human teammate if needed."
+        )
+        next_action = "collect_support_detail"
+    elif any(token in text for token in ("product", "price", "pricing", "buy", "catalog")) or intent_name in {
+        "product_recommendation",
+        "purchase_inquiry",
+    }:
+        response = f"What budget or use case should I narrow this around, {name}?"
+        next_action = "ask_product_preference"
+    else:
+        response = f"Thanks, {name}. What is the main thing you want help with right now?"
+        next_action = "clarify_request"
+    return {
+        "response": response,
+        "confidence": 0.72,
+        "attachments": [],
+        "product_images": [],
+        "product_ids": [],
+        "provider": "deterministic_fallback",
+        "model_name": "budget-exhausted",
+        "llm_id": "",
+        "next_action": next_action,
+        "llm_budget_exhausted": True,
+        "rag_called": False,
+    }
 
 
 class SupportAgent(BaseAgent):
@@ -38,6 +77,34 @@ class SupportAgent(BaseAgent):
         # Onboarding flow takes precedence for new_customer lifecycle stage.
         lifecycle = str(customer.get("lifecycle_stage") or "").strip().lower()
         latest_text_raw = str(getattr(request, "message_text", "") or "").strip()
+        if not latest_text_raw:
+            logger.info(
+                "support_response_generation_skipped workflow_id=%s message_id=%s reason=empty_message",
+                context.workflow_id,
+                str(getattr(request, "message_id", "") or ""),
+            )
+            return AgentRunResult(
+                agent_name=self.name,
+                payload={
+                    "response": "",
+                    "confidence": 0.0,
+                    "confidence_threshold": 0.7,
+                    "attachments": [],
+                    "product_images": [],
+                    "product_ids": [],
+                    "provider": "none",
+                    "model_name": "",
+                    "llm_id": "",
+                    "knowledge_context": "",
+                    "deliver_response": False,
+                    "escalate": False,
+                    "escalation_reason": "",
+                    "next_action": "ignore_empty_message",
+                    "qualification": qualification,
+                    "reused_prefetched_response": False,
+                    "rag_called": False,
+                },
+            )
         if lifecycle == "new_customer" and latest_text_raw:
             try:
                 from services.ai_service.onboarding_flows import advance_onboarding
@@ -52,6 +119,14 @@ class SupportAgent(BaseAgent):
             except Exception:
                 onboarding = {}
             if onboarding.get("response"):
+                logger.info(
+                    "onboarding_flow_used=true llm_calls_saved=true workflow_id=%s message_id=%s conversation_id=%s company_id=%s step=%s",
+                    context.workflow_id,
+                    str(getattr(request, "message_id", "") or ""),
+                    str(getattr(request, "conversation_id", "") or ""),
+                    context.company_id,
+                    str(onboarding.get("step") or ""),
+                )
                 payload = {
                     "response": str(onboarding.get("response") or ""),
                     "confidence": 0.95,
@@ -71,6 +146,8 @@ class SupportAgent(BaseAgent):
                     "onboarding_step": onboarding.get("step", ""),
                     "onboarding_complete": bool(onboarding.get("complete")),
                     "qualification": qualification,
+                    "reused_prefetched_response": False,
+                    "rag_called": False,
                 }
                 return AgentRunResult(agent_name=self.name, payload=payload)
 
@@ -95,6 +172,8 @@ class SupportAgent(BaseAgent):
                 "next_action": "ask_adaptive_question",
                 "source": "adaptive_qualification",
                 "qualification": qualification,
+                "reused_prefetched_response": False,
+                "rag_called": False,
             }
             return AgentRunResult(agent_name=self.name, payload=payload)
         conversation_history = list(getattr(request, "conversation_context", []) or []) or list(
@@ -106,26 +185,68 @@ class SupportAgent(BaseAgent):
         sentiment_gate = dict(capture.get("sentiment_gate") or {})
         threshold = await fetch_company_ai_threshold(context.db, context.company_id)
         knowledge_context = str(getattr(request, "knowledge_context", "") or "").strip()
-        if not knowledge_context:
-            knowledge_context = await get_company_knowledge(
-                context.db,
-                company_id=context.company_id,
-                current_query=latest_text,
-                top_k=3,
-            )
         prefetched = dict(capture.get("prefetched_support_response") or {})
-        ai_result = prefetched or await generate_ai_response(
-            conversation_history,
-            customer,
-            company_id=context.company_id,
-            db=context.db,
-            knowledge_context=knowledge_context,
-            actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
-            conversation_id=str(getattr(request, "conversation_id", "") or ""),
-            channel=str(getattr(request, "channel", "") or "web_chat"),
-            observed_sentiment=sentiment,
-            observed_intent=intent,
-        )
+        prefetched_response = str(prefetched.get("response") or "").strip()
+        prefetched_invalid = bool(prefetched.get("invalid") or (prefetched.get("api_error") and not prefetched_response))
+        if prefetched_response and not prefetched_invalid:
+            ai_result = prefetched
+            reused_prefetched_response = True
+            logger.info(
+                "support_prefetched_response_reused workflow_id=%s message_id=%s conversation_id=%s company_id=%s provider=%s model=%s reused_prefetched_response=true",
+                context.workflow_id,
+                str(getattr(request, "message_id", "") or ""),
+                str(getattr(request, "conversation_id", "") or ""),
+                context.company_id,
+                str(prefetched.get("provider") or ""),
+                str(prefetched.get("model_name") or ""),
+            )
+            log_llm_reuse(
+                agent_name=self.name.value,
+                function_name="_handle_message_support",
+                call_purpose="support_response",
+                provider=str(prefetched.get("provider") or ""),
+                model=str(prefetched.get("model_name") or ""),
+            )
+        else:
+            reused_prefetched_response = False
+            if prefetched:
+                logger.warning(
+                    "support_prefetched_response_invalid workflow_id=%s message_id=%s conversation_id=%s company_id=%s keys=%s api_error=%s",
+                    context.workflow_id,
+                    str(getattr(request, "message_id", "") or ""),
+                    str(getattr(request, "conversation_id", "") or ""),
+                    context.company_id,
+                    sorted(prefetched.keys()),
+                    bool(prefetched.get("api_error")),
+                )
+            logger.warning(
+                "support_fresh_response_generation workflow_id=%s message_id=%s conversation_id=%s company_id=%s reused_prefetched_response=false",
+                context.workflow_id,
+                str(getattr(request, "message_id", "") or ""),
+                str(getattr(request, "conversation_id", "") or ""),
+                context.company_id,
+            )
+            if not has_llm_budget_remaining():
+                logger.warning(
+                    "support_generation_skipped workflow_id=%s message_id=%s reason=budget_exhausted",
+                    context.workflow_id,
+                    str(getattr(request, "message_id", "") or ""),
+                )
+                ai_result = _deterministic_budget_fallback(latest_text, intent, customer)
+            else:
+                ai_result = await generate_ai_response(
+                    conversation_history,
+                    customer,
+                    company_id=context.company_id,
+                    db=context.db,
+                    knowledge_context=knowledge_context,
+                    actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
+                    conversation_id=str(getattr(request, "conversation_id", "") or ""),
+                    message_id=str(getattr(request, "message_id", "") or ""),
+                    channel=str(getattr(request, "channel", "") or "web_chat"),
+                    observed_sentiment=sentiment,
+                    observed_intent=intent,
+                )
         confidence = float(ai_result.get("confidence", 0.0) or 0.0)
         escalate_for_signal = should_auto_escalate(
             latest_text,
@@ -142,6 +263,9 @@ class SupportAgent(BaseAgent):
             escalation_reason = "Intent and sentiment indicate a human handoff is safer."
         elif confidence < threshold:
             escalation_reason = f"AI confidence {confidence:.2f} is below threshold {threshold:.2f}."
+        if ai_result.get("llm_budget_exhausted"):
+            escalate = False
+            escalation_reason = ""
         payload = {
             "response": str(ai_result.get("response") or ""),
             "confidence": confidence,
@@ -156,8 +280,11 @@ class SupportAgent(BaseAgent):
             "deliver_response": bool(ai_result.get("response")) and not escalate,
             "escalate": escalate,
             "escalation_reason": escalation_reason,
-            "next_action": "manual_review" if escalate else "send_response",
+            "next_action": str(ai_result.get("next_action") or ("manual_review" if escalate else "send_response")),
             "qualification": qualification,
+            "reused_prefetched_response": reused_prefetched_response,
+            "rag_called": bool(ai_result.get("rag_called")),
+            "llm_budget_exhausted": bool(ai_result.get("llm_budget_exhausted")),
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
 

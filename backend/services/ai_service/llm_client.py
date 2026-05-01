@@ -9,7 +9,9 @@ from typing import Any, Optional
 from pydantic import BaseModel
 
 from shared.config import (
+    ai_enable_provider_fallback,
     ai_max_tokens,
+    ai_max_provider_attempts,
     ai_model_name,
     ai_provider_name,
     ai_temperature,
@@ -25,6 +27,7 @@ from shared.config import (
     openai_model_name,
 )
 from services.ai_service.common import _extract_data_url_payload, _sanitize_schema, estimate_tokens
+from services.ai_service.llm_tracking import get_llm_context, reserve_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -195,35 +198,72 @@ def _log_llm_call(
     usage: dict[str, int] | None = None,
     error: Exception | None = None,
     fallback_from: str = "",
+    call_type: str = "text",
+    call_purpose: str = "",
+    function_name: str = "",
+    agent_name: str = "",
+    attempt_number: int = 1,
+    fallback_used: bool = False,
+    call_number: int = 0,
+    token_estimate: int = 0,
 ) -> None:
     usage_payload = usage or _normalize_usage_dict(prompt=prompt, response_text=response_text)
+    context = get_llm_context()
     message = (
-        "llm_call outcome=%s provider=%s model=%s latency_ms=%.2f "
-        "prompt_tokens=%s completion_tokens=%s total_tokens=%s fallback_from=%s"
+        "llm_call outcome=%s message_id=%s conversation_id=%s workflow_id=%s company_id=%s "
+        "agent=%s function=%s provider=%s model=%s purpose=%s call_type=%s attempt=%s "
+        "fallback_used=%s fallback_from=%s call_number=%s budget_count=%s token_estimate=%s latency_ms=%.2f "
+        "prompt_tokens=%s completion_tokens=%s total_tokens=%s"
     )
     if error is None:
         logger.info(
             message,
             outcome,
+            (context.message_id if context else "") or "-",
+            (context.conversation_id if context else "") or "-",
+            (context.workflow_id if context else "") or "-",
+            (context.company_id if context else "") or "-",
+            agent_name or (context.agent_name if context else "") or "-",
+            function_name or "-",
             provider,
             model,
+            call_purpose or "-",
+            call_type or "-",
+            attempt_number,
+            bool(fallback_used),
+            fallback_from or "-",
+            call_number or (context.call_count if context else 0),
+            call_number or (context.call_count if context else 0),
+            token_estimate or estimate_tokens(prompt),
             latency_ms,
             usage_payload.get("prompt_tokens", 0),
             usage_payload.get("completion_tokens", 0),
             usage_payload.get("total_tokens", 0),
-            fallback_from or "-",
         )
         return
     logger.warning(
         message + " error_type=%s error=%s",
         outcome,
+        (context.message_id if context else "") or "-",
+        (context.conversation_id if context else "") or "-",
+        (context.workflow_id if context else "") or "-",
+        (context.company_id if context else "") or "-",
+        agent_name or (context.agent_name if context else "") or "-",
+        function_name or "-",
         provider,
         model,
+        call_purpose or "-",
+        call_type or "-",
+        attempt_number,
+        bool(fallback_used),
+        fallback_from or "-",
+        call_number or (context.call_count if context else 0),
+        call_number or (context.call_count if context else 0),
+        token_estimate or estimate_tokens(prompt),
         latency_ms,
         usage_payload.get("prompt_tokens", 0),
         usage_payload.get("completion_tokens", 0),
         usage_payload.get("total_tokens", 0),
-        fallback_from or "-",
         error.__class__.__name__,
         str(error).splitlines()[0][:240],
     )
@@ -412,15 +452,45 @@ async def call_model_text(
     use_pro: bool = False,
     generation_config: Any = None,
     image_urls: Optional[list[str]] = None,
+    *,
+    call_type: str = "text",
+    call_purpose: str = "",
+    function_name: str = "",
+    agent_name: str = "",
+    max_provider_attempts: int | None = None,
+    allow_provider_fallback: bool | None = None,
+    count_against_budget: bool = True,
 ) -> str:
     selected = dict(engine or _default_engine(use_pro=use_pro))
     primary_provider = (selected.get("provider") or "openai").strip().lower()
     provider_order = _get_fallback_provider_order(primary_provider)
+    if allow_provider_fallback is None:
+        allow_provider_fallback = ai_enable_provider_fallback()
+    if not allow_provider_fallback:
+        provider_order = provider_order[:1]
+    max_attempts = max_provider_attempts if max_provider_attempts is not None else ai_max_provider_attempts()
+    provider_order = provider_order[: max(1, int(max_attempts or 1))]
+    if not provider_order:
+        _, reason = get_provider_runtime_info(primary_provider)
+        raise RuntimeError(reason or f"No configured AI providers are ready for {primary_provider or 'unknown'}")
 
     last_exc: Exception | None = None
-    for provider in provider_order:
+    for attempt_number, provider in enumerate(provider_order, start=1):
         provider_engine = _engine_for_provider(selected, provider, use_pro=use_pro)
         started = time.perf_counter()
+        token_estimate = estimate_tokens(prompt)
+        call_number = reserve_llm_call(
+            agent_name=agent_name,
+            function_name=function_name or "call_model_text",
+            provider=provider,
+            model=str(provider_engine.get("model_name") or ""),
+            call_purpose=call_purpose,
+            call_type=call_type,
+            attempt_number=attempt_number,
+            fallback_used=provider != primary_provider,
+            token_estimate=token_estimate,
+            count_against_budget=count_against_budget,
+        )
         try:
             text, resolved_model, usage = await _call_provider_once(
                 provider,
@@ -438,6 +508,14 @@ async def call_model_text(
                 latency_ms=(time.perf_counter() - started) * 1000.0,
                 usage=usage,
                 fallback_from=primary_provider if provider != primary_provider else "",
+                call_type=call_type,
+                call_purpose=call_purpose,
+                function_name=function_name or "call_model_text",
+                agent_name=agent_name,
+                attempt_number=attempt_number,
+                fallback_used=provider != primary_provider,
+                call_number=call_number,
+                token_estimate=token_estimate,
             )
             return text
         except Exception as exc:
@@ -450,6 +528,14 @@ async def call_model_text(
                 latency_ms=(time.perf_counter() - started) * 1000.0,
                 error=exc,
                 fallback_from=primary_provider if provider != primary_provider else "",
+                call_type=call_type,
+                call_purpose=call_purpose,
+                function_name=function_name or "call_model_text",
+                agent_name=agent_name,
+                attempt_number=attempt_number,
+                fallback_used=provider != primary_provider,
+                call_number=call_number,
+                token_estimate=token_estimate,
             )
             last_exc = exc
             # 429/quota errors are project-level for this provider — skip
@@ -484,6 +570,13 @@ async def call_model_json(
     engine: Optional[dict] = None,
     use_pro: bool = False,
     image_urls: Optional[list[str]] = None,
+    *,
+    call_purpose: str = "",
+    function_name: str = "",
+    agent_name: str = "",
+    max_provider_attempts: int | None = None,
+    allow_provider_fallback: bool | None = None,
+    count_against_budget: bool = True,
 ) -> dict[str, Any]:
     selected = dict(engine or _default_engine(use_pro=use_pro))
     provider = (selected.get("provider") or "openai").strip().lower()
@@ -497,6 +590,13 @@ async def call_model_json(
             engine=selected,
             generation_config=config,
             image_urls=image_urls,
+            call_type="json",
+            call_purpose=call_purpose,
+            function_name=function_name or "call_model_json",
+            agent_name=agent_name,
+            max_provider_attempts=max_provider_attempts,
+            allow_provider_fallback=allow_provider_fallback,
+            count_against_budget=count_against_budget,
         )
     else:
         schema_text = json.dumps(_sanitize_schema(schema.model_json_schema()), ensure_ascii=True)
@@ -505,6 +605,13 @@ async def call_model_json(
             engine=selected,
             generation_config={"response_format": "json_object"},
             image_urls=image_urls,
+            call_type="json",
+            call_purpose=call_purpose,
+            function_name=function_name or "call_model_json",
+            agent_name=agent_name,
+            max_provider_attempts=max_provider_attempts,
+            allow_provider_fallback=allow_provider_fallback,
+            count_against_budget=count_against_budget,
         )
     return schema.model_validate(_extract_json_object(raw)).model_dump()
 
@@ -606,6 +713,12 @@ async def call_with_engines(
     use_pro: bool = False,
     generation_config: Any = None,
     image_parts: Optional[list] = None,
+    *,
+    call_purpose: str = "",
+    function_name: str = "",
+    agent_name: str = "",
+    max_provider_attempts: int | None = None,
+    allow_provider_fallback: bool | None = None,
 ) -> str:
     image_urls = [item for item in (image_parts or []) if isinstance(item, str) and item.startswith("data:")]
     ordered_engines: list[dict] = []
@@ -627,17 +740,40 @@ async def call_with_engines(
             engine=_default_engine(use_pro=use_pro),
             generation_config=generation_config,
             image_urls=image_urls,
+            call_purpose=call_purpose,
+            function_name=function_name or "call_with_engines",
+            agent_name=agent_name,
+            max_provider_attempts=max_provider_attempts,
+            allow_provider_fallback=allow_provider_fallback,
         )
 
     last_exc: Exception | None = None
     quota_exhausted_providers: set[str] = set()
-    for engine in ordered_engines:
+    if allow_provider_fallback is None:
+        allow_provider_fallback = ai_enable_provider_fallback()
+    if not allow_provider_fallback:
+        ordered_engines = ordered_engines[:1]
+    max_attempts = max_provider_attempts if max_provider_attempts is not None else ai_max_provider_attempts()
+    ordered_engines = ordered_engines[: max(1, int(max_attempts or 1))]
+    primary_provider = str(ordered_engines[0].get("provider") or "").strip().lower() if ordered_engines else ""
+    for attempt_number, engine in enumerate(ordered_engines, start=1):
         provider = str(engine.get("provider") or "").strip().lower()
         # 429/RESOURCE_EXHAUSTED is project-level quota; skip all remaining
         # engines for this provider — they will fail identically.
         if provider in quota_exhausted_providers:
             continue
         started = time.perf_counter()
+        call_number = reserve_llm_call(
+            agent_name=agent_name,
+            function_name=function_name or "call_with_engines",
+            provider=provider,
+            model=str(engine.get("model_name") or ""),
+            call_purpose=call_purpose,
+            call_type="text",
+            attempt_number=attempt_number,
+            fallback_used=provider != primary_provider,
+            token_estimate=estimate_tokens(prompt),
+        )
         try:
             text, resolved_model, usage = await _call_provider_once(
                 provider,
@@ -654,6 +790,12 @@ async def call_with_engines(
                 response_text=text,
                 latency_ms=(time.perf_counter() - started) * 1000.0,
                 usage=usage,
+                call_purpose=call_purpose,
+                function_name=function_name or "call_with_engines",
+                agent_name=agent_name,
+                attempt_number=attempt_number,
+                fallback_used=provider != primary_provider,
+                call_number=call_number,
             )
             return text
         except Exception as exc:
@@ -665,6 +807,12 @@ async def call_with_engines(
                 prompt=prompt,
                 latency_ms=(time.perf_counter() - started) * 1000.0,
                 error=exc,
+                call_purpose=call_purpose,
+                function_name=function_name or "call_with_engines",
+                agent_name=agent_name,
+                attempt_number=attempt_number,
+                fallback_used=provider != primary_provider,
+                call_number=call_number,
             )
             last_exc = exc
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str.upper():
@@ -679,6 +827,13 @@ async def call_model_json_batch(
     tasks: dict[str, dict],
     engine: Optional[dict] = None,
     use_pro: bool = False,
+    *,
+    call_purpose: str = "",
+    function_name: str = "",
+    agent_name: str = "",
+    individual_fallback: bool = True,
+    max_provider_attempts: int | None = None,
+    allow_provider_fallback: bool | None = None,
 ) -> dict[str, Any]:
     """Execute multiple JSON-schema tasks in a single LLM request.
 
@@ -732,12 +887,28 @@ async def call_model_json_batch(
                 response_mime_type="application/json",
                 response_schema=combined_schema,
             )
-            raw = await call_model_text(wrapper_prompt, engine=selected, generation_config=config)
+            raw = await call_model_text(
+                wrapper_prompt,
+                engine=selected,
+                generation_config=config,
+                call_type="json_batch",
+                call_purpose=call_purpose or ",".join(tasks.keys()),
+                function_name=function_name or "call_model_json_batch",
+                agent_name=agent_name,
+                max_provider_attempts=max_provider_attempts,
+                allow_provider_fallback=allow_provider_fallback,
+            )
         else:
             raw = await call_model_text(
                 f"Return ONLY valid JSON.\n\n{wrapper_prompt}",
                 engine=selected,
                 generation_config={"response_format": "json_object"},
+                call_type="json_batch",
+                call_purpose=call_purpose or ",".join(tasks.keys()),
+                function_name=function_name or "call_model_json_batch",
+                agent_name=agent_name,
+                max_provider_attempts=max_provider_attempts,
+                allow_provider_fallback=allow_provider_fallback,
             )
         parsed = _extract_json_object(raw)
         results: dict[str, Any] = {}
@@ -761,12 +932,22 @@ async def call_model_json_batch(
         logger.warning(
             "llm_batch_call failed, falling back to individual calls: %s", exc
         )
+        if not individual_fallback:
+            return {key: None for key in tasks}
         # Individual fallback
         fallback: dict[str, Any] = {}
         for key, spec in tasks.items():
             try:
                 fallback[key] = await call_model_json(
-                    spec["prompt"], spec["schema"], engine=engine, use_pro=use_pro
+                    spec["prompt"],
+                    spec["schema"],
+                    engine=engine,
+                    use_pro=use_pro,
+                    call_purpose=f"batch_individual_fallback:{key}",
+                    function_name=function_name or "call_model_json_batch",
+                    agent_name=agent_name,
+                    max_provider_attempts=1,
+                    allow_provider_fallback=False,
                 )
             except Exception as exc2:
                 logger.warning("llm_batch_call individual fallback failed for %s: %s", key, exc2)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from agent_orchestrator.agents.base import BaseAgent, WorkflowContextProtocol
 from agent_orchestrator.schemas import AgentName, AgentRunResult, WorkflowKind
 from services.ai_service.facade import generate_lead_score
+from services.ai_service.llm_tracking import has_llm_budget_remaining
+
+logger = logging.getLogger(__name__)
 
 
 class QualificationAgent(BaseAgent):
@@ -21,7 +25,7 @@ class QualificationAgent(BaseAgent):
         lifecycle_stage = str(customer.get("lifecycle_stage") or "").strip().lower()
 
         qualification_hint = dict(capture.get("qualification_hint") or {})
-        ready_for_scoring = bool(qualification_hint.get("ready_for_scoring", True))
+        ready_for_scoring = qualification_hint.get("ready_for_scoring") is True
         next_question = str(qualification_hint.get("next_question") or "").strip()
 
         # Defer scoring until adaptive questioning has collected enough info,
@@ -31,8 +35,13 @@ class QualificationAgent(BaseAgent):
             context.workflow_kind == WorkflowKind.MESSAGE
             and lifecycle_stage != "customer"
             and not ready_for_scoring
-            and next_question
         ):
+            logger.info(
+                "qualification_scoring_skipped workflow_id=%s company_id=%s reason=adaptive_incomplete missing_fields=%s",
+                context.workflow_id,
+                context.company_id,
+                list(qualification_hint.get("missing_fields") or []),
+            )
             payload = {
                 "score": 0,
                 "grade": "in_discovery",
@@ -44,16 +53,22 @@ class QualificationAgent(BaseAgent):
                     "Adaptive qualification is still collecting required fields "
                     f"({', '.join(qualification_hint.get('missing_fields', []))})."
                 ),
-                "next_action": next_question,
+                "next_action": next_question or "Continue support conversation",
                 "structured_lead": structured_lead,
                 "adaptive_question": next_question,
                 "missing_fields": list(qualification_hint.get("missing_fields") or []),
                 "completed_fields": list(qualification_hint.get("completed_fields") or []),
                 "ready_for_scoring": False,
+                "qualification_scoring_called": False,
             }
             return AgentRunResult(agent_name=self.name, payload=payload)
 
         if context.workflow_kind == WorkflowKind.MESSAGE and lifecycle_stage == "customer":
+            logger.info(
+                "qualification_scoring_skipped workflow_id=%s company_id=%s reason=existing_customer",
+                context.workflow_id,
+                context.company_id,
+            )
             payload = {
                 "score": 95,
                 "grade": "customer",
@@ -63,9 +78,39 @@ class QualificationAgent(BaseAgent):
                 "route_to_support": True,
                 "reasoning": "Existing customer conversation routed directly to support.",
                 "next_action": "Respond to customer",
+                "qualification_scoring_called": False,
             }
             return AgentRunResult(agent_name=self.name, payload=payload)
 
+        if not has_llm_budget_remaining():
+            logger.info(
+                "qualification_scoring_skipped workflow_id=%s company_id=%s reason=budget_exhausted",
+                context.workflow_id,
+                context.company_id,
+            )
+            payload = {
+                "score": 0,
+                "grade": "deferred",
+                "phase": str(structured_lead.get("phase") or "awareness"),
+                "classification": "scoring_deferred_budget_exhausted",
+                "lead_status": str(structured_lead.get("status") or lifecycle_stage or "new"),
+                "route_to_support": bool(
+                    context.workflow_kind == WorkflowKind.MESSAGE or getattr(context.request, "auto_support", True)
+                ),
+                "reasoning": "Lead scoring deferred because the message AI budget was exhausted.",
+                "next_action": "Continue support conversation; score lead asynchronously later.",
+                "structured_lead": structured_lead,
+                "ready_for_scoring": True,
+                "qualification_scoring_called": False,
+            }
+            return AgentRunResult(agent_name=self.name, payload=payload)
+
+        logger.info(
+            "qualification_scoring_executed workflow_id=%s company_id=%s workflow_kind=%s",
+            context.workflow_id,
+            context.company_id,
+            context.workflow_kind.value,
+        )
         score_result = await generate_lead_score(
             structured_lead,
             db=context.db,
@@ -90,6 +135,7 @@ class QualificationAgent(BaseAgent):
             "structured_lead": structured_lead,
             "ready_for_scoring": True,
             "completed_fields": list(qualification_hint.get("completed_fields") or []),
+            "qualification_scoring_called": True,
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
 

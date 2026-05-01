@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 from typing import Any
+
+from fastapi.encoders import jsonable_encoder
 
 from agent_orchestrator.repository import (
     fetch_conversation,
@@ -12,11 +17,14 @@ from agent_orchestrator.schemas import GlobalMemory, WorkflowKind
 from core.utils import make_id
 from shared.cache import get_cache_client
 
+logger = logging.getLogger(__name__)
+
 
 class MemoryStore:
     def __init__(self, db) -> None:
         self.db = db
         self.cache = get_cache_client(namespace="agent_orchestrator_memory")
+        self._saved_hashes: dict[str, str] = {}
 
     def _memory_key(
         self,
@@ -84,7 +92,13 @@ class MemoryStore:
         return memory
 
     async def save_global_memory(self, memory: GlobalMemory) -> None:
-        payload = memory.model_dump()
+        payload = jsonable_encoder(memory.model_dump(mode="json"))
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str, ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+        if self._saved_hashes.get(payload["memory_key"]) == payload_hash:
+            logger.debug("global_memory_save_skipped reason=unchanged memory_key=%s", payload["memory_key"])
+            return
         await self.db.execute(
             "INSERT INTO global_memory("
             "id,memory_key,company_id,conversation_id,customer_id,lead_id,identity_context,"
@@ -109,6 +123,7 @@ class MemoryStore:
             payload["shared_context"],
         )
         await self.cache.set_json(payload["memory_key"], payload, ttl_seconds=3600)
+        self._saved_hashes[payload["memory_key"]] = payload_hash
 
     async def save_agent_memory(
         self,
@@ -120,6 +135,7 @@ class MemoryStore:
         memory_key: str,
         memory_value: dict[str, Any],
     ) -> None:
+        encoded_memory_value = jsonable_encoder(memory_value or {})
         await self.db.execute(
             "INSERT INTO agent_memory("
             "id,workflow_id,company_id,trace_id,agent_name,memory_key,memory_value,created_at,updated_at"
@@ -132,5 +148,5 @@ class MemoryStore:
             trace_id,
             agent_name,
             memory_key,
-            memory_value,
+            encoded_memory_value,
         )

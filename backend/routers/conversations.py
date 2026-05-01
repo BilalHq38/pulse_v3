@@ -5,7 +5,14 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse
 from agent_orchestrator.schemas import MessageWorkflowRequest
+from channel_layer.channel_identity import (
+    company_default_phone_region,
+    normalize_email as normalize_channel_email,
+    normalize_whatsapp_phone,
+    resolve_outbound_recipient as resolve_channel_outbound_recipient,
+)
 from channel_layer.router import get_outbound_router
 from channel_layer.schemas import ChannelType
 
@@ -33,9 +40,12 @@ from services.db_helpers import (
     persist_user_ai_memory,
     r,
     refresh_conversation_rollup,
+    normalize_attachment_row,
     rs,
     save_message_attachments,
 )
+from services.lead_stage_service import apply_message_stage_transition
+from services.media_storage import serve_stored_media
 
 from shared.usage_guard import check_conversation_limit, reserve_conversation_usage
 
@@ -91,21 +101,48 @@ def _channel_type_from_name(channel: str) -> Optional[ChannelType]:
 
 def _resolve_conversation_recipient(channel: str, convo: dict, customer: dict) -> str:
     normalized = str(channel or "").strip().lower()
-    conversation_channel_id = str(convo.get("channel_id") or convo.get("session_id") or "").strip()
+    identity = resolve_channel_outbound_recipient(normalized, convo, customer)
+    if identity.is_valid:
+        return identity.canonical_value
+    logger.warning(
+        "Failed to resolve conversation recipient channel=%s conversation_id=%s customer_id=%s raw=%s reason=%s",
+        normalized,
+        convo.get("id", ""),
+        customer.get("id", ""),
+        identity.raw_value,
+        identity.reason,
+    )
     if normalized == "whatsapp":
-        return str(conversation_channel_id or customer.get("phone") or "").strip()
-    if normalized in {"facebook", "instagram"}:
-        return str(
-            conversation_channel_id
-            or customer.get("phone")
-            or customer.get("email")
-            or ""
-        ).strip()
-    if normalized == "web_chat":
-        return str(conversation_channel_id or customer.get("email") or customer.get("id") or "").strip()
-    if normalized == "email":
-        return str(conversation_channel_id or customer.get("email") or "").strip()
+        return str(convo.get("channel_id") or customer.get("phone") or "").strip()
     return ""
+
+
+async def _mark_outbound_message_failed(
+    db,
+    *,
+    company_id: str,
+    db_message_id: str,
+    error: str = "",
+) -> None:
+    scoped_company_id = str(company_id or "").strip()
+    local_message_id = str(db_message_id or "").strip()
+    if not db or not scoped_company_id or not local_message_id:
+        return
+    try:
+        await db.execute(
+            "UPDATE messages SET delivery_status='failed', failed_at=COALESCE(failed_at, NOW()), updated_at=NOW() "
+            "WHERE id=$1 AND company_id=$2",
+            local_message_id,
+            scoped_company_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to mark outbound message failed company_id=%s message_id=%s error=%s update_error=%s",
+            scoped_company_id,
+            local_message_id,
+            error,
+            exc,
+        )
 
 
 async def _send_outbound_via_channel_layer(
@@ -123,15 +160,67 @@ async def _send_outbound_via_channel_layer(
 ) -> tuple[bool, str]:
     channel_type = _channel_type_from_name(channel)
     if not channel_type:
-        return False, f"Unsupported outbound channel: {channel}"
+        error = f"Unsupported outbound channel: {channel}"
+        await _mark_outbound_message_failed(db, company_id=company_id, db_message_id=db_message_id, error=error)
+        return False, error
 
     recipient = str(recipient_id or "").strip()
+    selected_recipient = recipient
+    if channel_type == ChannelType.WHATSAPP:
+        default_region = await company_default_phone_region(db, company_id)
+        identity = normalize_whatsapp_phone(recipient, default_region=default_region)
+        if not identity.is_valid:
+            error = (
+                "Invalid WhatsApp phone number. Save the contact number in full international format "
+                "or set the tenant default phone region in Company Settings."
+            )
+            logger.warning(
+                "Invalid WhatsApp outbound recipient trace_id=%s company_id=%s conversation_id=%s customer_id=%s "
+                "channel=%s message_id=%s raw_identity=%s normalized_identity=%s selected_outbound_recipient=%s reason=%s",
+                str((metadata or {}).get("trace_id") or ""),
+                company_id,
+                conversation_id,
+                str((metadata or {}).get("customer_id") or ""),
+                channel,
+                db_message_id,
+                recipient,
+                identity.canonical_value,
+                selected_recipient,
+                identity.reason,
+            )
+            await _mark_outbound_message_failed(db, company_id=company_id, db_message_id=db_message_id, error=error)
+            return False, error
+        recipient = identity.canonical_value
+        selected_recipient = recipient
+    elif channel_type == ChannelType.EMAIL:
+        identity = normalize_channel_email(recipient)
+        if not identity.is_valid:
+            error = "Invalid recipient email address"
+            await _mark_outbound_message_failed(db, company_id=company_id, db_message_id=db_message_id, error=error)
+            return False, error
+        recipient = identity.canonical_value
+        selected_recipient = recipient
     if not recipient:
-        return False, "Missing outbound recipient"
+        error = "Missing outbound recipient"
+        await _mark_outbound_message_failed(db, company_id=company_id, db_message_id=db_message_id, error=error)
+        return False, error
 
     message_metadata = dict(metadata or {})
     if not message_metadata.get("trace_id"):
         message_metadata["trace_id"] = _trace_id_from_context()
+    logger.info(
+        "Outbound recipient resolved trace_id=%s company_id=%s conversation_id=%s customer_id=%s channel=%s "
+        "message_id=%s raw_identity=%s normalized_identity=%s selected_outbound_recipient=%s",
+        message_metadata.get("trace_id", ""),
+        company_id,
+        conversation_id,
+        str(message_metadata.get("customer_id") or ""),
+        channel,
+        db_message_id,
+        recipient_id,
+        recipient,
+        selected_recipient,
+    )
 
     result = await get_outbound_router().send_to_channel(
         tenant_id=str(company_id or "").strip(),
@@ -176,17 +265,25 @@ async def _load_message_with_attachments(db, message_id: str) -> dict:
         "SELECT * FROM message_attachments WHERE message_id=$1 ORDER BY created_at ASC",
         message_id,
     )
-    msg["attachments"] = [
-        {
-            "id": row["id"],
-            "type": row["file_type"],
-            "url": row["file_url"],
-            "name": row["file_name"],
-            "size": row["file_size"],
-        }
-        for row in rows
-    ]
+    msg["attachments"] = [normalize_attachment_row(dict(row)) for row in rows]
     return msg
+
+
+async def _load_scoped_conversation(db, convo_id: str, current_user: dict) -> dict:
+    cid = get_company_id(current_user)
+    if cid:
+        convo = r(
+            await db.fetchrow(
+                "SELECT * FROM conversations WHERE id=$1 AND company_id=$2 LIMIT 1",
+                convo_id,
+                cid,
+            )
+        )
+    else:
+        convo = r(await db.fetchrow("SELECT * FROM conversations WHERE id=$1 LIMIT 1", convo_id))
+    if not convo:
+        raise HTTPException(404, "Conversation not found")
+    return convo
 
 
 @router.get("/conversations")
@@ -257,6 +354,17 @@ async def start_outbound_conversation(request: Request):
         contact_ref = (body.get("phone", "") or "").strip()
         if not contact_ref:
             raise HTTPException(400, "Phone number is required for WhatsApp")
+        identity = normalize_whatsapp_phone(
+            contact_ref,
+            default_region=await company_default_phone_region(db, cid),
+        )
+        if not identity.is_valid:
+            raise HTTPException(
+                400,
+                "Invalid WhatsApp phone number. Save the contact number in full international format "
+                "or set the tenant default phone region in Company Settings.",
+            )
+        contact_ref = identity.canonical_value
         recipient_id = ""
     else:
         recipient_id = (body.get("recipient_id", "") or "").strip()
@@ -308,6 +416,10 @@ async def start_outbound_conversation(request: Request):
             "actor_user_id": cu.get("sub", ""),
             "actor_user_role": cu.get("role", ""),
             "trace_id": _trace_id_from_context(),
+            "customer_id": str(customer.get("id") or ""),
+            "raw_sender_id": str(contact_ref or recipient_id or ""),
+            "normalized_sender_id": outbound_recipient,
+            "selected_outbound_recipient": outbound_recipient,
         },
     )
     await db.execute(
@@ -510,8 +622,14 @@ async def delete_conversation(convo_id: str, request: Request):
 @router.get("/conversations/{convo_id}/messages")
 async def get_messages(convo_id: str, request: Request):
     db = _db(request)
-    await get_current_user_flexible(request)
+    cu = await get_current_user_flexible(request)
+    await _load_scoped_conversation(db, convo_id, cu)
     return await fetch_messages_with_attachments(db, convo_id, limit=500)
+
+
+@router.get("/conversations/attachments/media/{company_id}/{filename}")
+async def get_conversation_attachment_media(company_id: str, filename: str) -> FileResponse:
+    return serve_stored_media(category="message-attachments", company_id=company_id, filename=filename)
 
 
 @router.post("/conversations/{convo_id}/messages", dependencies=[_send_message_dep])
@@ -522,9 +640,7 @@ async def send_message(convo_id: str, request: Request):
     content = (body.get("content", "") or "").strip()
     sender_type = body.get("sender_type", "agent")
     attachments = body.get("attachments", []) if isinstance(body.get("attachments", []), list) else []
-    convo = r(await db.fetchrow("SELECT * FROM conversations WHERE id=$1 LIMIT 1", convo_id))
-    if not convo:
-        raise HTTPException(404, "Conversation not found")
+    convo = await _load_scoped_conversation(db, convo_id, cu)
     if not content and not attachments:
         raise HTTPException(400, "Message content or an attachment is required")
 
@@ -683,6 +799,26 @@ async def send_message(convo_id: str, request: Request):
             logger.error(f"Message orchestration failed: {e}")
     message = await _load_message_with_attachments(db, msg_id)
     await emit_new_message(convo_id, message)
+    if sender_type in {"agent", "customer"}:
+        try:
+            await apply_message_stage_transition(
+                db,
+                company_id=company_id,
+                customer_id=str(convo.get("customer_id") or ""),
+                message_text=content,
+                direction="outbound" if sender_type == "agent" else "inbound",
+                source="message_sent" if sender_type == "agent" else "customer_reply",
+                event_id=msg_id,
+                changed_by_user_id=cu.get("sub", "") if sender_type == "agent" else "",
+            )
+        except Exception as exc:
+            logger.warning(
+                "conversation lead stage transition failed conversation_id=%s message_id=%s sender_type=%s: %s",
+                convo_id,
+                msg_id,
+                sender_type,
+                exc,
+            )
 
     # Ingest into ETL pipeline (fire-and-forget)
     try:
@@ -752,6 +888,10 @@ async def send_message(convo_id: str, request: Request):
                 "actor_user_id": cu.get("sub", ""),
                 "actor_user_role": cu.get("role", ""),
                 "trace_id": trace_id,
+                "customer_id": str(convo.get("customer_id") or ""),
+                "raw_sender_id": str(convo.get("channel_id") or ""),
+                "normalized_sender_id": recipient_id,
+                "selected_outbound_recipient": recipient_id,
             },
         )
         outbound_delivered = bool(sent)
@@ -934,6 +1074,10 @@ async def send_message(convo_id: str, request: Request):
                                 "actor_user_id": cu.get("sub", ""),
                                 "actor_user_role": cu.get("role", ""),
                                 "trace_id": trace_id,
+                                "customer_id": str(convo.get("customer_id") or ""),
+                                "raw_sender_id": str(convo.get("channel_id") or ""),
+                                "normalized_sender_id": recipient_id,
+                                "selected_outbound_recipient": recipient_id,
                             },
                         )
                         if not sent:
@@ -1074,9 +1218,41 @@ async def trigger_ai_response(convo_id: str, request: Request):
     trace_id = _trace_id_from_context()
     msgs_history = await fetch_messages_with_attachments(db, convo_id, limit=20)
     cust = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 LIMIT 1", convo.get("customer_id", "")))
-    last_cust_msg = next(
-        (m.get("content", "") for m in reversed(msgs_history) if m.get("sender_type") == "customer"),
-        "(manual trigger)",
+    last_cust_msg_record = next(
+        (dict(m or {}) for m in reversed(msgs_history) if (m or {}).get("sender_type") == "customer"),
+        {},
+    )
+    last_cust_msg = str(last_cust_msg_record.get("content") or "").strip() or "(manual trigger)"
+    last_cust_msg_id = str(last_cust_msg_record.get("id") or "").strip()
+    last_external_msg_id = str(last_cust_msg_record.get("external_message_id") or "").strip()
+    sender_contact = _resolve_conversation_recipient(str(convo.get("channel") or "web_chat"), convo, cust or {})
+    manual_idempotency_key = (
+        f"manual_ai_respond:{company_id}:{convo_id}:{last_external_msg_id or last_cust_msg_id or trace_id or make_id()}"
+    )
+    request_metadata = {
+        "source": "manual_ai_respond",
+        "trace_id": trace_id,
+        "message_id": manual_idempotency_key,
+        "external_message_id": last_external_msg_id,
+        "provider_event_id": last_external_msg_id,
+        "idempotency_key": manual_idempotency_key,
+        "raw_sender_id": str(convo.get("channel_id") or sender_contact or ""),
+        "normalized_sender_id": sender_contact,
+        "selected_outbound_recipient": sender_contact,
+        "customer_id": str(convo.get("customer_id") or ""),
+    }
+    logger.info(
+        "Manual AI response workflow request trace_id=%s company_id=%s conversation_id=%s customer_id=%s "
+        "channel=%s message_id=%s raw_identity=%s normalized_identity=%s selected_outbound_recipient=%s",
+        trace_id,
+        company_id,
+        convo_id,
+        str(convo.get("customer_id") or ""),
+        str(convo.get("channel") or "web_chat"),
+        manual_idempotency_key,
+        request_metadata["raw_sender_id"],
+        sender_contact,
+        sender_contact,
     )
     workflow = await orchestrate_message_workflow(
         MessageWorkflowRequest(
@@ -1084,15 +1260,20 @@ async def trigger_ai_response(convo_id: str, request: Request):
             company_id=company_id,
             conversation_id=convo_id,
             customer_id=convo.get("customer_id", ""),
+            message_id=manual_idempotency_key,
+            external_message_id=last_external_msg_id,
+            provider_event_id=last_external_msg_id,
+            idempotency_key=manual_idempotency_key,
             channel=str(convo.get("channel") or "web_chat"),
             source="manual_ai_respond",
             message_text=last_cust_msg,
             sender_name=str((cust or {}).get("name") or convo.get("customer_name") or ""),
+            sender_contact=sender_contact,
             actor_user_id=cu.get("sub", ""),
             actor_user_role=cu.get("role", ""),
             conversation_context=msgs_history,
             customer=cust or {},
-            metadata={"source": "manual_ai_respond", "trace_id": trace_id},
+            metadata=request_metadata,
         ),
         authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
         db=db,
@@ -1189,6 +1370,10 @@ async def trigger_ai_response(convo_id: str, request: Request):
                     "actor_user_id": cu.get("sub", ""),
                     "actor_user_role": cu.get("role", ""),
                     "trace_id": trace_id,
+                    "customer_id": str(convo.get("customer_id") or ""),
+                    "raw_sender_id": str(convo.get("channel_id") or ""),
+                    "normalized_sender_id": recipient_id,
+                    "selected_outbound_recipient": recipient_id,
                 },
             )
             if not sent:
@@ -1230,7 +1415,8 @@ async def list_conversation_logs(convo_id: str, request: Request):
 async def list_message_attachments(message_id: str, request: Request):
     db = _db(request)
     await get_current_user_flexible(request)
-    return rs(await db.fetch("SELECT * FROM message_attachments WHERE message_id=$1", message_id))
+    rows = rs(await db.fetch("SELECT * FROM message_attachments WHERE message_id=$1", message_id))
+    return [normalize_attachment_row(row) for row in rows]
 
 
 @router.post("/communications/email/send")

@@ -221,6 +221,8 @@ class InstagramAdapter(BaseChannelAdapter):
                             UnifiedAttachment(
                                 type=att_type or "file",
                                 url=url,
+                                provider_media_id=str(att_payload.get("id") or att.get("id") or "").strip(),
+                                raw_metadata={"provider": "instagram", "attachment": att},
                             )
                         )
                         result["message_type"] = att_type or "attachment"

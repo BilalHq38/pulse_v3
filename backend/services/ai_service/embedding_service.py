@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 from typing import Optional
 
 from core.utils import make_id
+from shared.cache import get_cache_client
 from services.ai_service.llm_client import (
     GEMINI_EMBEDDING_MODEL,
     OPENAI_EMBEDDING_MODEL,
@@ -12,10 +15,60 @@ from services.ai_service.llm_client import (
     _engine_for_provider,
     get_provider_runtime_info,
 )
+from services.ai_service.llm_tracking import get_llm_context, reserve_embedding_call
 
 logger = logging.getLogger(__name__)
 
 _PREFERRED_EMBEDDING_PROVIDER = (os.getenv("AI_EMBEDDING_PROVIDER", "") or "").strip().lower()
+_EMBEDDING_CACHE = get_cache_client(namespace="ai-embeddings")
+_EMBEDDING_CACHE_TTL_SECONDS = max(300, int(os.getenv("AI_EMBEDDING_CACHE_TTL_SECONDS", "86400") or 86400))
+_EMBEDDING_PROVIDER_FALLBACK = os.getenv("AI_ENABLE_EMBEDDING_PROVIDER_FALLBACK", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _normalize_embedding_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _embedding_cache_key(text: str) -> str:
+    normalized = _normalize_embedding_text(text)[:8000]
+    return "embed:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _should_skip_embedding_search(text: str) -> bool:
+    normalized = _normalize_embedding_text(text)
+    if len(normalized) < 12:
+        return True
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    if len(tokens) <= 2 and not any(
+        token in normalized
+        for token in ("product", "catalog", "price", "buy", "order", "plan", "service", "feature")
+    ):
+        return True
+    return False
+
+
+def _log_embedding_attempt(provider: str, model: str, attempt_number: int, text: str) -> None:
+    context = get_llm_context()
+    logger.info(
+        "llm_call outcome=attempt message_id=%s conversation_id=%s workflow_id=%s company_id=%s "
+        "agent=%s function=generate_embedding provider=%s model=%s purpose=embedding "
+        "call_type=embedding attempt=%s fallback_used=%s token_estimate=%s",
+        (context.message_id if context else "") or "-",
+        (context.conversation_id if context else "") or "-",
+        (context.workflow_id if context else "") or "-",
+        (context.company_id if context else "") or "-",
+        (context.agent_name if context else "") or "-",
+        provider or "-",
+        model or "-",
+        attempt_number,
+        attempt_number > 1,
+        len(text.strip()) // 4,
+    )
 
 
 def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
@@ -46,13 +99,40 @@ def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
 async def generate_embedding(text: str, engine: dict | None = None) -> Optional[list[float]]:
     if not text or not text.strip():
         return None
+    cache_key = _embedding_cache_key(text)
+    cached = await _EMBEDDING_CACHE.get_json(cache_key)
+    if isinstance(cached, list):
+        logger.info("embedding_cache_hit text_hash=%s dimensions=%s", cache_key[6:18], len(cached))
+        return [float(item) for item in cached]
+    logger.info("embedding_cache_miss text_hash=%s text_len=%s", cache_key[6:18], len(text or ""))
 
     from services.ai_service.llm_client import _gemini_client, _openai_client
 
-    for selected in _embedding_candidate_engines(engine):
+    candidates = _embedding_candidate_engines(engine)
+    if not _EMBEDDING_PROVIDER_FALLBACK:
+        candidates = candidates[:1]
+    for attempt_number, selected in enumerate(candidates, start=1):
         provider = (selected.get("provider") or "").lower()
         try:
             if provider == "gemini" and _gemini_client:
+                _log_embedding_attempt(provider, GEMINI_EMBEDDING_MODEL, attempt_number, text)
+                try:
+                    reserve_embedding_call(
+                        function_name="generate_embedding",
+                        provider=provider,
+                        model=GEMINI_EMBEDDING_MODEL,
+                        call_purpose="embedding",
+                        attempt_number=attempt_number,
+                        fallback_used=attempt_number > 1,
+                        token_estimate=len(text.strip()) // 4,
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "embedding_skipped_budget_exhausted provider=%s model=%s",
+                        provider,
+                        GEMINI_EMBEDDING_MODEL,
+                    )
+                    return None
                 result = await _gemini_client.aio.models.embed_content(
                     model=GEMINI_EMBEDDING_MODEL,
                     contents=text.strip()[:8000],
@@ -65,8 +145,27 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                         GEMINI_EMBEDDING_MODEL,
                         len(values),
                     )
+                    await _EMBEDDING_CACHE.set_json(cache_key, values, ttl_seconds=_EMBEDDING_CACHE_TTL_SECONDS)
                     return values
             if provider == "openai" and _openai_client:
+                _log_embedding_attempt(provider, OPENAI_EMBEDDING_MODEL, attempt_number, text)
+                try:
+                    reserve_embedding_call(
+                        function_name="generate_embedding",
+                        provider=provider,
+                        model=OPENAI_EMBEDDING_MODEL,
+                        call_purpose="embedding",
+                        attempt_number=attempt_number,
+                        fallback_used=attempt_number > 1,
+                        token_estimate=len(text.strip()) // 4,
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "embedding_skipped_budget_exhausted provider=%s model=%s",
+                        provider,
+                        OPENAI_EMBEDDING_MODEL,
+                    )
+                    return None
                 response = await _openai_client.embeddings.create(
                     model=OPENAI_EMBEDDING_MODEL,
                     input=text.strip()[:8000],
@@ -79,6 +178,7 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                         OPENAI_EMBEDDING_MODEL,
                         len(values),
                     )
+                    await _EMBEDDING_CACHE.set_json(cache_key, values, ttl_seconds=_EMBEDDING_CACHE_TTL_SECONDS)
                     return values
         except Exception as exc:
             logger.warning(
@@ -170,6 +270,9 @@ async def search_similar_embeddings(
     top_k: int = 5,
     engine: dict | None = None,
 ) -> list[dict]:
+    if _should_skip_embedding_search(query_text):
+        logger.info("embedding_search_skipped reason=low_value_query query_len=%s", len(query_text or ""))
+        return []
     embedding = await generate_embedding(query_text, engine)
     if embedding is None:
         return []

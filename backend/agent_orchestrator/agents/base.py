@@ -39,6 +39,8 @@ class AgentRegistry:
         self._agents: dict[str, BaseAgent] = {}
 
     def register(self, agent: BaseAgent) -> None:
+        if agent.name.value in self._agents:
+            raise ValueError(f"Agent already registered: {agent.name.value}")
         self._agents[agent.name.value] = agent
 
     def get(self, name: AgentName | str) -> BaseAgent:

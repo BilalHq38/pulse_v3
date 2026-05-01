@@ -31,11 +31,12 @@ from core.request_helpers import get_client_ip, resolve_frontend_base_url
 from core.phone_normalization import (
     normalize_to_e164_digits,
     phone_lookup_candidates,
-    strict_normalize_to_e164_digits,
 )
+from channel_layer.channel_identity import normalize_whatsapp_phone
 from core.utils import make_id, parse_dt
 from models.reference_data import ensure_company_reference_data, resolve_role_id
 from services.email_service import render_platform_email_html, send_email_async
+from services.media_storage import store_image_data_url
 from shared.database import company_context
 from shared.auth.dependencies import forbidden_exception, resolve_request_user, unauthorized_exception
 
@@ -44,6 +45,8 @@ _auth_security_ready = False
 _auth_security_lock = asyncio.Lock()
 _embedding_vector_ready = False
 _embedding_vector_lock = asyncio.Lock()
+_message_attachment_schema_ready = False
+_message_attachment_schema_lock = asyncio.Lock()
 _SUPER_ADMIN_COMPANY_ID_FALLBACK = "00000000-0000-0000-0000-000000000001"
 
 
@@ -85,10 +88,16 @@ async def normalize_customer_contact_phone(db, company_id: str, raw_phone: str) 
     if not raw:
         return ""
     fallback_region = await _company_default_phone_region(db, company_id)
-    normalized = strict_normalize_to_e164_digits(raw, fallback_region=fallback_region)
-    if normalized:
-        return normalized
-    return normalize_to_e164_digits(raw, fallback_region=fallback_region)
+    identity = normalize_whatsapp_phone(raw, default_region=fallback_region)
+    if identity.is_valid:
+        return identity.canonical_value
+    logger.warning(
+        "Rejected invalid customer phone before write company_id=%s raw_phone=%s reason=%s",
+        company_id,
+        raw,
+        identity.reason,
+    )
+    return ""
 
 
 def _unique_ordered(values: list[str]) -> list[str]:
@@ -186,6 +195,16 @@ async def resolve_customer_by_contact(
         return None
 
     fallback_region = await _company_default_phone_region(db, scoped_company_id)
+    if normalized_channel == "whatsapp":
+        phone_identity = normalize_whatsapp_phone(raw_phone, default_region=fallback_region)
+        if not phone_identity.is_valid:
+            logger.warning(
+                "Skipping invalid WhatsApp phone during customer lookup company_id=%s raw_phone=%s reason=%s",
+                scoped_company_id,
+                raw_phone,
+                phone_identity.reason,
+            )
+            return None
     phone_candidates = phone_lookup_candidates(raw_phone, fallback_region=fallback_region)
     normalized_phone = normalize_to_e164_digits(raw_phone, fallback_region=fallback_region)
     phone_candidates = _unique_ordered(phone_candidates + [normalized_phone])
@@ -880,6 +899,22 @@ def provider_has_credentials(provider: str) -> bool:
     return False
 
 
+def provider_configuration_status(provider: str, *, is_active: bool = True) -> tuple[str, str]:
+    provider = (provider or "").strip().lower()
+    if not is_active:
+        return "disabled", "Engine is disabled"
+    if provider not in {"gemini", "openai", "anthropic"}:
+        return "unavailable", f"Unsupported provider: {provider or 'unknown'}"
+    if provider_has_credentials(provider):
+        return "configured", ""
+    key_name = {
+        "gemini": "GEMINI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }[provider]
+    return "missing_api_key", f"{key_name} is not configured"
+
+
 def model_supports_vision(provider: str, model_name: str) -> bool:
     provider = (provider or "").strip().lower()
     model = (model_name or "").strip().lower()
@@ -896,7 +931,11 @@ def enrich_llm_engine(engine: Optional[dict], selected_id: str = "") -> dict:
     data = dict(engine or {})
     provider = data.get("provider", "")
     model_name = data.get("model_name", "")
-    data["provider_ready"] = provider_has_credentials(provider)
+    is_active = bool(data.get("is_active", True))
+    provider_status, provider_status_detail = provider_configuration_status(provider, is_active=is_active)
+    data["provider_ready"] = provider_status == "configured"
+    data["provider_status"] = provider_status
+    data["provider_status_detail"] = provider_status_detail
     data["supports_vision"] = model_supports_vision(provider, model_name)
     data["is_selected"] = bool(selected_id) and data.get("id", "") == selected_id
     data["scope"] = "global" if not str(data.get("company_id") or "").strip() else "tenant"
@@ -1269,10 +1308,45 @@ def is_data_url_image(url: str) -> bool:
         return False
 
 
+async def ensure_message_attachment_schema(db) -> None:
+    global _message_attachment_schema_ready
+    if _message_attachment_schema_ready or not db:
+        return
+    async with _message_attachment_schema_lock:
+        if _message_attachment_schema_ready:
+            return
+        statements = (
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS conversation_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS original_filename TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS mime_type TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS storage_url TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS thumbnail_url TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS provider_media_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_status TEXT NOT NULL DEFAULT 'skipped'",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_summary TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_detected_objects JSONB NOT NULL DEFAULT '[]'::jsonb",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_ocr_text TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_model TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_error TEXT NOT NULL DEFAULT ''",
+            "CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_id ON message_attachments(conversation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_message_attachments_customer_id ON message_attachments(customer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_message_attachments_image_analysis_status ON message_attachments(image_analysis_status)",
+        )
+        for statement in statements:
+            await db.execute(statement)
+        _message_attachment_schema_ready = True
+
+
 def normalize_attachment_payload(attachment: dict) -> Optional[dict]:
     if not isinstance(attachment, dict):
         return None
     url = str(attachment.get("url") or attachment.get("file_url") or "").strip()
+    data_url = str(attachment.get("data_url") or "").strip()
+    if not url and data_url:
+        url = data_url
     if not url:
         return None
     atype = str(attachment.get("type") or attachment.get("file_type") or "").strip().lower() or "unknown"
@@ -1283,28 +1357,72 @@ def normalize_attachment_payload(attachment: dict) -> Optional[dict]:
         size = max(0, int(size or 0))
     except Exception:
         size = 0
+    raw_metadata = attachment.get("raw_metadata") or attachment.get("metadata") or {}
+    if not isinstance(raw_metadata, dict):
+        raw_metadata = {"value": str(raw_metadata)}
     return {
         "type": atype,
         "url": url,
         "name": str(attachment.get("name") or attachment.get("file_name") or "").strip(),
         "size": size,
+        "mime_type": str(attachment.get("mime_type") or attachment.get("mimeType") or "").strip(),
+        "thumbnail_url": str(attachment.get("thumbnail_url") or attachment.get("thumbnailUrl") or "").strip(),
+        "provider_media_id": str(
+            attachment.get("provider_media_id")
+            or attachment.get("providerMediaId")
+            or attachment.get("media_id")
+            or attachment.get("id")
+            or ""
+        ).strip(),
+        "raw_metadata": raw_metadata,
     }
 
 
 def normalize_attachment_row(row: dict) -> dict:
     data = dict(row)
+    raw_metadata = data.get("raw_metadata") or {}
+    if not isinstance(raw_metadata, dict):
+        raw_metadata = {"value": str(raw_metadata)}
+    detected_objects = data.get("image_detected_objects") or []
+    if not isinstance(detected_objects, list):
+        detected_objects = []
     return {
         "id": data.get("id", ""),
         "type": str(data.get("file_type") or "unknown"),
         "url": str(data.get("file_url") or ""),
         "name": str(data.get("file_name") or ""),
         "size": int(data.get("file_size") or 0),
+        "conversation_id": str(data.get("conversation_id") or ""),
+        "customer_id": str(data.get("customer_id") or ""),
+        "channel": str(data.get("channel") or ""),
+        "original_filename": str(data.get("original_filename") or data.get("file_name") or ""),
+        "mime_type": str(data.get("mime_type") or ""),
+        "storage_url": str(data.get("storage_url") or data.get("file_url") or ""),
+        "thumbnail_url": str(data.get("thumbnail_url") or ""),
+        "provider_media_id": str(data.get("provider_media_id") or ""),
+        "raw_metadata": raw_metadata,
+        "image_analysis_status": str(data.get("image_analysis_status") or "skipped"),
+        "image_analysis_summary": str(data.get("image_analysis_summary") or ""),
+        "image_detected_objects": detected_objects,
+        "image_ocr_text": str(data.get("image_ocr_text") or ""),
+        "image_analysis_model": str(data.get("image_analysis_model") or ""),
+        "image_analysis_error": str(data.get("image_analysis_error") or ""),
     }
 
 
 async def save_message_attachments(db, message_id: str, attachments: Optional[list]) -> List[dict]:
     saved: List[dict] = []
-    company_id = await db.fetchval("SELECT company_id FROM messages WHERE id=$1 LIMIT 1", message_id)
+    if attachments:
+        await ensure_message_attachment_schema(db)
+    message_context = r(
+        await db.fetchrow(
+            "SELECT m.company_id,m.conversation_id,COALESCE(c.customer_id,'') AS customer_id,COALESCE(c.channel,'') AS channel "
+            "FROM messages m LEFT JOIN conversations c ON c.id=m.conversation_id AND c.company_id=m.company_id "
+            "WHERE m.id=$1 LIMIT 1",
+            message_id,
+        )
+    )
+    company_id = str((message_context or {}).get("company_id") or "")
     if attachments and not company_id:
         raise HTTPException(404, "Message not found")
     if company_id:
@@ -1313,19 +1431,66 @@ async def save_message_attachments(db, message_id: str, attachments: Optional[li
         normalized = normalize_attachment_payload(item)
         if not normalized:
             continue
+        if is_data_url_image(normalized["url"]):
+            stored = store_image_data_url(
+                normalized["url"],
+                category="message-attachments",
+                company_id=company_id,
+                public_url_prefix="/api/conversations/attachments/media",
+                original_filename=normalized["name"],
+            )
+            normalized["url"] = stored["url"]
+            normalized["name"] = normalized["name"] or stored["file_name"]
+            normalized["size"] = stored["file_size"]
+            normalized["mime_type"] = normalized["mime_type"] or stored["mime_type"]
+            normalized["storage_url"] = stored["url"]
+            normalized["raw_metadata"] = {**normalized["raw_metadata"], "storage_key": stored["storage_key"]}
+        else:
+            normalized["storage_url"] = normalized["url"]
+        is_image = normalized["type"] == "image" or str(normalized.get("mime_type") or "").startswith("image/")
+        image_analysis_status = str(normalized.get("image_analysis_status") or ("pending" if is_image else "skipped"))
         attachment_id = make_id()
         await db.execute(
-            "INSERT INTO message_attachments(id,company_id,message_id,file_type,file_url,file_name,file_size,created_at) "  # noqa: E501
-            "VALUES($1,$2,$3,$4,$5,$6,$7,NOW())",
+            "INSERT INTO message_attachments("
+            "id,company_id,message_id,conversation_id,customer_id,channel,file_type,file_url,file_name,file_size,"
+            "original_filename,mime_type,storage_url,thumbnail_url,provider_media_id,raw_metadata,"
+            "image_analysis_status,image_analysis_summary,image_detected_objects,image_ocr_text,image_analysis_model,"
+            "image_analysis_error,created_at"
+            ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'','[]'::jsonb,'','','',NOW())",
             attachment_id,
             company_id,
             message_id,
+            str((message_context or {}).get("conversation_id") or ""),
+            str((message_context or {}).get("customer_id") or ""),
+            str((message_context or {}).get("channel") or ""),
             normalized["type"],
             normalized["url"],
             normalized["name"],
             normalized["size"],
+            normalized["name"],
+            normalized["mime_type"],
+            normalized["storage_url"],
+            normalized["thumbnail_url"],
+            normalized["provider_media_id"],
+            normalized["raw_metadata"],
+            image_analysis_status,
         )
-        saved.append({"id": attachment_id, **normalized})
+        saved.append(
+            {
+                "id": attachment_id,
+                **normalized,
+                "conversation_id": str((message_context or {}).get("conversation_id") or ""),
+                "customer_id": str((message_context or {}).get("customer_id") or ""),
+                "channel": str((message_context or {}).get("channel") or ""),
+                "original_filename": normalized["name"],
+                "image_analysis_status": image_analysis_status,
+                "image_analysis_summary": "",
+                "image_detected_objects": [],
+                "image_ocr_text": "",
+                "image_analysis_model": "",
+                "image_analysis_error": "",
+            }
+        )
     return saved
 
 
@@ -1863,8 +2028,6 @@ async def get_or_create_customer_from_contact(
 ) -> dict:
     raw = (phone or "").strip()
     stored = await normalize_customer_contact_phone(db, current_user.get("company_id", ""), raw) if raw else ""
-    if raw and not stored:
-        stored = re.sub(r"\D", "", raw)
     normalized_email = (email or "").strip().lower()
     normalized_channel = str(channel or "").strip().lower()
     normalized_channel_profile_id = str(channel_profile_id or "").strip()
@@ -1985,7 +2148,10 @@ async def get_or_create_contact_conversation(
 async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> dict:
     email = (lead.get("email") or "").strip().lower()
     _raw_phone = (lead.get("phone") or "").strip()
-    phone = normalize_to_e164_digits(_raw_phone) if _raw_phone else ""
+    phone = ""
+    if _raw_phone:
+        identity = normalize_whatsapp_phone(_raw_phone)
+        phone = identity.canonical_value if identity.is_valid else ""
     name = (lead.get("name") or "").strip() or "Unknown"
     cid = current_user.get("company_id", "")
     wp, args = [], [cid]
@@ -2011,7 +2177,8 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
             "city=COALESCE(NULLIF($7,''),city),"
             "state=COALESCE(NULLIF($8,''),state),"
             "country=COALESCE(NULLIF($9,''),country),"
-            "lifecycle_stage='customer',updated_at=NOW() WHERE id=$10",
+            "lead_id=COALESCE(NULLIF($10,''),lead_id),"
+            "lifecycle_stage='customer',updated_at=NOW() WHERE id=$11",
             name or existing.get("name", "Unknown"),
             email or existing.get("email", ""),
             phone or existing.get("phone", ""),
@@ -2021,6 +2188,7 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
             lead.get("city", ""),
             lead.get("state", ""),
             lead.get("country", ""),
+            lead.get("id", ""),
             existing["id"],
         )
         cust = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1", existing["id"]))
@@ -2052,7 +2220,6 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
         )
         cust = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1", nid))
     await ensure_customer_profile(db, cust)
-    await db.execute("DELETE FROM leads WHERE id=$1", lead["id"])
     if email:
         await db.execute(
             "DELETE FROM leads WHERE company_id=$1 AND email=$2 AND id!=$3",

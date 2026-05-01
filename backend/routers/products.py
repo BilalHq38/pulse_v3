@@ -1,6 +1,7 @@
 """routers/products.py — Products, FAQs, Onboarding Docs — PostgreSQL."""
 
 import base64
+import csv
 import json
 import logging
 import posixpath
@@ -10,13 +11,14 @@ from io import BytesIO
 from typing import Optional
 from xml.etree import ElementTree as ET
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from openpyxl import load_workbook
 from pydantic import ValidationError
 from models.schemas import ProductCreate, ProductDescriptionRequest, ProductUpdate
 from services.ai_service.facade import generate_product_description, get_active_llm_engines
-from core.utils import make_id, now_ts, normalize_product_images
+from core.utils import is_valid_image_url, make_id, now_ts, normalize_product_images
 from services.db_helpers import r, rs, get_current_user_flexible
+from services.media_storage import serve_stored_media, store_image_bytes, store_image_data_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -287,6 +289,132 @@ def _has_non_empty_image_input(values: list) -> bool:
     return any(str(value or "").strip() for value in values)
 
 
+def _parse_price_cell(value) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[, ]+", "", raw)
+    normalized = _PRICE_SANITIZE_RE.sub("", normalized)
+    if normalized in {"", ".", "-", "-."}:
+        raise ValueError("Invalid price value")
+    parsed = float(normalized)
+    if parsed < 0:
+        raise ValueError("Invalid price value")
+    return str(int(parsed)) if parsed.is_integer() else f"{parsed:.2f}".rstrip("0").rstrip(".")
+
+
+def _split_image_cell(value) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split("|") if part.strip()]
+
+
+def _parse_bulk_product_rows(rows: list[list], *, row_images: dict[int, list[str]] | None = None) -> tuple[list[dict], list[dict]]:
+    errors: list[dict] = []
+    if not rows:
+        return [], [{"row": 1, "error": "The file is empty."}]
+
+    header_row_index = -1
+    for index, row in enumerate(rows):
+        values = list(row or [])
+        if any(str(value or "").strip() for value in values):
+            header_row_index = index
+            break
+    if header_row_index < 0:
+        return [], [{"row": 1, "error": "No header row found."}]
+
+    header_index: dict[str, int] = {}
+    for index, cell in enumerate(rows[header_row_index] or []):
+        key = _normalize_header(str(cell or ""))
+        if key and key not in header_index:
+            header_index[key] = index
+    if "name" not in header_index:
+        return [], [{"row": header_row_index + 1, "error": "Missing required `name` header."}]
+
+    image_header_present = any(key in header_index for key in {"image", "image_url", "image_url_1", "image_url_2", "image_url_3"})
+    parsed_items: list[dict] = []
+    embedded_by_row = row_images or {}
+
+    def read_cell(row_values: list, *aliases: str):
+        for alias in aliases:
+            index = header_index.get(alias)
+            if index is not None and index < len(row_values):
+                return row_values[index]
+        return ""
+
+    for row_index in range(header_row_index + 1, len(rows)):
+        row_values = list(rows[row_index] or [])
+        row_number = row_index + 1
+        if not any(str(value or "").strip() for value in row_values) and not embedded_by_row.get(row_number):
+            continue
+
+        name = str(read_cell(row_values, "name") or "").strip()
+        if not name:
+            errors.append({"row": row_number, "error": "Missing required product name."})
+            continue
+        try:
+            price = _parse_price_cell(read_cell(row_values, "price"))
+        except Exception:
+            errors.append({"row": row_number, "error": "Invalid price value."})
+            continue
+
+        raw_images = []
+        raw_images.extend(_split_image_cell(read_cell(row_values, "image_url", "image_url_1", "image")))
+        for column in ("image_url_2", "image_url_3"):
+            raw_images.extend(_split_image_cell(read_cell(row_values, column)))
+        raw_images.extend(str(item or "").strip() for item in embedded_by_row.get(row_number, []))
+        raw_images = [item for item in raw_images if item]
+        invalid_images = [item for item in raw_images if not is_valid_image_url(item)]
+        if invalid_images:
+            errors.append(
+                {
+                    "row": row_number,
+                    "error": f"Invalid image URL or embedded image data: {invalid_images[0][:120]}",
+                }
+            )
+            continue
+        image_urls = list(dict.fromkeys(raw_images))[:3]
+
+        payload = {
+            "name": name,
+            "product_title": str(read_cell(row_values, "product_title", "sku", "product_code") or "").strip(),
+            "description": str(read_cell(row_values, "description", "details") or "").strip(),
+            "price": price,
+            "price_currency": str(read_cell(row_values, "price_currency", "currency") or "USD").strip().upper() or "USD",
+            "category": _normalize_category(read_cell(row_values, "category")),
+            "product_type": _normalize_product_type(read_cell(row_values, "product_type", "type")),
+            "features": [],
+        }
+        if image_urls or image_header_present:
+            payload["images"] = image_urls
+        parsed_items.append({"rowNumber": row_number, "payload": payload})
+
+    return parsed_items, errors
+
+
+def _parse_bulk_product_file(filename: str, raw: bytes) -> tuple[list[dict], list[dict]]:
+    lower_name = str(filename or "").lower()
+    if lower_name.endswith(".csv"):
+        text = raw.decode("utf-8-sig")
+        rows = [row for row in csv.reader(text.splitlines())]
+        return _parse_bulk_product_rows(rows)
+
+    if not lower_name.endswith((".xlsx", ".xlsm", ".xltx", ".xltm", ".xls")):
+        raise HTTPException(400, "Unsupported spreadsheet format. Upload .xlsx, .xls, or .csv.")
+    try:
+        workbook = load_workbook(BytesIO(raw), data_only=True)
+    except Exception as exc:
+        raise HTTPException(400, "Could not read spreadsheet file") from exc
+    sheet = workbook.active
+    rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    row_images = _extract_sheet_row_images(sheet)
+    rich_images = _extract_richvalue_row_images(raw)
+    for row_number, images in rich_images.items():
+        row_images.setdefault(row_number, []).extend(images)
+    return _parse_bulk_product_rows(rows, row_images=row_images)
+
+
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 _SLUG_SANITIZE_RE = re.compile(r"[^a-z0-9_-]+")
 _PRICE_SANITIZE_RE = re.compile(r"[^0-9.-]")
@@ -360,6 +488,23 @@ def _normalize_images(images) -> list[str]:
     if not isinstance(images, list):
         raise HTTPException(400, "images must be an array")
     return normalize_product_images(images, limit=3)
+
+
+def _materialize_product_images(images: list[str], company_id: str) -> list[str]:
+    materialized: list[str] = []
+    for image_url in images or []:
+        value = str(image_url or "").strip()
+        if value.startswith("data:image/"):
+            stored = store_image_data_url(
+                value,
+                category="product-images",
+                company_id=company_id,
+                public_url_prefix="/api/products/media",
+            )
+            materialized.append(stored["url"])
+        else:
+            materialized.append(value)
+    return materialized[:3]
 
 
 def _normalize_features(features) -> list[str]:
@@ -621,6 +766,7 @@ async def create_product(body: ProductCreate, request: Request):
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
     normalized_body, images, features = _normalize_product_payload_for_create(body.model_dump())
+    images = _materialize_product_images(images, cid)
     pid = await _create_product_row(db, cid, normalized_body, images, features)
     return await _get_product(db, pid, cid)
 
@@ -657,30 +803,43 @@ async def bulk_upload_products(request: Request):
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
 
-    try:
-        body = await request.json()
-    except Exception as exc:
-        raise HTTPException(400, "request body must be valid JSON") from exc
-
-    upsert = True
-    if isinstance(body, dict):
-        raw_items = body.get("items", [])
-        upsert = bool(body.get("upsert", True))
-    elif isinstance(body, list):
-        raw_items = body
+    parse_errors: list[dict] = []
+    content_type = str(request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        upload = form.get("file")
+        if not upload or not hasattr(upload, "read"):
+            raise HTTPException(400, "file is required")
+        raw = await upload.read()
+        if not raw:
+            raise HTTPException(400, "file is empty")
+        upsert = str(form.get("upsert", "true")).strip().lower() not in {"false", "0", "no"}
+        raw_items, parse_errors = _parse_bulk_product_file(str(getattr(upload, "filename", "") or ""), raw)
     else:
-        raise HTTPException(400, "payload must be an array or an object containing items")
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(400, "request body must be valid JSON") from exc
+
+        upsert = True
+        if isinstance(body, dict):
+            raw_items = body.get("items", [])
+            upsert = bool(body.get("upsert", True))
+        elif isinstance(body, list):
+            raw_items = body
+        else:
+            raise HTTPException(400, "payload must be an array or an object containing items")
 
     if not isinstance(raw_items, list):
         raise HTTPException(400, "items must be an array")
-    if not raw_items:
+    if not raw_items and not parse_errors:
         raise HTTPException(400, "items must contain at least one row")
     if len(raw_items) > 1000:
         raise HTTPException(400, "items cannot exceed 1000 rows")
 
     created = 0
     updated = 0
-    errors: list[dict] = []
+    errors: list[dict] = list(parse_errors)
     results: list[dict] = []
 
     for index, raw_item in enumerate(raw_items):
@@ -703,6 +862,7 @@ async def bulk_upload_products(request: Request):
         try:
             validated = ProductCreate.model_validate(row_payload)
             normalized_body, images, features = _normalize_product_payload_for_create(validated.model_dump())
+            images = _materialize_product_images(images, cid)
             has_images = "images" in row_payload
             has_features = "features" in row_payload
 
@@ -741,6 +901,35 @@ async def bulk_upload_products(request: Request):
     }
 
 
+@router.post("/products/images/upload")
+@router.post("/company-data/products/images/upload")
+async def upload_product_image(request: Request, file: UploadFile = File(...)):
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
+    mime_type = str(file.content_type or "").strip().lower()
+    raw = await file.read()
+    stored = store_image_bytes(
+        raw,
+        mime_type=mime_type,
+        category="product-images",
+        company_id=cid,
+        public_url_prefix="/api/products/media",
+        original_filename=file.filename or "",
+    )
+    return {
+        "url": stored["url"],
+        "mime_type": stored["mime_type"],
+        "file_size": stored["file_size"],
+        "file_name": stored["file_name"],
+    }
+
+
+@router.get("/products/media/{company_id}/{filename}")
+@router.get("/company-data/products/media/{company_id}/{filename}")
+async def get_product_media(company_id: str, filename: str) -> FileResponse:
+    return serve_stored_media(category="product-images", company_id=company_id, filename=filename)
+
+
 @router.get("/products/{product_id}")
 @router.get("/company-data/products/{product_id}")
 async def get_product(product_id: str, request: Request):
@@ -762,6 +951,8 @@ async def update_product(product_id: str, body: ProductUpdate, request: Request)
     body_payload = body.model_dump(exclude_unset=True)
     body_payload.pop("_id", None)
     normalized_body, images, features = _normalize_product_payload_for_update(body_payload)
+    if images is not None:
+        images = _materialize_product_images(images, cid)
 
     if not normalized_body and images is None and features is None:
         existing = await _get_product(db, product_id, cid)

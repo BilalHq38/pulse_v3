@@ -36,6 +36,8 @@ class UnifiedAttachment(BaseModel):
     name: str = ""
     mime_type: str = ""
     size: int = 0
+    provider_media_id: str = ""
+    raw_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class UnifiedMessage(BaseModel):

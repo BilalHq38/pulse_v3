@@ -349,6 +349,15 @@ class TemplateCreate(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@router.get("/settings")
+async def get_settings_overview(request: Request):
+    return {
+        "personal": await get_personal_settings(request),
+        "company": await get_company_settings(request),
+        "channels": await get_channel_settings(request),
+    }
+
+
 @router.get("/settings/personal")
 async def get_personal_settings(request: Request):
     db = _db(request)
@@ -613,10 +622,37 @@ async def get_whatsapp_bridge_qr(request: Request):
 
     bridge_status = ""
     if isinstance(session_data, dict):
-        bridge_status = str(session_data.get("status") or "").strip()
+        bridge_status = str(session_data.get("state") or session_data.get("status") or "").strip()
     if isinstance(qr_data, dict) and not bridge_status:
-        bridge_status = str(qr_data.get("bridge_status") or "").strip()
-    out: dict = {"bridge_status": bridge_status, "qr_data_url": "", "qr_png_base64": ""}
+        bridge_status = str(qr_data.get("state") or qr_data.get("bridge_status") or "").strip()
+    legacy_progress = {
+        "idle": 0,
+        "qr_required": 20,
+        "need_qr": 20,
+        "qr_scanned": 45,
+        "authenticated": 65,
+        "initializing": 80,
+        "ready": 100,
+        "reconnecting": 55,
+        "failed": 0,
+        "disconnected": 0,
+    }
+    status_source = qr_data if isinstance(qr_data, dict) and qr_data else session_data if isinstance(session_data, dict) else {}
+    out: dict = {
+        "bridge_status": bridge_status,
+        "status": bridge_status,
+        "state": bridge_status,
+        "connected": bool(status_source.get("connected") or bridge_status == "ready"),
+        "progress": int(status_source.get("progress") or legacy_progress.get(bridge_status, 0)),
+        "message": str(status_source.get("message") or ""),
+        "phone": str(status_source.get("phone") or ""),
+        "qr": str(status_source.get("qr") or ""),
+        "retrying": bool(status_source.get("retrying")),
+        "last_error": str(status_source.get("last_error") or ""),
+        "updated_at": str(status_source.get("updated_at") or ""),
+        "qr_data_url": "",
+        "qr_png_base64": "",
+    }
     if isinstance(qr_data, dict):
         if qr_data.get("qr_data_url"):
             out["qr_data_url"] = str(qr_data["qr_data_url"])

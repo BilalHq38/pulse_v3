@@ -32,3 +32,11 @@ function resolveBackendBaseUrl() {
 export const BACKEND_BASE_URL = resolveBackendBaseUrl();
 export const API_BASE_URL = `${BACKEND_BASE_URL}/api`;
 
+export function resolveMediaUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return '';
+  if (value.startsWith('data:') || value.startsWith('blob:')) return value;
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith('/')) return `${BACKEND_BASE_URL}${value}`;
+  return value;
+}

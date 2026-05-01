@@ -194,6 +194,8 @@ class FacebookAdapter(BaseChannelAdapter):
                             UnifiedAttachment(
                                 type=att_type or "file",
                                 url=url,
+                                provider_media_id=str(payload_data.get("id") or attachment.get("id") or "").strip(),
+                                raw_metadata={"provider": "facebook", "attachment": attachment},
                             )
                         )
                         result["message_type"] = att_type or "attachment"

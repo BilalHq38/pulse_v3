@@ -4,6 +4,7 @@ import * as React from "react"
 
 const TOAST_LIMIT = 1
 const TOAST_REMOVE_DELAY = 1000000
+const TOAST_DEDUPE_WINDOW_MS = 6000
 const TYPE_TO_VARIANT = {
   success: "success",
   warning: "warning",
@@ -96,6 +97,15 @@ export const reducer = (state, action) => {
 const listeners = []
 
 let memoryState = { toasts: [] }
+const recentToastSignatures = new Map()
+
+function toastSignature(props) {
+  return [
+    props.variant || "default",
+    String(props.title || "").trim().toLowerCase(),
+    String(props.description || "").trim().toLowerCase(),
+  ].join("|")
+}
 
 function dispatch(action) {
   memoryState = reducer(memoryState, action)
@@ -105,8 +115,20 @@ function dispatch(action) {
 }
 
 function toast({
+  dedupeKey,
   ...props
 }) {
+  const signature = dedupeKey || toastSignature(props)
+  const now = Date.now()
+  const previousAt = recentToastSignatures.get(signature) || 0
+  if (now - previousAt < TOAST_DEDUPE_WINDOW_MS) {
+    return {
+      id: signature,
+      dismiss: () => {},
+      update: () => {},
+    }
+  }
+  recentToastSignatures.set(signature, now)
   const id = genId()
 
   const update = (props) =>

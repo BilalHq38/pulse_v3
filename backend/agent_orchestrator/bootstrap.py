@@ -100,6 +100,10 @@ _DDL = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_global_memory_company ON global_memory(company_id, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_workflows_company_status ON workflows(company_id, status, updated_at DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_workflows_message_idempotency "
+    "ON workflows(company_id, entity_type, entity_id) WHERE workflow_kind='message' AND entity_type='conversation_message'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_workflows_entity_idempotency "
+    "ON workflows(company_id, workflow_kind, entity_type, entity_id)",
     "CREATE INDEX IF NOT EXISTS idx_workflows_trace ON workflows(trace_id, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_workflow_executions_workflow ON workflow_executions(workflow_id, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_workflow_executions_company ON workflow_executions(company_id, started_at DESC)",

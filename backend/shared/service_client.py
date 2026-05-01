@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
+from fastapi.encoders import jsonable_encoder
 
 from shared.config import (
     ai_service_circuit_breaker_failures,
@@ -23,6 +24,18 @@ from shared.tracing import current_trace_headers, ensure_trace_context
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _safe_response_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = response.text
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("error") or payload.get("message") or payload
+    else:
+        detail = payload
+    return str(detail or "").replace("\n", " ")[:500]
 
 
 def build_internal_headers(
@@ -145,12 +158,13 @@ class ServiceClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> httpx.Response:
+        encoded_json = jsonable_encoder(json) if json is not None else None
         return await self._client.request(
             method=method,
             url=f"{self.base_url}{path}",
             headers=headers,
             params=params,
-            json=json,
+            json=encoded_json,
         )
 
     async def request(
@@ -174,17 +188,19 @@ class ServiceClient:
                     json=json,
                 )
                 if response.status_code >= 400:
+                    upstream_detail = _safe_response_detail(response)
                     if response.status_code in RETRYABLE_STATUS_CODES and attempt + 1 < self.retry_policy.attempts:
                         self.circuit_breaker.record_failure()
                         delay_seconds = _retry_delay_seconds(self.retry_policy, attempt, response)
                         logger.warning(
-                            "service_client retry service=%s method=%s path=%s attempt=%s status=%s delay_seconds=%.2f",
+                            "service_client retry service=%s method=%s path=%s attempt=%s status=%s delay_seconds=%.2f detail=%s",
                             self.service_name,
                             method,
                             path,
                             attempt + 1,
                             response.status_code,
                             delay_seconds,
+                            upstream_detail,
                         )
                         await asyncio.sleep(delay_seconds)
                         continue
@@ -195,7 +211,7 @@ class ServiceClient:
                     detail = "Unauthorized" if response.status_code in {401, 403} else "Upstream request failed"
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail=detail,
+                        detail=f"{detail}: {upstream_detail}" if upstream_detail else detail,
                     )
                 self.circuit_breaker.record_success()
                 if not response.content:
@@ -235,10 +251,11 @@ class ServiceClient:
                 self.circuit_breaker.record_failure()
                 break
         logger.error(
-            "service_client unavailable service=%s method=%s path=%s error=%s",
+            "service_client unavailable service=%s method=%s path=%s error=%s detail=%s",
             self.service_name,
             method,
             path,
             last_error.__class__.__name__ if last_error else "unknown",
+            str(last_error or "").replace("\n", " ")[:500],
         )
         raise HTTPException(status_code=503, detail="Upstream request failed")

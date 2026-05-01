@@ -752,6 +752,7 @@ CREATE TABLE IF NOT EXISTS messages (
     intent_confidence    NUMERIC(5,4),
     ai_confidence        NUMERIC(5,4),
     external_message_id  TEXT NOT NULL DEFAULT '',
+    idempotency_key      TEXT NOT NULL DEFAULT '',
     delivery_status      TEXT NOT NULL DEFAULT 'pending',
     sent_at              TIMESTAMPTZ,
     delivered_at         TIMESTAMPTZ,
@@ -769,20 +770,41 @@ CREATE INDEX IF NOT EXISTS idx_messages_company_id ON messages(company_id);
 CREATE INDEX IF NOT EXISTS idx_messages_company_created_at ON messages(company_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_company_conversation ON messages(company_id, conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_company_external_message_id ON messages(company_id, external_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_idempotency_key_nonempty
+    ON messages(company_id, idempotency_key)
+    WHERE BTRIM(idempotency_key) <> '';
 CREATE INDEX IF NOT EXISTS idx_messages_sentiment ON messages(company_id, sentiment_score);
 
 CREATE TABLE IF NOT EXISTS message_attachments (
     id         TEXT PRIMARY KEY,
     company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    customer_id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
     file_type  TEXT NOT NULL DEFAULT 'unknown',
     file_url   TEXT NOT NULL DEFAULT '',
     file_name  TEXT NOT NULL DEFAULT '',
     file_size  INTEGER NOT NULL DEFAULT 0,
+    original_filename TEXT NOT NULL DEFAULT '',
+    mime_type TEXT NOT NULL DEFAULT '',
+    storage_url TEXT NOT NULL DEFAULT '',
+    thumbnail_url TEXT NOT NULL DEFAULT '',
+    provider_media_id TEXT NOT NULL DEFAULT '',
+    raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    image_analysis_status TEXT NOT NULL DEFAULT 'skipped',
+    image_analysis_summary TEXT NOT NULL DEFAULT '',
+    image_detected_objects JSONB NOT NULL DEFAULT '[]'::jsonb,
+    image_ocr_text TEXT NOT NULL DEFAULT '',
+    image_analysis_model TEXT NOT NULL DEFAULT '',
+    image_analysis_error TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_message_attachments_company_id ON message_attachments(company_id);
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id ON message_attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_id ON message_attachments(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_customer_id ON message_attachments(customer_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_image_analysis_status ON message_attachments(image_analysis_status);
 
 CREATE TABLE IF NOT EXISTS conversation_logs (
     id          TEXT PRIMARY KEY,
@@ -2089,6 +2111,7 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}':
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS external_message_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
@@ -2096,6 +2119,9 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 CREATE INDEX IF NOT EXISTS idx_messages_company_external_message_id ON messages(company_id, external_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_idempotency_key_nonempty
+    ON messages(company_id, idempotency_key)
+    WHERE BTRIM(idempotency_key) <> '';
 
 ALTER TABLE user_oauth_providers ADD COLUMN IF NOT EXISTS company_id TEXT;
 UPDATE user_oauth_providers uop
@@ -2114,12 +2140,35 @@ WHERE u.id = evrc.user_id
 CREATE INDEX IF NOT EXISTS idx_email_verification_resend_controls_company_id ON email_verification_resend_controls(company_id);
 
 ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS company_id TEXT;
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS conversation_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS original_filename TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS mime_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS storage_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS thumbnail_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS provider_media_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_status TEXT NOT NULL DEFAULT 'skipped';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_detected_objects JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_ocr_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_error TEXT NOT NULL DEFAULT '';
 UPDATE message_attachments ma
 SET company_id = m.company_id
 FROM messages m
 WHERE m.id = ma.message_id
   AND (ma.company_id IS NULL OR BTRIM(ma.company_id) = '');
+UPDATE message_attachments ma
+SET conversation_id = m.conversation_id
+FROM messages m
+WHERE m.id = ma.message_id
+  AND (ma.conversation_id IS NULL OR BTRIM(ma.conversation_id) = '');
 CREATE INDEX IF NOT EXISTS idx_message_attachments_company_id ON message_attachments(company_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_id ON message_attachments(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_customer_id ON message_attachments(customer_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_image_analysis_status ON message_attachments(image_analysis_status);
 
 ALTER TABLE conversation_logs ADD COLUMN IF NOT EXISTS company_id TEXT;
 UPDATE conversation_logs cl

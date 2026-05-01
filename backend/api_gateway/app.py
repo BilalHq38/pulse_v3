@@ -346,29 +346,15 @@ def _resolve_identity_tenant_id(request: Request, claims: dict[str, Any], full_p
             raise HTTPException(status_code=403, detail="Cross-tenant identity access denied")
         if claim_tenant:
             tenant_id = claim_tenant
+        elif requested_tenant:
+            tenant_id = requested_tenant
         else:
-            tenant_id = requested_tenant or default_tenant
-            logger.warning(
-                "identity tenant fallback applied role=%s claim_tenant=%s fallback_tenant=%s",
-                role,
-                claim_tenant,
-                tenant_id,
-            )
+            raise HTTPException(status_code=403, detail="Tenant identity is required")
 
     if tenant_id not in tenant_keys:
-        if role != "super_admin" and claim_tenant:
-            if is_production():
-                raise HTTPException(status_code=403, detail="Tenant identity configuration missing")
-            logger.warning(
-                "identity tenant mapping missing for claim_tenant=%s in non-production; using default tenant=%s",
-                claim_tenant,
-                default_tenant,
-            )
-        logger.warning(
-            "identity tenant mapping missing for tenant_id=%s, using default tenant=%s",
-            tenant_id,
-            default_tenant,
-        )
+        if role != "super_admin":
+            raise HTTPException(status_code=403, detail="Tenant identity configuration missing")
+        logger.warning("identity tenant mapping missing for super_admin tenant_id=%s", tenant_id)
         tenant_id = default_tenant
     return tenant_id
 

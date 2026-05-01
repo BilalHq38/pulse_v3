@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useDeferredValue } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
+import { resolveMediaUrl } from '@/lib/backend-url';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import BulkUploadModal from '@/components/BulkUploadModal';
@@ -31,6 +32,19 @@ const CUSTOMER_BULK_GUIDE_ROWS = [
   { column: 'tags', help: 'Optional comma-separated tags.' },
   { column: 'channels', help: 'Optional comma-separated channels such as email, whatsapp, or instagram.' },
 ];
+
+function AvatarBubble({ avatar, name, className = 'w-9 h-9', textClass = 'text-sm' }) {
+  const [failed, setFailed] = useState(false);
+  const url = resolveMediaUrl(avatar || '');
+  const initial = (name || '?').charAt(0);
+  return (
+    <div className={`${className} rounded-full bg-gradient-to-br from-blue-500/30 to-blue-600/30 flex items-center justify-center ${textClass} font-bold text-blue-600 overflow-hidden flex-shrink-0`}>
+      {url && !failed ? (
+        <img src={url} alt="" referrerPolicy="no-referrer" className="h-full w-full object-cover" onError={() => setFailed(true)} />
+      ) : initial}
+    </div>
+  );
+}
 
 function CustomerCardSkeleton() {
   return (
@@ -550,7 +564,7 @@ export default function CustomersPage() {
               <tr key={cust.id} className="border-b border-slate-100 hover:bg-slate-50 transition-colors cursor-pointer" onClick={() => selectCustomer(cust)} data-testid={`customer-row-${cust.id}`}>
                 <td className="px-6 py-4">
                   <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500/30 to-blue-600/30 flex items-center justify-center text-sm font-bold text-blue-600">{cust.name?.charAt(0)}</div>
+                    <AvatarBubble avatar={cust.avatar} name={cust.name} />
                     <div>
                       <p className="text-sm font-medium text-slate-700">{cust.name}</p>
                       <p className="text-xs text-slate-400">{cust.email}</p>
@@ -613,7 +627,7 @@ export default function CustomersPage() {
             <div className="p-6">
               <div className="flex items-start justify-between mb-6">
                 <div className="flex items-center gap-4">
-                  <div className="w-14 h-14 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center text-xl font-bold text-white">{selected.name?.charAt(0)}</div>
+                  <AvatarBubble avatar={selected.avatar} name={selected.name} className="w-14 h-14" textClass="text-xl" />
                   <div>
                     <h3 className="text-xl font-bold text-slate-900">{selected.name}</h3>
                     <p className="text-sm text-slate-400">{selected.company}</p>

@@ -109,6 +109,8 @@ def is_valid_image_url(value: str) -> bool:
             return 0 < len(raw) <= 8 * 1024 * 1024
         except Exception:
             return False
+    if text.startswith(("/api/products/media/", "/api/conversations/attachments/media/")):
+        return True
     parsed = urlparse(text)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and bool(parsed.path)
 

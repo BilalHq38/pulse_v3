@@ -192,6 +192,12 @@ async def score_lead(
         next_action=str(result.get("next_action", "")),
         phase=str(result.get("phase", "")),
         nurture_message=str(result.get("nurture_message", "")),
+        scoring_status=str(result.get("scoring_status") or "completed"),
+        provider=str(result.get("provider") or ""),
+        model_name=str(result.get("model_name") or ""),
+        error_type=str(result.get("error_type") or ""),
+        error_reason=str(result.get("error_reason") or ""),
+        fallback_used=bool(result.get("fallback_used")),
     )
 
 

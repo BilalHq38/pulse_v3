@@ -81,6 +81,12 @@ class LeadScoreResponse(BaseModel):
     next_action: str = ""
     phase: str = ""
     nurture_message: str = ""
+    scoring_status: str = "completed"
+    provider: str = ""
+    model_name: str = ""
+    error_type: str = ""
+    error_reason: str = ""
+    fallback_used: bool = False
 
 
 class CombinedRequest(BaseModel):

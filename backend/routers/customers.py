@@ -1,21 +1,24 @@
-"""routers/customers.py — PostgreSQL version."""
+"""routers/customers.py - PostgreSQL version."""
 
 import logging
 from typing import Optional
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from services.ai_service.facade import calculate_churn_risk
+
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+
 from core.phone_normalization import strict_normalize_to_e164_digits
 from core.utils import make_id, now_ts
+from services.ai_service.facade import calculate_churn_risk
 from services.db_helpers import (
+    create_notification,
+    ensure_customer_profile,
+    get_company_id,
+    get_current_user_flexible,
     r,
     rs,
-    get_current_user_flexible,
-    get_company_id,
-    ensure_customer_profile,
-    create_notification,
 )
-from shared.webhook_task_runner import create_safe_detached_task
+from services.lead_stage_service import transition_lead_stage
 from shared.tabular_uploads import parse_tabular_upload, split_multi_value
+from shared.webhook_task_runner import create_safe_detached_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -135,28 +138,67 @@ async def _load_social_profiles(db, customer_id: str) -> dict:
     return {row["platform"]: row["profile_id"] for row in rows if row.get("platform")}
 
 
-@router.get("/customers")
-async def list_customers(request: Request, segment: Optional[str] = None, search: Optional[str] = None):
-    db = _db(request)
-    cu = await get_current_user_flexible(request)
-    cid = get_company_id(cu)
-    sql = "SELECT c.*,ARRAY(SELECT tag FROM customer_tags WHERE customer_id=c.id) AS tags,ARRAY(SELECT channel FROM customer_channels WHERE customer_id=c.id) AS channels FROM customers c WHERE c.company_id=$1 AND c.lifecycle_stage!='lead'"  # noqa: E501
-    args = [cid]
+async def _fetch_customers(
+    db,
+    company_id: str,
+    *,
+    segment: str = "",
+    search: str = "",
+    limit: int = 500,
+) -> list[dict]:
+    if not company_id:
+        return []
+
+    sql = (
+        "SELECT c.*, "
+        "ARRAY(SELECT tag FROM customer_tags WHERE customer_id=c.id) AS tags, "
+        "ARRAY(SELECT channel FROM customer_channels WHERE customer_id=c.id) AS channels "
+        "FROM customers c WHERE c.company_id=$1 AND c.lifecycle_stage!='lead'"
+    )
+    args = [company_id]
     if segment:
         args.append(segment)
         sql += f" AND c.segment=${len(args)}"
     if search:
-        args.append(f"%{search}%")
-        name_idx = len(args)
-        args.append(f"%{search}%")
-        email_idx = len(args)
-        sql += f" AND (c.name ILIKE ${name_idx} OR c.email ILIKE ${email_idx})"
-    sql += " ORDER BY c.created_at DESC LIMIT 500"
+        pattern = f"%{search}%"
+        args.extend([pattern, pattern, pattern, pattern])
+        sql += (
+            f" AND (c.name ILIKE ${len(args) - 3} "
+            f"OR c.email ILIKE ${len(args) - 2} "
+            f"OR c.phone ILIKE ${len(args) - 1} "
+            f"OR c.customer_company_name ILIKE ${len(args)})"
+        )
+    safe_limit = max(1, min(int(limit or 500), 500))
+    args.append(safe_limit)
+    sql += f" ORDER BY c.created_at DESC LIMIT ${len(args)}"
+
     customers = rs(await db.fetch(sql, *args))
     for customer in customers:
         customer["social_profiles"] = await _load_social_profiles(db, customer["id"])
         _serialize_customer(customer)
     return customers
+
+
+@router.get("/customers")
+async def list_customers(request: Request, segment: Optional[str] = None, search: Optional[str] = None):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    return await _fetch_customers(db, cid or "", segment=segment or "", search=search or "", limit=500)
+
+
+@router.get("/customers/search")
+async def search_customers(
+    request: Request,
+    q: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    query = (q or search or "").strip()
+    return await _fetch_customers(db, cid or "", search=query, limit=limit)
 
 
 @router.get("/customers/{customer_id}")
@@ -209,7 +251,7 @@ async def create_customer(request: Request):
         if not phone:
             raise HTTPException(
                 400,
-                "Invalid phone number. Use a valid number in E.164 or international form (e.g. +92… or +44…), "
+                "Invalid phone number. Use a valid number in E.164 or international form (e.g. +92... or +44...), "
                 "or a valid local number for WHATSAPP_DEFAULT_COUNTRY.",
             )
     name = (body.get("name", "") or "").strip()
@@ -252,7 +294,7 @@ async def create_customer(request: Request):
         cust["social_profiles"] = await _load_social_profiles(db, cust_id)
         _serialize_customer(cust)
     await ensure_customer_profile(db, cust)
-    from core.socket import sio, connected_users
+    from core.socket import connected_users, sio
 
     await create_notification(
         db,
@@ -287,7 +329,7 @@ async def update_customer(customer_id: str, request: Request):
         if not out:
             raise HTTPException(
                 400,
-                "Invalid phone number. Use a valid number in E.164 or international form (e.g. +92… or +44…), "
+                "Invalid phone number. Use a valid number in E.164 or international form (e.g. +92... or +44...), "
                 "or a valid local number for WHATSAPP_DEFAULT_COUNTRY.",
             )
         safe_body["phone"] = out
@@ -443,7 +485,9 @@ async def bulk_upload_customers(request: Request, file: UploadFile = File(...)):
                 tags=tags if _row_has_any(row, "tags", "labels") else None,
                 channels=channels if _row_has_any(row, "channels", "preferred_channels") else None,
             )
-            created_customer = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 AND company_id=$2", customer_id, cid))
+            created_customer = r(
+                await db.fetchrow("SELECT * FROM customers WHERE id=$1 AND company_id=$2", customer_id, cid)
+            )
             await ensure_customer_profile(db, created_customer)
             summary["created"] += 1
         except HTTPException as exc:
@@ -549,6 +593,29 @@ async def create_purchase(request: Request):
         float(body.get("amount", 0)),
         body["customer_id"],
     )
+    lead = r(
+        await db.fetchrow(
+            "SELECT l.* FROM leads l JOIN customers c ON c.lead_id=l.id "
+            "WHERE c.id=$1 AND c.company_id=$2 AND l.company_id=$2 LIMIT 1",
+            body["customer_id"],
+            cid,
+        )
+    )
+    if lead:
+        try:
+            await transition_lead_stage(
+                db,
+                lead,
+                "won",
+                reason="Successful payment or purchase recorded",
+                source="payment",
+                confidence=1.0,
+                changed_by_user_id=cu.get("sub", ""),
+                event_id=f"purchase:{purchase_id}",
+                automatic=True,
+            )
+        except Exception as exc:
+            logger.warning("purchase lead stage transition failed purchase_id=%s lead_id=%s: %s", purchase_id, lead.get("id"), exc)
     create_safe_detached_task(
         db,
         db.execute(

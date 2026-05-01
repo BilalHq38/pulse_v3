@@ -5,7 +5,8 @@
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",
-    "dev": "nodemon bridge.js"
+    "dev": "nodemon bridge.js",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "libphonenumber-js": "^1.11.0",

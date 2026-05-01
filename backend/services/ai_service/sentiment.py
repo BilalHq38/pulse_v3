@@ -416,7 +416,21 @@ async def _call_sentiment_api(
                 errors.append(f"{signature}: {reason}")
                 continue
             try:
-                payload = await call_model_json(prompt, SentimentResult, engine=engine)
+                logger.info(
+                    "sentiment_llm_called company_id=%s provider=%s model=%s",
+                    company_id or "",
+                    provider,
+                    model,
+                )
+                payload = await call_model_json(
+                    prompt,
+                    SentimentResult,
+                    engine=engine,
+                    call_purpose="sentiment",
+                    function_name="_call_sentiment_api",
+                    max_provider_attempts=1,
+                    allow_provider_fallback=False,
+                )
                 return payload, engine
             except Exception as exc:
                 error_str = str(exc)
@@ -593,11 +607,21 @@ def should_auto_escalate(message_text: str, sentiment: dict | None = None, inten
 
 async def analyze_sentiment(text: str, db=None, company_id: str = "", **kwargs) -> dict:
     source_text = (text or "").strip() or "[empty message]"
+    lowered = source_text.lower()
+    if lowered in {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay"} or len(lowered.split()) <= 2:
+        result = analyze_local_sentiment(source_text)
+        result["scope"] = "message"
+        result["source"] = "local_low_risk"
+        return result
     prompt = _message_prompt(source_text)
     try:
         raw, engine = await _call_sentiment_api(prompt, db=db, company_id=company_id)
         _log_sentiment_payload("raw", scope="message", source_text=source_text, payload=raw, engine=engine)
         if _should_retry_for_zero_score(raw):
+            logger.info(
+                "sentiment_llm_retry scope=message company_id=%s reason=zero_score second_model_call=true",
+                company_id or "",
+            )
             raw, engine = await _call_sentiment_api(
                 _with_non_zero_retry_instruction(prompt),
                 db=db,
@@ -648,6 +672,10 @@ async def analyze_conversation_sentiment(
         raw, engine = await _call_sentiment_api(prompt, db=db, company_id=company_id)
         _log_sentiment_payload("raw", scope="conversation", source_text=source_text, payload=raw, engine=engine)
         if _should_retry_for_zero_score(raw):
+            logger.info(
+                "sentiment_llm_retry scope=conversation company_id=%s reason=zero_score second_model_call=true",
+                company_id or "",
+            )
             raw, engine = await _call_sentiment_api(
                 _with_non_zero_retry_instruction(prompt),
                 db=db,

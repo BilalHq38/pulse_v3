@@ -118,7 +118,7 @@ async def orchestrate_message_workflow(
                     user_id=_service_user(payload),
                     user_role=_service_role(payload),
                 ),
-                json=payload.model_dump(),
+                json=payload.model_dump(mode="json"),
             ),
             timeout=orchestrator_request_timeout_seconds(),
         )
@@ -204,10 +204,19 @@ async def orchestrate_lead_workflow(
                 user_id=_service_user(payload),
                 user_role=_service_role(payload),
             ),
-            json=payload.model_dump(),
+            json=payload.model_dump(mode="json"),
         )
         return WorkflowResponse.model_validate(response)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Orchestrator lead workflow request failed company_id=%s lead_id=%s customer_id=%s conversation_id=%s error=%s; trying local fallback=%s",
+            payload.company_id,
+            payload.lead_id,
+            payload.customer_id,
+            payload.conversation_id,
+            exc,
+            db is not None,
+        )
         if db is None:
             raise
         return await _lead_workflow_fallback(payload, db=db)

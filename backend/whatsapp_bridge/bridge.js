@@ -15,6 +15,16 @@ const fs = require("fs");
 const path = require("path");
 const util = require("util");
 const { parsePhoneNumberFromString } = require("libphonenumber-js");
+const {
+  SESSION_STATES,
+  connectedForState,
+  messageForState,
+  progressForState,
+} = require("./session_state");
+const {
+  resolveInboundSenderIdentity,
+  stringifyIdentityValue,
+} = require("./inbound_identity");
 
 function loadEnvFile(filePath) {
   try {
@@ -75,8 +85,6 @@ function validateRequiredBridgeEnv() {
     requiredEnv("PYTHON_BACKEND"),
     requiredEnv("WHATSAPP_WEBHOOK_PATH"),
     requiredEnv("WHATSAPP_BRIDGE_SECRET", ["BRIDGE_SECRET"]),
-    requiredEnv("WHATSAPP_PHONE_NUMBER_ID", ["PHONE_NUMBER_ID"]),
-    requiredEnv("WHATSAPP_BUSINESS_ACCOUNT_ID"),
     requiredEnv("WHATSAPP_WEBHOOK_SECRET", ["META_WEBHOOK_SECRET", "BRIDGE_WEBHOOK_SECRET"]),
   ];
   const missing = requirements.filter((item) => !item.value);
@@ -122,17 +130,24 @@ const WHATSAPP_BUSINESS_ACCOUNT_ID = readEnvValue("WHATSAPP_BUSINESS_ACCOUNT_ID"
 const WEBHOOK_SIGNING_SECRET = readEnvValue("WHATSAPP_WEBHOOK_SECRET", ["META_WEBHOOK_SECRET", "BRIDGE_WEBHOOK_SECRET"]);
 const MY_NUMBER = process.env.MY_WHATSAPP_NUMBER || "";
 const BRIDGE_FORWARD_TIMEOUT_MS = readEnvInt("BRIDGE_FORWARD_TIMEOUT_MS", 10000);
-const BRIDGE_READY_TIMEOUT_MS = readEnvInt("BRIDGE_READY_TIMEOUT_MS", 60000);
-const BRIDGE_CHECK_READY_TIMEOUT_MS = readEnvInt("BRIDGE_CHECK_READY_TIMEOUT_MS", 60000);
+const BRIDGE_READY_TIMEOUT_MS = readEnvInt("BRIDGE_READY_TIMEOUT_MS", 180000);
+const BRIDGE_CHECK_READY_TIMEOUT_MS = readEnvInt("BRIDGE_CHECK_READY_TIMEOUT_MS", 180000);
 const BRIDGE_JSON_LIMIT = readEnvValue("BRIDGE_JSON_LIMIT") || "10mb";
 const WWEBJS_AUTH_TIMEOUT_MS = readEnvInt("WWEBJS_AUTH_TIMEOUT_MS", 180000);
-const WWEBJS_READY_AFTER_INIT_TIMEOUT_MS = readEnvInt("WWEBJS_READY_AFTER_INIT_TIMEOUT_MS", 60000);
+const WWEBJS_READY_AFTER_INIT_TIMEOUT_MS = readEnvInt("WWEBJS_READY_AFTER_INIT_TIMEOUT_MS", 180000);
 const WWEBJS_SESSION_INIT_DELAY_MS = readEnvInt("WWEBJS_SESSION_INIT_DELAY_MS", 2000);
+const WWEBJS_INIT_MAX_ATTEMPTS = readEnvInt("WWEBJS_INIT_MAX_ATTEMPTS", 3);
+const WWEBJS_INIT_RETRY_BASE_DELAY_MS = readEnvInt("WWEBJS_INIT_RETRY_BASE_DELAY_MS", 3000);
+const WWEBJS_INIT_RETRY_MAX_DELAY_MS = readEnvInt("WWEBJS_INIT_RETRY_MAX_DELAY_MS", 20000);
 const PUPPETEER_PROTOCOL_TIMEOUT_MS = readEnvInt("PUPPETEER_PROTOCOL_TIMEOUT_MS", 180000);
 const PUPPETEER_NAVIGATION_TIMEOUT_MS = readEnvInt("PUPPETEER_NAVIGATION_TIMEOUT_MS", 180000);
 const WHATSAPP_SEND_RETRY_ATTEMPTS = readEnvInt("WHATSAPP_SEND_RETRY_ATTEMPTS", 3);
 const WHATSAPP_SEND_RETRY_BASE_DELAY_MS = readEnvInt("WHATSAPP_SEND_RETRY_BASE_DELAY_MS", 800);
 const WHATSAPP_SEND_RETRY_MAX_DELAY_MS = readEnvInt("WHATSAPP_SEND_RETRY_MAX_DELAY_MS", 5000);
+
+function isPlaceholderValue(value) {
+  return /^replace-with-|^your-|^placeholder$/i.test(String(value || "").trim());
+}
 
 const WWEBJS_AUTH_DIR = path.join(__dirname, ".wwebjs_auth");
 const SESSION_METADATA_DIR = path.join(WWEBJS_AUTH_DIR, ".scope_meta");
@@ -189,6 +204,88 @@ function logBridgeEvent(level, event, data = {}) {
   } else {
     console.log(line);
   }
+}
+
+function bridgeTraceId(req) {
+  return String(
+    (req && req.headers && (req.headers["x-trace-id"] || req.headers["x-request-id"])) || "",
+  ).trim();
+}
+
+function initRetryDelayMs(attempt) {
+  const base = Math.max(250, WWEBJS_INIT_RETRY_BASE_DELAY_MS);
+  const max = Math.max(base, WWEBJS_INIT_RETRY_MAX_DELAY_MS);
+  return Math.min(max, base * (2 ** Math.max(0, attempt - 1)));
+}
+
+function sessionLogContext(session, extra = {}) {
+  return {
+    scope: session && session.scopeKey ? session.scopeKey : "",
+    company_id: session && session.companyId ? session.companyId : "",
+    user_id: session && session.userId ? session.userId : "",
+    attempt: session && session.initAttempt ? session.initAttempt : 0,
+    state: session && session.state ? session.state : SESSION_STATES.IDLE,
+    trace_id: session && session.traceId ? session.traceId : "",
+    elapsed_ms: session && session.stateStartedAt ? Date.now() - session.stateStartedAt : 0,
+    ...extra,
+  };
+}
+
+function setSessionState(session, state, extra = {}) {
+  if (!session) return;
+  const nextState = String(state || SESSION_STATES.IDLE);
+  if (session.state !== nextState) {
+    session.state = nextState;
+    session.stateStartedAt = Date.now();
+  }
+  session.updatedAt = Date.now();
+  if (Object.prototype.hasOwnProperty.call(extra, "retrying")) {
+    session.retrying = Boolean(extra.retrying);
+  }
+  if (Object.prototype.hasOwnProperty.call(extra, "lastError")) {
+    session.lastInitError = String(extra.lastError || "");
+  }
+  persistSessionMetadata(session);
+}
+
+function sessionSnapshot(session) {
+  if (!session) {
+    const state = SESSION_STATES.DISCONNECTED;
+    return {
+      connected: false,
+      state,
+      status: state,
+      bridge_status: state,
+      progress: progressForState(state),
+      message: messageForState(state),
+      phone: "",
+      qr: "",
+      retrying: false,
+      last_error: "",
+      updated_at: new Date().toISOString(),
+      scope: "",
+      company_id: "",
+      user_id: "",
+    };
+  }
+  const state = isSessionReady(session) ? SESSION_STATES.READY : session.state || SESSION_STATES.IDLE;
+  return {
+    connected: connectedForState(state),
+    state,
+    status: state,
+    bridge_status: state,
+    progress: progressForState(state),
+    message: messageForState(state, { retrying: session.retrying }),
+    phone: state === SESSION_STATES.READY ? session.phone || "" : "",
+    qr: state === SESSION_STATES.QR_REQUIRED ? session.lastQrString || "" : "",
+    retrying: Boolean(session.retrying),
+    last_error: session.lastInitError || "",
+    updated_at: new Date(session.updatedAt || Date.now()).toISOString(),
+    scope: session.scopeKey,
+    company_id: session.companyId || "",
+    user_id: session.userId || "",
+    bridgeSecretConfigured: Boolean(BRIDGE_SECRET),
+  };
 }
 
 function maskPhone(value) {
@@ -249,9 +346,28 @@ function parseDataUrl(dataUrl) {
   return { mimeType: match[1], data: match[2] };
 }
 
-function attachmentToMedia(attachment) {
+async function attachmentToMedia(attachment) {
   if (!attachment || String(attachment.type || "").toLowerCase() !== "image") return null;
-  const parsed = parseDataUrl(attachment.url || attachment.file_url || "");
+  const sourceUrl = String(attachment.url || attachment.file_url || "").trim();
+  let parsed = parseDataUrl(sourceUrl);
+  if (!parsed && sourceUrl) {
+    try {
+      const absoluteUrl = sourceUrl.startsWith("/") ? `${PYTHON_BACKEND}${sourceUrl}` : sourceUrl;
+      if (/^https?:\/\//i.test(absoluteUrl)) {
+        const response = await axios.get(absoluteUrl, { responseType: "arraybuffer", timeout: BRIDGE_FORWARD_TIMEOUT_MS });
+        const mimeType = String(response.headers["content-type"] || attachment.mime_type || "image/jpeg").split(";")[0].trim();
+        if (mimeType.startsWith("image/")) {
+          parsed = { mimeType, data: Buffer.from(response.data).toString("base64") };
+        }
+      }
+    } catch (err) {
+      logBridgeEvent("warn", "whatsapp.outbound.attachment_fetch_failed", {
+        url: sourceUrl.slice(0, 200),
+        error: trimText(err && err.message ? err.message : err, 300),
+      });
+      return null;
+    }
+  }
   if (!parsed) return null;
   const fallbackExt = parsed.mimeType.split("/")[1] || "jpg";
   const filename = attachment.name || `image.${fallbackExt}`;
@@ -634,6 +750,9 @@ function persistSessionMetadata(session) {
     companyId: session.companyId || "",
     userId: session.userId || "",
     phone: session.phone || "",
+    state: session.state || SESSION_STATES.IDLE,
+    retrying: Boolean(session.retrying),
+    lastError: session.lastInitError || "",
     updatedAt: new Date().toISOString(),
   };
   try {
@@ -667,13 +786,8 @@ function sessionAuthDir(scopeKey) {
 }
 
 function sessionStatus(session) {
-  if (!session) return "missing";
-  if (isSessionReady(session)) return "ready";
-  if (session.lastQrString) return "need_qr";
-  if (session.initPromise) return "initializing";
-  if (session.lastInitError) return "disconnected";
-  if (session.isAuthenticated) return "initializing";
-  return "disconnected";
+  if (!session) return SESSION_STATES.DISCONNECTED;
+  return sessionSnapshot(session).state;
 }
 
 function sessionFromRequest(req) {
@@ -694,8 +808,16 @@ function sessionFromRequest(req) {
 async function forwardInboundMessage(session, msg) {
   if (msg.isGroupMsg || msg.from === "status@broadcast") return;
 
-  const senderPhone = String(msg.from || "").replace("@c.us", "").replace(/\D/g, "");
-  const senderName = msg._data && msg._data.notifyName ? msg._data.notifyName : `WhatsApp ${senderPhone}`;
+  const senderIdentity = await resolveInboundSenderIdentity(msg);
+  const senderPhone = senderIdentity.senderPhoneDigits || senderIdentity.rawSenderDigits;
+  const rawFrom = stringifyIdentityValue(msg.from);
+  const msgAuthor = stringifyIdentityValue(msg.author);
+  const msgIdRemote = stringifyIdentityValue(msg.id && msg.id.remote);
+  const senderName = (
+    senderIdentity.rawFields.contact_name
+    || (msg._data && msg._data.notifyName)
+    || `WhatsApp ${senderIdentity.senderPhone || senderPhone || "contact"}`
+  );
   const isImageMessage = Boolean(msg.hasMedia);
   let imagePayload = null;
 
@@ -704,10 +826,32 @@ async function forwardInboundMessage(session, msg) {
     company_id: session.companyId || "",
     user_id: session.userId || "",
     message_id: msg && msg.id ? msg.id.id || msg.id._serialized || "" : "",
-    from: maskPhone(senderPhone),
+    source: "whatsapp_web_bridge",
+    raw_from: rawFrom,
+    msg_from: rawFrom,
+    msg_author: msgAuthor,
+    msg_id_remote: msgIdRemote,
+    raw_sender_id: senderIdentity.rawSenderId,
+    normalized_sender: senderIdentity.senderPhone,
+    selected_identity_source: senderIdentity.selectedSource,
+    provider_sender_id: senderIdentity.providerSenderId,
+    from: maskPhone(senderIdentity.senderPhone || senderPhone),
     has_media: isImageMessage,
     body_length: String(msg.body || "").length,
   });
+  if (!senderIdentity.isValid) {
+    logBridgeEvent("warn", "whatsapp.incoming.identity_unresolved", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      raw_from: rawFrom,
+      msg_author: msgAuthor,
+      msg_id_remote: msgIdRemote,
+      raw_sender_id: senderIdentity.rawSenderId,
+      provider_sender_id: senderIdentity.providerSenderId,
+      candidates: senderIdentity.candidates.map((item) => ({ label: item.label, raw: item.raw })),
+    });
+  }
 
   if (isImageMessage) {
     try {
@@ -732,10 +876,16 @@ async function forwardInboundMessage(session, msg) {
   }
 
   try {
+    const phoneNumberId = isPlaceholderValue(WHATSAPP_PHONE_NUMBER_ID) ? "" : WHATSAPP_PHONE_NUMBER_ID;
+    const businessAccountId = isPlaceholderValue(WHATSAPP_BUSINESS_ACCOUNT_ID) ? "" : WHATSAPP_BUSINESS_ACCOUNT_ID;
     const metadata = {
-      phone_number_id: WHATSAPP_PHONE_NUMBER_ID,
+      source: "whatsapp_web_bridge",
       bridge_scope: session.scopeKey,
+      provider: "whatsapp-web.js",
     };
+    if (phoneNumberId) {
+      metadata.phone_number_id = phoneNumberId;
+    }
     if (session.phone || MY_NUMBER) {
       metadata.display_phone_number = session.phone || MY_NUMBER;
     }
@@ -745,13 +895,34 @@ async function forwardInboundMessage(session, msg) {
     if (session.userId) {
       metadata.bridge_user_id = session.userId;
     }
+    if (senderIdentity.rawFields.profile_picture_url) {
+      metadata.profile_picture_url = senderIdentity.rawFields.profile_picture_url;
+    }
 
     const messagePayload = {
       from: senderPhone,
       type: imagePayload ? "image" : "text",
       text: { body: msg.body || "" },
       timestamp: Math.floor(Date.now() / 1000),
-      id: msg.id.id,
+      id: (msg.id && (msg.id.id || msg.id._serialized)) || "",
+      web_bridge: {
+        source: "whatsapp_web_bridge",
+        raw_from: rawFrom,
+        msg_from: rawFrom,
+        msg_author: msgAuthor,
+        msg_to: stringifyIdentityValue(msg.to),
+        msg_id_remote: msgIdRemote,
+        msg_id_id: stringifyIdentityValue(msg.id && msg.id.id),
+        msg_id_serialized: stringifyIdentityValue(msg.id && msg.id._serialized),
+        raw_sender_id: senderIdentity.rawSenderId,
+        provider_sender_id: senderIdentity.providerSenderId,
+        selected_identity_source: senderIdentity.selectedSource,
+        sender_phone: senderIdentity.senderPhone,
+        sender_phone_digits: senderIdentity.senderPhoneDigits,
+        contact_number: senderIdentity.rawFields.contact_number || "",
+        contact_id: senderIdentity.rawFields.contact_id || "",
+        chat_id: senderIdentity.rawFields.chat_id || "",
+      },
     };
     if (imagePayload) {
       messagePayload.image = imagePayload;
@@ -759,15 +930,25 @@ async function forwardInboundMessage(session, msg) {
 
     const payload = {
       entry: [{
-        id: WHATSAPP_BUSINESS_ACCOUNT_ID,
+        id: businessAccountId || `whatsapp-web:${session.scopeKey}`,
         changes: [{
           value: {
-            business_account_id: WHATSAPP_BUSINESS_ACCOUNT_ID,
+            business_account_id: businessAccountId,
             metadata,
             messages: [messagePayload],
             contacts: [{
-              profile: { name: senderName },
-              wa_id: senderPhone,
+              profile: {
+                name: senderName,
+                picture: senderIdentity.rawFields.profile_picture_url || "",
+                profile_picture: senderIdentity.rawFields.profile_picture_url || "",
+              },
+              wa_id: senderIdentity.senderPhoneDigits || "",
+              web_bridge: {
+                sender_phone: senderIdentity.senderPhone,
+                provider_sender_id: senderIdentity.providerSenderId,
+                contact_id: senderIdentity.rawFields.contact_id || "",
+                profile_picture_url: senderIdentity.rawFields.profile_picture_url || "",
+              },
             }],
           },
         }],
@@ -777,7 +958,7 @@ async function forwardInboundMessage(session, msg) {
     const rawPayload = JSON.stringify(payload);
     const signature = buildMetaSignature(rawPayload);
 
-    await axios.post(`${PYTHON_BACKEND}${WHATSAPP_WEBHOOK_PATH}`, rawPayload, {
+    const response = await axios.post(`${PYTHON_BACKEND}${WHATSAPP_WEBHOOK_PATH}`, rawPayload, {
       headers: {
         "Content-Type": "application/json",
         "X-Hub-Signature-256": signature,
@@ -790,8 +971,17 @@ async function forwardInboundMessage(session, msg) {
     logBridgeEvent("info", "whatsapp.incoming.forwarded", {
       scope: session.scopeKey,
       message_id: messagePayload.id || "",
-      from: maskPhone(senderPhone),
+      source: "whatsapp_web_bridge",
+      raw_from: rawFrom,
+      raw_sender_id: senderIdentity.rawSenderId,
+      normalized_sender: senderIdentity.senderPhone,
+      from: maskPhone(senderIdentity.senderPhone || senderPhone),
       type: messagePayload.type,
+      backend_status: response.status,
+      backend_response_status: response.data && response.data.status ? response.data.status : "",
+      backend_message_id: response.data && response.data.message_id ? response.data.message_id : "",
+      backend_conversation_id: response.data && response.data.conversation_id ? response.data.conversation_id : "",
+      backend_customer_id: response.data && response.data.customer_id ? response.data.customer_id : "",
     });
     console.log(`[${session.scopeKey}] Forwarded inbound message to Python backend`);
   } catch (err) {
@@ -871,11 +1061,11 @@ function attachClientHandlers(session) {
     session.lastQrString = String(qr || "");
     session.isReady = false;
     session.isAuthenticated = false;
-    persistSessionMetadata(session);
+    session.lastInitError = "";
+    session.retrying = false;
+    setSessionState(session, SESSION_STATES.QR_REQUIRED);
     logBridgeEvent("info", "whatsapp.session.qr_required", {
-      scope: session.scopeKey,
-      company_id: session.companyId || "",
-      user_id: session.userId || "",
+      ...sessionLogContext(session),
     });
     console.log(`\n[${session.scopeKey}] Scan this QR code with WhatsApp:`);
     qrcode.generate(qr, { small: true });
@@ -884,11 +1074,20 @@ function attachClientHandlers(session) {
   client.on("authenticated", () => {
     session.lastQrString = "";
     session.isAuthenticated = true;
-    persistSessionMetadata(session);
+    session.lastInitError = "";
+    session.retrying = false;
+    setSessionState(session, SESSION_STATES.QR_SCANNED);
+    logBridgeEvent("info", "whatsapp.session.qr_scanned", {
+      ...sessionLogContext(session),
+    });
+    setSessionState(session, SESSION_STATES.AUTHENTICATED);
     logBridgeEvent("info", "whatsapp.session.authenticated", {
-      scope: session.scopeKey,
-      company_id: session.companyId || "",
-      user_id: session.userId || "",
+      ...sessionLogContext(session),
+    });
+    setSessionState(session, SESSION_STATES.INITIALIZING);
+    logBridgeEvent("info", "whatsapp.session.waiting_for_ready", {
+      ...sessionLogContext(session),
+      timeout_ms: WWEBJS_READY_AFTER_INIT_TIMEOUT_MS,
     });
     console.log(`[${session.scopeKey}] WhatsApp authenticated`);
   });
@@ -898,9 +1097,10 @@ function attachClientHandlers(session) {
     session.isAuthenticated = false;
     session.lastQrString = "";
     session.lastInitError = String(message || "Authentication failed");
-    persistSessionMetadata(session);
+    session.retrying = false;
+    setSessionState(session, SESSION_STATES.FAILED, { lastError: session.lastInitError });
     logBridgeEvent("error", "whatsapp.session.auth_failed", {
-      scope: session.scopeKey,
+      ...sessionLogContext(session),
       error: trimText(message, 400),
     });
     console.error(`[${session.scopeKey}] Auth failed: ${message}`);
@@ -912,17 +1112,16 @@ function attachClientHandlers(session) {
     session.lastReadyAt = Date.now();
     session.lastInitError = "";
     session.lastQrString = "";
+    session.retrying = false;
     session.phone = String(
       (client.info && client.info.wid && client.info.wid.user) || MY_NUMBER || "",
     ).trim();
-    persistSessionMetadata(session);
+    setSessionState(session, SESSION_STATES.READY);
     // #region agent log
     _dbgLog("H4", "bridge.js:ready", "client ready", { scopeKey: session.scopeKey });
     // #endregion
     logBridgeEvent("info", "whatsapp.session.ready", {
-      scope: session.scopeKey,
-      company_id: session.companyId || "",
-      user_id: session.userId || "",
+      ...sessionLogContext(session),
       phone: maskPhone(session.phone),
     });
     console.log(
@@ -935,9 +1134,10 @@ function attachClientHandlers(session) {
     session.isAuthenticated = false;
     session.lastQrString = "";
     session.phone = "";
-    persistSessionMetadata(session);
+    session.retrying = false;
+    setSessionState(session, SESSION_STATES.DISCONNECTED);
     logBridgeEvent("warn", "whatsapp.session.disconnected", {
-      scope: session.scopeKey,
+      ...sessionLogContext(session),
       reason: trimText(reason, 300),
     });
     console.log(`[${session.scopeKey}] Disconnected: ${reason}`);
@@ -962,11 +1162,18 @@ function createSession(scopeInput) {
     scopeKey: scope.scopeKey,
     companyId: scope.companyId,
     userId: scope.userId,
-    phone: "",
+    phone: String(scopeInput.phone || "").trim(),
     isReady: false,
     isAuthenticated: false,
+    state: scopeInput.state === SESSION_STATES.READY ? SESSION_STATES.INITIALIZING : (scopeInput.state || SESSION_STATES.IDLE),
+    stateStartedAt: Date.now(),
+    updatedAt: Date.now(),
+    retrying: false,
+    initAttempt: 0,
+    clientStarted: false,
+    traceId: "",
     initPromise: null,
-    lastInitError: "",
+    lastInitError: String(scopeInput.lastError || "").trim(),
     lastReadyAt: 0,
     lastQrString: "",
     client: null,
@@ -987,6 +1194,18 @@ async function ensureSessionInitialized(session) {
     });
     // #endregion
     return session.initPromise;
+  }
+  if (
+    session.clientStarted &&
+    [
+      SESSION_STATES.QR_REQUIRED,
+      SESSION_STATES.QR_SCANNED,
+      SESSION_STATES.AUTHENTICATED,
+      SESSION_STATES.INITIALIZING,
+      SESSION_STATES.RECONNECTING,
+    ].includes(session.state)
+  ) {
+    return;
   }
 
   const queued = sessionInitQueue.then(() => initializeSessionSequentially(session));
@@ -1047,6 +1266,7 @@ function rebuildSessionClient(session) {
   session.isReady = false;
   session.isAuthenticated = false;
   session.lastQrString = "";
+  session.clientStarted = false;
   session.client = buildClient(session);
   attachClientHandlers(session);
 }
@@ -1075,17 +1295,20 @@ async function initializeSessionSequentially(session) {
 
   removeChromiumSingletonLocks(sessionAuthDir(session.scopeKey));
   session.lastInitError = "";
+  session.retrying = false;
+  setSessionState(session, SESSION_STATES.INITIALIZING);
   logBridgeEvent("info", "whatsapp.session.init_start", {
-    scope: session.scopeKey,
-    company_id: session.companyId || "",
-    user_id: session.userId || "",
+    ...sessionLogContext(session),
+    max_attempts: WWEBJS_INIT_MAX_ATTEMPTS,
+    ready_timeout_ms: WWEBJS_READY_AFTER_INIT_TIMEOUT_MS,
   });
 
-  // Allow up to 3 attempts: the first crash is almost always a transient
-  // TargetCloseError during WhatsApp Web script injection (OOM / slow start).
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  const maxAttempts = Math.max(1, WWEBJS_INIT_MAX_ATTEMPTS);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    session.initAttempt = attempt;
     session.lastInitError = "";
     try {
+      session.clientStarted = true;
       await withTimeout(
         session.client.initialize(),
         WWEBJS_AUTH_TIMEOUT_MS,
@@ -1096,22 +1319,52 @@ async function initializeSessionSequentially(session) {
       const readyState = await waitForReadyOrQr(session, WWEBJS_READY_AFTER_INIT_TIMEOUT_MS);
       if (readyState === "ready") {
         logBridgeEvent("info", "whatsapp.session.init_ready", {
-          scope: session.scopeKey,
-          attempt,
+          ...sessionLogContext(session, { attempt }),
         });
         return;
       }
       if (readyState === "qr") {
         logBridgeEvent("info", "whatsapp.session.init_waiting_for_qr", {
-          scope: session.scopeKey,
-          attempt,
+          ...sessionLogContext(session, { attempt }),
         });
         return;
+      }
+      if (readyState === "timeout" && session.isAuthenticated) {
+        const delayMs = initRetryDelayMs(attempt);
+        logBridgeEvent("warn", "whatsapp.session.ready_timeout_transient", {
+          ...sessionLogContext(session, { attempt }),
+          timeout_ms: WWEBJS_READY_AFTER_INIT_TIMEOUT_MS,
+          retry_available: attempt < maxAttempts,
+        });
+        if (attempt < maxAttempts) {
+          session.retrying = true;
+          setSessionState(session, SESSION_STATES.RECONNECTING, { retrying: true });
+          logBridgeEvent("warn", "whatsapp.session.retry_scheduled", {
+            ...sessionLogContext(session, { attempt }),
+            delay_ms: delayMs,
+            next_attempt: attempt + 1,
+          });
+          const becameReady = await waitForReady(session, delayMs);
+          if (becameReady) return;
+          try {
+            await session.client.destroy();
+          } catch {
+            /* ignore cleanup failure */
+          }
+          removeChromiumSingletonLocks(sessionAuthDir(session.scopeKey));
+          rebuildSessionClient(session);
+          session.lastInitError = "";
+          session.retrying = false;
+          setSessionState(session, SESSION_STATES.INITIALIZING);
+          continue;
+        }
       }
       throw new Error(`WhatsApp session did not reach ready state (${readyState})`);
     } catch (err) {
       const formatted = formatBridgeError(err);
       session.isReady = false;
+      const transient = isTransientPuppeteerError(err);
+      const canRetry = attempt < maxAttempts && transient;
       session.lastInitError = formatted.clientMessage;
 
       // #region agent log
@@ -1132,18 +1385,28 @@ async function initializeSessionSequentially(session) {
       });
       // #endregion
 
-      logBridgeEvent("error", "whatsapp.session.init_failed", {
-        scope: session.scopeKey,
-        attempt,
-        transient: isTransientPuppeteerError(err),
+      logBridgeEvent(canRetry ? "warn" : "error", canRetry ? "whatsapp.session.init_timeout_transient" : "whatsapp.session.init_failed", {
+        ...sessionLogContext(session, { attempt }),
+        transient,
+        retry_available: canRetry,
         error: formatted.clientMessage,
       });
       console.error(`[${session.scopeKey}] Initialize failed: ${err.message || err}`);
 
-      if (attempt >= 3 || !isTransientPuppeteerError(err)) {
+      if (!canRetry) {
+        session.retrying = false;
+        setSessionState(session, SESSION_STATES.FAILED, { lastError: formatted.clientMessage });
         throw err;
       }
 
+      session.retrying = true;
+      setSessionState(session, SESSION_STATES.RECONNECTING, { retrying: true });
+      const delayMs = initRetryDelayMs(attempt);
+      logBridgeEvent("warn", "whatsapp.session.retry_scheduled", {
+        ...sessionLogContext(session, { attempt }),
+        delay_ms: delayMs,
+        next_attempt: attempt + 1,
+      });
       try {
         await session.client.destroy();
       } catch {
@@ -1152,7 +1415,9 @@ async function initializeSessionSequentially(session) {
       removeChromiumSingletonLocks(sessionAuthDir(session.scopeKey));
       rebuildSessionClient(session);
       session.lastInitError = "";
-      await sleep(retryDelayMs(attempt));
+      await sleep(delayMs);
+      session.retrying = false;
+      setSessionState(session, SESSION_STATES.INITIALIZING);
     }
   }
 }
@@ -1215,11 +1480,9 @@ app.get("/health", (_req, res) => {
     bridgeSecretConfigured: Boolean(BRIDGE_SECRET),
     webhookSecretConfigured: Boolean(WEBHOOK_SIGNING_SECRET),
     active_sessions: Array.from(sessions.values()).map((session) => ({
-      scope: session.scopeKey,
+      ...sessionSnapshot(session),
       company_id: session.companyId || "",
       user_id: session.userId || "",
-      phone: session.phone || "",
-      status: sessionStatus(session),
     })),
   });
 });
@@ -1227,25 +1490,23 @@ app.get("/health", (_req, res) => {
 app.get("/session", async (req, res) => {
   if (!requireBridgeSecret(req, res)) return;
   const session = createSession(sessionFromRequest(req));
+  session.traceId = bridgeTraceId(req);
   ensureSessionInitialized(session).catch(() => {});
-  res.json({
-    status: sessionStatus(session),
-    phone: session.phone || "",
-    scope: session.scopeKey,
-    bridgeSecretConfigured: Boolean(BRIDGE_SECRET),
-  });
+  res.json(sessionSnapshot(session));
 });
 
 app.get("/qr", async (req, res) => {
   if (!requireBridgeSecret(req, res)) return;
   const session = createSession(sessionFromRequest(req));
+  session.traceId = bridgeTraceId(req);
   ensureSessionInitialized(session).catch(() => {});
+  const snapshot = sessionSnapshot(session);
 
   if (session.isReady) {
-    return res.json({ qr_data_url: "", bridge_status: "ready", scope: session.scopeKey });
+    return res.json({ ...snapshot, qr_data_url: "", qr_png_base64: "" });
   }
   if (!session.lastQrString) {
-    return res.json({ qr_data_url: "", bridge_status: sessionStatus(session), scope: session.scopeKey });
+    return res.json({ ...snapshot, qr_data_url: "", qr_png_base64: "" });
   }
 
   QRImage.toDataURL(session.lastQrString, { errorCorrectionLevel: "M", width: 280 }, (err, dataUrl) => {
@@ -1253,7 +1514,7 @@ app.get("/qr", async (req, res) => {
       console.error(`[${session.scopeKey}] QR PNG error: ${err.message}`);
       return res.status(500).json({ error: err.message });
     }
-    res.json({ qr_data_url: dataUrl, bridge_status: "need_qr", scope: session.scopeKey });
+    res.json({ ...sessionSnapshot(session), qr_data_url: dataUrl, qr_png_base64: "" });
   });
 });
 
@@ -1267,8 +1528,11 @@ app.post("/disconnect", async (req, res) => {
 
   try {
     session.isReady = false;
+    session.isAuthenticated = false;
     session.lastQrString = "";
     session.phone = "";
+    session.retrying = false;
+    setSessionState(session, SESSION_STATES.DISCONNECTED);
     try {
       await session.client.logout();
     } catch (err) {
@@ -1287,37 +1551,38 @@ app.post("/send", async (req, res) => {
 
   const { to, message, attachments } = req.body || {};
   const mediaItems = Array.isArray(attachments)
-    ? attachments.map(attachmentToMedia).filter(Boolean)
+    ? (await Promise.all(attachments.map(attachmentToMedia))).filter(Boolean)
     : [];
   if (!to || (!String(message || "").trim() && mediaItems.length === 0)) {
     return res.status(400).json({ error: "Missing 'to' or content" });
   }
 
   const session = createSession(sessionFromRequest(req));
+  session.traceId = bridgeTraceId(req);
   ensureSessionInitialized(session).catch(() => {});
   logBridgeEvent("info", "whatsapp.outgoing.request", {
-    scope: session.scopeKey,
-    company_id: session.companyId || "",
-    user_id: session.userId || "",
+    ...sessionLogContext(session),
     target: maskPhone(to),
     body_length: String(message || "").length,
     attachment_count: mediaItems.length,
     status: sessionStatus(session),
   });
-  const ready = await waitForReady(session, BRIDGE_READY_TIMEOUT_MS);
-  if (!ready) {
-    logBridgeEvent("warn", "whatsapp.outgoing.not_ready", {
-      scope: session.scopeKey,
+  if (!isSessionReady(session)) {
+    const snapshot = sessionSnapshot(session);
+    logBridgeEvent("warn", "whatsapp.outgoing.send_blocked_not_ready", {
+      ...sessionLogContext(session),
       target: maskPhone(to),
-      status: sessionStatus(session),
+      status: snapshot.state,
       last_error: session.lastInitError || "",
     });
     return res.status(503).json({
+      success: false,
+      code: "WHATSAPP_SESSION_NOT_READY",
       error: session.lastQrString
         ? "WhatsApp session is not connected for this account. Please scan the QR code first."
         : "WhatsApp session is still starting. Please retry in a few seconds.",
+      ...snapshot,
       scope: session.scopeKey,
-      status: sessionStatus(session),
     });
   }
 
@@ -1402,19 +1667,21 @@ app.post("/send", async (req, res) => {
 app.get("/check/:phone", async (req, res) => {
   if (!requireBridgeSecret(req, res)) return;
   const session = createSession(sessionFromRequest(req));
+  session.traceId = bridgeTraceId(req);
   ensureSessionInitialized(session).catch(() => {});
-  const ready = await waitForReady(session, BRIDGE_CHECK_READY_TIMEOUT_MS);
-  if (!ready) {
+  if (!isSessionReady(session)) {
+    const snapshot = sessionSnapshot(session);
     logBridgeEvent("warn", "whatsapp.check.not_ready", {
-      scope: session.scopeKey,
+      ...sessionLogContext(session),
       target: maskPhone(req.params.phone || ""),
-      status: sessionStatus(session),
+      status: snapshot.state,
       last_error: session.lastInitError || "",
     });
     return res.status(503).json({
+      code: "WHATSAPP_SESSION_NOT_READY",
       error: "WhatsApp session is not ready for this account.",
+      ...snapshot,
       scope: session.scopeKey,
-      status: sessionStatus(session),
     });
   }
   try {

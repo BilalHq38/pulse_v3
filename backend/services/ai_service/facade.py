@@ -187,13 +187,23 @@ def _safe_ai_reply_default(message_text: str, customer_info: dict | None = None)
 
 
 def _safe_lead_score_default(lead_data: dict) -> dict:
-    return LeadScoreResult(
-        score=50,
-        grade="warm",
-        reasoning="AI service unavailable. Review the lead manually.",
-        next_action="Review lead manually",
+    result = LeadScoreResult(
+        score=0,
+        grade="cold",
+        reasoning="AI service unavailable. Lead was not scored; review manually.",
+        next_action="Review lead manually after AI provider is available.",
         phase="awareness",
     ).model_dump()
+    result.update(
+        {
+            "grade": "deferred",
+            "scoring_status": "failed",
+            "error_type": "ai_service_unavailable",
+            "error_reason": "AI service unavailable",
+            "fallback_used": True,
+        }
+    )
+    return result
 
 
 def _safe_nurture_default(lead_data: dict, stage: str) -> dict:

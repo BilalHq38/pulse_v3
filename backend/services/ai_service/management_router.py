@@ -15,6 +15,8 @@ from services.db_helpers import (
     ensure_company_settings_row,
     ensure_default_llm_engine,
     get_current_user_flexible,
+    model_supports_vision,
+    provider_configuration_status,
     r,
     require_roles,
     rs,
@@ -104,6 +106,60 @@ def _super_admin_requested_company_id(request: Request, current_user: dict) -> s
     if not _is_super_admin(current_user):
         return (current_user.get("company_id", "") or "").strip()
     return (request.query_params.get("company_id", "") or "").strip()
+
+
+def _unique_model_names(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        model_name = str(value or "").strip()
+        if not model_name or model_name in seen:
+            continue
+        seen.add(model_name)
+        out.append(model_name)
+    return out
+
+
+def _supported_model_catalog() -> dict[str, list[str]]:
+    gemini_fallbacks = [
+        item.strip()
+        for item in (os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash")).split(",")
+        if item.strip()
+    ]
+    return {
+        "openai": _unique_model_names(
+            [
+                os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                "gpt-4o-mini",
+                "gpt-4o",
+                "gpt-4-turbo",
+            ]
+        ),
+        "anthropic": _unique_model_names(
+            [
+                os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+                "claude-3-5-sonnet-20241022",
+                "claude-3-5-haiku-20241022",
+            ]
+        ),
+        "gemini": _unique_model_names(
+            [
+                os.environ.get("GEMINI_FLASH_MODEL", "gemini-2.5-flash"),
+                os.environ.get("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
+                *gemini_fallbacks,
+            ]
+        ),
+    }
+
+
+async def _list_scoped_llm_engines(db, company_id: str, selected_id: str = "") -> list[dict]:
+    rows = await db.fetch(
+        "SELECT * FROM llm_engines "
+        "WHERE company_id='' OR company_id=$1 "
+        "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, provider, model_name",
+        company_id,
+    )
+    return [enrich_llm_engine(engine, selected_id=selected_id) for engine in rs(rows)]
 
 
 @router.get("/ai/architecture")
@@ -231,6 +287,10 @@ async def ai_sentiment(request: Request):
     cu = await get_current_user_flexible(request)
     body = await request.json()
     text = body.get("text", "")
+    logger.info(
+        "manual_ai_endpoint_called endpoint=/ai/sentiment company_id=%s purpose=admin_test",
+        cu.get("company_id", ""),
+    )
     sentiment = await analyze_sentiment(text, db=db, company_id=cu.get("company_id", ""))
     return build_sentiment_gate(text, sentiment)
 
@@ -240,6 +300,10 @@ async def ai_classify(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     body = await request.json()
+    logger.info(
+        "manual_ai_endpoint_called endpoint=/ai/classify company_id=%s purpose=admin_test",
+        cu.get("company_id", ""),
+    )
     return await classify_intent(
         body.get("text", ""),
         db=db,
@@ -256,17 +320,52 @@ async def list_llm_engines(request: Request):
     cid = _super_admin_requested_company_id(request, cu)
     if _is_super_admin(cu) and not cid:
         raise HTTPException(400, "company_id query parameter is required for super_admin LLM engine queries")
+    await ensure_default_llm_engine(db)
     selected_id = ""
     if cid:
         settings = await ensure_company_settings_row(db, cid)
         selected_id = settings.get("active_llm_engine_id", "")
-    rows = await db.fetch(
-        "SELECT * FROM llm_engines "
-        "WHERE company_id='' OR company_id=$1 "
-        "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, provider, model_name",
-        cid,
-    )
-    return [enrich_llm_engine(engine, selected_id=selected_id) for engine in rs(rows)]
+    return await _list_scoped_llm_engines(db, cid, selected_id=selected_id)
+
+
+@router.get("/ai/models")
+async def list_supported_llm_models(request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = _super_admin_requested_company_id(request, cu)
+    if _is_super_admin(cu) and not cid:
+        raise HTTPException(400, "company_id query parameter is required for super_admin LLM model queries")
+    await ensure_default_llm_engine(db)
+    selected_id = ""
+    if cid:
+        settings = await ensure_company_settings_row(db, cid)
+        selected_id = settings.get("active_llm_engine_id", "")
+    engines = await _list_scoped_llm_engines(db, cid, selected_id=selected_id)
+    providers = []
+    models = []
+    for provider, provider_models in _supported_model_catalog().items():
+        status, status_detail = provider_configuration_status(provider)
+        providers.append(
+            {
+                "provider": provider,
+                "status": status,
+                "status_detail": status_detail,
+                "configured": status == "configured",
+            }
+        )
+        for model_name in provider_models:
+            models.append(
+                {
+                    "provider": provider,
+                    "model_name": model_name,
+                    "status": status,
+                    "status_detail": status_detail,
+                    "configured": status == "configured",
+                    "supports_vision": model_supports_vision(provider, model_name),
+                    "source": "catalog",
+                }
+            )
+    return {"providers": providers, "models": models, "engines": engines}
 
 
 @router.post("/ai/llm-engines")

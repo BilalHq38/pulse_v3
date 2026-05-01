@@ -190,6 +190,14 @@ async def join_conversation(sid, data):
             await sio.disconnect(sid)
             return
         await sio.enter_room(sid, f"convo_{convo_id}")
+        logger.info(
+            "Socket joined conversation sid=%s user_id=%s company_id=%s conversation_id=%s socket_room=%s",
+            sid,
+            payload.get("sub", ""),
+            company_id,
+            convo_id,
+            f"convo_{convo_id}",
+        )
 
 
 @sio.event
@@ -205,12 +213,27 @@ async def leave_conversation(sid, data):
 async def emit_new_message(conversation_id: str, message: dict):
     try:
         company_id = await _resolve_conversation_company_id(conversation_id)
+        message_id = str((message or {}).get("id") or "").strip()
+        logger.info(
+            "Socket emit new_message conversation_id=%s company_id=%s message_id=%s socket_room=%s emitted_event=new_message frontend_expected_event=new_message",
+            conversation_id,
+            company_id,
+            message_id,
+            f"convo_{conversation_id}",
+        )
         await sio.emit(
             "new_message",
             _json_safe({"conversation_id": conversation_id, "message": message}),
             room=f"convo_{conversation_id}",
         )
         if company_id:
+            logger.info(
+                "Socket emit conversation_updated conversation_id=%s company_id=%s message_id=%s socket_room=%s emitted_event=conversation_updated frontend_expected_event=conversation_updated",
+                conversation_id,
+                company_id,
+                message_id,
+                f"company_{company_id}",
+            )
             await sio.emit(
                 "conversation_updated",
                 {"conversation_id": conversation_id},

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from fastapi import Request
 
 from channel_layer.base import BaseChannelAdapter
+from channel_layer.channel_identity import company_default_phone_region, normalize_whatsapp_phone
 from channel_layer.schemas import (
     AdapterHealthStatus,
     ChannelType,
@@ -21,10 +22,42 @@ from channel_layer.schemas import (
     UnifiedAttachment,
     UnifiedMessage,
 )
-from core.phone_normalization import normalize_to_e164_digits
 from core.utils import make_id
 
 logger = logging.getLogger(__name__)
+
+
+def _first_text(*values) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _whatsapp_web_bridge_sender_identity(
+    msg: dict,
+    contact: dict,
+    *,
+    default_region: str | None = None,
+) -> tuple:
+    web_bridge = msg.get("web_bridge") if isinstance(msg.get("web_bridge"), dict) else {}
+    contact_bridge = contact.get("web_bridge") if isinstance(contact.get("web_bridge"), dict) else {}
+    candidates = [
+        web_bridge.get("sender_phone"),
+        web_bridge.get("sender_phone_digits"),
+        contact_bridge.get("sender_phone"),
+        contact.get("wa_id"),
+        msg.get("from"),
+        web_bridge.get("contact_number"),
+        web_bridge.get("msg_from"),
+        web_bridge.get("raw_from"),
+    ]
+    for candidate in candidates:
+        identity = normalize_whatsapp_phone(str(candidate or ""), default_region=default_region)
+        if identity.is_valid:
+            return identity, web_bridge
+    return normalize_whatsapp_phone("", default_region=default_region), web_bridge
 
 
 class WhatsAppAdapter(BaseChannelAdapter):
@@ -44,7 +77,9 @@ class WhatsAppAdapter(BaseChannelAdapter):
         tenant_id: str,
     ) -> UnifiedMessage:
         """Parse a Meta WhatsApp webhook payload into UnifiedMessage."""
-        normalized = self.normalize_message(payload)
+        default_region = await company_default_phone_region(db, tenant_id)
+        normalized = self.normalize_message(payload, default_region=default_region)
+        identity = normalized.get("sender_identity") or {}
         return UnifiedMessage(
             message_id=normalized.get("message_id") or make_id(),
             tenant_id=tenant_id,
@@ -58,8 +93,17 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 "phone_number_id": normalized.get("phone_number_id", ""),
                 "business_account_id": normalized.get("business_account_id", ""),
                 "profile_name": normalized.get("profile_name", ""),
+                "profile_picture_url": normalized.get("profile_picture_url", ""),
                 "message_type": normalized.get("message_type", "text"),
                 "raw_message": normalized.get("raw_message", {}),
+                "raw_provider_payload": normalized.get("raw_payload", {}),
+                "raw_sender_id": normalized.get("raw_sender_id", ""),
+                "raw_wa_id": normalized.get("raw_wa_id", ""),
+                "normalized_sender_id": identity.get("canonical_value", ""),
+                "provider_sender_id": identity.get("provider_sender_id", ""),
+                "identity_source": identity.get("source", ""),
+                "identity_reason": identity.get("reason", ""),
+                "identity_confidence": identity.get("confidence", 0.0),
             },
             attachments=normalized.get("attachments", []),
             reply_to_message_id=normalized.get("reply_to_message_id", ""),
@@ -75,6 +119,11 @@ class WhatsAppAdapter(BaseChannelAdapter):
 
         to_phone = message.external_user_id or message.metadata.get("phone", "")
         db_message_id = str(message.metadata.get("db_message_id") or "").strip()
+        conversation_id = str(message.metadata.get("conversation_id") or "").strip() or str(
+            message.metadata.get("conversationId") or ""
+        ).strip()
+        customer_id = str(message.metadata.get("customer_id") or "").strip()
+        idempotency_key = str(message.metadata.get("idempotency_key") or "").strip()
         actor_user_id = str(
             message.metadata.get("actor_user_id")
             or message.metadata.get("owner_user_id")
@@ -100,6 +149,9 @@ class WhatsAppAdapter(BaseChannelAdapter):
             company_id=message.tenant_id,
             db_message_id=db_message_id,
             user_id=actor_user_id,
+            conversation_id=conversation_id or str(message.metadata.get("conversation_id") or ""),
+            customer_id=customer_id,
+            idempotency_key=idempotency_key,
         )
 
         return SendResult(
@@ -165,7 +217,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
 
         return False
 
-    def normalize_message(self, raw_payload: dict) -> dict:
+    def normalize_message(self, raw_payload: dict, default_region: str | None = None) -> dict:
         """
         Extract core message fields from Meta WhatsApp webhook format.
 
@@ -197,10 +249,15 @@ class WhatsAppAdapter(BaseChannelAdapter):
             "phone_number_id": "",
             "business_account_id": "",
             "profile_name": "",
+            "profile_picture_url": "",
             "attachments": [],
             "reply_to_message_id": "",
             "timestamp": datetime.now(timezone.utc),
             "raw_message": {},
+            "raw_payload": raw_payload,
+            "raw_sender_id": "",
+            "raw_wa_id": "",
+            "sender_identity": {},
         }
 
         for entry in raw_payload.get("entry", []) or []:
@@ -213,7 +270,15 @@ class WhatsAppAdapter(BaseChannelAdapter):
 
                 contacts = value.get("contacts", []) or []
                 if contacts:
-                    result["profile_name"] = str(((contacts[0] or {}).get("profile") or {}).get("name") or "").strip()
+                    profile = ((contacts[0] or {}).get("profile") or {})
+                    result["profile_name"] = str(profile.get("name") or "").strip()
+                    result["profile_picture_url"] = str(
+                        profile.get("profile_picture")
+                        or profile.get("picture")
+                        or (contacts[0] or {}).get("profile_picture_url")
+                        or ""
+                    ).strip()
+                    result["raw_wa_id"] = str((contacts[0] or {}).get("wa_id") or "").strip()
 
                 messages = value.get("messages", []) or []
                 if not messages:
@@ -222,7 +287,69 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 msg = messages[0] or {}
                 result["raw_message"] = msg
                 result["message_id"] = str(msg.get("id") or "").strip()
-                result["sender_phone"] = normalize_to_e164_digits(str(msg.get("from") or "").strip())
+                metadata_source = str(metadata.get("source") or "").strip()
+                is_web_bridge = metadata_source == "whatsapp_web_bridge" or isinstance(msg.get("web_bridge"), dict)
+                web_bridge = {}
+                if is_web_bridge:
+                    sender_identity, web_bridge = _whatsapp_web_bridge_sender_identity(
+                        msg,
+                        contacts[0] if contacts else {},
+                        default_region=default_region,
+                    )
+                    result["raw_sender_id"] = _first_text(
+                        web_bridge.get("selected_identity_source") and web_bridge.get("raw_sender_id"),
+                        web_bridge.get("sender_phone"),
+                        web_bridge.get("sender_phone_digits"),
+                        msg.get("from"),
+                    )
+                    result["raw_wa_id"] = _first_text(
+                        (contacts[0] or {}).get("wa_id") if contacts else "",
+                        web_bridge.get("sender_phone_digits"),
+                    )
+                    result["profile_picture_url"] = _first_text(
+                        result.get("profile_picture_url"),
+                        web_bridge.get("profile_picture_url"),
+                        metadata.get("profile_picture_url"),
+                    )
+                else:
+                    result["raw_sender_id"] = str(msg.get("from") or "").strip()
+                    sender_identity = normalize_whatsapp_phone(
+                        result["raw_sender_id"],
+                        default_region=default_region,
+                    )
+                    if not sender_identity.is_valid and result["raw_wa_id"]:
+                        wa_identity = normalize_whatsapp_phone(
+                            result["raw_wa_id"],
+                            default_region=default_region,
+                        )
+                        if wa_identity.is_valid:
+                            sender_identity = wa_identity
+                result["sender_phone"] = sender_identity.canonical_value
+                result["sender_identity"] = {
+                    "raw_value": sender_identity.raw_value,
+                    "canonical_value": sender_identity.canonical_value,
+                    "provider_id": sender_identity.provider_id,
+                    "is_valid": sender_identity.is_valid,
+                    "reason": sender_identity.reason,
+                    "channel": sender_identity.channel,
+                    "confidence": sender_identity.confidence,
+                }
+                if is_web_bridge:
+                    result["sender_identity"]["provider_sender_id"] = _first_text(
+                        web_bridge.get("provider_sender_id"),
+                        web_bridge.get("raw_from"),
+                        web_bridge.get("msg_id_remote"),
+                    )
+                    result["sender_identity"]["source"] = "whatsapp_web_bridge"
+                if not sender_identity.is_valid:
+                    logger.warning(
+                        "Suspicious WhatsApp sender identity source=%s raw_sender_id=%s raw_wa_id=%s provider_sender_id=%s reason=%s",
+                        "whatsapp_web_bridge" if is_web_bridge else "meta_cloud",
+                        result["raw_sender_id"],
+                        result["raw_wa_id"],
+                        (web_bridge or {}).get("provider_sender_id", ""),
+                        sender_identity.reason,
+                    )
                 result["message_type"] = str(msg.get("type") or "text").strip()
 
                 # Parse timestamp (Meta may deliver seconds or milliseconds)
@@ -254,6 +381,12 @@ class WhatsAppAdapter(BaseChannelAdapter):
                                 mime_type=str(media_data.get("mime_type") or "").strip(),
                                 name=str(media_data.get("filename") or "").strip(),
                                 size=int(media_data.get("size") or 0),
+                                provider_media_id=media_id,
+                                raw_metadata={
+                                    "provider_media_id": media_id,
+                                    "message_type": msg_type,
+                                    "has_data_url": bool(data_url),
+                                },
                             )
                         )
                 elif msg_type == "location":

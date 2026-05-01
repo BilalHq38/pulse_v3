@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api from '@/lib/api';
+import { resolveMediaUrl } from '@/lib/backend-url';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -38,34 +39,11 @@ const CHANNELS = [
 const CHAT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const MAX_CHAT_IMAGE_SIZE_MB = 8;
 const MAX_CHAT_IMAGES = 4;
-const IDENTITY_CONSENT_VERSION = 'v1.0';
-const IDENTITY_CONSENT_METHOD = 'checkbox';
 
-function normalizeIdentityPlatform(channelKey) {
-  const normalized = String(channelKey || 'web_chat').trim().toLowerCase();
-  if (normalized === 'whatsapp' || normalized === 'facebook' || normalized === 'instagram' || normalized === 'web_chat' || normalized === 'email') {
-    return normalized;
-  }
-  return 'web_chat';
-}
-
-function resolveIdentityPlatformUserId(conversation, customer) {
-  if (!conversation) return '';
-  const fromConversation = String(conversation.channel_id || '').trim();
-  if (fromConversation) return fromConversation;
-
-  const platform = normalizeIdentityPlatform(conversation.channel);
-  const socialProfiles = (customer && typeof customer.social_profiles === 'object' && customer.social_profiles) || {};
-  if ((platform === 'facebook' || platform === 'instagram') && socialProfiles[platform]) {
-    return String(socialProfiles[platform]).trim();
-  }
-  if (platform === 'whatsapp' && customer?.phone) {
-    return String(customer.phone).trim();
-  }
-  if (customer?.email) {
-    return String(customer.email).trim().toLowerCase();
-  }
-  return String(conversation.customer_id || '').trim();
+function isLikelyValidDisplayPhone(value) {
+  const text = String(value || '').trim();
+  const digits = text.replace(/\D/g, '');
+  return Boolean(text.startsWith('+') && digits.length >= 8 && digits.length <= 15);
 }
 
 function normalizeAttachments(attachments) {
@@ -76,12 +54,65 @@ function normalizeAttachments(attachments) {
       return {
         id: attachment.id || `att-${index}`,
         type: attachment.type || attachment.file_type || 'unknown',
-        url: attachment.url || attachment.file_url || '',
+        url: resolveMediaUrl(attachment.url || attachment.file_url || ''),
         name: attachment.name || attachment.file_name || '',
         size: Number(attachment.size || attachment.file_size || 0),
+        mime_type: attachment.mime_type || '',
+        image_analysis_status: attachment.image_analysis_status || '',
       };
     })
     .filter((attachment) => attachment && attachment.url);
+}
+
+function ChatImageThumb({ attachment, className, onOpen }) {
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={`relative block w-full overflow-hidden bg-slate-100 text-left ${className || ''}`}
+      disabled={failed}
+      title={attachment.name || 'Open image'}
+    >
+      {!loaded && !failed && (
+        <div className="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400">
+          Loading
+        </div>
+      )}
+      {failed ? (
+        <div className="flex h-28 items-center justify-center px-3 text-center text-[11px] text-slate-500">
+          Image unavailable
+        </div>
+      ) : (
+        <img
+          src={attachment.url}
+          alt={attachment.name || 'attachment'}
+          className="h-full w-full object-cover"
+          onLoad={() => setLoaded(true)}
+          onError={() => setFailed(true)}
+        />
+      )}
+      {attachment.name && !failed && (
+        <span className="absolute bottom-1 left-1.5 max-w-[85%] truncate rounded bg-black/50 px-1 py-0.5 text-[10px] font-medium leading-tight text-white">
+          {attachment.name}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function ContactAvatar({ entity, name, channelMeta, className = 'w-10 h-10', textClass = 'text-sm' }) {
+  const [failed, setFailed] = useState(false);
+  const url = resolveMediaUrl(entity?.avatar || entity?.customer_avatar || entity?.profile_picture_url || '');
+  const initial = (name || entity?.customer_name || entity?.name || '?').charAt(0);
+  return (
+    <div className={`${className} rounded-full ${channelMeta?.lightBg || 'bg-slate-100'} flex items-center justify-center ${textClass} font-bold ${channelMeta?.text || 'text-slate-600'} overflow-hidden flex-shrink-0`}>
+      {url && !failed ? (
+        <img src={url} alt="" referrerPolicy="no-referrer" className="h-full w-full object-cover" onError={() => setFailed(true)} />
+      ) : initial}
+    </div>
+  );
 }
 
 function normalizeMessage(message) {
@@ -90,6 +121,15 @@ function normalizeMessage(message) {
     ...message,
     attachments: normalizeAttachments(message.attachments),
   };
+}
+
+function extractMessagesPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === 'object') {
+    if (Array.isArray(payload.messages)) return payload.messages;
+    if (Array.isArray(payload.data)) return payload.data;
+  }
+  return null;
 }
 
 function mergeMessageUpdate(currentMessage, incomingMessage) {
@@ -250,14 +290,9 @@ export default function InboxPage() {
   const [customerEditLoading, setCustomerEditLoading] = useState(false);
   const [customerEditTarget, setCustomerEditTarget] = useState(null);
   const [customerEditForm, setCustomerEditForm] = useState({ name: '', email: '', phone: '', company: '' });
-  const [identityConsentChecked, setIdentityConsentChecked] = useState(false);
-  const [identityConsentActive, setIdentityConsentActive] = useState(false);
-  const [identityConsentToken, setIdentityConsentToken] = useState('');
-  const [identityStatusLoading, setIdentityStatusLoading] = useState(false);
-  const [identityVerifying, setIdentityVerifying] = useState(false);
-  const [identityResult, setIdentityResult] = useState(null);
-  const [identityError, setIdentityError] = useState('');
   const [notifyNewMessage, setNotifyNewMessage] = useState(true);
+  const [imagePreview, setImagePreview] = useState(null);
+  const [imagePreviewFailed, setImagePreviewFailed] = useState(false);
   const messagesEndRef = useRef(null);
   const composerFileRef = useRef(null);
   const customerSidebarRef = useRef(null);
@@ -322,7 +357,9 @@ export default function InboxPage() {
       }
       setMessages(prev => {
         const nextMessage = normalizeMessage(data.message);
-        if (prev.some(m => m.id === nextMessage.id)) return prev;
+        if (prev.some(m => m.id === nextMessage.id)) {
+          return prev.map(m => m.id === nextMessage.id ? mergeMessageUpdate(m, nextMessage) : m);
+        }
         return [...prev, nextMessage];
       });
     } else if (eventName === 'conversation_updated') {
@@ -556,7 +593,11 @@ export default function InboxPage() {
   const loadMessages = async (convoId) => {
     try {
       const res = await api.get(`/conversations/${convoId}/messages`);
-      setMessages(Array.isArray(res.data) ? res.data.map(normalizeMessage) : []);
+      const loadedMessages = extractMessagesPayload(res.data);
+      if (!loadedMessages) {
+        throw new Error('Unexpected messages response shape');
+      }
+      setMessages(loadedMessages.map(normalizeMessage));
     }
     catch (err) {
       console.error(err);
@@ -567,143 +608,6 @@ export default function InboxPage() {
       });
     }
   };
-
-  const resetIdentityContext = useCallback(() => {
-    setIdentityConsentChecked(false);
-    setIdentityConsentActive(false);
-    setIdentityConsentToken('');
-    setIdentityResult(null);
-    setIdentityError('');
-  }, []);
-
-  const loadIdentityConsentStatus = useCallback(async (conversation = selectedConvo, customer = customerInfo) => {
-    if (!conversation) return;
-    const platform = normalizeIdentityPlatform(conversation.channel);
-    const platformUserId = resolveIdentityPlatformUserId(conversation, customer);
-    if (!platformUserId) {
-      setIdentityConsentActive(false);
-      setIdentityConsentToken('');
-      return;
-    }
-
-    setIdentityStatusLoading(true);
-    try {
-      const res = await api.get(`/consent/status/${encodeURIComponent(platformUserId)}`);
-      const rows = Array.isArray(res.data) ? res.data : [];
-      const activeConsent = rows.find((row) => row?.platform === platform && row?.consent_active);
-      setIdentityConsentActive(Boolean(activeConsent));
-      setIdentityConsentToken(activeConsent?.consent_token || '');
-      setIdentityConsentChecked(Boolean(activeConsent));
-      setIdentityError('');
-    } catch (err) {
-      console.error('Failed to load identity consent status:', err);
-      setIdentityConsentActive(false);
-      setIdentityConsentToken('');
-      setIdentityError(err?.response?.data?.detail || 'Identity consent status could not be loaded.');
-    } finally {
-      setIdentityStatusLoading(false);
-    }
-  }, [selectedConvo, customerInfo]);
-
-  const resolveIdentityForConversation = useCallback(async (
-    consentToken,
-    conversation = selectedConvo,
-    customer = customerInfo,
-  ) => {
-    if (!conversation || !consentToken) return null;
-    const platform = normalizeIdentityPlatform(conversation.channel);
-    const platformUserId = resolveIdentityPlatformUserId(conversation, customer);
-    if (!platformUserId) {
-      setIdentityError('Platform user identifier is missing.');
-      return null;
-    }
-
-    setIdentityVerifying(true);
-    try {
-      const response = await api.post('/v1/identity/resolve', {
-        platform,
-        platform_user_id: platformUserId,
-        consent_token: consentToken,
-        phone_number: customer?.phone || undefined,
-        email_address: customer?.email || undefined,
-        full_name: conversation.customer_name || customer?.name || undefined,
-        username: customer?.social_profiles?.[platform] || undefined,
-        locale: window?.navigator?.language || undefined,
-        device_signals: {
-          conversation_id: conversation.id || '',
-          channel: conversation.channel || '',
-          channel_id: conversation.channel_id || '',
-          customer_id: conversation.customer_id || '',
-        },
-        cookie_id: conversation.session_id || undefined,
-      });
-      setIdentityResult(response.data || null);
-      setIdentityError('');
-      return response.data || null;
-    } catch (err) {
-      console.error('Identity resolve failed:', err);
-      setIdentityResult(null);
-      setIdentityError(err?.response?.data?.detail || 'Identity verification failed.');
-      return null;
-    } finally {
-      setIdentityVerifying(false);
-    }
-  }, [selectedConvo, customerInfo]);
-
-  const grantConsentAndResolveIdentity = useCallback(async (
-    conversation = selectedConvo,
-    customer = customerInfo,
-  ) => {
-    if (!conversation) return false;
-    if (!identityConsentChecked) {
-      setIdentityError('Consent checkbox must be confirmed before verification.');
-      return false;
-    }
-
-    const platform = normalizeIdentityPlatform(conversation.channel);
-    const platformUserId = resolveIdentityPlatformUserId(conversation, customer);
-    if (!platformUserId) {
-      setIdentityError('Platform user identifier is missing.');
-      return false;
-    }
-
-    try {
-      const consentRes = await api.post('/consent/grant', {
-        platform_user_id: platformUserId,
-        platform,
-        consent_version: IDENTITY_CONSENT_VERSION,
-        consent_method: IDENTITY_CONSENT_METHOD,
-        granular_consent: {
-          consent_device_tracking: false,
-          consent_behavioral_analysis: true,
-          consent_cross_platform_link: true,
-          consent_profile_picture: false,
-          consent_data_retention_days: 365,
-        },
-      });
-      const consentToken = consentRes?.data?.consent_token || '';
-      if (!consentToken) {
-        setIdentityError('Consent granted but no token was returned.');
-        return false;
-      }
-      setIdentityConsentActive(true);
-      setIdentityConsentToken(consentToken);
-      const result = await resolveIdentityForConversation(consentToken, conversation, customer);
-      return Boolean(result);
-    } catch (err) {
-      console.error('Consent grant failed:', err);
-      setIdentityError(err?.response?.data?.detail || 'Consent grant failed.');
-      return false;
-    }
-  }, [selectedConvo, customerInfo, identityConsentChecked, resolveIdentityForConversation]);
-
-  useEffect(() => {
-    if (!selectedConvo) {
-      resetIdentityContext();
-      return;
-    }
-    loadIdentityConsentStatus(selectedConvo, customerInfo);
-  }, [selectedConvo, customerInfo, loadIdentityConsentStatus, resetIdentityContext]);
 
   const handleComposerFiles = async (fileList) => {
     const files = Array.from(fileList || []);
@@ -750,25 +654,6 @@ export default function InboxPage() {
   const sendMessage = async () => {
     if ((!newMessage.trim() && composerAttachments.length === 0) || !selectedConvo || sending) return;
 
-    const platformUserId = resolveIdentityPlatformUserId(selectedConvo, customerInfo);
-    if (platformUserId) {
-      let identityWarning = '';
-      if (identityConsentActive && identityConsentToken && !identityResult) {
-        const resolved = await resolveIdentityForConversation(identityConsentToken, selectedConvo, customerInfo);
-        if (!resolved) {
-          identityWarning = 'Identity verification is unavailable. Sending message without identity linking.';
-        }
-      } else if (identityConsentChecked && !identityConsentActive) {
-        const verified = await grantConsentAndResolveIdentity(selectedConvo, customerInfo);
-        if (!verified) {
-          identityWarning = 'Consent verification failed. Sending message without identity linking.';
-        }
-      }
-      if (identityWarning) {
-        setIdentityError(identityWarning);
-      }
-    }
-
     setSending(true);
     try {
       const res = await api.post(`/conversations/${selectedConvo.id}/messages`, {
@@ -800,6 +685,7 @@ export default function InboxPage() {
           type: 'warning',
           title: 'Delivery Failed',
           message: res.data?.outbound_error || `The message was saved, but ${selectedConvo.customer_name || 'this contact'} did not receive it yet.`,
+          dedupeKey: `delivery-failed:${selectedConvo.id}:${res.data?.outbound_error || ''}`,
         });
       } else {
         showToast({
@@ -950,7 +836,6 @@ export default function InboxPage() {
     setCustomerInfo(null);
     setComposerAttachments([]);
     setComposerError('');
-    resetIdentityContext();
     setSelectedConvo(convo);
     setMaximized(true);
     setShowCustomerSidebar(false);
@@ -965,7 +850,6 @@ export default function InboxPage() {
     setComposerError('');
     setUnificationMatch(null);
     setUnificationPanelOpen(false);
-    resetIdentityContext();
   };
 
   const openCustomerProfileSidebar = useCallback(() => {
@@ -1163,9 +1047,7 @@ export default function InboxPage() {
                   data-testid={`convo-card-${convo.id}`}
                 >
                   <div className="flex items-start gap-3">
-                    <div className={`w-10 h-10 rounded-full ${ch.lightBg} flex items-center justify-center text-sm font-bold ${ch.text} flex-shrink-0`}>
-                      {convo.customer_name?.charAt(0)}
-                    </div>
+                    <ContactAvatar entity={convo} name={convo.customer_name} channelMeta={ch} />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between mb-1">
                         <span className="text-sm font-semibold text-slate-800 truncate">{convo.customer_name}</span>
@@ -1346,9 +1228,7 @@ export default function InboxPage() {
                           data-testid={`convo-card-${convo.id}`}
                         >
                           <div className="flex items-start gap-2.5 mb-2">
-                            <div className={`w-8 h-8 rounded-full ${ch.lightBg} flex items-center justify-center text-xs font-bold ${ch.text} flex-shrink-0`}>
-                              {convo.customer_name?.charAt(0)}
-                            </div>
+                            <ContactAvatar entity={convo} name={convo.customer_name} channelMeta={ch} className="w-8 h-8" textClass="text-xs" />
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center justify-between">
                                 <span className="text-[13px] font-semibold text-slate-800 truncate">{convo.customer_name}</span>
@@ -1440,9 +1320,7 @@ export default function InboxPage() {
                   onClick={openCustomerProfileSidebar}
                   className="flex items-center gap-2 sm:gap-3 min-w-0 rounded-xl px-1.5 py-1 -mx-1.5 hover:bg-slate-50 transition-colors text-left"
                 >
-                  <div className={`w-8 h-8 sm:w-10 sm:h-10 rounded-full ${chInfo?.lightBg || 'bg-slate-100'} flex items-center justify-center text-xs sm:text-sm font-bold ${chInfo?.text || 'text-slate-600'} flex-shrink-0`}>
-                    {selectedConvo.customer_name?.charAt(0)}
-                  </div>
+                  <ContactAvatar entity={selectedConvo} name={selectedConvo.customer_name} channelMeta={chInfo} className="w-8 h-8 sm:w-10 sm:h-10" textClass="text-xs sm:text-sm" />
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <h3 className="text-sm font-semibold text-slate-900 truncate">{selectedConvo.customer_name}</h3>
@@ -1459,16 +1337,6 @@ export default function InboxPage() {
                       </span>
                     )}
                     <span className="text-[11px] text-slate-400 hidden sm:inline truncate">{selectedConvo.subject}</span>
-                    {identityConsentActive && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-50 text-emerald-700 border-emerald-200 font-medium">
-                        Consent active
-                      </span>
-                    )}
-                    {identityResult && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-blue-50 text-blue-700 border-blue-200 font-medium">
-                        Identity {Math.round((identityResult.confidence_score || 0) * 100)}%
-                      </span>
-                    )}
                     {unificationMatch && (
                       <button onClick={() => setUnificationPanelOpen(!unificationPanelOpen)}
                         className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 text-indigo-700 font-semibold hover:from-indigo-100 hover:to-purple-100 transition-all animate-pulse"
@@ -1580,6 +1448,15 @@ export default function InboxPage() {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 sm:py-5 space-y-3 sm:space-y-4 bg-slate-50/50" data-testid="message-thread">
+              {messages.length === 0 && (
+                <div className="flex h-full min-h-[220px] items-center justify-center text-center text-slate-400">
+                  <div>
+                    <MessageSquare size={30} className="mx-auto mb-2 opacity-40" />
+                    <p className="text-sm font-medium text-slate-500">No messages yet</p>
+                    <p className="text-xs">Start the conversation from the composer below.</p>
+                  </div>
+                </div>
+              )}
               {messages.map((msg) => {
                 const isCustomer = msg.sender_type === 'customer';
                 const isAI = msg.sender_type === 'ai';
@@ -1644,18 +1521,12 @@ export default function InboxPage() {
                         {imageAttachments.length > 0 && (
                           <div className={`grid gap-0.5 ${imageAttachments.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
                             {imageAttachments.slice(0, 4).map((att, idx) => (
-                              <a key={att.id || idx} href={att.url} target="_blank" rel="noreferrer" className="relative block">
-                                <img
-                                  src={att.url}
-                                  alt={att.name || 'attachment'}
-                                  className={`w-full object-cover ${imageAttachments.length === 1 ? 'max-h-52' : 'h-28'} ${idx === 0 && imageAttachments.length > 1 ? 'rounded-tl-xl' : ''} ${idx === 1 && imageAttachments.length > 1 ? 'rounded-tr-xl' : ''} ${imageAttachments.length === 1 ? 'rounded-t-xl' : ''}`}
-                                />
-                                {att.name && (
-                                  <span className="absolute bottom-1 left-1.5 text-[10px] text-white font-medium bg-black/50 rounded px-1 py-0.5 leading-tight">
-                                    {att.name}
-                                  </span>
-                                )}
-                              </a>
+                              <ChatImageThumb
+                                key={att.id || idx}
+                                attachment={att}
+                                onOpen={() => { setImagePreviewFailed(false); setImagePreview(att); }}
+                                className={`${imageAttachments.length === 1 ? 'h-52 rounded-t-xl' : 'h-28'} ${idx === 0 && imageAttachments.length > 1 ? 'rounded-tl-xl' : ''} ${idx === 1 && imageAttachments.length > 1 ? 'rounded-tr-xl' : ''}`}
+                              />
                             ))}
                           </div>
                         )}
@@ -1729,49 +1600,6 @@ export default function InboxPage() {
                   <AlertDescription>{composerError}</AlertDescription>
                 </Alert>
               )}
-              <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
-                <div className="flex items-start gap-2.5 sm:items-center">
-                  <input
-                    type="checkbox"
-                    checked={identityConsentChecked}
-                    onChange={(e) => {
-                      setIdentityConsentChecked(e.target.checked);
-                      if (!e.target.checked) {
-                        setIdentityConsentActive(false);
-                        setIdentityConsentToken('');
-                        setIdentityResult(null);
-                      }
-                    }}
-                    className="mt-0.5 sm:mt-0"
-                  />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-[11px] font-medium text-slate-700">
-                      Consent required for cross-platform identity linking.
-                    </p>
-                    <p className="text-[10px] text-slate-500">
-                      Verify once per conversation before sending identity-aware replies.
-                    </p>
-                    {identityResult && (
-                      <p className="text-[10px] text-blue-600 mt-1">
-                        Linked profile {identityResult.customer_id} at {Math.round((identityResult.confidence_score || 0) * 100)}% confidence.
-                      </p>
-                    )}
-                    {identityError && (
-                      <Alert variant="destructive" className="mt-2 border-red-200 bg-red-50 text-red-700">
-                        <AlertDescription className="text-[10px]">{identityError}</AlertDescription>
-                      </Alert>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => grantConsentAndResolveIdentity(selectedConvo, customerInfo)}
-                    disabled={identityStatusLoading || identityVerifying || !identityConsentChecked}
-                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium border border-blue-200 text-blue-700 bg-white hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {identityStatusLoading ? 'Checking...' : identityVerifying ? 'Verifying...' : identityConsentActive ? 'Re-verify' : 'Grant & Verify'}
-                  </button>
-                </div>
-              </div>
               <div className="flex items-center gap-2">
                 <button onClick={triggerAI} disabled={aiLoading} className="p-2 sm:p-2.5 rounded-lg bg-purple-50 border border-purple-200 text-purple-500 hover:bg-purple-100 transition-colors disabled:opacity-50 flex-shrink-0" data-testid="ai-respond-btn" title="Generate AI response">
                   {aiLoading ? <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div> : <Sparkles size={16} />}
@@ -1807,6 +1635,38 @@ export default function InboxPage() {
             </div>
           </div>
 
+          {imagePreview && (
+            <div
+              className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4"
+              onClick={() => { setImagePreview(null); setImagePreviewFailed(false); }}
+              role="dialog"
+              aria-modal="true"
+            >
+              <div className="relative max-h-[92vh] w-full max-w-4xl" onClick={(event) => event.stopPropagation()}>
+                <button
+                  type="button"
+                  onClick={() => { setImagePreview(null); setImagePreviewFailed(false); }}
+                  className="absolute right-2 top-2 z-10 rounded-full bg-black/60 p-2 text-white hover:bg-black/75"
+                  title="Close preview"
+                >
+                  <X size={18} />
+                </button>
+                {imagePreviewFailed ? (
+                  <div className="flex min-h-[280px] items-center justify-center rounded-lg bg-white px-6 text-center text-sm font-medium text-slate-500 shadow-2xl">
+                    Image unavailable
+                  </div>
+                ) : (
+                  <img
+                    src={imagePreview.url}
+                    alt={imagePreview.name || 'attachment preview'}
+                    className="max-h-[92vh] w-full rounded-lg object-contain shadow-2xl"
+                    onError={() => setImagePreviewFailed(true)}
+                  />
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Customer Sidebar - Desktop always visible, Mobile as overlay */}
           {customerInfo && (
             <>
@@ -1829,8 +1689,8 @@ export default function InboxPage() {
                 </div>
                 <div className="p-5">
                   <div className="text-center mb-5">
-                    <div className={`w-14 h-14 rounded-full ${chInfo?.lightBg || 'bg-blue-50'} mx-auto flex items-center justify-center text-lg font-bold ${chInfo?.text || 'text-blue-600'} mb-2`}>
-                      {customerInfo.name?.charAt(0)}
+                    <div className="mx-auto mb-2 w-14">
+                      <ContactAvatar entity={customerInfo} name={customerInfo.name} channelMeta={chInfo} className="w-14 h-14" textClass="text-lg" />
                     </div>
                     <h4 className="text-sm font-semibold text-slate-900">{customerInfo.name}</h4>
                     <p className="text-[11px] text-slate-400">{customerInfo.company}</p>
@@ -1842,7 +1702,15 @@ export default function InboxPage() {
                   <div className="space-y-4">
                     <div className="space-y-1.5">
                       {customerInfo.email && <p className="text-xs text-slate-600 flex items-center gap-2"><Mail size={12} className="text-slate-400" /> <span className="truncate">{customerInfo.email}</span></p>}
-                      {customerInfo.phone && <p className="text-xs text-slate-600 flex items-center gap-2"><Phone size={12} className="text-slate-400" /> {customerInfo.phone}</p>}
+                      {customerInfo.phone && isLikelyValidDisplayPhone(customerInfo.phone) && (
+                        <p className="text-xs text-slate-600 flex items-center gap-2"><Phone size={12} className="text-slate-400" /> {customerInfo.phone}</p>
+                      )}
+                      {customerInfo.phone && !isLikelyValidDisplayPhone(customerInfo.phone) && (
+                        <p className="text-xs text-amber-800 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5">
+                          <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
+                          <span>Stored phone needs review before WhatsApp replies.</span>
+                        </p>
+                      )}
                     </div>
 
                     <div className="grid grid-cols-2 gap-2">

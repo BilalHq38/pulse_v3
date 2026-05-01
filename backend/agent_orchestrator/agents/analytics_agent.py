@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from agent_orchestrator.agents.base import BaseAgent, WorkflowContextProtocol
@@ -19,6 +20,10 @@ from data_pipeline.storage import (
     upsert_lead_metrics,
 )
 from services.ai_service.facade import summarize_customer_interaction
+from services.ai_service.llm_tracking import has_llm_budget_remaining
+from shared.config import ai_analytics_llm_enabled, ai_analytics_summary_min_messages
+
+logger = logging.getLogger(__name__)
 
 
 class AnalyticsAgent(BaseAgent):
@@ -88,7 +93,28 @@ class AnalyticsAgent(BaseAgent):
         )
         recent_messages = list(context.global_memory.conversation_history) or daily_messages
         summary = {}
-        if customer:
+        request_metadata = dict(getattr(request, "metadata", {}) or {})
+        explicit_analytics_mode = bool(request_metadata.get("analytics_llm"))
+        scheduled_summary = bool(request_metadata.get("daily_summary"))
+        analytics_enabled = bool(ai_analytics_llm_enabled() or explicit_analytics_mode or scheduled_summary)
+        threshold_met = len(recent_messages) >= ai_analytics_summary_min_messages()
+        terminal_status = str(conversation.get("status") or "").strip().lower() in {"closed", "resolved"}
+        should_summarize = bool(
+            customer
+            and analytics_enabled
+            and (terminal_status or explicit_analytics_mode or scheduled_summary or threshold_met)
+        )
+        skip_reason = ""
+        if not customer:
+            skip_reason = "no_customer"
+        elif not analytics_enabled:
+            skip_reason = "disabled"
+        elif not should_summarize:
+            skip_reason = "threshold_not_met"
+        elif not has_llm_budget_remaining():
+            skip_reason = "budget_exhausted"
+            should_summarize = False
+        if customer and should_summarize:
             ai_summary = await summarize_customer_interaction(
                 recent_messages,
                 customer,
@@ -110,6 +136,20 @@ class AnalyticsAgent(BaseAgent):
                     "ai_handled": bool(conversation.get("ai_handled", True)),
                 },
             )
+            analytics_llm_called = True
+        elif customer:
+            logger.info(
+                "analytics_summary_skipped workflow_id=%s conversation_id=%s company_id=%s message_count=%s status=%s reason=%s",
+                context.workflow_id,
+                conversation_id,
+                context.company_id,
+                len(recent_messages),
+                str(conversation.get("status") or "open"),
+                skip_reason or "unknown",
+            )
+            analytics_llm_called = False
+        else:
+            analytics_llm_called = False
         analytics_event = await upsert_analytics_event(
             context.db,
             {
@@ -139,6 +179,7 @@ class AnalyticsAgent(BaseAgent):
                 "conversation_metrics": metrics,
                 "customer_summary": summary,
                 "analytics_event": analytics_event,
+                "analytics_llm_called": analytics_llm_called,
             },
         )
 
