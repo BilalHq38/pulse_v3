@@ -53,11 +53,14 @@ class RespondRequest(BaseModel):
 
 class RespondResponse(BaseModel):
     reply: str
+    response: str = ""
     confidence: float = 0.0
     sentiment: dict[str, Any] | None = None
     intent: dict[str, Any] | None = None
     conversation_sentiment: dict[str, Any] | None = None
     engine: str = ""
+    provider: str = ""
+    model_name: str = ""
     llm_id: str = ""
     agent_id: str = ""
     agent_type: str = ""
@@ -67,6 +70,12 @@ class RespondResponse(BaseModel):
     conversation_stage: str = ""
     next_action: str = ""
     intent_shift: bool = False
+    degraded: bool = False
+    api_error: bool = False
+    provider_error: dict[str, Any] = Field(default_factory=dict)
+    error_type: str = ""
+    error_reason: str = ""
+    fallback_used: bool = False
 
 
 class LeadScoreRequest(BaseModel):

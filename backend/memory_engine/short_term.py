@@ -39,8 +39,12 @@ class ShortTermMemory:
     def __init__(self, namespace: str = "memory_engine_st") -> None:
         self._cache = get_cache_client(namespace=namespace)
 
-    def _key(self, tenant_id: str, user_id: str, suffix: str) -> str:
-        return f"{tenant_id}:{user_id}:{suffix}"
+    def _key(self, tenant_id: str, user_id: str, suffix: str, *, conversation_id: str = "") -> str:
+        user_scope = str(user_id or "").strip()
+        conversation_scope = str(conversation_id or "").strip()
+        if conversation_scope:
+            return f"{tenant_id}:user:{user_scope}:conversation:{conversation_scope}:{suffix}"
+        return f"{tenant_id}:user:{user_scope}:{suffix}"
 
     async def load(
         self,
@@ -50,13 +54,11 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> ShortTermContext:
         """Load all short-term context for a user."""
-        discriminator = conversation_id or user_id
-
-        recent_messages = await self._get_recent_messages(tenant_id, discriminator)
-        active_session = await self._get_json(tenant_id, discriminator, "session")
-        pending_intent = await self._get_json(tenant_id, discriminator, "intent")
-        last_ai_response = await self._get_string(tenant_id, discriminator, "last_ai")
-        conversation_state = await self._get_json(tenant_id, discriminator, "conv_state")
+        recent_messages = await self._get_recent_messages(tenant_id, user_id, conversation_id=conversation_id)
+        active_session = await self._get_json(tenant_id, user_id, "session", conversation_id=conversation_id)
+        pending_intent = await self._get_json(tenant_id, user_id, "intent", conversation_id=conversation_id)
+        last_ai_response = await self._get_string(tenant_id, user_id, "last_ai", conversation_id=conversation_id)
+        conversation_state = await self._get_json(tenant_id, user_id, "conv_state", conversation_id=conversation_id)
 
         return ShortTermContext(
             recent_messages=recent_messages,
@@ -75,8 +77,7 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> None:
         """Append a message to the recent messages list."""
-        discriminator = conversation_id or user_id
-        key = self._key(tenant_id, discriminator, "messages")
+        key = self._key(tenant_id, user_id, "messages", conversation_id=conversation_id)
 
         existing = await self._cache.get_json(key)
         messages: list[dict] = existing if isinstance(existing, list) else []
@@ -97,8 +98,7 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> None:
         """Store active session context."""
-        discriminator = conversation_id or user_id
-        key = self._key(tenant_id, discriminator, "session")
+        key = self._key(tenant_id, user_id, "session", conversation_id=conversation_id)
         await self._cache.set_json(key, session_data, ttl_seconds=_DEFAULT_TTL)
 
     async def store_intent(
@@ -110,8 +110,7 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> None:
         """Store pending intent state."""
-        discriminator = conversation_id or user_id
-        key = self._key(tenant_id, discriminator, "intent")
+        key = self._key(tenant_id, user_id, "intent", conversation_id=conversation_id)
         await self._cache.set_json(key, intent_data, ttl_seconds=_DEFAULT_TTL)
 
     async def store_last_ai_response(
@@ -123,8 +122,7 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> None:
         """Store the last AI response for deduplication."""
-        discriminator = conversation_id or user_id
-        key = self._key(tenant_id, discriminator, "last_ai")
+        key = self._key(tenant_id, user_id, "last_ai", conversation_id=conversation_id)
         await self._cache.set_json(key, {"text": response_text}, ttl_seconds=_DEFAULT_TTL)
 
     async def store_conversation_state(
@@ -136,8 +134,7 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> None:
         """Store conversation state (stage, intent, turn count)."""
-        discriminator = conversation_id or user_id
-        key = self._key(tenant_id, discriminator, "conv_state")
+        key = self._key(tenant_id, user_id, "conv_state", conversation_id=conversation_id)
         await self._cache.set_json(key, state, ttl_seconds=_DEFAULT_TTL)
 
     async def invalidate(
@@ -148,9 +145,8 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> None:
         """Clear all short-term memory for a user/conversation."""
-        discriminator = conversation_id or user_id
         for suffix in ("messages", "session", "intent", "last_ai", "conv_state"):
-            key = self._key(tenant_id, discriminator, suffix)
+            key = self._key(tenant_id, user_id, suffix, conversation_id=conversation_id)
             try:
                 await self._cache.delete(key)
             except Exception:
@@ -158,18 +154,18 @@ class ShortTermMemory:
 
     # ── Internal helpers ─────────────────────────────────────────────────
 
-    async def _get_recent_messages(self, tenant_id: str, discriminator: str) -> list[dict]:
-        key = self._key(tenant_id, discriminator, "messages")
+    async def _get_recent_messages(self, tenant_id: str, user_id: str, *, conversation_id: str = "") -> list[dict]:
+        key = self._key(tenant_id, user_id, "messages", conversation_id=conversation_id)
         data = await self._cache.get_json(key)
         return data if isinstance(data, list) else []
 
-    async def _get_json(self, tenant_id: str, discriminator: str, suffix: str) -> dict:
-        key = self._key(tenant_id, discriminator, suffix)
+    async def _get_json(self, tenant_id: str, user_id: str, suffix: str, *, conversation_id: str = "") -> dict:
+        key = self._key(tenant_id, user_id, suffix, conversation_id=conversation_id)
         data = await self._cache.get_json(key)
         return data if isinstance(data, dict) else {}
 
-    async def _get_string(self, tenant_id: str, discriminator: str, suffix: str) -> str:
-        key = self._key(tenant_id, discriminator, suffix)
+    async def _get_string(self, tenant_id: str, user_id: str, suffix: str, *, conversation_id: str = "") -> str:
+        key = self._key(tenant_id, user_id, suffix, conversation_id=conversation_id)
         data = await self._cache.get_json(key)
         if isinstance(data, dict):
             return str(data.get("text") or "").strip()

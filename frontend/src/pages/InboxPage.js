@@ -26,6 +26,7 @@ import {
   Check,
   MoreVertical,
   Image as ImageIcon,
+  PlayCircle,
 } from 'lucide-react';
 
 const CHANNELS = [
@@ -53,7 +54,11 @@ function normalizeAttachments(attachments) {
       if (!attachment || typeof attachment !== 'object') return null;
       return {
         id: attachment.id || `att-${index}`,
-        type: attachment.type || attachment.file_type || 'unknown',
+        type: String(attachment.type || attachment.file_type || '').startsWith('video') || String(attachment.mime_type || '').startsWith('video/')
+          ? 'video'
+          : String(attachment.type || attachment.file_type || '').startsWith('image') || String(attachment.mime_type || '').startsWith('image/')
+            ? 'image'
+            : attachment.type || attachment.file_type || 'unknown',
         url: resolveMediaUrl(attachment.url || attachment.file_url || ''),
         name: attachment.name || attachment.file_name || '',
         size: Number(attachment.size || attachment.file_size || 0),
@@ -62,6 +67,28 @@ function normalizeAttachments(attachments) {
       };
     })
     .filter((attachment) => attachment && attachment.url);
+}
+
+function normalizeReactions(reactions) {
+  if (!Array.isArray(reactions)) return [];
+  const latest = new Map();
+  reactions.forEach((reaction, index) => {
+    if (!reaction || typeof reaction !== 'object') return;
+    const action = String(reaction.action || 'added').toLowerCase();
+    const key = reaction.id || reaction.provider_message_id || `${reaction.actor_id || 'actor'}-${reaction.emoji || index}`;
+    if (action === 'removed') {
+      latest.delete(key);
+      return;
+    }
+    latest.set(key, {
+      id: key,
+      emoji: reaction.emoji || '',
+      actor_type: reaction.actor_type || 'customer',
+      actor_id: reaction.actor_id || '',
+      action,
+    });
+  });
+  return Array.from(latest.values()).filter((reaction) => reaction.emoji);
 }
 
 function ChatImageThumb({ attachment, className, onOpen }) {
@@ -102,6 +129,29 @@ function ChatImageThumb({ attachment, className, onOpen }) {
   );
 }
 
+function ChatVideoThumb({ attachment, onOpen }) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="relative flex h-40 w-full items-center justify-center overflow-hidden bg-slate-900 text-white"
+      title={attachment.name || 'Open video'}
+    >
+      <video src={attachment.url} className="h-full w-full object-cover opacity-80" muted preload="metadata" />
+      <span className="absolute inset-0 flex items-center justify-center">
+        <span className="rounded-full bg-black/55 p-2">
+          <PlayCircle size={28} />
+        </span>
+      </span>
+      {attachment.name && (
+        <span className="absolute bottom-1 left-1.5 max-w-[85%] truncate rounded bg-black/55 px-1 py-0.5 text-[10px] font-medium leading-tight text-white">
+          {attachment.name}
+        </span>
+      )}
+    </button>
+  );
+}
+
 function ContactAvatar({ entity, name, channelMeta, className = 'w-10 h-10', textClass = 'text-sm' }) {
   const [failed, setFailed] = useState(false);
   const url = resolveMediaUrl(entity?.avatar || entity?.customer_avatar || entity?.profile_picture_url || '');
@@ -120,6 +170,7 @@ function normalizeMessage(message) {
   return {
     ...message,
     attachments: normalizeAttachments(message.attachments),
+    reactions: normalizeReactions(message.reactions),
   };
 }
 
@@ -139,6 +190,7 @@ function mergeMessageUpdate(currentMessage, incomingMessage) {
     ...currentMessage,
     ...normalized,
     attachments: normalized.attachments?.length ? normalized.attachments : (currentMessage.attachments || []),
+    reactions: normalized.reactions?.length ? normalized.reactions : (currentMessage.reactions || []),
   };
 }
 
@@ -293,6 +345,8 @@ export default function InboxPage() {
   const [notifyNewMessage, setNotifyNewMessage] = useState(true);
   const [imagePreview, setImagePreview] = useState(null);
   const [imagePreviewFailed, setImagePreviewFailed] = useState(false);
+  const [videoPreview, setVideoPreview] = useState(null);
+  const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
   const messagesEndRef = useRef(null);
   const composerFileRef = useRef(null);
   const customerSidebarRef = useRef(null);
@@ -371,6 +425,19 @@ export default function InboxPage() {
     } else if (eventName === 'message_deleted') {
       if (data?.conversation_id && data?.message_id) {
         setMessages(prev => prev.filter(m => m.id !== data.message_id));
+      }
+    } else if (eventName === 'message_reaction_updated') {
+      const reaction = data?.reaction;
+      if (data?.conversation_id && reaction?.message_id) {
+        setMessages(prev => prev.map((message) => {
+          if (message.id !== reaction.message_id) return message;
+          const existing = Array.isArray(message.reactions) ? message.reactions : [];
+          const next = normalizeReactions([
+            ...existing.filter((item) => item.id !== reaction.id && item.provider_message_id !== reaction.provider_message_id),
+            reaction,
+          ]);
+          return { ...message, reactions: next };
+        }));
       }
     }
   }, [loadConversations, notifyNewMessage]);
@@ -1463,6 +1530,8 @@ export default function InboxPage() {
                 const isSystem = msg.sender_type === 'system';
                 const messageSentiment = getSentimentMeta(msg.sentiment_score, '', msg.sentiment_emotion);
                 const imageAttachments = Array.isArray(msg.attachments) ? msg.attachments.filter((attachment) => attachment.type === 'image') : [];
+                const videoAttachments = Array.isArray(msg.attachments) ? msg.attachments.filter((attachment) => attachment.type === 'video') : [];
+                const reactions = Array.isArray(msg.reactions) ? msg.reactions : [];
 
                 if (isSystem) {
                   const isEscalationAlert = isEscalationSystemMessage(msg.content) || msg.is_alert;
@@ -1530,6 +1599,17 @@ export default function InboxPage() {
                             ))}
                           </div>
                         )}
+                        {videoAttachments.length > 0 && (
+                          <div className="grid gap-0.5">
+                            {videoAttachments.slice(0, 2).map((att, idx) => (
+                              <ChatVideoThumb
+                                key={att.id || idx}
+                                attachment={att}
+                                onOpen={() => { setVideoPreviewFailed(false); setVideoPreview(att); }}
+                              />
+                            ))}
+                          </div>
+                        )}
                         <div className="px-3 sm:px-4 py-2.5 sm:py-3">
                           {editingMessageId === msg.id ? (
                             <div className="space-y-2">
@@ -1570,6 +1650,19 @@ export default function InboxPage() {
                             {messageSentiment.percentage}%
                           </span>
                         )}
+                      {reactions.length > 0 && (
+                        <div className={`mt-1 flex flex-wrap gap-1 ${isCustomer ? 'justify-start' : 'justify-end'}`} data-testid={`msg-${msg.id}-reactions`}>
+                          {reactions.map((reaction) => (
+                            <span
+                              key={reaction.id}
+                              className="inline-flex min-h-6 items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-sm shadow-sm"
+                              title={reaction.actor_type || 'reaction'}
+                            >
+                              {reaction.emoji}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -1661,6 +1754,39 @@ export default function InboxPage() {
                     alt={imagePreview.name || 'attachment preview'}
                     className="max-h-[92vh] w-full rounded-lg object-contain shadow-2xl"
                     onError={() => setImagePreviewFailed(true)}
+                  />
+                )}
+              </div>
+            </div>
+          )}
+
+          {videoPreview && (
+            <div
+              className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4"
+              onClick={() => { setVideoPreview(null); setVideoPreviewFailed(false); }}
+              role="dialog"
+              aria-modal="true"
+            >
+              <div className="relative max-h-[92vh] w-full max-w-4xl" onClick={(event) => event.stopPropagation()}>
+                <button
+                  type="button"
+                  onClick={() => { setVideoPreview(null); setVideoPreviewFailed(false); }}
+                  className="absolute right-2 top-2 z-10 rounded-full bg-black/60 p-2 text-white hover:bg-black/75"
+                  title="Close preview"
+                >
+                  <X size={18} />
+                </button>
+                {videoPreviewFailed ? (
+                  <div className="flex min-h-[280px] items-center justify-center rounded-lg bg-white px-6 text-center text-sm font-medium text-slate-500 shadow-2xl">
+                    Video unavailable
+                  </div>
+                ) : (
+                  <video
+                    src={videoPreview.url}
+                    className="max-h-[92vh] w-full rounded-lg bg-black shadow-2xl"
+                    controls
+                    autoPlay
+                    onError={() => setVideoPreviewFailed(true)}
                   />
                 )}
               </div>

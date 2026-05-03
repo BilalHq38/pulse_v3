@@ -18,6 +18,7 @@ from services.ai_service.llm_client import _resolve_engine_for_request, call_mod
 logger = logging.getLogger(__name__)
 _MEMORY_DEDUP_CACHE = get_cache_client(namespace="ai-memory-dedup")
 _MEMORY_DEDUP_TABLE_READY = False
+_CONVERSATION_SCOPED_MEMORY_TYPES = {"last_ai_response", "shown_products", "conversation_state"}
 
 
 def _render_messages(messages: list) -> str:
@@ -32,6 +33,21 @@ def _safe_json_loads(value: str) -> dict:
         return {}
 
 
+def _has_conversation_memory_scope(company_id: str, entity_id: str, convo_id: str, memory_type: str) -> bool:
+    if memory_type not in _CONVERSATION_SCOPED_MEMORY_TYPES:
+        return bool(company_id and entity_id)
+    if company_id and entity_id and convo_id:
+        return True
+    logger.info(
+        "personalization_memory_disabled reason=missing_scope company_id_present=%s entity_id_present=%s convo_id_present=%s memory_type=%s",
+        bool(company_id),
+        bool(entity_id),
+        bool(convo_id),
+        memory_type,
+    )
+    return False
+
+
 async def get_latest_context_memory(
     db,
     company_id: str,
@@ -42,10 +58,13 @@ async def get_latest_context_memory(
 ) -> dict:
     if not db or not company_id or not entity_id:
         return {}
+    if not _has_conversation_memory_scope(company_id, entity_id, convo_id, memory_type):
+        return {}
+    convo_filter = "AND convo_id=$4" if memory_type in _CONVERSATION_SCOPED_MEMORY_TYPES else "AND ($4='' OR convo_id=$4)"
     row = await db.fetchrow(
         "SELECT * FROM context_memories "
         "WHERE company_id=$1 AND entity_id=$2 AND memory_type=$3 "
-        "AND ($4='' OR convo_id=$4) "
+        f"{convo_filter} "
         "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1",
         company_id,
         entity_id,
@@ -88,10 +107,12 @@ async def store_context_memory(
     global _MEMORY_DEDUP_TABLE_READY
     if not db or not company_id or not entity_id:
         return ""
+    if not _has_conversation_memory_scope(company_id, entity_id, convo_id, memory_type):
+        return ""
     memory_id = make_id()
     message_id = str((content or {}).get("message_id") or "").strip()
     if message_id:
-        dedupe_key = f"{company_id}:{convo_id}:{message_id}:{memory_type}"
+        dedupe_key = f"{company_id}:{entity_id}:{convo_id}:{message_id}:{memory_type}"
         if not _MEMORY_DEDUP_TABLE_READY:
             try:
                 await db.execute(
@@ -155,10 +176,11 @@ async def store_context_memory(
         try:
             existing_id = await db.fetchval(
                 "SELECT id FROM context_memories "
-                "WHERE company_id=$1 AND convo_id=$2 AND memory_type=$3 "
-                "AND (memory_content::jsonb ->> 'message_id')=$4 "
+                "WHERE company_id=$1 AND entity_id=$2 AND convo_id=$3 AND memory_type=$4 "
+                "AND (memory_content::jsonb ->> 'message_id')=$5 "
                 "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
                 company_id,
+                entity_id,
                 convo_id,
                 memory_type,
                 message_id,

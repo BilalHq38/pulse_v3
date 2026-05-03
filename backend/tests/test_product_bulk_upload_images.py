@@ -39,3 +39,10 @@ def test_bulk_product_rows_report_invalid_image_input():
     assert items == []
     assert errors[0]["row"] == 2
     assert "Invalid image" in errors[0]["error"]
+
+
+def test_bulk_upload_content_type_detection_allows_only_json_payloads_for_json_path():
+    assert products._is_json_bulk_content_type("application/json")
+    assert products._is_json_bulk_content_type("application/vnd.api+json; charset=utf-8")
+    assert not products._is_json_bulk_content_type("text/plain")
+    assert not products._is_json_bulk_content_type("")

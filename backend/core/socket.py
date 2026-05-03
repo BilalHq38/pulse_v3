@@ -277,3 +277,21 @@ async def emit_message_deleted(conversation_id: str, message_id: str):
             )
     except Exception as e:
         logger.error("Socket emit error: %s", e)
+
+
+async def emit_message_reaction_updated(conversation_id: str, reaction: dict):
+    try:
+        company_id = await _resolve_conversation_company_id(conversation_id)
+        await sio.emit(
+            "message_reaction_updated",
+            _json_safe({"conversation_id": conversation_id, "reaction": reaction}),
+            room=f"convo_{conversation_id}",
+        )
+        if company_id:
+            await sio.emit(
+                "conversation_updated",
+                {"conversation_id": conversation_id},
+                room=f"company_{company_id}",
+            )
+    except Exception as e:
+        logger.error("Socket emit error: %s", e)

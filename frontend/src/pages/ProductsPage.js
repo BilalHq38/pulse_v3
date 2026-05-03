@@ -407,9 +407,7 @@ export default function ProductsPage() {
       const formData = new FormData();
       formData.append('file', file);
       formData.append('upsert', 'true');
-      const response = await api.post('/products/bulk-upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
+      const response = await api.post('/products/bulk-upload', formData);
 
       const created = Number(response?.data?.created || 0);
       const updated = Number(response?.data?.updated || 0);
@@ -1086,6 +1084,7 @@ export default function ProductsPage() {
         templateHeaders={PRODUCT_BULK_TEMPLATE_HEADERS}
         templateSample={PRODUCT_BULK_TEMPLATE_SAMPLE}
         guideRows={PRODUCT_BULK_GUIDE_ROWS}
+        requirementsText="Required minimum: name. Image URL columns and embedded XLSX images are imported with the original file."
       />
 
       {/* ── Delete Confirm Modal ───────────────────────────────── */}

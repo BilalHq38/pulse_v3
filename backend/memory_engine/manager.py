@@ -70,19 +70,60 @@ class MemoryManager:
         Returns:
             MemoryContext containing short-term, long-term, and semantic context.
         """
+        if not tenant_id or not user_id:
+            logger.warning(
+                "memory_personalization_disabled reason=missing_scope tenant_id_present=%s user_id_present=%s conversation_id_present=%s",
+                bool(tenant_id),
+                bool(user_id),
+                bool(conversation_id),
+            )
+            from memory_engine.schemas import LongTermContext, SemanticContext, ShortTermContext
+
+            return MemoryContext(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                short_term=ShortTermContext(),
+                long_term=LongTermContext(),
+                semantic=SemanticContext(),
+            )
+
         increment_counter(
             "memory_engine.fetch_context",
             labels={"tenant_id": tenant_id},
         )
 
         # Parallel fetch across all tiers
+        from memory_engine.schemas import ShortTermContext
+
+        if not conversation_id:
+            logger.info(
+                "memory_short_term_disabled reason=missing_conversation_scope tenant=%s user=%s",
+                tenant_id,
+                user_id,
+            )
+        short_term_task = (
+            self.short_term.load(tenant_id, user_id, conversation_id=conversation_id)
+            if conversation_id
+            else asyncio.sleep(0, result=ShortTermContext())
+        )
+
         tasks = [
-            self.short_term.load(tenant_id, user_id, conversation_id=conversation_id),
+            short_term_task,
             self.long_term.load(self.db, tenant_id, user_id, conversation_id=conversation_id),
         ]
 
         if include_semantic and current_query:
-            tasks.append(self.semantic.load(self.db, tenant_id, current_query, top_k=5))
+            tasks.append(
+                self.semantic.load(
+                    self.db,
+                    tenant_id,
+                    current_query,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    top_k=5,
+                )
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -123,6 +164,14 @@ class MemoryManager:
 
         This should be called after every AI response or user message.
         """
+        if not data.tenant_id or not data.user_id:
+            logger.warning(
+                "memory_store_interaction_skipped reason=missing_scope tenant_id_present=%s user_id_present=%s conversation_id_present=%s",
+                bool(data.tenant_id),
+                bool(data.user_id),
+                bool(data.conversation_id),
+            )
+            return
         increment_counter(
             "memory_engine.store_interaction",
             labels={"tenant_id": data.tenant_id},
@@ -137,17 +186,25 @@ class MemoryManager:
             "channel": data.channel,
         }
 
-        tasks: list[Any] = [
-            self.short_term.store_message(
+        tasks: list[Any] = []
+        if data.conversation_id:
+            tasks.append(
+                self.short_term.store_message(
+                    data.tenant_id,
+                    data.user_id,
+                    message_data,
+                    conversation_id=data.conversation_id,
+                )
+            )
+        else:
+            logger.info(
+                "memory_short_term_store_skipped reason=missing_conversation_scope tenant=%s user=%s",
                 data.tenant_id,
                 data.user_id,
-                message_data,
-                conversation_id=data.conversation_id,
-            ),
-        ]
+            )
 
         # Store intent in short-term
-        if data.intent:
+        if data.intent and data.conversation_id:
             tasks.append(
                 self.short_term.store_intent(
                     data.tenant_id,
@@ -158,7 +215,7 @@ class MemoryManager:
             )
 
         # Store AI response in short-term
-        if data.ai_response:
+        if data.ai_response and data.conversation_id:
             tasks.append(
                 self.short_term.store_last_ai_response(
                     data.tenant_id,

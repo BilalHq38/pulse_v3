@@ -47,16 +47,29 @@ export function useConfirmDialog() {
 
   const confirmDialog = useMemo(() => (
     <AlertDialog open={dialog.open} onOpenChange={(open) => { if (!open) closeConfirmDialog(); }}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>{dialog.title}</AlertDialogTitle>
-          <AlertDialogDescription>{dialog.description}</AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>{dialog.cancelLabel}</AlertDialogCancel>
+      <AlertDialogContent
+        className="w-[calc(100vw-2rem)] max-w-md gap-0 overflow-hidden rounded-xl border border-slate-200 bg-white p-0 text-slate-900 shadow-2xl sm:rounded-xl"
+        data-testid="confirm-dialog"
+      >
+        <div className="p-6">
+          <AlertDialogHeader className="space-y-2 text-left">
+            <AlertDialogTitle className="text-lg font-semibold leading-6 text-slate-950">
+              {dialog.title}
+            </AlertDialogTitle>
+            {dialog.description ? (
+              <AlertDialogDescription className="text-sm leading-6 text-slate-600">
+                {dialog.description}
+              </AlertDialogDescription>
+            ) : null}
+          </AlertDialogHeader>
+        </div>
+        <AlertDialogFooter className="gap-2 border-t border-slate-100 bg-slate-50 px-6 py-4 sm:flex-row sm:justify-end sm:space-x-0">
+          <AlertDialogCancel className="mt-0 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-100 hover:text-slate-900">
+            {dialog.cancelLabel}
+          </AlertDialogCancel>
           <AlertDialogAction
             onClick={handleConfirm}
-            className="bg-red-600 text-white hover:bg-red-500 focus:ring-red-500"
+            className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-red-700 focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
           >
             {dialog.confirmLabel}
           </AlertDialogAction>

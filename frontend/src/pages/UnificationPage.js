@@ -5,7 +5,6 @@ import {
   RefreshCw,
   Search,
   Shield,
-  Sparkles,
   WandSparkles,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
@@ -29,15 +28,6 @@ const TAG_FILTERS = [
   { value: 'ai_match', label: 'AI Match' },
 ];
 
-const EMPTY_RESOLVE_FORM = {
-  platform: 'pulse_customer',
-  platform_user_id: '',
-  phone_number: '',
-  email_address: '',
-  full_name: '',
-  username: '',
-};
-
 const normalizeId = (value) => String(value || '').trim();
 
 const operationLabel = (operation) => {
@@ -49,17 +39,6 @@ const operationLabel = (operation) => {
   if (type === 'auto-detect') return 'Auto-detect completed';
   if (type === 'review-resolve') return 'Review decision applied';
   return 'Operation completed';
-};
-
-const createResolvePayload = (draft) => {
-  return {
-    platform: draft.platform,
-    platform_user_id: normalizeId(draft.platform_user_id),
-    phone_number: normalizeId(draft.phone_number) || null,
-    email_address: normalizeId(draft.email_address) || null,
-    full_name: normalizeId(draft.full_name) || null,
-    username: normalizeId(draft.username) || null,
-  };
 };
 
 function StatCard({ title, value, hint, badge }) {
@@ -77,9 +56,8 @@ function StatCard({ title, value, hint, badge }) {
 
 export default function UnificationPage() {
   const { user } = useAuth();
-  const { requestConfirmation, confirmDialog } = useConfirmDialog();
+  const { confirmDialog } = useConfirmDialog();
 
-  const tenantContext = useIdentityUnificationStore((state) => state.tenantContext);
   const profiles = useIdentityUnificationStore((state) => state.profiles);
   const profileDetails = useIdentityUnificationStore((state) => state.profileDetails);
   const profileMeta = useIdentityUnificationStore((state) => state.profileMeta);
@@ -98,8 +76,6 @@ export default function UnificationPage() {
   const fetchProfileDetail = useIdentityUnificationStore((state) => state.fetchProfileDetail);
   const fetchReviewQueue = useIdentityUnificationStore((state) => state.fetchReviewQueue);
   const refreshAll = useIdentityUnificationStore((state) => state.refreshAll);
-  const runResolve = useIdentityUnificationStore((state) => state.runResolve);
-  const runUnify = useIdentityUnificationStore((state) => state.runUnify);
   const runMerge = useIdentityUnificationStore((state) => state.runMerge);
   const runSplit = useIdentityUnificationStore((state) => state.runSplit);
   const runAutoDetect = useIdentityUnificationStore((state) => state.runAutoDetect);
@@ -109,8 +85,6 @@ export default function UnificationPage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [tagFilter, setTagFilter] = useState('all');
   const [selectedDetailId, setSelectedDetailId] = useState('');
-  const [resolveDraft, setResolveDraft] = useState(EMPTY_RESOLVE_FORM);
-  const [resolveResult, setResolveResult] = useState(null);
   const lastOperationToastRef = useRef(0);
   const lastErrorToastRef = useRef('');
 
@@ -272,31 +246,6 @@ export default function UnificationPage() {
     await resolveReviewSuggestion({ suggestionId, action, notes });
   };
 
-  const handleResolveAction = async (actionType) => {
-    const payload = createResolvePayload(resolveDraft);
-    if (!payload.platform_user_id) {
-      showToast({
-        type: 'error',
-        title: 'User ID Required',
-        message: 'Enter the platform user ID before resolving identity.',
-      });
-      return;
-    }
-
-    const result = actionType === 'unify' ? await runUnify(payload) : await runResolve(payload);
-    if (result) {
-      setResolveResult(result);
-      if (result.customer_id) {
-        setSelectedDetailId(result.customer_id);
-        await fetchProfileDetail(result.customer_id, { force: true });
-      }
-      setResolveDraft((prev) => ({
-        ...prev,
-        platform_user_id: '',
-      }));
-    }
-  };
-
   return (
     <div className="space-y-6 pb-8">
       <section className="rounded-3xl border border-slate-200 bg-white shadow-sm">
@@ -313,24 +262,24 @@ export default function UnificationPage() {
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap gap-3">
               <button
                 type="button"
                 onClick={refreshAll}
                 disabled={loadingProfiles || loadingReviewQueue || actionInFlight}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-800 shadow-sm hover:bg-slate-100 disabled:opacity-50"
               >
-                <RefreshCw size={13} className={loadingProfiles || loadingReviewQueue ? 'animate-spin' : ''} />
+                <RefreshCw size={16} className={loadingProfiles || loadingReviewQueue ? 'animate-spin' : ''} />
                 Refresh Data
               </button>
               <button
                 type="button"
                 onClick={runAutoDetect}
                 disabled={!isAdmin || actionInFlight}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-500 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:opacity-50"
               >
-                <WandSparkles size={13} />
-                Auto-Detect Matches
+                <WandSparkles size={16} />
+                Auto Detect Matches
               </button>
             </div>
           </div>
@@ -379,139 +328,9 @@ export default function UnificationPage() {
         />
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-[1.4fr,1fr]">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.8fr),minmax(22rem,0.95fr)]">
         <div className="space-y-6">
-          <section className="rounded-2xl border border-slate-200 bg-white p-4">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <div>
-                <h2 className="text-sm font-semibold text-slate-900">Authenticated Request Scope</h2>
-                <p className="mt-1 text-xs text-slate-500">
-                  Identity requests now flow through the gateway using the active authenticated session. Tenant context is derived from your account, not manual API keys.
-                </p>
-              </div>
-              <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600">
-                <Shield size={12} />
-                {tenantContext.userRole || 'company_agent'}
-              </span>
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
-                <span className="mb-1 block font-semibold text-slate-500">Tenant ID</span>
-                <span className="font-mono text-slate-700">{tenantContext.tenantId || 'Derived by gateway'}</span>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
-                <span className="mb-1 block font-semibold text-slate-500">Auth Path</span>
-                <span className="text-slate-700">JWT session via API gateway</span>
-              </div>
-            </div>
-          </section>
-
-          <section className="rounded-2xl border border-slate-200 bg-white p-4">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h2 className="text-sm font-semibold text-slate-900">Identity Resolve Console</h2>
-                <p className="mt-1 text-xs text-slate-500">Resolve or unify incoming cross-platform records using the backend identity contract.</p>
-              </div>
-              <TagBadge kind="ai_match" label="Live API" compact />
-            </div>
-
-            <div className="grid gap-2 md:grid-cols-2">
-              <label className="text-xs text-slate-500">
-                Platform
-                <select
-                  value={resolveDraft.platform}
-                  onChange={(event) => setResolveDraft((prev) => ({ ...prev, platform: event.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs text-slate-700"
-                >
-                  <option value="pulse_customer">pulse_customer</option>
-                  <option value="whatsapp">whatsapp</option>
-                  <option value="facebook">facebook</option>
-                  <option value="instagram">instagram</option>
-                  <option value="email">email</option>
-                  <option value="web_chat">web_chat</option>
-                </select>
-              </label>
-              <label className="text-xs text-slate-500">
-                Platform User ID
-                <input
-                  value={resolveDraft.platform_user_id}
-                  onChange={(event) => setResolveDraft((prev) => ({ ...prev, platform_user_id: event.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs text-slate-700"
-                  placeholder="required"
-                />
-              </label>
-              <label className="text-xs text-slate-500">
-                Email
-                <input
-                  value={resolveDraft.email_address}
-                  onChange={(event) => setResolveDraft((prev) => ({ ...prev, email_address: event.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs text-slate-700"
-                  placeholder="optional"
-                />
-              </label>
-              <label className="text-xs text-slate-500">
-                Phone
-                <input
-                  value={resolveDraft.phone_number}
-                  onChange={(event) => setResolveDraft((prev) => ({ ...prev, phone_number: event.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs text-slate-700"
-                  placeholder="optional"
-                />
-              </label>
-              <label className="text-xs text-slate-500">
-                Full Name
-                <input
-                  value={resolveDraft.full_name}
-                  onChange={(event) => setResolveDraft((prev) => ({ ...prev, full_name: event.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs text-slate-700"
-                  placeholder="optional"
-                />
-              </label>
-              <label className="text-xs text-slate-500">
-                Username
-                <input
-                  value={resolveDraft.username}
-                  onChange={(event) => setResolveDraft((prev) => ({ ...prev, username: event.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs text-slate-700"
-                  placeholder="optional"
-                />
-              </label>
-            </div>
-
-            <div className="mt-3 flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => handleResolveAction('resolve')}
-                disabled={actionInFlight || !normalizeId(resolveDraft.platform_user_id)}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50"
-              >
-                <Search size={12} />
-                Resolve
-              </button>
-              <button
-                type="button"
-                onClick={() => handleResolveAction('unify')}
-                disabled={actionInFlight || !normalizeId(resolveDraft.platform_user_id)}
-                className="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500 disabled:opacity-50"
-              >
-                <Sparkles size={12} />
-                Unify
-              </button>
-            </div>
-
-            {resolveResult ? (
-              <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
-                <p className="font-semibold text-slate-700">Result</p>
-                <p className="mt-1 text-slate-600">Customer ID: {resolveResult.customer_id || 'n/a'}</p>
-                <p className="text-slate-600">Match Type: {resolveResult.match_type || 'n/a'}</p>
-                <p className="text-slate-600">Confidence: {Math.round((Number(resolveResult.confidence_score || 0) || 0) * 100)}%</p>
-                <p className="text-slate-600">Review Required: {resolveResult.review_required ? 'yes' : 'no'}</p>
-              </div>
-            ) : null}
-          </section>
-
-          <section className="rounded-2xl border border-slate-200 bg-white p-4">
+          <section className="rounded-2xl border border-slate-200 bg-white p-5">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <h2 className="text-sm font-semibold text-slate-900">Unified Profiles</h2>

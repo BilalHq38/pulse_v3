@@ -94,6 +94,15 @@ class ContextBuilder:
         Returns:
             PromptContext with all sections token-budgeted and ready.
         """
+        if not tenant_id or not user_id:
+            logger.warning(
+                "prompt_context_personalization_disabled reason=missing_scope tenant_id_present=%s user_id_present=%s conversation_id_present=%s",
+                bool(tenant_id),
+                bool(user_id),
+                bool(conversation_id),
+            )
+            return PromptContext()
+
         # Fetch full memory context
         memory = await self._memory.fetch_context(
             user_id,

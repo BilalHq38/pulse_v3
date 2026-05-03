@@ -1011,6 +1011,10 @@ async def auto_detect_review_candidates(
                 (primary_mapping.platform_username if primary_mapping else "") or signal_profile.get("username") or None
             ),
             profile_picture_phash=signal_profile.get("profile_picture_phash"),
+            profile_picture_url=signal_profile.get("profile_picture_url"),
+            description=signal_profile.get("description"),
+            bio=signal_profile.get("bio"),
+            company_name=signal_profile.get("company_name"),
             language=signal_profile.get("language"),
             locale=signal_profile.get("locale"),
             device_signals=latest_fingerprint.signals_json if latest_fingerprint else {},
@@ -1058,12 +1062,20 @@ async def auto_detect_review_candidates(
             "username": payload.username,
             "fingerprint_hash": latest_fingerprint.fingerprint_hash if latest_fingerprint else None,
         }
+        score_payload = {
+            "source": "auto_detect",
+            "total_score": best_candidate.score,
+            "confidence": score_to_confidence(best_candidate.score),
+            "matched_fields": best_candidate.independent_signals,
+            "match_reasons": best_candidate.independent_signals,
+            "auto_detect": best_candidate.breakdown,
+        }
         audit = await _write_audit(
             db,
             tenant_id,
             customer.customer_id,
             input_signals,
-            {"auto_detect": best_candidate.breakdown},
+            score_payload,
             match_type=best_candidate.match_type,
             confidence=score_to_confidence(best_candidate.score),
             decision="review_required",
@@ -1078,7 +1090,7 @@ async def auto_detect_review_candidates(
             customer.customer_id,
             best_candidate.customer.customer_id,
             best_candidate.decision_reason or "auto_detect_candidate",
-            {"auto_detect": best_candidate.breakdown},
+            score_payload,
             best_candidate.independent_signals,
             status="pending",
             source="auto_detect",
@@ -1107,10 +1119,14 @@ async def submit_public_unification(
         phone_number=payload.phone_number,
         email_address=payload.email_address,
         full_name=payload.full_name,
-        username=payload.username,
-        profile_picture_phash=payload.profile_picture_phash,
-        language=payload.language,
-        locale=payload.locale,
+            username=payload.username,
+            profile_picture_phash=payload.profile_picture_phash,
+            profile_picture_url=payload.profile_picture_url,
+            description=payload.description,
+            bio=payload.bio,
+            company_name=payload.company_name,
+            language=payload.language,
+            locale=payload.locale,
         device_signals=payload.device_signals,
         typing_speed=payload.typing_speed,
         message_patterns=payload.message_patterns,
@@ -1574,6 +1590,10 @@ async def enrich_identity(db: AsyncSession, tenant_id: str, payload: EnrichReque
         full_name=payload.full_name,
         username=payload.username or payload.platform_username,
         profile_picture_phash=payload.profile_picture_phash,
+        profile_picture_url=payload.profile_picture_url,
+        description=payload.description,
+        bio=payload.bio,
+        company_name=payload.company_name,
         language=payload.language,
         locale=payload.locale,
         device_signals=payload.device_signals,
@@ -1705,6 +1725,8 @@ async def _score_candidate(
 ) -> CandidateScore:
     candidate = CandidateScore(customer=customer)
     profile = customer.signal_profile or {}
+    payload_phone = normalize_phone(payload.phone_number)
+    payload_email = normalize_email(payload.email_address)
 
     if phone_hash and customer.primary_phone_hash == phone_hash:
         candidate.score += 500
@@ -1718,6 +1740,42 @@ async def _score_candidate(
         candidate.independent_signals.append("email")
         candidate.breakdown["email"] = 500
         candidate.decision_reason = "email_hash_exact_match"
+
+    if "phone" not in candidate.independent_signals and payload_phone:
+        for mapping in customer.mappings or []:
+            if normalize_phone(mapping.phone) == payload_phone:
+                candidate.score += 450
+                candidate.data_sources_used.append("phone")
+                candidate.independent_signals.append("phone")
+                candidate.breakdown["phone_normalized"] = 450
+                candidate.decision_reason = "phone_normalized_match"
+                break
+
+    if "email" not in candidate.independent_signals and payload_email:
+        for mapping in customer.mappings or []:
+            if normalize_email(mapping.email) == payload_email:
+                candidate.score += 450
+                candidate.data_sources_used.append("email")
+                candidate.independent_signals.append("email")
+                candidate.breakdown["email_normalized"] = 450
+                candidate.decision_reason = "email_normalized_match"
+                break
+
+    if payload.platform and payload.platform_user_id:
+        for mapping in customer.mappings or []:
+            if (
+                normalize_text(mapping.platform) == normalize_text(payload.platform)
+                and str(mapping.platform_user_id or "").strip() == str(payload.platform_user_id or "").strip()
+            ):
+                candidate.score += 500
+                candidate.data_sources_used.append("channel_identity")
+                candidate.independent_signals.append("channel_identity")
+                candidate.breakdown["channel_identity"] = {
+                    "platform": payload.platform,
+                    "score": 500,
+                }
+                candidate.decision_reason = "channel_identity_match"
+                break
 
     latest_fingerprint = customer.fingerprints[-1] if customer.fingerprints else None
     if fingerprint_hash and latest_fingerprint and latest_fingerprint.fingerprint_hash == fingerprint_hash:
@@ -1758,6 +1816,31 @@ async def _score_candidate(
         candidate.data_sources_used.append("profile_picture")
         candidate.independent_signals.append("profile_picture")
         candidate.breakdown["profile_picture"] = {"distance": pic_distance, "score": 80}
+
+    payload_picture_url = normalize_text(payload.profile_picture_url)
+    profile_picture_url = normalize_text(profile.get("profile_picture_url"))
+    if payload_picture_url and profile_picture_url and payload_picture_url == profile_picture_url:
+        candidate.score += 80
+        candidate.data_sources_used.append("profile_picture")
+        if "profile_picture" not in candidate.independent_signals:
+            candidate.independent_signals.append("profile_picture")
+        candidate.breakdown["profile_picture_url"] = 80
+
+    description_left = normalize_text(payload.description) or normalize_text(payload.bio)
+    description_right = normalize_text(profile.get("description")) or normalize_text(profile.get("bio"))
+    description_score = username_similarity(description_left, description_right)
+    if description_score >= 0.80:
+        candidate.score += 40
+        candidate.data_sources_used.append("description")
+        candidate.independent_signals.append("description")
+        candidate.breakdown["description_similarity"] = round(description_score, 4)
+
+    company_score = fuzzy_name_similarity(payload.company_name, profile.get("company_name"))
+    if company_score >= 0.88:
+        candidate.score += 50
+        candidate.data_sources_used.append("company")
+        candidate.independent_signals.append("company")
+        candidate.breakdown["company_similarity"] = round(company_score, 4)
 
     if ip_subnet(payload.ip_address) and ip_subnet(payload.ip_address) == profile.get("ip_subnet"):
         candidate.score += 40
@@ -2211,6 +2294,14 @@ def _build_signal_profile(payload: ResolveRequest, fingerprint_hash: str | None)
         profile["locale"] = payload.locale
     if payload.profile_picture_phash:
         profile["profile_picture_phash"] = payload.profile_picture_phash
+    if payload.profile_picture_url:
+        profile["profile_picture_url"] = str(payload.profile_picture_url).strip()
+    if payload.description:
+        profile["description"] = normalize_text(payload.description)
+    if payload.bio:
+        profile["bio"] = normalize_text(payload.bio)
+    if payload.company_name:
+        profile["company_name"] = normalize_text(payload.company_name)
     if payload.typing_speed is not None:
         profile["typing_speed"] = payload.typing_speed
     if payload.session_timing:

@@ -4,9 +4,11 @@ import hashlib
 import logging
 import os
 import re
+import time
 from typing import Optional
 
 from core.utils import make_id
+from shared.config import ai_embedding_unsupported_cooldown_seconds
 from shared.cache import get_cache_client
 from services.ai_service.llm_client import (
     GEMINI_EMBEDDING_MODEL,
@@ -28,15 +30,82 @@ _EMBEDDING_PROVIDER_FALLBACK = os.getenv("AI_ENABLE_EMBEDDING_PROVIDER_FALLBACK"
     "yes",
     "on",
 }
+_UNSUPPORTED_MODEL_COOLDOWNS: dict[str, float] = {}
+_UNSUPPORTED_MODEL_LOGGED_UNTIL: dict[str, float] = {}
 
 
 def _normalize_embedding_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
 
-def _embedding_cache_key(text: str) -> str:
+def _embedding_cache_key(text: str, *, provider: str = "", model: str = "") -> str:
     normalized = _normalize_embedding_text(text)[:8000]
-    return "embed:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    scope = f"{provider.strip().lower()}:{model.strip().lower()}:{normalized}"
+    return "embed:" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+
+def _embedding_model_for_provider(provider: str) -> str:
+    if provider == "gemini":
+        return GEMINI_EMBEDDING_MODEL
+    if provider == "openai":
+        return OPENAI_EMBEDDING_MODEL
+    return ""
+
+
+def _embedding_provider_signature(provider: str) -> str:
+    return f"{provider}:{_embedding_model_for_provider(provider)}"
+
+
+def _classify_embedding_error(exc: Exception) -> str:
+    message = str(exc or "").lower()
+    if (
+        "not found" in message
+        or "not_supported" in message
+        or "not supported" in message
+        or "unsupported" in message
+        or "404" in message
+    ) and ("embed" in message or "embedding" in message or "model" in message):
+        return "unsupported_embedding_model"
+    if "quota" in message or "rate limit" in message or "resource_exhausted" in message:
+        return "quota_exhausted"
+    if "api key" in message or "permission" in message or "unauthorized" in message or "forbidden" in message:
+        return "provider_not_configured"
+    return "provider_error"
+
+
+def _cooldown_key(provider: str, model: str, error_type: str) -> str:
+    return f"{provider.strip().lower()}:{model.strip().lower()}:{error_type}"
+
+
+def _is_embedding_model_in_cooldown(provider: str, model: str, error_type: str = "unsupported_embedding_model") -> bool:
+    key = _cooldown_key(provider, model, error_type)
+    expires_at = float(_UNSUPPORTED_MODEL_COOLDOWNS.get(key) or 0)
+    if expires_at <= time.monotonic():
+        _UNSUPPORTED_MODEL_COOLDOWNS.pop(key, None)
+        _UNSUPPORTED_MODEL_LOGGED_UNTIL.pop(key, None)
+        return False
+    return True
+
+
+def _mark_embedding_model_cooldown(provider: str, model: str, error_type: str, exc: Exception) -> None:
+    if error_type != "unsupported_embedding_model":
+        return
+    cooldown_seconds = ai_embedding_unsupported_cooldown_seconds()
+    if cooldown_seconds <= 0:
+        return
+    key = _cooldown_key(provider, model, error_type)
+    expires_at = time.monotonic() + cooldown_seconds
+    _UNSUPPORTED_MODEL_COOLDOWNS[key] = expires_at
+    if float(_UNSUPPORTED_MODEL_LOGGED_UNTIL.get(key) or 0) <= time.monotonic():
+        _UNSUPPORTED_MODEL_LOGGED_UNTIL[key] = expires_at
+        logger.warning(
+            "embedding_provider_disabled_temporarily provider=%s model=%s error_type=%s cooldown_seconds=%s error=%s",
+            provider,
+            model,
+            error_type,
+            cooldown_seconds,
+            exc,
+        )
 
 
 def _should_skip_embedding_search(text: str) -> bool:
@@ -88,7 +157,7 @@ def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
         if not ready:
             continue
         candidate = base_engine if provider == str(base_engine.get("provider") or "").strip().lower() else _engine_for_provider(base_engine, provider)
-        signature = f"{provider}:{candidate.get('model_name', '')}"
+        signature = _embedding_provider_signature(provider)
         if signature in seen:
             continue
         seen.add(signature)
@@ -99,12 +168,6 @@ def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
 async def generate_embedding(text: str, engine: dict | None = None) -> Optional[list[float]]:
     if not text or not text.strip():
         return None
-    cache_key = _embedding_cache_key(text)
-    cached = await _EMBEDDING_CACHE.get_json(cache_key)
-    if isinstance(cached, list):
-        logger.info("embedding_cache_hit text_hash=%s dimensions=%s", cache_key[6:18], len(cached))
-        return [float(item) for item in cached]
-    logger.info("embedding_cache_miss text_hash=%s text_len=%s", cache_key[6:18], len(text or ""))
 
     from services.ai_service.llm_client import _gemini_client, _openai_client
 
@@ -113,14 +176,42 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
         candidates = candidates[:1]
     for attempt_number, selected in enumerate(candidates, start=1):
         provider = (selected.get("provider") or "").lower()
+        model = _embedding_model_for_provider(provider)
+        if not model:
+            continue
+        if _is_embedding_model_in_cooldown(provider, model):
+            logger.debug(
+                "embedding_provider_skipped_cooldown provider=%s model=%s error_type=unsupported_embedding_model",
+                provider,
+                model,
+            )
+            continue
+        cache_key = _embedding_cache_key(text, provider=provider, model=model)
+        cached = await _EMBEDDING_CACHE.get_json(cache_key)
+        if isinstance(cached, list):
+            logger.info(
+                "embedding_cache_hit provider=%s model=%s text_hash=%s dimensions=%s",
+                provider,
+                model,
+                cache_key[6:18],
+                len(cached),
+            )
+            return [float(item) for item in cached]
+        logger.info(
+            "embedding_cache_miss provider=%s model=%s text_hash=%s text_len=%s",
+            provider,
+            model,
+            cache_key[6:18],
+            len(text or ""),
+        )
         try:
             if provider == "gemini" and _gemini_client:
-                _log_embedding_attempt(provider, GEMINI_EMBEDDING_MODEL, attempt_number, text)
+                _log_embedding_attempt(provider, model, attempt_number, text)
                 try:
                     reserve_embedding_call(
                         function_name="generate_embedding",
                         provider=provider,
-                        model=GEMINI_EMBEDDING_MODEL,
+                        model=model,
                         call_purpose="embedding",
                         attempt_number=attempt_number,
                         fallback_used=attempt_number > 1,
@@ -130,11 +221,11 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                     logger.warning(
                         "embedding_skipped_budget_exhausted provider=%s model=%s",
                         provider,
-                        GEMINI_EMBEDDING_MODEL,
+                        model,
                     )
                     return None
                 result = await _gemini_client.aio.models.embed_content(
-                    model=GEMINI_EMBEDDING_MODEL,
+                    model=model,
                     contents=text.strip()[:8000],
                 )
                 values = getattr((getattr(result, "embeddings", []) or [None])[0], "values", None)
@@ -142,18 +233,18 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                     logger.info(
                         "embedding_generated provider=%s model=%s dimensions=%s",
                         provider,
-                        GEMINI_EMBEDDING_MODEL,
+                        model,
                         len(values),
                     )
                     await _EMBEDDING_CACHE.set_json(cache_key, values, ttl_seconds=_EMBEDDING_CACHE_TTL_SECONDS)
                     return values
             if provider == "openai" and _openai_client:
-                _log_embedding_attempt(provider, OPENAI_EMBEDDING_MODEL, attempt_number, text)
+                _log_embedding_attempt(provider, model, attempt_number, text)
                 try:
                     reserve_embedding_call(
                         function_name="generate_embedding",
                         provider=provider,
-                        model=OPENAI_EMBEDDING_MODEL,
+                        model=model,
                         call_purpose="embedding",
                         attempt_number=attempt_number,
                         fallback_used=attempt_number > 1,
@@ -163,11 +254,11 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                     logger.warning(
                         "embedding_skipped_budget_exhausted provider=%s model=%s",
                         provider,
-                        OPENAI_EMBEDDING_MODEL,
+                        model,
                     )
                     return None
                 response = await _openai_client.embeddings.create(
-                    model=OPENAI_EMBEDDING_MODEL,
+                    model=model,
                     input=text.strip()[:8000],
                 )
                 values = response.data[0].embedding
@@ -175,16 +266,19 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                     logger.info(
                         "embedding_generated provider=%s model=%s dimensions=%s",
                         provider,
-                        OPENAI_EMBEDDING_MODEL,
+                        model,
                         len(values),
                     )
                     await _EMBEDDING_CACHE.set_json(cache_key, values, ttl_seconds=_EMBEDDING_CACHE_TTL_SECONDS)
                     return values
         except Exception as exc:
+            error_type = _classify_embedding_error(exc)
+            _mark_embedding_model_cooldown(provider, model, error_type, exc)
             logger.warning(
-                "embedding_generation_failed provider=%s model=%s error=%s",
+                "embedding_generation_failed provider=%s model=%s error_type=%s error=%s",
                 provider,
-                OPENAI_EMBEDDING_MODEL if provider == "openai" else GEMINI_EMBEDDING_MODEL,
+                model,
+                error_type,
                 exc,
             )
             continue
@@ -269,6 +363,7 @@ async def search_similar_embeddings(
     source_type: str = "",
     top_k: int = 5,
     engine: dict | None = None,
+    source_ids: list[str] | None = None,
 ) -> list[dict]:
     if _should_skip_embedding_search(query_text):
         logger.info("embedding_search_skipped reason=low_value_query query_len=%s", len(query_text or ""))
@@ -278,32 +373,59 @@ async def search_similar_embeddings(
         return []
     vector_value = "[" + ",".join(str(item) for item in embedding) + "]"
     try:
+        cleaned_source_ids = [str(item).strip() for item in (source_ids or []) if str(item).strip()]
         if source_type:
-            rows = await db.fetch(
-                "SELECT id,source_type,source_id,content,metadata,"
-                "1 - (embedding <=> $1::vector) AS similarity "
-                "FROM embeddings WHERE company_id=$2 AND source_type=$3 AND embedding IS NOT NULL "
-                "ORDER BY embedding <=> $1::vector LIMIT $4",
-                vector_value,
-                company_id,
-                source_type,
-                top_k,
-            )
+            if cleaned_source_ids:
+                rows = await db.fetch(
+                    "SELECT id,source_type,source_id,content,metadata,"
+                    "1 - (embedding <=> $1::vector) AS similarity "
+                    "FROM embeddings WHERE company_id=$2 AND source_type=$3 AND source_id = ANY($4::text[]) "
+                    "AND embedding IS NOT NULL ORDER BY embedding <=> $1::vector LIMIT $5",
+                    vector_value,
+                    company_id,
+                    source_type,
+                    cleaned_source_ids,
+                    top_k,
+                )
+            else:
+                rows = await db.fetch(
+                    "SELECT id,source_type,source_id,content,metadata,"
+                    "1 - (embedding <=> $1::vector) AS similarity "
+                    "FROM embeddings WHERE company_id=$2 AND source_type=$3 AND embedding IS NOT NULL "
+                    "ORDER BY embedding <=> $1::vector LIMIT $4",
+                    vector_value,
+                    company_id,
+                    source_type,
+                    top_k,
+                )
         else:
-            rows = await db.fetch(
-                "SELECT id,source_type,source_id,content,metadata,"
-                "1 - (embedding <=> $1::vector) AS similarity "
-                "FROM embeddings WHERE company_id=$2 AND embedding IS NOT NULL "
-                "ORDER BY embedding <=> $1::vector LIMIT $3",
-                vector_value,
-                company_id,
-                top_k,
-            )
+            if cleaned_source_ids:
+                rows = await db.fetch(
+                    "SELECT id,source_type,source_id,content,metadata,"
+                    "1 - (embedding <=> $1::vector) AS similarity "
+                    "FROM embeddings WHERE company_id=$2 AND source_id = ANY($3::text[]) AND embedding IS NOT NULL "
+                    "ORDER BY embedding <=> $1::vector LIMIT $4",
+                    vector_value,
+                    company_id,
+                    cleaned_source_ids,
+                    top_k,
+                )
+            else:
+                rows = await db.fetch(
+                    "SELECT id,source_type,source_id,content,metadata,"
+                    "1 - (embedding <=> $1::vector) AS similarity "
+                    "FROM embeddings WHERE company_id=$2 AND embedding IS NOT NULL "
+                    "ORDER BY embedding <=> $1::vector LIMIT $3",
+                    vector_value,
+                    company_id,
+                    top_k,
+                )
         results = [dict(row) for row in rows]
         logger.debug(
-            "embedding_search company_id=%s source_type=%s query_len=%s result_count=%s",
+            "embedding_search company_id=%s source_type=%s source_id_scope=%s query_len=%s result_count=%s",
             company_id,
             source_type or "*",
+            len(cleaned_source_ids),
             len(query_text or ""),
             len(results),
         )

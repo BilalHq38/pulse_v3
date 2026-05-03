@@ -402,11 +402,16 @@ async def rank_products_for_query(
     exclude_ids: list[str] | None = None,
     history_text: str = "",
     history_product_ids: list[str] | None = None,
+    customer_id: str = "",
+    conversation_id: str = "",
 ) -> list[dict]:
     excluded = {str(item).strip() for item in [*(exclude_ids or []), *(history_product_ids or [])] if str(item).strip()}
+    history_affects_ranking = bool(str(history_text or "").strip() or excluded)
     cache_material = json.dumps(
         {
             "company_id": company_id,
+            "conversation_id": str(conversation_id or "").strip() if history_affects_ranking else "",
+            "customer_id": str(customer_id or "").strip() if history_affects_ranking else "",
             "query": str(query or "").strip().lower(),
             "exclude": sorted(excluded),
             "history": str(history_text or "").strip().lower()[:600],
@@ -525,6 +530,8 @@ async def build_ai_context(
     max_products: int = 3,
     history_text: str = "",
     history_product_ids: list[str] | None = None,
+    customer_id: str = "",
+    conversation_id: str = "",
 ) -> dict:
     if not db:
         return {
@@ -532,6 +539,7 @@ async def build_ai_context(
             "product_ids": [],
             "product_attachments": [],
             "products": [],
+            "public_company": {},
         }
     skip_rag, skip_reason = _should_skip_rag_query(current_query)
     if skip_rag:
@@ -547,11 +555,13 @@ async def build_ai_context(
             "product_attachments": [],
             "products": [],
             "rag_called": False,
+            "public_company": {},
         }
 
     chunks: list[str] = []
     product_attachments: list[dict] = []
     selected_products: list[dict] = []
+    public_company: dict = {}
     excluded_ids = {
         str(item).strip() for item in [*(exclude_product_ids or []), *(history_product_ids or [])] if str(item).strip()
     }
@@ -559,7 +569,7 @@ async def build_ai_context(
     try:
         company_profile = (
             await db.fetchrow(
-                "SELECT c.name AS company_name, cs.industry, cs.description, cs.website_address "
+                "SELECT c.name AS company_name, cs.industry, cs.tagline, cs.description, cs.website_address "
                 "FROM companies c LEFT JOIN company_settings cs ON cs.company_id = c.id "
                 "WHERE c.id=$1 LIMIT 1",
                 company_id,
@@ -569,11 +579,20 @@ async def build_ai_context(
         )
         if company_profile:
             profile = dict(company_profile)
+            public_company = {
+                "company_name": str(profile.get("company_name") or "").strip(),
+                "industry": str(profile.get("industry") or "").strip(),
+                "tagline": str(profile.get("tagline") or "").strip(),
+                "description": str(profile.get("description") or "").strip(),
+                "website_address": str(profile.get("website_address") or "").strip(),
+            }
             intro = []
             if profile.get("company_name"):
                 intro.append(f"Company: {profile['company_name']}")
             if profile.get("industry"):
                 intro.append(f"Industry: {profile['industry']}")
+            if profile.get("tagline"):
+                intro.append(f"Tagline: {profile['tagline']}")
             if profile.get("description"):
                 intro.append(f"Brand description: {profile['description']}")
             if profile.get("website_address"):
@@ -590,6 +609,8 @@ async def build_ai_context(
                 exclude_ids=exclude_product_ids,
                 history_text=history_text,
                 history_product_ids=history_product_ids,
+                customer_id=customer_id,
+                conversation_id=conversation_id,
             )
         elif company_id:
             catalog = await _load_product_catalog(db, company_id, limit=max(max_products * 4, 12))
@@ -636,6 +657,7 @@ async def build_ai_context(
         "product_ids": [product["id"] for product in selected_products],
         "product_attachments": product_attachments[:max_products],
         "rag_called": True,
+        "public_company": public_company,
     }
 
 

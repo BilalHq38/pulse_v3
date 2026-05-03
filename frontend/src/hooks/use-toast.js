@@ -166,6 +166,37 @@ function sanitizeToastMessage(message) {
   return String(message || "").trim()
 }
 
+function mapTechnicalErrorMessage(text, fallback) {
+  const normalized = String(text || "").trim()
+  const lower = normalized.toLowerCase()
+  if (!normalized) return fallback
+  if (
+    lower.includes("request body must be valid json")
+    || lower.includes("bulk upload body must be valid json")
+    || lower.includes("invalid multipart upload")
+    || lower.includes("multipart/form-data")
+    || lower.includes("missing multipart boundary")
+  ) {
+    return "Upload the spreadsheet as an Excel or CSV file."
+  }
+  if (
+    lower.includes("could not read spreadsheet")
+    || lower.includes("unsupported spreadsheet format")
+    || lower.includes("invalid spreadsheet")
+  ) {
+    return "The selected file could not be read."
+  }
+  if (
+    lower.includes("email delivery is not configured")
+    || lower.includes("email channel is not enabled")
+    || lower.includes("configure brevo")
+    || lower.includes("configure smtp")
+  ) {
+    return "Email channel is not configured."
+  }
+  return normalized
+}
+
 function getErrorMessage(error, fallback = "We couldn't finish that action.") {
   const responseDetail = error?.response?.data?.detail
   const responseError = error?.response?.data?.error
@@ -180,12 +211,12 @@ function getErrorMessage(error, fallback = "We couldn't finish that action.") {
       })
       .filter(Boolean)
       .join(". ")
-    return joined || fallback
+    return mapTechnicalErrorMessage(joined, fallback)
   }
 
   if (raw && typeof raw === "object") {
     const message = String(raw.message || raw.detail || "").trim()
-    return message || fallback
+    return mapTechnicalErrorMessage(message, fallback)
   }
 
   const text = String(raw || "").trim()
@@ -193,7 +224,7 @@ function getErrorMessage(error, fallback = "We couldn't finish that action.") {
   if (/network error/i.test(text)) return "The request could not reach the server. Please try again."
   if (/request failed with status code/i.test(text)) return fallback
   if (text.startsWith("{") || text.startsWith("[")) return fallback
-  return text
+  return mapTechnicalErrorMessage(text, fallback)
 }
 
 function showToast({

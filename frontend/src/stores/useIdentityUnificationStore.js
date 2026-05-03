@@ -529,7 +529,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
           timestamp: Date.now(),
         },
       });
-      await get().fetchReviewQueue();
+      await Promise.all([get().fetchReviewQueue(), get().fetchProfiles()]);
       return result;
     } catch (error) {
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;

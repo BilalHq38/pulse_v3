@@ -129,6 +129,15 @@ export default function LeadsPage() {
   const [showEditLead, setShowEditLead] = useState(false);
   const [editLeadForm, setEditLeadForm] = useState({ name: '', email: '', phone: '', company: '', source: 'web_chat', notes: '', status: 'new' });
   const [nurtureComposer, setNurtureComposer] = useState({ open: false, lead: null, message: null, channel: '' });
+  const [leadEmailComposer, setLeadEmailComposer] = useState({
+    open: false,
+    lead: null,
+    subject: '',
+    body: '',
+    originalSubject: '',
+    originalBody: '',
+    sending: false,
+  });
   const [creatingLead, setCreatingLead] = useState(false);
   const [createLeadError, setCreateLeadError] = useState('');
   const [loadError, setLoadError] = useState('');
@@ -454,28 +463,87 @@ export default function LeadsPage() {
     return [...messages].reverse().find((item) => !item?.sent) || null;
   };
 
-  const buildLeadEmailDraft = (lead) => ({
-    subject: `Pulse Engine follow up for ${lead?.name || 'lead'}`,
-    body: `Hi ${lead?.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
-  });
+  const buildLeadEmailDraft = (lead) => {
+    const latestDraft = getLatestDraft(lead);
+    const name = String(lead?.name || '').trim();
+    const company = String(lead?.company || '').trim();
+    const notes = String(lead?.notes || '').trim();
+    const subject = company ? `Follow up for ${company}` : `Follow up${name ? ` for ${name}` : ''}`;
+    const body = latestDraft?.message
+      ? String(latestDraft.message)
+      : [
+          `Hi ${name || 'there'},`,
+          '',
+          notes
+            ? `I wanted to follow up on your interest and the note we have: ${notes}`
+            : 'I wanted to follow up and see what would be most useful for you next.',
+          '',
+          'Best regards,',
+        ].join('\n');
+    return { subject, body };
+  };
 
-  const sendLeadEmail = async (lead) => {
+  const closeLeadEmailComposer = () => {
+    if (leadEmailComposer.sending) return;
+    setLeadEmailComposer({
+      open: false,
+      lead: null,
+      subject: '',
+      body: '',
+      originalSubject: '',
+      originalBody: '',
+      sending: false,
+    });
+  };
+
+  const openLeadEmailComposer = (lead) => {
     if (!lead?.email) {
       askForContacts(lead, 'email');
       return;
     }
     const draft = buildLeadEmailDraft(lead);
+    setLeadEmailComposer({
+      open: true,
+      lead,
+      subject: draft.subject,
+      body: draft.body,
+      originalSubject: draft.subject,
+      originalBody: draft.body,
+      sending: false,
+    });
+  };
+
+  const submitLeadEmail = async () => {
+    const lead = leadEmailComposer.lead;
+    if (!lead || leadEmailComposer.sending) return;
+    if (!lead.email) {
+      closeLeadEmailComposer();
+      askForContacts(lead, 'email');
+      return;
+    }
+    const subject = leadEmailComposer.subject.trim();
+    const body = leadEmailComposer.body.trim();
+    if (!subject || !body) {
+      showToast({
+        type: 'error',
+        title: 'Email Incomplete',
+        message: 'Add a subject and message before sending the email.',
+      });
+      return;
+    }
+    setLeadEmailComposer((prev) => ({ ...prev, sending: true }));
     try {
       await api.post('/communications/email/send', {
         to_email: lead.email,
-        subject: draft.subject,
-        body: draft.body,
+        subject,
+        body,
       });
       showToast({
         type: 'success',
         title: 'Email Sent',
         message: `${lead.name || lead.email} received an email on ${lead.email}.`,
       });
+      closeLeadEmailComposer();
     } catch (err) {
       console.error(err);
       showToast({
@@ -483,6 +551,7 @@ export default function LeadsPage() {
         title: 'Email Failed',
         message: getErrorMessage(err, `We could not send an email to ${lead.email}.`),
       });
+      setLeadEmailComposer((prev) => ({ ...prev, sending: false }));
     }
   };
 
@@ -574,6 +643,10 @@ export default function LeadsPage() {
   const handlePickMethod = (method) => {
     if (!selectedLead) return;
     setShowMethodPicker(false);
+    if (method.channel === 'email') {
+      openLeadEmailComposer(selectedLead);
+      return;
+    }
     if (!method.isPrimaryContact) {
       navigate(`/inbox?outbound=1&channel=${encodeURIComponent(method.channel)}&name=${encodeURIComponent(selectedLead.name || 'Lead')}&phone=${encodeURIComponent(selectedLead.phone || '')}`);
       return;
@@ -587,7 +660,7 @@ export default function LeadsPage() {
   };
 
   const handleEmailLead = (lead) => {
-    void sendLeadEmail(lead);
+    openLeadEmailComposer(lead);
   };
 
   const submitContacts = async () => {
@@ -631,7 +704,7 @@ export default function LeadsPage() {
       setContactPrompt({ open: false, mode: 'message', lead: null, method: null });
 
       if (contactPrompt.mode === 'email') {
-        await sendLeadEmail(updatedLead);
+        openLeadEmailComposer(updatedLead);
         return;
       }
 
@@ -1266,8 +1339,8 @@ export default function LeadsPage() {
       )}
 
       {showMethodPicker && selectedLead && (
-        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="lead-message-methods-modal">
-          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md">
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="lead-message-methods-modal" onClick={() => setShowMethodPicker(false)}>
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md" onClick={(e) => e.stopPropagation()}>
             <div className="p-5">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-bold text-slate-900">Choose Message Method</h3>
@@ -1327,6 +1400,82 @@ export default function LeadsPage() {
         </div>
       )}
 
+      {leadEmailComposer.open && leadEmailComposer.lead && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 backdrop-blur-sm"
+          data-testid="lead-email-composer-modal"
+          onClick={closeLeadEmailComposer}
+        >
+          <div
+            className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="space-y-4 p-5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="text-lg font-bold text-slate-900">Email Lead</h3>
+                  <p className="mt-1 truncate text-sm text-slate-500">
+                    To {leadEmailComposer.lead.email}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeLeadEmailComposer}
+                  disabled={leadEmailComposer.sending}
+                  className="text-slate-400 hover:text-slate-600 disabled:opacity-50"
+                  data-testid="close-lead-email-composer"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              <label className="block">
+                <span className="mb-1 block text-xs font-semibold uppercase tracking-wider text-slate-400">Subject</span>
+                <input
+                  value={leadEmailComposer.subject}
+                  onChange={(e) => setLeadEmailComposer((prev) => ({ ...prev, subject: e.target.value }))}
+                  disabled={leadEmailComposer.sending}
+                  className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500/20 disabled:opacity-60"
+                  data-testid="lead-email-subject"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-xs font-semibold uppercase tracking-wider text-slate-400">Message</span>
+                <textarea
+                  value={leadEmailComposer.body}
+                  onChange={(e) => setLeadEmailComposer((prev) => ({ ...prev, body: e.target.value }))}
+                  disabled={leadEmailComposer.sending}
+                  rows={8}
+                  className="w-full resize-none rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm leading-6 text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500/20 disabled:opacity-60"
+                  data-testid="lead-email-body"
+                />
+              </label>
+
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closeLeadEmailComposer}
+                  disabled={leadEmailComposer.sending}
+                  className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={submitLeadEmail}
+                  disabled={leadEmailComposer.sending}
+                  className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+                  data-testid="send-lead-email"
+                >
+                  {leadEmailComposer.sending ? 'Sending...' : 'Send Email'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {nurtureComposer.open && nurtureComposer.lead && nurtureComposer.message && (
         <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="lead-nurture-send-modal" onClick={closeNurtureComposer}>
           <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg" onClick={(e) => e.stopPropagation()}>
@@ -1370,6 +1519,7 @@ export default function LeadsPage() {
                 onClick={submitNurtureMessageSend}
                 disabled={sendingNurtureId === nurtureComposer.message.id}
                 className="w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+                data-testid="submit-nurture-send"
               >
                 {sendingNurtureId === nurtureComposer.message.id
                   ? 'Sending...'

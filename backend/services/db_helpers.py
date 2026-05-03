@@ -47,6 +47,8 @@ _embedding_vector_ready = False
 _embedding_vector_lock = asyncio.Lock()
 _message_attachment_schema_ready = False
 _message_attachment_schema_lock = asyncio.Lock()
+_message_reaction_schema_ready: set[str] = set()
+_message_reaction_schema_lock = asyncio.Lock()
 _SUPER_ADMIN_COMPANY_ID_FALLBACK = "00000000-0000-0000-0000-000000000001"
 
 
@@ -1494,6 +1496,232 @@ async def save_message_attachments(db, message_id: str, attachments: Optional[li
     return saved
 
 
+def _is_message_reaction_missing_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return exc.__class__.__name__ == "UndefinedTableError" or (
+        "message_reactions" in message and "does not exist" in message
+    )
+
+
+async def _message_reaction_schema_scope(db) -> str:
+    fetchval = getattr(db, "fetchval", None)
+    if not fetchval:
+        return f"db:{id(db)}"
+    try:
+        schema = await fetchval("SELECT current_schema()")
+        return str(schema or f"db:{id(db)}")
+    except Exception:
+        return f"db:{id(db)}"
+
+
+async def _message_reaction_relation_exists(db) -> bool | None:
+    fetchval = getattr(db, "fetchval", None)
+    if not fetchval:
+        return None
+    try:
+        return bool(await fetchval("SELECT to_regclass('message_reactions') IS NOT NULL"))
+    except Exception:
+        return None
+
+
+async def ensure_message_reaction_schema(db, *, force: bool = False) -> None:
+    if not db:
+        return
+    scope = await _message_reaction_schema_scope(db)
+    if not force and scope in _message_reaction_schema_ready:
+        exists = await _message_reaction_relation_exists(db)
+        if exists is not False:
+            return
+        _message_reaction_schema_ready.discard(scope)
+    async with _message_reaction_schema_lock:
+        if not force and scope in _message_reaction_schema_ready:
+            exists = await _message_reaction_relation_exists(db)
+            if exists is not False:
+                return
+            _message_reaction_schema_ready.discard(scope)
+        exists = await _message_reaction_relation_exists(db)
+        if exists is True:
+            _message_reaction_schema_ready.add(scope)
+            return
+        statements = (
+            "CREATE TABLE IF NOT EXISTS message_reactions ("
+            "id TEXT PRIMARY KEY,"
+            "company_id TEXT NOT NULL DEFAULT '',"
+            "conversation_id TEXT NOT NULL DEFAULT '',"
+            "message_id TEXT NOT NULL DEFAULT '',"
+            "provider_message_id TEXT NOT NULL DEFAULT '',"
+            "target_provider_message_id TEXT NOT NULL DEFAULT '',"
+            "channel TEXT NOT NULL DEFAULT '',"
+            "actor_type TEXT NOT NULL DEFAULT 'customer',"
+            "actor_id TEXT NOT NULL DEFAULT '',"
+            "emoji TEXT NOT NULL DEFAULT '',"
+            "action TEXT NOT NULL DEFAULT 'added',"
+            "raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+            ")",
+            "CREATE INDEX IF NOT EXISTS idx_message_reactions_conversation_id ON message_reactions(conversation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_message_reactions_message_id ON message_reactions(message_id)",
+            "CREATE INDEX IF NOT EXISTS idx_message_reactions_target_provider ON message_reactions(company_id,channel,target_provider_message_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_message_reactions_provider_event "
+            "ON message_reactions(company_id,channel,provider_message_id) WHERE BTRIM(provider_message_id) <> ''",
+        )
+        for statement in statements:
+            await db.execute(statement)
+        exists = await _message_reaction_relation_exists(db)
+        if exists is False:
+            logger.warning("message_reactions schema creation did not expose relation in schema=%s", scope)
+            return
+        _message_reaction_schema_ready.add(scope)
+
+
+def normalize_reaction_row(row: dict) -> dict:
+    data = dict(row or {})
+    raw_payload = data.get("raw_payload") or {}
+    if not isinstance(raw_payload, dict):
+        raw_payload = {"value": str(raw_payload)}
+    return {
+        "id": str(data.get("id") or ""),
+        "company_id": str(data.get("company_id") or ""),
+        "conversation_id": str(data.get("conversation_id") or ""),
+        "message_id": str(data.get("message_id") or ""),
+        "provider_message_id": str(data.get("provider_message_id") or ""),
+        "target_provider_message_id": str(data.get("target_provider_message_id") or ""),
+        "channel": str(data.get("channel") or ""),
+        "actor_type": str(data.get("actor_type") or "customer"),
+        "actor_id": str(data.get("actor_id") or ""),
+        "emoji": str(data.get("emoji") or ""),
+        "action": str(data.get("action") or "added"),
+        "raw_payload": raw_payload,
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+async def save_message_reaction(
+    db,
+    *,
+    company_id: str,
+    channel: str,
+    provider_message_id: str = "",
+    target_provider_message_id: str = "",
+    message_id: str = "",
+    conversation_id: str = "",
+    actor_type: str = "customer",
+    actor_id: str = "",
+    emoji: str = "",
+    action: str = "added",
+    raw_payload: Optional[dict] = None,
+) -> dict:
+    if not db:
+        return {}
+    await ensure_message_reaction_schema(db)
+    scoped_company_id = str(company_id or "").strip()
+    scoped_channel = str(channel or "").strip().lower()
+    target_provider_id = str(target_provider_message_id or "").strip()
+    scoped_message_id = str(message_id or "").strip()
+    scoped_conversation_id = str(conversation_id or "").strip()
+    scoped_provider_event_id = str(provider_message_id or "").strip()
+    actor = str(actor_id or "").strip()
+    reaction_action = str(action or "added").strip().lower()
+    if reaction_action not in {"added", "updated", "removed"}:
+        reaction_action = "added"
+    reaction_emoji = "" if reaction_action == "removed" else str(emoji or "").strip()
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+
+    if not scoped_company_id or not scoped_channel:
+        return {}
+
+    if scoped_message_id:
+        target = r(
+            await db.fetchrow(
+                "SELECT id,conversation_id,external_message_id FROM messages WHERE company_id=$1 AND id=$2 LIMIT 1",
+                scoped_company_id,
+                scoped_message_id,
+            )
+        )
+    elif target_provider_id:
+        target = r(
+            await db.fetchrow(
+                "SELECT id,conversation_id,external_message_id FROM messages "
+                "WHERE company_id=$1 AND (external_message_id=$2 OR id=$2) "
+                "ORDER BY created_at DESC LIMIT 1",
+                scoped_company_id,
+                target_provider_id,
+            )
+        )
+    else:
+        target = {}
+
+    if target:
+        scoped_message_id = str(target.get("id") or scoped_message_id)
+        scoped_conversation_id = str(target.get("conversation_id") or scoped_conversation_id)
+        target_provider_id = target_provider_id or str(target.get("external_message_id") or "")
+
+    if not scoped_provider_event_id:
+        digest = hashlib.sha256(
+            f"{scoped_company_id}:{scoped_channel}:{target_provider_id}:{scoped_message_id}:{actor}:{reaction_emoji}:{reaction_action}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:32]
+        scoped_provider_event_id = f"reaction:{digest}"
+
+    existing = r(
+        await db.fetchrow(
+            "SELECT * FROM message_reactions WHERE company_id=$1 AND channel=$2 AND provider_message_id=$3 LIMIT 1",
+            scoped_company_id,
+            scoped_channel,
+            scoped_provider_event_id,
+        )
+    )
+    if existing:
+        row = await db.fetchrow(
+            "UPDATE message_reactions SET conversation_id=$1,message_id=$2,target_provider_message_id=$3,"
+            "actor_type=$4,actor_id=$5,emoji=$6,action=$7,raw_payload=$8,updated_at=NOW() "
+            "WHERE id=$9 RETURNING *",
+            scoped_conversation_id,
+            scoped_message_id,
+            target_provider_id,
+            str(actor_type or "customer").strip() or "customer",
+            actor,
+            reaction_emoji,
+            reaction_action,
+            payload,
+            existing["id"],
+        )
+        return normalize_reaction_row(dict(row))
+
+    reaction_id = make_id()
+    try:
+        row = await db.fetchrow(
+            "INSERT INTO message_reactions("
+            "id,company_id,conversation_id,message_id,provider_message_id,target_provider_message_id,channel,"
+            "actor_type,actor_id,emoji,action,raw_payload,created_at,updated_at"
+            ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW()) RETURNING *",
+            reaction_id,
+            scoped_company_id,
+            scoped_conversation_id,
+            scoped_message_id,
+            scoped_provider_event_id,
+            target_provider_id,
+            scoped_channel,
+            str(actor_type or "customer").strip() or "customer",
+            actor,
+            reaction_emoji,
+            reaction_action,
+            payload,
+        )
+        return normalize_reaction_row(dict(row))
+    except Exception:
+        row = await db.fetchrow(
+            "SELECT * FROM message_reactions WHERE company_id=$1 AND channel=$2 AND provider_message_id=$3 LIMIT 1",
+            scoped_company_id,
+            scoped_channel,
+            scoped_provider_event_id,
+        )
+        return normalize_reaction_row(dict(row)) if row else {}
+
+
 async def fetch_messages_with_attachments(db, convo_id: str, limit: int = 500) -> List[dict]:
     rows = await db.fetch(
         "SELECT * FROM messages WHERE conversation_id=$1 ORDER BY created_at ASC LIMIT $2",
@@ -1512,8 +1740,36 @@ async def fetch_messages_with_attachments(db, convo_id: str, limit: int = 500) -
     for row in attachments:
         item = normalize_attachment_row(dict(row))
         by_message.setdefault(str(row["message_id"]), []).append(item)
+    await ensure_message_reaction_schema(db)
+    try:
+        reactions = await db.fetch(
+            "SELECT * FROM message_reactions WHERE message_id = ANY($1::text[]) AND action <> 'removed' "
+            "ORDER BY created_at ASC",
+            message_ids,
+        )
+    except Exception as exc:
+        if not _is_message_reaction_missing_error(exc):
+            raise
+        logger.warning("message_reactions missing while loading conversation messages; retrying schema creation")
+        await ensure_message_reaction_schema(db, force=True)
+        try:
+            reactions = await db.fetch(
+                "SELECT * FROM message_reactions WHERE message_id = ANY($1::text[]) AND action <> 'removed' "
+                "ORDER BY created_at ASC",
+                message_ids,
+            )
+        except Exception as retry_exc:
+            if not _is_message_reaction_missing_error(retry_exc):
+                raise
+            logger.warning("message_reactions still unavailable after schema retry; returning messages without reactions")
+            reactions = []
+    reactions_by_message: dict[str, list] = {}
+    for row in reactions:
+        item = normalize_reaction_row(dict(row))
+        reactions_by_message.setdefault(str(row["message_id"]), []).append(item)
     for msg in messages:
         msg["attachments"] = by_message.get(msg["id"], [])
+        msg["reactions"] = reactions_by_message.get(msg["id"], [])
     return messages
 
 

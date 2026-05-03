@@ -327,7 +327,7 @@ def ai_input_token_budget(default: int = 12000) -> int:
 
 
 def ai_enable_rule_based_recovery() -> bool:
-    return os.environ.get("AI_ENABLE_RULE_BASED_RECOVERY", "false").strip().lower() in {
+    return os.environ.get("AI_ENABLE_RULE_BASED_RECOVERY", "true").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -393,12 +393,34 @@ def gemini_fallback_models(default: str = "gemini-2.5-flash-lite,gemini-2.5-flas
     ]
 
 
-def gemini_embedding_model_name(default: str = "models/text-embedding-004") -> str:
-    return (os.environ.get("GEMINI_EMBEDDING_MODEL", default) or default).strip()
+def normalize_gemini_embedding_model_name(model_name: str | None = None, default: str = "gemini-embedding-exp-03-07") -> str:
+    """Return the Gemini embedding model name expected by the SDK.
+
+    The REST API documents resource names as ``models/{model}``, while the
+    Python SDK accepts the model code. Keeping the user-facing env flexible
+    prevents ``models/models/...`` style failures without exposing secrets or
+    silently inventing a different configured model.
+    """
+    raw = (model_name if model_name is not None else os.environ.get("GEMINI_EMBEDDING_MODEL", default))
+    value = (raw or default).strip()
+    while value.startswith("models/"):
+        value = value.split("/", 1)[1].strip()
+    return value or default
+
+
+def gemini_embedding_model_name(default: str = "gemini-embedding-exp-03-07") -> str:
+    return normalize_gemini_embedding_model_name(default=default)
 
 
 def openai_embedding_model_name(default: str = "text-embedding-3-small") -> str:
     return (os.environ.get("OPENAI_EMBEDDING_MODEL", default) or default).strip()
+
+
+def ai_embedding_unsupported_cooldown_seconds(default: int = 900) -> int:
+    try:
+        return max(0, int(os.environ.get("AI_EMBEDDING_UNSUPPORTED_COOLDOWN_SECONDS", str(default)) or default))
+    except ValueError:
+        return default
 
 
 def ai_response_recent_ai_message_limit(default: int = 3) -> int:

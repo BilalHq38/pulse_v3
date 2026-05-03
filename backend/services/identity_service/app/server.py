@@ -190,6 +190,10 @@ class InternalIdentityResolveRequest(BaseModel):
     full_name: str | None = None
     username: str | None = None
     profile_picture_phash: str | None = None
+    profile_picture_url: str | None = None
+    description: str | None = None
+    bio: str | None = None
+    company_name: str | None = None
     language: str | None = None
     locale: str | None = None
     device_signals: dict[str, Any] = Field(default_factory=dict)
@@ -272,10 +276,58 @@ def _flatten_numeric(value: Any) -> float:
     return 0.0
 
 
+def _score_to_display_confidence(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if numeric > 1.0:
+        return round(min(0.9999, max(0.05, numeric / 1000.0)), 6)
+    return round(min(max(numeric, 0.0), 1.0), 6)
+
+
+def _safe_signal_profile(profile: UnifiedCustomer | None) -> dict[str, Any]:
+    return dict(getattr(profile, "signal_profile", None) or {})
+
+
+def _profile_avatar_url(profile: UnifiedCustomer | None) -> str:
+    signal_profile = _safe_signal_profile(profile)
+    for key in ("profile_picture_url", "avatar_url", "image_url"):
+        value = str(signal_profile.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _source_channels(profile: UnifiedCustomer | None) -> list[str]:
+    mappings = list(getattr(profile, "mappings", []) or [])
+    return sorted({str(item.platform or "").strip() for item in mappings if str(item.platform or "").strip()})
+
+
+def _candidate_payload(profile: UnifiedCustomer | None, mapping: IdentityMapping | None, fallback_id: str | None) -> dict[str, Any]:
+    profile_id = str(getattr(profile, "customer_id", "") or fallback_id or "").strip()
+    signal_profile = _safe_signal_profile(profile)
+    return {
+        "id": profile_id,
+        "customer_id": profile_id,
+        "display_name": (getattr(profile, "primary_name", "") if profile else "")
+        or (mapping.name if mapping else "")
+        or (mapping.platform_username if mapping else "")
+        or (f"Customer {profile_id[:8]}" if profile_id else "Unknown"),
+        "email": (mapping.email if mapping else "") or "",
+        "phone": (mapping.phone if mapping else "") or "",
+        "avatar_url": _profile_avatar_url(profile),
+        "source_channels": _source_channels(profile),
+        "company_name": str(signal_profile.get("company_name") or "").strip(),
+        "description": str(signal_profile.get("description") or signal_profile.get("bio") or "").strip(),
+    }
+
+
 def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
     primary_email = ""
     primary_phone = ""
     display_name = profile.primary_name or ""
+    avatar_url = ""
     members = []
     for mapping in profile.mappings:
         if not primary_email and mapping.email:
@@ -284,6 +336,8 @@ def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
             primary_phone = mapping.phone
         if not display_name:
             display_name = mapping.name or mapping.platform_username or mapping.platform_user_id
+        if not avatar_url:
+            avatar_url = str((profile.signal_profile or {}).get("profile_picture_url") or "").strip()
         members.append(
             {
                 "customer_id": mapping.mapping_id,
@@ -304,6 +358,7 @@ def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
         "display_name": display_name or f"Identity {profile.customer_id[:8]}",
         "primary_email": primary_email,
         "primary_phone": primary_phone,
+        "avatar_url": avatar_url,
         "platforms_used": ", ".join(platforms) if platforms else "unknown",
         "member_count": len(members),
         "members": members,
@@ -389,6 +444,10 @@ async def _resolve_with_auto_consent(
             full_name=payload.full_name,
             username=payload.username,
             profile_picture_phash=payload.profile_picture_phash,
+            profile_picture_url=payload.profile_picture_url,
+            description=payload.description,
+            bio=payload.bio,
+            company_name=payload.company_name,
             language=payload.language,
             locale=payload.locale,
             device_signals=payload.device_signals,
@@ -681,15 +740,22 @@ async def identity_suggestions_compat(
             score_value = score_breakdown.get("confidence")
         if score_value is None:
             score_value = _flatten_numeric(score_breakdown)
-        try:
-            score = min(max(float(score_value), 0.0), 1.0)
-        except (TypeError, ValueError):
-            score = 0.0
+        score = _score_to_display_confidence(score_value)
 
         reasons = item.independent_signals or []
-        reason_text = (
-            ", ".join([str(part).strip() for part in reasons if str(part).strip()]) or item.reason or "identity_review"
-        )
+        matched_fields = [
+            str(part).strip()
+            for part in (
+                score_breakdown.get("matched_fields")
+                or score_breakdown.get("match_reasons")
+                or reasons
+                or []
+            )
+            if str(part).strip()
+        ]
+        reason_text = ", ".join(matched_fields) or item.reason or "identity_review"
+        candidate_a = _candidate_payload(source, source_mapping, item.source_customer_id)
+        candidate_b = _candidate_payload(candidate, candidate_mapping, item.candidate_customer_id)
 
         output.append(
             {
@@ -700,24 +766,28 @@ async def identity_suggestions_compat(
                 "source": item.source,
                 "customer_id_a": item.source_customer_id,
                 "customer_id_b": item.candidate_customer_id,
-                "name_a": (source.primary_name if source else "")
-                or (source_mapping.name if source_mapping else "")
-                or (source_mapping.platform_username if source_mapping else "")
-                or (f"Customer {str(item.source_customer_id)[:8]}" if item.source_customer_id else "Unknown"),
-                "email_a": (source_mapping.email if source_mapping else "") or "",
-                "phone_a": (source_mapping.phone if source_mapping else "") or "",
-                "company_a": "",
-                "customer_company_name_a": "",
-                "name_b": (candidate.primary_name if candidate else "")
-                or (candidate_mapping.name if candidate_mapping else "")
-                or (candidate_mapping.platform_username if candidate_mapping else "")
-                or (f"Customer {item.candidate_customer_id[:8]}" if item.candidate_customer_id else "Unknown"),
-                "email_b": (candidate_mapping.email if candidate_mapping else "") or "",
-                "phone_b": (candidate_mapping.phone if candidate_mapping else "") or "",
-                "company_b": "",
-                "customer_company_name_b": "",
+                "candidate_a": candidate_a,
+                "candidate_b": candidate_b,
+                "name_a": candidate_a["display_name"],
+                "email_a": candidate_a["email"],
+                "phone_a": candidate_a["phone"],
+                "avatar_a": candidate_a["avatar_url"],
+                "channels_a": candidate_a["source_channels"],
+                "company_a": candidate_a["company_name"],
+                "customer_company_name_a": candidate_a["company_name"],
+                "name_b": candidate_b["display_name"],
+                "email_b": candidate_b["email"],
+                "phone_b": candidate_b["phone"],
+                "avatar_b": candidate_b["avatar_url"],
+                "channels_b": candidate_b["source_channels"],
+                "company_b": candidate_b["company_name"],
+                "customer_company_name_b": candidate_b["company_name"],
                 "match_score": score,
+                "confidence": score,
                 "match_reasons": reason_text,
+                "matched_fields": matched_fields,
+                "source_channels": sorted(set(candidate_a["source_channels"] + candidate_b["source_channels"])),
+                "score_breakdown": score_breakdown,
                 "status": item.status,
                 "created_at": item.created_at,
             }

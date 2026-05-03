@@ -172,6 +172,13 @@ class LongTermMemory:
         """Store the rolling set of shown product IDs in context memory."""
         if not db or not tenant_id or not user_id:
             return
+        if not conversation_id:
+            logger.info(
+                "shown_products_store_skipped reason=missing_conversation_scope tenant=%s user=%s",
+                tenant_id,
+                user_id,
+            )
+            return
 
         cleaned = [str(item).strip() for item in product_ids if str(item).strip()]
         if not cleaned:
@@ -182,7 +189,7 @@ class LongTermMemory:
         existing_id = await db.fetchval(
             "SELECT id FROM context_memories "
             "WHERE company_id=$1 AND entity_id=$2 AND memory_type='shown_products' "
-            "AND ($3='' OR convo_id=$3) "
+            "AND convo_id=$3 "
             "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1",
             tenant_id,
             user_id,
@@ -306,11 +313,13 @@ class LongTermMemory:
 
     async def _fetch_shown_products(self, db, tenant_id: str, user_id: str, conversation_id: str) -> list[str]:
         """Fetch previously shown product IDs from context_memories."""
+        if not conversation_id:
+            return []
         try:
             row = await db.fetchrow(
                 "SELECT memory_content FROM context_memories "
                 "WHERE company_id=$1 AND entity_id=$2 AND memory_type='shown_products' "
-                "AND ($3='' OR convo_id=$3) "
+                "AND convo_id=$3 "
                 "ORDER BY updated_at DESC LIMIT 1",
                 tenant_id,
                 user_id,
@@ -327,12 +336,14 @@ class LongTermMemory:
 
     async def _fetch_context_memories(self, db, tenant_id: str, user_id: str, conversation_id: str) -> list[dict]:
         """Fetch all context memories for additional context."""
+        if not conversation_id:
+            return []
         try:
             rows = await db.fetch(
                 "SELECT memory_type, memory_content, relevance_score, updated_at "
                 "FROM context_memories "
                 "WHERE company_id=$1 AND entity_id=$2 "
-                "AND ($3='' OR convo_id=$3) "
+                "AND convo_id=$3 "
                 "ORDER BY updated_at DESC LIMIT 10",
                 tenant_id,
                 user_id,

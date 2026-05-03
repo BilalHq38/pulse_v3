@@ -135,11 +135,14 @@ async def respond_to_customer(
     )
     return RespondResponse(
         reply=result.get("response", ""),
+        response=result.get("response", ""),
         confidence=float(result.get("confidence", 0.0) or 0.0),
         sentiment=sentiment,
         intent=intent,
         conversation_sentiment=result.get("conversation_sentiment") or {},
         engine=f"{result.get('provider', '')}:{result.get('model_name', '')}".strip(":"),
+        provider=str(result.get("provider") or ""),
+        model_name=str(result.get("model_name") or ""),
         llm_id=str(result.get("llm_id", "") or ""),
         agent_id=str(result.get("agent_id", "") or ""),
         agent_type=str(result.get("agent_type", "") or ""),
@@ -149,6 +152,12 @@ async def respond_to_customer(
         conversation_stage=str(result.get("conversation_stage") or ""),
         next_action=str(result.get("next_action") or ""),
         intent_shift=bool(result.get("intent_shift")),
+        degraded=bool(result.get("degraded")),
+        api_error=bool(result.get("api_error")),
+        provider_error=result.get("provider_error") or {},
+        error_type=str(result.get("error_type") or ""),
+        error_reason=str(result.get("error_reason") or ""),
+        fallback_used=bool(result.get("fallback_used")),
     )
 
 

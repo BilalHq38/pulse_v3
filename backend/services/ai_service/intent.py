@@ -9,6 +9,28 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_URGENCY = {"low", "medium", "high", "critical"}
 _QUOTA_MARKERS = ("resource_exhausted", "quota", "rate-limit", "rate limit", "429")
+_INTENT_ALIASES = {
+    "product_interest": "product_recommendation",
+    "product_inquiry": "product_catalog_question",
+    "product_question": "product_catalog_question",
+    "catalog_question": "product_catalog_question",
+    "price_question": "pricing_question",
+    "pricing_payment": "pricing_question",
+    "payment_question": "pricing_question",
+    "order_status": "shipping_question",
+    "delivery_question": "shipping_question",
+    "purchase": "buying_intent",
+    "purchase_intent": "buying_intent",
+    "conversion_intent": "buying_intent",
+    "service_inquiry": "service_question",
+    "service_info": "service_question",
+    "company_info": "company_question",
+    "business_inquiry": "business_question",
+    "continue": "follow_up_continue",
+    "next": "follow_up_continue",
+    "opt_out": "rejection_or_opt_out",
+    "escalation": "human_handoff",
+}
 
 
 def _normalize_intent_payload(raw: dict) -> dict:
@@ -16,6 +38,7 @@ def _normalize_intent_payload(raw: dict) -> dict:
     intent_name = str(payload.get("intent") or "general_question").strip().lower()
     if not intent_name:
         intent_name = "general_question"
+    intent_name = _INTENT_ALIASES.get(intent_name, intent_name)
     confidence = float(payload.get("confidence") or 0.0)
     confidence = max(0.0, min(1.0, confidence))
     urgency = str(payload.get("urgency") or "medium").strip().lower()
@@ -57,16 +80,41 @@ def _safe_intent_error(exc: Exception | None) -> tuple[str, str]:
 
 def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None = None) -> dict:
     lower = (text or "").lower()
+    normalized = " ".join("".join(ch if ch.isalnum() or ch.isspace() else " " for ch in lower).split())
     intent_name = previous_intent if previous_intent and previous_intent != "unknown" else "general_question"
     confidence = 0.15
-    if any(token in lower for token in ("price", "cost", "buy", "purchase", "available", "product")):
-        intent_name = "product_interest"
+    if normalized in {"next", "yes", "yeah", "yep", "ok", "okay", "continue", "show", "send", "proceed", "go ahead", "tell me more", "more"}:
+        intent_name = "follow_up_continue"
+        confidence = 0.5
+    elif any(token in lower for token in ("image", "photo", "picture", "catalog", "show me")):
+        intent_name = "product_image_request"
+        confidence = 0.4
+    elif any(phrase in lower for phrase in ("where can i buy", "where can i order", "order link", "website", "buy link")):
+        intent_name = "website_link_request"
+        confidence = 0.45
+    elif any(phrase in lower for phrase in ("i want to buy", "want to buy", "i want this", "want this", "purchase", "place order", "how can i order")):
+        intent_name = "buying_intent"
+        confidence = 0.45
+    elif any(token in lower for token in ("price", "cost", "how much", "rate", "charges")):
+        intent_name = "pricing_question"
+        confidence = 0.4
+    elif any(token in lower for token in ("available", "availability", "stock", "in stock")):
+        intent_name = "availability_question"
+        confidence = 0.4
+    elif any(token in lower for token in ("product", "products", "item", "items", "catalog")):
+        intent_name = "product_catalog_question"
+        confidence = 0.35
+    elif any(token in lower for token in ("service", "services", "offer", "provide", "providing")):
+        intent_name = "service_question"
+        confidence = 0.35
+    elif any(phrase in lower for phrase in ("who are you", "about your company", "your business", "your brand")):
+        intent_name = "company_question"
         confidence = 0.35
     elif any(token in lower for token in ("refund", "cancel", "complaint", "broken", "issue", "problem")):
         intent_name = "support_request"
         confidence = 0.35
     elif any(token in lower for token in ("order", "delivery", "shipping", "tracking")):
-        intent_name = "order_status"
+        intent_name = "shipping_question"
         confidence = 0.3
     elif any(token in lower for token in ("hi", "hello", "hey", "salam", "assalam")):
         intent_name = "greeting"
@@ -107,15 +155,21 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
         "The JSON object must contain exactly these keys:\n"
         '{"intent":"snake_case_intent","confidence":0.0,"entities":{},"urgency":"low|medium|high|critical"}\n\n'
 
+        "SUPPORTED INTENTS:\n"
+        "greeting, gratitude, general_question, unclear_request, company_question, service_question, business_question, "
+        "follow_up_continue, product_catalog_question, product_recommendation, purchase_inquiry, product_image_request, pricing_question, availability_question, "
+        "buying_intent, order_intent, website_link_request, support_request, complaint, refund, cancel_request, "
+        "shipping_question, negotiation, human_handoff, rejection_or_opt_out.\n\n"
+
         "INTENT SELECTION RULES:\n"
         "- Choose exactly one primary intent.\n"
         "- The intent must be written in clear snake_case.\n"
         "- Prefer a specific intent when the customer message clearly indicates one.\n"
-        "- If the latest message is short but the recent conversation clearly explains it, use the conversation context.\n"
+        "- If the latest message is short but the recent conversation clearly explains it, use follow_up_continue or the specific continuation intent.\n"
         "- If the latest message changes the topic, classify the latest message, not the older topic.\n"
         "- If the message is only a greeting, thanks, emoji, or very vague text, use a general intent with lower confidence.\n"
         "- If the customer is asking about price, cost, rates, packages, discounts, or payment, classify it as a pricing/payment-related intent.\n"
-        "- If the customer asks for product details, availability, images, catalog, features, size, color, stock, or recommendations, classify it as a product/service inquiry intent.\n"
+        "- If the customer asks for product details, availability, images, catalog, features, size, color, stock, or recommendations, classify it as product_catalog_question, product_recommendation, product_image_request, pricing_question, or availability_question.\n"
         "- If the customer wants to buy, book, order, reserve, confirm, subscribe, or proceed, classify it as a purchase/booking/conversion intent.\n"
         "- If the customer complains, reports an issue, asks for support, refund, cancellation, replacement, or says something is not working, classify it as a support/complaint intent.\n"
         "- If the customer asks to speak to a person, manager, owner, agent, or support team, classify it as a human handoff/escalation intent.\n"
@@ -149,7 +203,7 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
         "CONTEXT HANDLING:\n"
         "- previous_intent can help maintain continuity, but it must not override a clear new intent in latest_message.\n"
         "- recent_conversation can clarify pronouns like 'it', 'that one', 'same', 'how much', or 'send it'.\n"
-        "- If latest_message is a short reply such as 'yes', 'ok', 'send', or 'price?', infer intent from recent_conversation and lower confidence if still uncertain.\n"
+        "- If latest_message is a short reply such as 'next', 'yes', 'ok', 'show', 'continue', 'tell me more', 'send', or 'price?', infer intent from recent_conversation; use follow_up_continue when it means continue the previous topic.\n"
         "- If recent_conversation is missing, classify using latest_message only.\n\n"
 
         "SAFETY AND ACCURACY:\n"

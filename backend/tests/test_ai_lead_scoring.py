@@ -93,7 +93,7 @@ async def test_intent_quota_failure_returns_local_fallback(monkeypatch):
     )
 
     assert result["source"] == "local_fallback"
-    assert result["intent"] == "product_interest"
+    assert result["intent"] == "pricing_question"
     assert result["error_type"] == "quota_exhausted"
 
 

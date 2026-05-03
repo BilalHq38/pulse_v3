@@ -28,21 +28,24 @@ export function normalizeChannelKey(raw) {
 }
 
 /**
- * Deduplicates a list of contact methods by channel+profileUrl identity.
+ * Deduplicates a list of contact methods by channel type.
  * Preserves the isPrimaryContact flag if any duplicate has it.
  */
 export function dedupeMethods(methods) {
   const merged = new Map();
   methods.forEach((m) => {
-    const key = `${m.channel}|${m.profileUrl || ''}`;
+    const key = m.channel;
     if (!merged.has(key)) {
       merged.set(key, m);
       return;
     }
     const existing = merged.get(key);
-    if (!existing.isPrimaryContact && m.isPrimaryContact) {
-      merged.set(key, { ...existing, isPrimaryContact: true });
-    }
+    merged.set(key, {
+      ...existing,
+      profileUrl: existing.profileUrl || m.profileUrl || '',
+      source: existing.source || m.source || '',
+      isPrimaryContact: Boolean(existing.isPrimaryContact || m.isPrimaryContact),
+    });
   });
   return Array.from(merged.values());
 }
@@ -118,6 +121,7 @@ export function buildCustomerMethods(customer) {
   const primaryChannel = inferPrimaryCustomerChannel(customer);
   const addMethod = (channel, profileUrl = '', source = 'customer_profile') => {
     const normalized = normalizeChannelKey(channel);
+    if (normalized === 'email') return;
     if (!CHANNEL_META[normalized]) return;
     methods.push({ channel: normalized, profileUrl: profileUrl || '', source, isPrimaryContact: normalized === primaryChannel });
   };
@@ -139,11 +143,10 @@ export function buildCustomerMethods(customer) {
     });
   }
 
-  addMethod('instagram', customer?.instagram_profile_url || '', 'customer_instagram');
-  addMethod('facebook', customer?.facebook_profile_url || '', 'customer_facebook');
-  addMethod('twitter', customer?.twitter_profile_url || '', 'customer_twitter');
-  addMethod('whatsapp', customer?.whatsapp_profile_url || '', 'customer_whatsapp');
-  if (customer?.email) addMethod('email', customer.email, 'customer_email');
+  if (customer?.instagram_profile_url) addMethod('instagram', customer.instagram_profile_url, 'customer_instagram');
+  if (customer?.facebook_profile_url) addMethod('facebook', customer.facebook_profile_url, 'customer_facebook');
+  if (customer?.twitter_profile_url) addMethod('twitter', customer.twitter_profile_url, 'customer_twitter');
+  if (customer?.whatsapp_profile_url || customer?.phone) addMethod('whatsapp', customer?.whatsapp_profile_url || '', 'customer_whatsapp');
 
   return dedupeMethods(methods).sort((a, b) => {
     if (a.isPrimaryContact && !b.isPrimaryContact) return -1;

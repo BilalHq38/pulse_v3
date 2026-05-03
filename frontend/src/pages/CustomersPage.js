@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useDeferredValue } from 'react';
+import { useState, useEffect, useCallback, useDeferredValue, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
 import { resolveMediaUrl } from '@/lib/backend-url';
@@ -109,19 +109,34 @@ export default function CustomersPage() {
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const customerSelectionRequestRef = useRef('');
+  const dismissedCustomerParamRef = useRef('');
+  const latestSearchParamsRef = useRef(searchParams);
+  const selectedCustomerIdRef = useRef('');
+
+  useEffect(() => {
+    latestSearchParamsRef.current = searchParams;
+    if (!searchParams.get('customer')) dismissedCustomerParamRef.current = '';
+  }, [searchParams]);
+
+  useEffect(() => {
+    selectedCustomerIdRef.current = selected?.id || '';
+  }, [selected?.id]);
 
   const closeCustomerDetail = useCallback(() => {
+    dismissedCustomerParamRef.current = selectedCustomerIdRef.current || latestSearchParamsRef.current.get('customer') || '';
+    customerSelectionRequestRef.current = '';
     setSelected(null);
     setCustomerProfile(null);
     setCustomerPurchases([]);
     setCustomerJourney([]);
     setCustomerUnifiedProfile(null);
-    if (searchParams.get('customer')) {
-      const nextParams = new URLSearchParams(searchParams);
+    setSearchParams((currentParams) => {
+      const nextParams = new URLSearchParams(currentParams);
       nextParams.delete('customer');
-      setSearchParams(nextParams, { replace: true });
-    }
-  }, [searchParams, setSearchParams]);
+      return nextParams;
+    }, { replace: true });
+  }, [setSearchParams]);
 
   const loadCustomers = useCallback(async () => {
     setLoadError('');
@@ -157,28 +172,59 @@ export default function CustomersPage() {
   }, [closeCustomerDetail]);
 
   const selectCustomer = useCallback(async (cust) => {
+    dismissedCustomerParamRef.current = '';
     setDetailTab('overview');
+    setCustomerProfile(null);
+    setCustomerPurchases([]);
+    setCustomerJourney([]);
     setCustomerUnifiedProfile(null);
+    const requestKey = `${cust?.id || ''}:${Date.now()}`;
+    customerSelectionRequestRef.current = requestKey;
     if (cust?.id) {
-      const nextParams = new URLSearchParams(searchParams);
-      nextParams.set('customer', cust.id);
-      setSearchParams(nextParams, { replace: true });
+      setSearchParams((currentParams) => {
+        const nextParams = new URLSearchParams(currentParams);
+        nextParams.set('customer', cust.id);
+        return nextParams;
+      }, { replace: true });
     }
     try {
       const res = await api.get(`/customers/${cust.id}`);
+      if (customerSelectionRequestRef.current !== requestKey) return;
       setSelected(res.data);
-      api.get(`/customers/${cust.id}/profile`).then(r => setCustomerProfile(r.data)).catch(() => setCustomerProfile(null));
-      api.get('/purchases', { params: { customer_id: cust.id } }).then(r => setCustomerPurchases(r.data || [])).catch(() => setCustomerPurchases([]));
-      api.get('/journey/tracking', { params: { customer_id: cust.id } }).then(r => setCustomerJourney(r.data || [])).catch(() => setCustomerJourney([]));
-      api.get(`/identity/customer/${cust.id}`).then(r => {
+      api.get(`/customers/${cust.id}/profile`).then((r) => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
+        setCustomerProfile(r.data);
+      }).catch(() => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
+        setCustomerProfile(null);
+      });
+      api.get('/purchases', { params: { customer_id: cust.id } }).then((r) => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
+        setCustomerPurchases(r.data || []);
+      }).catch(() => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
+        setCustomerPurchases([]);
+      });
+      api.get('/journey/tracking', { params: { customer_id: cust.id } }).then((r) => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
+        setCustomerJourney(r.data || []);
+      }).catch(() => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
+        setCustomerJourney([]);
+      });
+      api.get(`/identity/customer/${cust.id}`).then((r) => {
+        if (customerSelectionRequestRef.current !== requestKey) return;
         if (r.data?.unified) setCustomerUnifiedProfile(r.data.profile);
       }).catch(() => {});
-    } catch (err) { setSelected(cust); }
-  }, [searchParams, setSearchParams]);
+    } catch (err) {
+      if (customerSelectionRequestRef.current === requestKey) setSelected(cust);
+    }
+  }, [setSearchParams]);
 
   useEffect(() => {
     const requestedCustomerId = searchParams.get('customer');
     if (!requestedCustomerId || loading || selected?.id === requestedCustomerId) return;
+    if (dismissedCustomerParamRef.current === requestedCustomerId) return;
     const customer = customers.find((item) => item.id === requestedCustomerId);
     if (customer) {
       selectCustomer(customer);
@@ -222,12 +268,14 @@ export default function CustomersPage() {
   };
 
   const openMessagePicker = (customer) => {
-    const methods = buildCustomerMethods(customer);
+    const methods = buildCustomerMethods(customer).filter((method) => method.channel !== 'email');
     if (methods.length === 0) {
       showToast({
         type: 'error',
         title: 'No Channels',
-        message: 'No messaging channels are available for this customer yet.',
+        message: customer?.email
+          ? 'Use the Email button for this customer. No chat channels are available yet.'
+          : 'No messaging channels are available for this customer yet.',
       });
       return;
     }
@@ -321,6 +369,10 @@ export default function CustomersPage() {
   const handlePickMethod = (method) => {
     if (!activeCustomerForMethods) return;
     setShowMethodPicker(false);
+    if (method.channel === 'email') {
+      openEmailComposer(activeCustomerForMethods);
+      return;
+    }
     if (!method.isPrimaryContact) {
       navigate(`/inbox?outbound=1&channel=${encodeURIComponent(method.channel)}&name=${encodeURIComponent(activeCustomerForMethods.name || 'Customer')}&phone=${encodeURIComponent(activeCustomerForMethods.phone || '')}`);
       return;
@@ -622,6 +674,9 @@ export default function CustomersPage() {
         >
           <div
             className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg max-h-[80vh] overflow-y-auto"
+            role="dialog"
+            aria-modal="true"
+            data-testid="customer-detail-panel"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="p-6">
@@ -642,7 +697,15 @@ export default function CustomersPage() {
                   >
                     Edit
                   </button>
-                  <button onClick={closeCustomerDetail} className="text-slate-400 hover:text-slate-600"><X size={20} /></button>
+                  <button
+                    type="button"
+                    onClick={closeCustomerDetail}
+                    className="text-slate-400 hover:text-slate-600"
+                    aria-label="Close customer detail"
+                    data-testid="customer-detail-close-btn"
+                  >
+                    <X size={20} />
+                  </button>
                 </div>
               </div>
 
@@ -847,8 +910,8 @@ export default function CustomersPage() {
       )}
 
       {showMethodPicker && activeCustomerForMethods && (
-        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="customer-message-methods-modal">
-          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md">
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4" data-testid="customer-message-methods-modal" onClick={() => setShowMethodPicker(false)}>
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md" onClick={(e) => e.stopPropagation()}>
             <div className="p-5">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-bold text-slate-900">Choose Message Method</h3>

@@ -28,6 +28,8 @@ export default function ProfileCard({
   const confidence =
     Number(profileMeta?.confidenceScore || profile?.profile_confidence || profile?.confidence_score || 0) || 0;
   const reviewStatus = String(profileMeta?.reviewStatus || profile?.review_status || '').trim();
+  const avatarUrl = String(profile?.avatar_url || '').trim();
+  const initials = (String(profile?.display_name || '?').charAt(0) || '?').toUpperCase();
 
   return (
     <article
@@ -38,9 +40,20 @@ export default function ProfileCard({
       }`}
     >
       <div className="flex items-start gap-3">
-        <div className="h-11 w-11 shrink-0 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-white flex items-center justify-center text-sm font-bold">
-          {(String(profile?.display_name || '?').charAt(0) || '?').toUpperCase()}
-        </div>
+        {avatarUrl ? (
+          <img
+            src={avatarUrl}
+            alt=""
+            className="h-11 w-11 shrink-0 rounded-xl border border-slate-200 object-cover"
+            onError={(event) => {
+              event.currentTarget.style.display = 'none';
+            }}
+          />
+        ) : (
+          <div className="h-11 w-11 shrink-0 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-white flex items-center justify-center text-sm font-bold">
+            {initials}
+          </div>
+        )}
 
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">

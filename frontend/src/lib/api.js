@@ -20,6 +20,22 @@ const api = axios.create({
 let accessToken = '';
 let refreshPromise = null;
 
+function isFormDataPayload(data) {
+  return typeof FormData !== 'undefined' && data instanceof FormData;
+}
+
+function removeContentTypeHeader(headers) {
+  if (!headers) return;
+  if (typeof headers.delete === 'function') {
+    headers.delete('Content-Type');
+    headers.delete('content-type');
+    return;
+  }
+  Object.keys(headers).forEach((key) => {
+    if (key.toLowerCase() === 'content-type') delete headers[key];
+  });
+}
+
 function clearCachedUser() {
   localStorage.removeItem('pe_token');
   localStorage.removeItem('pe_refresh');
@@ -76,6 +92,9 @@ export async function clearAuthSession() {
 }
 
 api.interceptors.request.use((config) => {
+  if (isFormDataPayload(config.data)) {
+    removeContentTypeHeader(config.headers);
+  }
   const token = accessToken;
   if (token) {
     config.headers = config.headers || {};

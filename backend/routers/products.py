@@ -415,6 +415,11 @@ def _parse_bulk_product_file(filename: str, raw: bytes) -> tuple[list[dict], lis
     return _parse_bulk_product_rows(rows, row_images=row_images)
 
 
+def _is_json_bulk_content_type(content_type: str) -> bool:
+    media_type = str(content_type or "").lower().split(";", 1)[0].strip()
+    return media_type == "application/json" or media_type.endswith("+json")
+
+
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 _SLUG_SANITIZE_RE = re.compile(r"[^a-z0-9_-]+")
 _PRICE_SANITIZE_RE = re.compile(r"[^0-9.-]")
@@ -806,20 +811,32 @@ async def bulk_upload_products(request: Request):
     parse_errors: list[dict] = []
     content_type = str(request.headers.get("content-type") or "").lower()
     if content_type.startswith("multipart/form-data"):
-        form = await request.form()
+        try:
+            form = await request.form()
+        except Exception as exc:
+            logger.warning("Invalid product bulk multipart upload company_id=%s error=%s", cid, exc)
+            raise HTTPException(
+                400,
+                "Invalid multipart upload. Send the spreadsheet as multipart/form-data with a file field named `file`.",
+            ) from exc
         upload = form.get("file")
         if not upload or not hasattr(upload, "read"):
-            raise HTTPException(400, "file is required")
+            raise HTTPException(400, "Spreadsheet file is required in multipart field `file`.")
         raw = await upload.read()
         if not raw:
-            raise HTTPException(400, "file is empty")
+            raise HTTPException(400, "Spreadsheet file is empty.")
         upsert = str(form.get("upsert", "true")).strip().lower() not in {"false", "0", "no"}
         raw_items, parse_errors = _parse_bulk_product_file(str(getattr(upload, "filename", "") or ""), raw)
     else:
+        if not _is_json_bulk_content_type(content_type):
+            raise HTTPException(
+                400,
+                "Upload spreadsheets as multipart/form-data with a file field named `file`, or send application/json with an items array.",
+            )
         try:
             body = await request.json()
         except Exception as exc:
-            raise HTTPException(400, "request body must be valid JSON") from exc
+            raise HTTPException(400, "JSON bulk upload body must be valid JSON.") from exc
 
         upsert = True
         if isinstance(body, dict):

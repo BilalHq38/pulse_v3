@@ -31,6 +31,8 @@ class SemanticMemory:
         tenant_id: str,
         query: str,
         *,
+        user_id: str = "",
+        conversation_id: str = "",
         top_k: int = 5,
         min_similarity: float = 0.5,
     ) -> SemanticContext:
@@ -47,8 +49,22 @@ class SemanticMemory:
         # Search knowledge base
         knowledge_results = await self._search_knowledge(db, tenant_id, query, top_k=top_k)
 
-        # Search past interactions
-        interaction_results = await self._search_interactions(db, tenant_id, query, top_k=min(3, top_k))
+        # Search past interactions only inside the current customer/conversation
+        # scope. Knowledge base embeddings are company-scoped public data; past
+        # interactions are customer-specific and must not be cached/retrieved by
+        # query text alone.
+        interaction_results: list[dict[str, Any]] = []
+        if user_id or conversation_id:
+            interaction_results = await self._search_interactions(
+                db,
+                tenant_id,
+                query,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                top_k=min(3, top_k),
+            )
+        else:
+            logger.info("semantic_interaction_search_skipped reason=missing_customer_scope tenant=%s", tenant_id)
 
         # Filter by minimum similarity
         relevant_knowledge = [r for r in knowledge_results if float(r.get("similarity") or 0) >= min_similarity]
@@ -143,9 +159,18 @@ class SemanticMemory:
         tenant_id: str,
         query: str,
         *,
+        user_id: str = "",
+        conversation_id: str = "",
         top_k: int = 3,
     ) -> list[dict[str, Any]]:
         """Search past interaction embeddings."""
+        source_ids = [
+            str(item).strip()
+            for item in (conversation_id, user_id)
+            if str(item or "").strip()
+        ]
+        if not source_ids:
+            return []
         try:
             from services.ai_service.embedding_service import search_similar_embeddings
 
@@ -155,6 +180,7 @@ class SemanticMemory:
                 query,
                 source_type="interaction",
                 top_k=top_k,
+                source_ids=source_ids,
             )
         except Exception as exc:
             logger.warning(

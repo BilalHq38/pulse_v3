@@ -806,6 +806,29 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_id ON message_at
 CREATE INDEX IF NOT EXISTS idx_message_attachments_customer_id ON message_attachments(customer_id);
 CREATE INDEX IF NOT EXISTS idx_message_attachments_image_analysis_status ON message_attachments(image_analysis_status);
 
+CREATE TABLE IF NOT EXISTS message_reactions (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    provider_message_id TEXT NOT NULL DEFAULT '',
+    target_provider_message_id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
+    actor_type TEXT NOT NULL DEFAULT 'customer',
+    actor_id TEXT NOT NULL DEFAULT '',
+    emoji TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'added',
+    raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_message_reactions_conversation_id ON message_reactions(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_message_reactions_message_id ON message_reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_reactions_target_provider ON message_reactions(company_id,channel,target_provider_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_message_reactions_provider_event
+    ON message_reactions(company_id,channel,provider_message_id)
+    WHERE BTRIM(provider_message_id) <> '';
+
 CREATE TABLE IF NOT EXISTS conversation_logs (
     id          TEXT PRIMARY KEY,
     company_id  TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),

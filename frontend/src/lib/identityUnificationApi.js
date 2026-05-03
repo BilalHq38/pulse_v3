@@ -29,7 +29,9 @@ const normalizeProfileSummary = (profile = {}) => {
     display_name: String(item.display_name || '').trim(),
     primary_email: String(item.primary_email || '').trim(),
     primary_phone: String(item.primary_phone || '').trim(),
+    avatar_url: String(item.avatar_url || item.profile_picture_url || '').trim(),
     platforms_used: String(item.platforms_used || '').trim(),
+    source_channels: asArray(item.source_channels),
     member_count: Number(item.member_count || 0) || 0,
     members: asArray(item.members),
     total_interactions: Number(item.total_interactions || 0) || 0,
@@ -40,6 +42,23 @@ const normalizeProfileSummary = (profile = {}) => {
     review_status: String(item.review_status || '').trim(),
     confidence_score: Number(item.confidence_score || 0) || 0,
     profile_confidence: Number(item.profile_confidence || item.confidence_score || 0) || 0,
+  };
+};
+
+const normalizeCandidateProfile = (candidate = {}, fallback = {}) => {
+  const item = asObject(candidate);
+  const legacy = asObject(fallback);
+  const id = String(item.id || item.customer_id || legacy.customer_id || '').trim();
+  return {
+    id,
+    customer_id: String(item.customer_id || id || '').trim(),
+    display_name: String(item.display_name || item.name || legacy.name || id || 'Unknown profile').trim(),
+    email: String(item.email || legacy.email || '').trim(),
+    phone: String(item.phone || legacy.phone || '').trim(),
+    avatar_url: String(item.avatar_url || item.profile_picture_url || legacy.avatar_url || '').trim(),
+    source_channels: asArray(item.source_channels || legacy.source_channels),
+    company_name: String(item.company_name || legacy.company_name || '').trim(),
+    description: String(item.description || legacy.description || '').trim(),
   };
 };
 
@@ -72,12 +91,40 @@ const normalizeSuggestion = (suggestion = {}) => {
   const resolutionId = String(
     item.resolution_id || item.suggestion_id || item.id || '',
   ).trim();
+  const matchedFields = asArray(item.matched_fields || item.match_reasons_list)
+    .map((field) => String(field || '').trim())
+    .filter(Boolean);
+  const sourceChannels = asArray(item.source_channels)
+    .map((channel) => String(channel || '').trim())
+    .filter(Boolean);
   return {
     ...item,
     id: resolutionId,
     suggestion_id: resolutionId,
     resolution_id: resolutionId,
     review_id: String(item.review_id || '').trim(),
+    match_score: Number(item.match_score || item.confidence || 0) || 0,
+    confidence: Number(item.confidence || item.match_score || 0) || 0,
+    matched_fields: matchedFields,
+    source_channels: sourceChannels,
+    candidate_a: normalizeCandidateProfile(item.candidate_a, {
+      customer_id: item.customer_id_a,
+      name: item.name_a,
+      email: item.email_a,
+      phone: item.phone_a,
+      avatar_url: item.avatar_a,
+      source_channels: item.channels_a,
+      company_name: item.company_a || item.customer_company_name_a,
+    }),
+    candidate_b: normalizeCandidateProfile(item.candidate_b, {
+      customer_id: item.customer_id_b,
+      name: item.name_b,
+      email: item.email_b,
+      phone: item.phone_b,
+      avatar_url: item.avatar_b,
+      source_channels: item.channels_b,
+      company_name: item.company_b || item.customer_company_name_b,
+    }),
   };
 };
 

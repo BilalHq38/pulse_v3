@@ -24,3 +24,15 @@ test('Inbox image preview has open, close, and broken-image fallback behavior', 
   expect(source).toContain('setImagePreviewFailed(true)');
   expect(source).toContain('Image unavailable');
 });
+
+test('Inbox renders video attachments with an openable preview and fallback', () => {
+  expect(source).toContain('function ChatVideoThumb');
+  expect(source).toContain('setVideoPreview(att)');
+  expect(source).toContain('Video unavailable');
+});
+
+test('Inbox handles realtime message reaction updates and renders reactions on bubbles', () => {
+  expect(source).toContain("eventName === 'message_reaction_updated'");
+  expect(source).toContain('normalizeReactions');
+  expect(source).toContain("data-testid={`msg-${msg.id}-reactions`}");
+});

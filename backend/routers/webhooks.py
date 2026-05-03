@@ -41,7 +41,7 @@ from services.agent_orchestrator.facade import (
     orchestrate_lead_workflow,
     orchestrate_message_workflow,
 )
-from core.socket import emit_new_message
+from core.socket import emit_message_reaction_updated, emit_new_message
 from core.utils import make_id, now_ts
 from shared.background_queue import get_background_queue, serialize_coroutine
 from shared.cache import get_cache_client
@@ -85,6 +85,7 @@ from services.db_helpers import (
     record_webhook_event,
     resolve_customer_by_contact,
     save_message_attachments,
+    save_message_reaction,
     upsert_customer_social_profile,
     _notify_agents_handoff,
 )
@@ -112,6 +113,104 @@ _UNPROCESSED_SCHEMA_LOCK = asyncio.Lock()
 _MESSAGES_IDEMPOTENCY_SCHEMA_READY = False
 _MESSAGES_IDEMPOTENCY_SCHEMA_LOCK = asyncio.Lock()
 _CHANNEL_NORMALIZER = MessageNormalizer()
+
+
+def _coerce_reaction_action(raw_action: str = "", *, emoji: str = "") -> str:
+    action = str(raw_action or "").strip().lower()
+    if action in {"remove", "removed", "delete", "deleted", "unreact"}:
+        return "removed"
+    if action in {"update", "updated", "edit", "edited"}:
+        return "updated"
+    if not str(emoji or "").strip():
+        return "removed"
+    return "added"
+
+
+def _extract_whatsapp_reaction(msg: dict) -> dict:
+    message = msg or {}
+    if str(message.get("type") or "").strip().lower() != "reaction":
+        return {}
+    reaction = message.get("reaction") if isinstance(message.get("reaction"), dict) else {}
+    emoji = str(reaction.get("emoji") or reaction.get("reaction") or "").strip()
+    target_provider_message_id = str(
+        reaction.get("message_id")
+        or reaction.get("messageId")
+        or reaction.get("msg_id")
+        or reaction.get("target_message_id")
+        or ""
+    ).strip()
+    return {
+        "provider_message_id": str(message.get("id") or reaction.get("id") or "").strip(),
+        "target_provider_message_id": target_provider_message_id,
+        "emoji": emoji,
+        "action": _coerce_reaction_action(str(reaction.get("action") or ""), emoji=emoji),
+        "raw_payload": message,
+    }
+
+
+def _extract_messenger_reaction(evt: dict) -> dict:
+    event = evt or {}
+    reaction = (
+        event.get("reaction")
+        if isinstance(event.get("reaction"), dict)
+        else event.get("message_reaction")
+        if isinstance(event.get("message_reaction"), dict)
+        else {}
+    )
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    if not reaction and str(message.get("type") or "").lower() not in {"reaction", "message_reaction"}:
+        return {}
+    payload = reaction or message
+    emoji = str(payload.get("emoji") or payload.get("reaction") or "").strip()
+    target_provider_message_id = str(
+        payload.get("message_id")
+        or payload.get("mid")
+        or payload.get("target_message_id")
+        or payload.get("target_mid")
+        or ""
+    ).strip()
+    provider_message_id = str(
+        payload.get("id")
+        or payload.get("reaction_id")
+        or message.get("mid")
+        or event.get("timestamp")
+        or ""
+    ).strip()
+    return {
+        "provider_message_id": provider_message_id,
+        "target_provider_message_id": target_provider_message_id,
+        "emoji": emoji,
+        "action": _coerce_reaction_action(str(payload.get("action") or payload.get("verb") or ""), emoji=emoji),
+        "raw_payload": event,
+    }
+
+
+async def _store_and_emit_message_reaction(
+    db,
+    *,
+    company_id: str,
+    channel: str,
+    reaction: dict,
+    actor_type: str,
+    actor_id: str,
+) -> dict:
+    if not reaction:
+        return {}
+    saved = await save_message_reaction(
+        db,
+        company_id=company_id,
+        channel=channel,
+        provider_message_id=str(reaction.get("provider_message_id") or ""),
+        target_provider_message_id=str(reaction.get("target_provider_message_id") or ""),
+        actor_type=actor_type,
+        actor_id=actor_id,
+        emoji=str(reaction.get("emoji") or ""),
+        action=str(reaction.get("action") or "added"),
+        raw_payload=reaction.get("raw_payload") if isinstance(reaction.get("raw_payload"), dict) else reaction,
+    )
+    if saved and saved.get("conversation_id"):
+        await emit_message_reaction_updated(str(saved.get("conversation_id") or ""), saved)
+    return saved
 
 
 def _db(req):
@@ -1424,6 +1523,26 @@ async def _handle_whatsapp_webhook_payload(
                         )
                         skipped_reasons.append("invalid_sender_identity")
                         continue
+                    reaction_payload = _extract_whatsapp_reaction(msg or {})
+                    if reaction_payload:
+                        saved_reaction = await _store_and_emit_message_reaction(
+                            db,
+                            company_id=resolved_company_id,
+                            channel="whatsapp",
+                            reaction=reaction_payload,
+                            actor_type="customer",
+                            actor_id=sender_phone,
+                        )
+                        processed_results.append(
+                            {
+                                "reaction_id": saved_reaction.get("id", ""),
+                                "conversation_id": saved_reaction.get("conversation_id", ""),
+                                "message_id": saved_reaction.get("message_id", ""),
+                                "processed_reaction": bool(saved_reaction),
+                            }
+                        )
+                        processed_any = True
+                        continue
                     single_payload = {
                         "entry": [
                             {
@@ -1682,6 +1801,17 @@ async def _handle_facebook_webhook_payload(
                 sid = str(((evt or {}).get("sender", {}) or {}).get("id") or "").strip()
                 if not sid:
                     continue
+                reaction_payload = _extract_messenger_reaction(evt or {})
+                if reaction_payload:
+                    await _store_and_emit_message_reaction(
+                        db,
+                        company_id=company_id,
+                        channel="facebook",
+                        reaction=reaction_payload,
+                        actor_type="customer",
+                        actor_id=sid,
+                    )
+                    continue
 
                 single_payload = {
                     "entry": [
@@ -1837,6 +1967,17 @@ async def _handle_instagram_webhook_payload(
                     continue
                 sid = str(((evt or {}).get("sender", {}) or {}).get("id") or "").strip()
                 if not sid:
+                    continue
+                reaction_payload = _extract_messenger_reaction(evt or {})
+                if reaction_payload:
+                    await _store_and_emit_message_reaction(
+                        db,
+                        company_id=company_id,
+                        channel="instagram",
+                        reaction=reaction_payload,
+                        actor_type="customer",
+                        actor_id=sid,
+                    )
                     continue
 
                 single_payload = {

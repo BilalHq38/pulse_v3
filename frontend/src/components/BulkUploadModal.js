@@ -19,6 +19,7 @@ export default function BulkUploadModal({
   templateHeaders,
   templateSample,
   guideRows,
+  requirementsText = 'Required minimum: name, phone, or email.',
 }) {
   const [selectedFile, setSelectedFile] = useState(null);
 
@@ -159,7 +160,7 @@ export default function BulkUploadModal({
                 </label>
 
                 <div className="mt-4 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">
-                  Required minimum: name, phone, or email.
+                  {requirementsText}
                 </div>
 
                 <div className="mt-5 flex gap-3">

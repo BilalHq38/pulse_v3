@@ -818,8 +818,8 @@ async function forwardInboundMessage(session, msg) {
     || (msg._data && msg._data.notifyName)
     || `WhatsApp ${senderIdentity.senderPhone || senderPhone || "contact"}`
   );
-  const isImageMessage = Boolean(msg.hasMedia);
-  let imagePayload = null;
+  const hasMedia = Boolean(msg.hasMedia);
+  let mediaPayload = null;
 
   logBridgeEvent("info", "whatsapp.incoming.received", {
     scope: session.scopeKey,
@@ -836,7 +836,7 @@ async function forwardInboundMessage(session, msg) {
     selected_identity_source: senderIdentity.selectedSource,
     provider_sender_id: senderIdentity.providerSenderId,
     from: maskPhone(senderIdentity.senderPhone || senderPhone),
-    has_media: isImageMessage,
+    has_media: hasMedia,
     body_length: String(msg.body || "").length,
   });
   if (!senderIdentity.isValid) {
@@ -853,14 +853,23 @@ async function forwardInboundMessage(session, msg) {
     });
   }
 
-  if (isImageMessage) {
+  if (hasMedia) {
     try {
       const media = await msg.downloadMedia();
-      if (media && typeof media.mimetype === "string" && media.mimetype.startsWith("image/")) {
-        imagePayload = {
+      if (media && typeof media.mimetype === "string") {
+        const mimeType = media.mimetype;
+        const mediaType = mimeType.startsWith("image/")
+          ? "image"
+          : mimeType.startsWith("video/")
+            ? "video"
+            : mimeType.startsWith("audio/")
+              ? "audio"
+              : "document";
+        mediaPayload = {
+          type: mediaType,
           data_url: `data:${media.mimetype};base64,${media.data}`,
           filename: media.filename || "",
-          mime_type: media.mimetype,
+          mime_type: mimeType,
           size: Number((msg._data && msg._data.size) || 0),
           caption: msg.body || "",
         };
@@ -901,7 +910,7 @@ async function forwardInboundMessage(session, msg) {
 
     const messagePayload = {
       from: senderPhone,
-      type: imagePayload ? "image" : "text",
+      type: mediaPayload ? mediaPayload.type : "text",
       text: { body: msg.body || "" },
       timestamp: Math.floor(Date.now() / 1000),
       id: (msg.id && (msg.id.id || msg.id._serialized)) || "",
@@ -924,8 +933,10 @@ async function forwardInboundMessage(session, msg) {
         chat_id: senderIdentity.rawFields.chat_id || "",
       },
     };
-    if (imagePayload) {
-      messagePayload.image = imagePayload;
+    if (mediaPayload) {
+      const payloadForType = { ...mediaPayload };
+      delete payloadForType.type;
+      messagePayload[mediaPayload.type] = payloadForType;
     }
 
     const payload = {
@@ -991,6 +1002,109 @@ async function forwardInboundMessage(session, msg) {
       error: trimText(err && err.message ? err.message : err, 500),
     });
     console.error(`[${session.scopeKey}] Forward failed: ${err.message}`);
+  }
+}
+
+async function forwardInboundReaction(session, reaction) {
+  const rawSender = stringifyIdentityValue(
+    reaction && (reaction.senderId || reaction.author || reaction.from || (reaction.id && reaction.id.participant)),
+  );
+  const targetMessageId = stringifyIdentityValue(
+    reaction && (reaction.msgId || reaction.messageId || reaction.parentMsgId || reaction.id),
+  );
+  const providerReactionId = stringifyIdentityValue(reaction && reaction.id ? reaction.id : "")
+    || `${targetMessageId}:${rawSender}:${reaction && reaction.timestamp ? reaction.timestamp : Date.now()}`;
+  const emoji = String((reaction && (reaction.reaction || reaction.emoji)) || "").trim();
+  const senderPhone = normalizePhoneNumber(rawSender);
+  if (!senderPhone || !targetMessageId) {
+    logBridgeEvent("warn", "whatsapp.incoming.reaction_skipped", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      raw_sender: rawSender,
+      target_message_id: targetMessageId,
+    });
+    return;
+  }
+
+  try {
+    const phoneNumberId = isPlaceholderValue(WHATSAPP_PHONE_NUMBER_ID) ? "" : WHATSAPP_PHONE_NUMBER_ID;
+    const businessAccountId = isPlaceholderValue(WHATSAPP_BUSINESS_ACCOUNT_ID) ? "" : WHATSAPP_BUSINESS_ACCOUNT_ID;
+    const metadata = {
+      source: "whatsapp_web_bridge",
+      bridge_scope: session.scopeKey,
+      provider: "whatsapp-web.js",
+      company_id: session.companyId || DEFAULT_BRIDGE_COMPANY_ID || "",
+      bridge_user_id: session.userId || "",
+      display_phone_number: session.phone || MY_NUMBER || "",
+      phone_number_id: phoneNumberId,
+    };
+    const messagePayload = {
+      from: senderPhone,
+      type: "reaction",
+      timestamp: Math.floor(Date.now() / 1000),
+      id: providerReactionId,
+      reaction: {
+        message_id: targetMessageId,
+        emoji,
+        action: emoji ? "added" : "removed",
+      },
+      web_bridge: {
+        source: "whatsapp_web_bridge",
+        raw_from: rawSender,
+        sender_phone: senderPhone ? `+${senderPhone}` : "",
+        sender_phone_digits: senderPhone,
+        provider_sender_id: rawSender,
+      },
+    };
+    const payload = {
+      entry: [{
+        id: businessAccountId || `whatsapp-web:${session.scopeKey}`,
+        changes: [{
+          value: {
+            business_account_id: businessAccountId,
+            metadata,
+            messages: [messagePayload],
+            contacts: [{
+              profile: { name: `WhatsApp ${senderPhone}` },
+              wa_id: senderPhone,
+              web_bridge: {
+                sender_phone: senderPhone ? `+${senderPhone}` : "",
+                provider_sender_id: rawSender,
+              },
+            }],
+          },
+        }],
+      }],
+    };
+    const rawPayload = JSON.stringify(payload);
+    const signature = buildMetaSignature(rawPayload);
+    const response = await axios.post(`${PYTHON_BACKEND}${WHATSAPP_WEBHOOK_PATH}`, rawPayload, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": signature,
+        "X-Bridge-Secret": BRIDGE_SECRET,
+        "X-Bridge-Company-Id": session.companyId || "",
+        "X-Bridge-User-Id": session.userId || "",
+      },
+      timeout: BRIDGE_FORWARD_TIMEOUT_MS,
+    });
+    logBridgeEvent("info", "whatsapp.incoming.reaction_forwarded", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      message_id: providerReactionId,
+      target_message_id: targetMessageId,
+      backend_status: response.status,
+    });
+  } catch (err) {
+    logBridgeEvent("error", "whatsapp.incoming.reaction_forward_failed", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      target_message_id: targetMessageId,
+      error: trimText(err && err.message ? err.message : err, 500),
+    });
   }
 }
 
@@ -1145,6 +1259,10 @@ function attachClientHandlers(session) {
 
   client.on("message", async (msg) => {
     await forwardInboundMessage(session, msg);
+  });
+
+  client.on("message_reaction", async (reaction) => {
+    await forwardInboundReaction(session, reaction);
   });
 }
 
