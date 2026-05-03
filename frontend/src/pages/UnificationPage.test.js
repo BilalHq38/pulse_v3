@@ -189,9 +189,9 @@ test('Unification page focuses on identity resolution without backend auth reque
   const refresh = Array.from(container.querySelectorAll('button')).find((button) => button.textContent.includes('Refresh Data'));
   const autoDetect = Array.from(container.querySelectorAll('button')).find((button) => button.textContent.includes('Auto Detect Matches'));
 
-  expect(refresh.className).toContain('px-4');
+  expect(refresh.className).toContain('px-5');
   expect(refresh.className).toContain('text-sm');
-  expect(autoDetect.className).toContain('px-4');
+  expect(autoDetect.className).toContain('px-5');
   expect(autoDetect.className).toContain('text-sm');
 
   await act(async () => root.unmount());
@@ -214,12 +214,12 @@ test('Auto Detect calls backend matching endpoint and renders side-by-side candi
   expect(candidate.textContent).toContain('91% match');
   expect(candidate.textContent).toContain('Phone');
   expect(candidate.textContent).toContain('Email');
-  expect(candidate.textContent).toContain('Profile Picture');
+  expect(candidate.textContent).toContain('Avatar');
   expect(candidate.textContent).toContain('Whatsapp');
   expect(candidate.textContent).toContain('Instagram');
   expect(
     Array.from(candidate.querySelectorAll('div')).some((node) =>
-      String(node.className || '').includes('lg:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)]'),
+      String(node.className || '').includes('md:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)]'),
     ),
   ).toBe(true);
 
@@ -230,7 +230,6 @@ test('Merge and Skip actions resolve the selected suggestion', async () => {
   const { container, root } = await renderPage();
   const buttons = Array.from(container.querySelectorAll('button'));
   const merge = buttons.find((button) => button.textContent.trim() === 'Merge');
-  const skip = buttons.find((button) => button.textContent.trim() === 'Skip');
 
   await act(async () => {
     merge.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -242,8 +241,10 @@ test('Merge and Skip actions resolve the selected suggestion', async () => {
     notes: null,
   });
 
+  await tick();
+  const refreshedSkip = Array.from(container.querySelectorAll('button')).find((button) => button.textContent.trim() === 'Skip');
   await act(async () => {
-    skip.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    refreshedSkip.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   });
   expect(mockApi.post).toHaveBeenCalledWith('/identity/suggestions/suggestion-1/resolve', {
     suggestion_id: 'suggestion-1',

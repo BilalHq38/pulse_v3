@@ -564,6 +564,23 @@ def _extract_json_object(raw: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
+def _classify_llm_error(exc: Exception) -> str:
+    message = str(exc or "").lower()
+    if "quota" in message or "rate limit" in message or "resource_exhausted" in message or "429" in message:
+        return "quota_exhausted"
+    if (
+        "api key" in message
+        or "not configured" in message
+        or "permission" in message
+        or "unauthorized" in message
+        or "forbidden" in message
+        or "unsupported provider" in message
+        or "no configured ai providers" in message
+    ):
+        return "provider_not_configured"
+    return "provider_error"
+
+
 async def call_model_json(
     prompt: str,
     schema: type[BaseModel],
@@ -932,6 +949,14 @@ async def call_model_json_batch(
         logger.warning(
             "llm_batch_call failed, falling back to individual calls: %s", exc
         )
+        error_type = _classify_llm_error(exc)
+        if error_type in {"quota_exhausted", "provider_not_configured"}:
+            logger.warning(
+                "llm_batch_call individual fallback skipped error_type=%s tasks=%s",
+                error_type,
+                list(tasks.keys()),
+            )
+            return {key: None for key in tasks}
         if not individual_fallback:
             return {key: None for key in tasks}
         # Individual fallback

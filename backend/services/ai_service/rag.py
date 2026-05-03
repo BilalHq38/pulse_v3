@@ -112,10 +112,12 @@ def _tokenize(text: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if token]
 
 
-def _should_skip_rag_query(query: str) -> tuple[bool, str]:
+def _should_skip_rag_query(query: str, *, intent_name: str = "", has_history: bool = False) -> tuple[bool, str]:
     normalized = _normalize_term(query)
     if not normalized:
         return True, "empty_query"
+    if intent_name == "follow_up_continue" or has_history:
+        return False, ""
     if normalized in _RAG_SKIP_PHRASES:
         return True, "greeting_or_gratitude"
     tokens = _tokenize(normalized)
@@ -532,6 +534,8 @@ async def build_ai_context(
     history_product_ids: list[str] | None = None,
     customer_id: str = "",
     conversation_id: str = "",
+    intent_name: str = "",
+    has_history: bool = False,
 ) -> dict:
     if not db:
         return {
@@ -541,7 +545,11 @@ async def build_ai_context(
             "products": [],
             "public_company": {},
         }
-    skip_rag, skip_reason = _should_skip_rag_query(current_query)
+    skip_rag, skip_reason = _should_skip_rag_query(
+        current_query,
+        intent_name=intent_name,
+        has_history=has_history or bool(history_product_ids),
+    )
     if skip_rag:
         logger.info(
             "rag_skipped company_id=%s reason=%s query_len=%s",

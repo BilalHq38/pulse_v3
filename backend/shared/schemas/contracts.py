@@ -116,6 +116,9 @@ class CombinedResponse(BaseModel):
     conversation_sentiment: dict[str, Any] = Field(default_factory=dict)
     intent: dict[str, Any]
     ai_response: dict[str, Any]
+    ai_response_error: str = ""
+    llm_budget_exhausted: bool = False
+    ai_response_generated: bool = True
 
 
 class NurtureRequest(BaseModel):
@@ -158,6 +161,7 @@ class KnowledgeRequest(BaseModel):
 
 class ProductDescriptionRequest(BaseModel):
     name: str
+    company_id: str = ""
     product_title: str = ""
     product_type: str = ""
     category: str = ""

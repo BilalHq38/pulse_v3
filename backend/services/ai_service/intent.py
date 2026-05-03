@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from services.ai_service.common import IntentResult
 from services.ai_service.llm_client import _resolve_engine_for_request, call_model_json
@@ -66,6 +67,47 @@ def _render_history_context(conversation_context: list | None) -> str:
     return "\n".join(lines)
 
 
+def is_short_follow_up_message(text: str, previous_ai_question: str = "") -> bool:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in {
+        "next",
+        "yes",
+        "yeah",
+        "yep",
+        "ok",
+        "okay",
+        "sure",
+        "sure go ahead",
+        "go ahead",
+        "continue",
+        "tell me more",
+        "tell me about it",
+        "what else",
+        "show me more",
+        "more",
+    }:
+        return True
+    previous = str(previous_ai_question or "").lower()
+    if previous and len(normalized.split()) <= 5:
+        return any(marker in previous for marker in ("which", "do you want", "would you like", "details about"))
+    return False
+
+
+def _extract_last_topic(conversation_context: list | None) -> str:
+    candidates: list[str] = []
+    for item in conversation_context or []:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "")
+        for match in re.finditer(r"\b([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,4})\b", content):
+            value = " ".join(match.group(1).split()).strip()
+            if value.lower() in {"I", "We", "You", "Hi", "Hello", "Thanks"}:
+                continue
+            candidates.append(value)
+    return candidates[-1] if candidates else ""
+
+
 def _safe_intent_error(exc: Exception | None) -> tuple[str, str]:
     if exc is None:
         return "unknown_error", "Intent classifier unavailable"
@@ -83,7 +125,7 @@ def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None
     normalized = " ".join("".join(ch if ch.isalnum() or ch.isspace() else " " for ch in lower).split())
     intent_name = previous_intent if previous_intent and previous_intent != "unknown" else "general_question"
     confidence = 0.15
-    if normalized in {"next", "yes", "yeah", "yep", "ok", "okay", "continue", "show", "send", "proceed", "go ahead", "tell me more", "more"}:
+    if is_short_follow_up_message(text) or normalized in {"next", "yes", "yeah", "yep", "ok", "okay", "continue", "show", "send", "proceed", "go ahead", "tell me more", "more"}:
         intent_name = "follow_up_continue"
         confidence = 0.5
     elif any(token in lower for token in ("image", "photo", "picture", "catalog", "show me")):
@@ -230,7 +272,11 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
                 call_purpose="intent_classification",
                 function_name="classify_intent",
             )
-            return _normalize_intent_payload(remote)
+            normalized = _normalize_intent_payload(remote)
+            last_topic = _extract_last_topic(kwargs.get("conversation_context"))
+            if last_topic and isinstance(normalized.get("entities"), dict):
+                normalized["entities"].setdefault("last_topic", last_topic)
+            return normalized
         except Exception as exc:
             last_exc = exc
             error_type, error_reason = _safe_intent_error(exc)
@@ -251,7 +297,10 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
         fallback.get("error_type", ""),
         fallback.get("error_reason", ""),
     )
+    last_topic = _extract_last_topic(kwargs.get("conversation_context"))
+    if last_topic and isinstance(fallback.get("entities"), dict):
+        fallback["entities"].setdefault("last_topic", last_topic)
     return fallback
 
 
-__all__ = ["classify_intent"]
+__all__ = ["classify_intent", "is_short_follow_up_message"]

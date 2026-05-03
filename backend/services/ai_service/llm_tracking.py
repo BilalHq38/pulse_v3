@@ -23,8 +23,8 @@ class LLMCallContext:
     workflow_id: str = ""
     company_id: str = ""
     agent_name: str = ""
-    max_calls: int = 2
-    max_embedding_calls: int = 1
+    max_calls: int = 5
+    max_embedding_calls: int = 2
     call_count: int = 0
     embedding_call_count: int = 0
     total_ai_api_call_count: int = 0

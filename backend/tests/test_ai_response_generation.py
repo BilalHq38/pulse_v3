@@ -1,6 +1,7 @@
 import pytest
 
 from services.ai_service import response_generator
+from services.ai_service.facade import _safe_ai_reply_default
 
 
 @pytest.fixture(autouse=True)
@@ -563,6 +564,55 @@ async def test_greeting_with_no_context_does_not_ask_for_budget(monkeypatch):
         assert phrase not in result["response"]
 
 
+def test_safe_ai_reply_default_product_prompt_has_no_budget():
+    response = _safe_ai_reply_default("show me products", {"name": "Customer"})
+
+    assert "budget" not in response.lower()
+
+
+def test_build_pricing_response_single_product_is_prose():
+    response = response_generator.build_pricing_response(
+        "what is the price",
+        ai_context={
+            "products": [
+                {
+                    "name": "Starter Plan",
+                    "price": "49",
+                    "price_currency": "USD",
+                    "features": ["inbox", "automation"],
+                }
+            ]
+        },
+    )
+
+    assert response.startswith("The Starter Plan is 49 USD")
+    assert not response.startswith("1.")
+
+
+def test_build_support_response_acknowledges_delayed_delivery():
+    response = response_generator.build_support_response("my order is delayed")
+
+    assert "delivery" in response.lower()
+    assert "not arrived" in response.lower() or "delayed" in response.lower()
+
+
+def test_clean_customer_response_drops_only_internal_sentence():
+    raw = "We can help with setup. Conversation stage: discovery. Which service do you want?"
+
+    cleaned = response_generator._clean_customer_response_text(raw)
+
+    assert "We can help with setup" in cleaned
+    assert "Which service do you want" in cleaned
+    assert "Conversation stage" not in cleaned
+
+
+def test_fix_grammar_errors_removes_malformed_company_phrase():
+    fixed = response_generator._fix_grammar_errors("We provide Nexora Labs is a software company")
+
+    assert fixed != "We provide Nexora Labs is a software company"
+    assert "We provide a software company" in fixed
+
+
 @pytest.mark.asyncio
 async def test_no_internal_phrases_in_any_response(monkeypatch):
     """Internal phrases must never leak into customer-facing responses."""
@@ -646,3 +696,30 @@ async def test_product_image_request_api_url_returned_in_attachments(monkeypatch
     assert "Blue Sneakers" in result["response"]
     assert len(result["attachments"]) == 1
     assert result["attachments"][0]["url"] == "/api/products/media/company-1/blue-sneakers.jpg"
+
+
+@pytest.mark.asyncio
+async def test_next_action_is_machine_safe_label_on_fallback(monkeypatch):
+    async def fake_engine(**_kwargs):
+        return {"provider": "gemini", "model_name": "gemini-2.5-flash", "id": "llm-1"}
+
+    async def fail_text(*_args, **_kwargs):
+        raise RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")
+
+    monkeypatch.setattr(response_generator, "_allow_rule_based_recovery", lambda: False)
+    monkeypatch.setattr(response_generator, "_resolve_engine_cached", fake_engine)
+    monkeypatch.setattr(response_generator, "_generate_response_text", fail_text)
+
+    result = await response_generator.generate_ai_response(
+        [{"sender_type": "customer", "content": "I need support"}],
+        customer_info={"id": "cust-1"},
+        company_id="company-1",
+        observed_sentiment={"emotion": "neutral", "score": 0.0},
+        observed_conversation_sentiment={"sentiment_label": "neutral", "score": 0.0},
+        observed_intent={"intent": "support_request", "confidence": 0.9, "urgency": "medium"},
+    )
+
+    forbidden = ["Answer the customer", "Ask one specific", "using available context"]
+    assert result["next_action"] == "support_resolution"
+    for phrase in forbidden:
+        assert phrase.lower() not in result["next_action"].lower()

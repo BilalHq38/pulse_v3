@@ -1,5 +1,6 @@
 import pytest
 
+from shared.schemas.contracts import CombinedResponse
 from agent_orchestrator.agents.capture_agent import _adaptive_short_circuit_decision
 from agent_orchestrator.agents.support_agent import _deterministic_budget_fallback
 from agent_orchestrator.schemas import MessageWorkflowRequest
@@ -10,6 +11,7 @@ from services.ai_service.llm_tracking import (
     reserve_embedding_call,
     set_llm_context,
 )
+from services.ai_service import llm_client, response_generator
 
 
 def _manager():
@@ -172,3 +174,82 @@ def test_support_budget_fallback_is_deliverable():
     assert result["provider"] == "deterministic_fallback"
     assert result["llm_budget_exhausted"] is True
     assert result["response"]
+
+
+def test_combined_response_preserves_degraded_metadata():
+    payload = CombinedResponse(
+        sentiment={"score": 0},
+        conversation_sentiment={"score": 0},
+        intent={"intent": "general_question"},
+        ai_response={},
+        ai_response_error="AI_BUDGET_EXCEEDED type=llm",
+        llm_budget_exhausted=True,
+        ai_response_generated=False,
+    )
+
+    assert payload.llm_budget_exhausted is True
+    assert payload.ai_response_generated is False
+
+
+@pytest.mark.asyncio
+async def test_call_model_json_batch_quota_error_skips_individual_fallback(monkeypatch):
+    from services.ai_service.common import IntentResult
+
+    calls = {"json": 0}
+
+    async def fail_text(*_args, **_kwargs):
+        raise RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")
+
+    async def count_json(*_args, **_kwargs):
+        calls["json"] += 1
+        return {}
+
+    monkeypatch.setattr(llm_client, "call_model_text", fail_text)
+    monkeypatch.setattr(llm_client, "call_model_json", count_json)
+
+    result = await llm_client.call_model_json_batch(
+        {
+            "one": {"prompt": "classify one", "schema": IntentResult},
+            "two": {"prompt": "classify two", "schema": IntentResult},
+            "three": {"prompt": "classify three", "schema": IntentResult},
+        },
+        engine={"provider": "openai", "model_name": "gpt-test"},
+        individual_fallback=True,
+    )
+
+    assert result == {"one": None, "two": None, "three": None}
+    assert calls["json"] == 0
+
+
+@pytest.mark.asyncio
+async def test_combined_analysis_raises_low_existing_budget_to_allow_response(monkeypatch):
+    async def fake_engine(**_kwargs):
+        return {"provider": "openai", "model_name": "gpt-test", "id": "llm-1"}
+
+    async def fake_batch(*_args, **_kwargs):
+        return {
+            "message_sentiment": {"score": 0.1, "emotion": "neutral", "confidence": 0.8, "sentiment_label": "neutral"},
+            "conversation_sentiment": {"score": 0.1, "emotion": "neutral", "confidence": 0.8, "sentiment_label": "neutral"},
+            "intent": {"intent": "greeting", "confidence": 0.9, "entities": {}, "urgency": "low"},
+        }
+
+    async def fake_response(*_args, **_kwargs):
+        return {"response": "Hi, what can I help with?", "confidence": 0.9}
+
+    monkeypatch.setattr(response_generator, "_resolve_engine_cached", fake_engine)
+    monkeypatch.setattr(response_generator, "call_model_json_batch", fake_batch)
+    monkeypatch.setattr(response_generator, "generate_ai_response", fake_response)
+
+    token = set_llm_context(company_id="co", max_calls=2, max_embedding_calls=1)
+    try:
+        result = await response_generator.generate_combined_ai_analysis(
+            "hi",
+            [{"sender_type": "customer", "content": "hi"}],
+            company_id="co",
+        )
+        snapshot = get_ai_usage_snapshot()
+    finally:
+        reset_llm_context(token)
+
+    assert result["ai_response_generated"] is True
+    assert snapshot["max_llm_calls"] == 5

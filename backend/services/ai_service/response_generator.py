@@ -31,7 +31,7 @@ from services.ai_service.common import (
     text_similarity,
     truncate_text_for_tokens,
 )
-from services.ai_service.intent import classify_intent
+from services.ai_service.intent import classify_intent, is_short_follow_up_message
 from services.ai_service.llm_client import (
     _resolve_engine_for_request,
     call_model_json_batch,
@@ -40,7 +40,7 @@ from services.ai_service.llm_client import (
     call_model_text,
     validate_live_engine,
 )
-from services.ai_service.llm_tracking import has_llm_budget_remaining
+from services.ai_service.llm_tracking import get_llm_context, has_llm_budget_remaining, set_llm_context
 from services.ai_service.memory_service import (
     get_conversation_state_memory,
     get_last_ai_response_context,
@@ -81,6 +81,12 @@ async def _resolve_engine_cached(db, company_id: str, use_pro: bool = False) -> 
         ts, engine = _ENGINE_CACHE[cache_key]
         if now - ts < _ENGINE_CACHE_TTL:
             return engine
+    logger.info(
+        "llm_engine_cache_miss company_id=%s use_pro=%s ttl_seconds=%s note=engine_changes_may_take_ttl_to_propagate_per_worker",
+        company_id or "<global>",
+        use_pro,
+        _ENGINE_CACHE_TTL,
+    )
     engine = await _resolve_engine_for_request(db=db, company_id=company_id, use_pro=use_pro)
     _ENGINE_CACHE[cache_key] = (now, engine)
     return engine
@@ -187,6 +193,7 @@ def _derive_conversation_state(
         str((previous_state or {}).get("intent") or "").strip().lower()
         or str(((last_response_context or {}).get("intent") or {}).get("intent") or "").strip().lower()
     )
+    entities = observed_intent.get("entities") if isinstance(observed_intent.get("entities"), dict) else {}
     urgency = str((observed_intent or {}).get("urgency") or "medium").strip().lower() or "medium"
     sentiment_label = _sentiment_label(observed_sentiment)
     turn_count = max(1, int((previous_state or {}).get("turn_count") or 0) + 1)
@@ -202,6 +209,10 @@ def _derive_conversation_state(
         stage = "discovery"
     if urgency in {"high", "critical"} and stage != "wrap_up":
         stage = "resolution"
+    same_intent_turns = 1
+    if previous_intent and previous_intent == current_intent:
+        same_intent_turns = int((previous_state or {}).get("same_intent_turns") or 1) + 1
+    topic_exhausted = same_intent_turns >= 3 and not bool(entities)
 
     next_action_map = {
     "refund": (
@@ -306,6 +317,9 @@ def _derive_conversation_state(
         "sentiment_label": sentiment_label,
         "turn_count": turn_count,
         "latest_query": query,
+        "entities": entities,
+        "same_intent_turns": same_intent_turns,
+        "topic_exhausted": topic_exhausted,
     }
 
 
@@ -516,7 +530,12 @@ _INTERNAL_RESPONSE_MARKERS = (
     "give a direct",
     "ask one specific",
     "use available context",
+    "using available context",
+    "answer the customer",
     "answer the customer's question directly",
+    "acknowledge the refund request",
+    "answer the delivery/shipping question",
+    "continue the previous topic naturally",
     "clarify customer objective",
     "route the conversation",
     "routing note",
@@ -541,12 +560,51 @@ _INTERNAL_RESPONSE_MARKERS = (
 def _is_short_follow_up(query: str) -> bool:
     normalized = re.sub(r"[^a-z0-9\s]", "", str(query or "").strip().lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized in _SHORT_FOLLOW_UPS
+    return normalized in _SHORT_FOLLOW_UPS or is_short_follow_up_message(query)
 
 
 def _canonical_intent(intent_name: str) -> str:
     normalized = str(intent_name or "general_question").strip().lower() or "general_question"
     return _INTENT_ALIASES.get(normalized, normalized)
+
+
+def _customer_safe_next_action(state: dict, intent_name: str) -> str:
+    intent_name = _canonical_intent(intent_name or str((state or {}).get("intent") or ""))
+    mapping = {
+        "greeting": "greet_and_ask",
+        "follow_up_continue": "continue_topic",
+        "human_handoff": "escalate_to_human",
+        "rejection_or_opt_out": "respect_opt_out",
+        "refund": "support_resolution",
+        "cancel_request": "support_resolution",
+        "complaint": "support_resolution",
+        "support_request": "support_resolution",
+        "shipping_question": "support_resolution",
+        "pricing_question": "answer_pricing",
+        "product_catalog_question": "show_products",
+        "product_recommendation": "show_products",
+        "product_image_request": "show_product_images",
+        "service_question": "answer_services",
+        "company_question": "answer_company",
+        "buying_intent": "guide_purchase",
+        "order_intent": "guide_purchase",
+        "website_link_request": "guide_purchase",
+    }
+    return mapping.get(intent_name, "continue_conversation")
+
+
+def _get_last_topic(intent_payload: dict | None, conversation_context: list[dict] | None = None) -> str:
+    entities = (intent_payload or {}).get("entities") if isinstance((intent_payload or {}).get("entities"), dict) else {}
+    for key in ("last_topic", "product_name", "service_name", "previous_topic"):
+        value = str(entities.get(key) or "").strip()
+        if value:
+            return value
+    for item in reversed(conversation_context or []):
+        content = str((item or {}).get("content") or "").strip()
+        topic = _infer_topic_from_text(content)
+        if topic:
+            return topic
+    return ""
 
 
 def _infer_topic_from_text(text: str) -> str:
@@ -575,7 +633,7 @@ def _normalize_observed_intent(
     previous_intent = _canonical_intent(
         str((previous_state or {}).get("intent") or ((last_response_context or {}).get("intent") or {}).get("intent") or "")
     )
-    if _is_short_follow_up(query):
+    if _is_short_follow_up(query) or is_short_follow_up_message(query, previous_response):
         intent_name = "follow_up_continue"
         topic = _infer_topic_from_text(previous_response) or previous_intent
         payload.setdefault("entities", {})
@@ -712,11 +770,98 @@ def _service_next_step(fields: dict, *, include_products: bool = False, follow_u
     return "Which service would you like details about first?"
 
 
+def _fix_grammar_errors(text: str) -> str:
+    fixed = str(text or "")
+    fixed = re.sub(r"\bWe provide\s+[A-Z][A-Za-z0-9&.' -]{1,80}\s+is\s+", "We provide ", fixed)
+    fixed = re.sub(r"\s+([?.!,])", r"\1", fixed)
+    fixed = re.sub(r"\s{2,}", " ", fixed).strip()
+    return fixed
+
+
+def _cap_knowledge_context(knowledge_text: str, query: str = "", *, max_paragraphs: int = 3) -> str:
+    text = str(knowledge_text or "").strip()
+    if not text:
+        return ""
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}|\s\|\s", text) if p.strip()]
+    if len(paragraphs) <= max_paragraphs:
+        return "\n".join(paragraphs)
+    query_tokens = set(re.findall(r"[a-z0-9]+", str(query or "").lower()))
+    scored = []
+    for index, paragraph in enumerate(paragraphs):
+        tokens = set(re.findall(r"[a-z0-9]+", paragraph.lower()))
+        scored.append((len(tokens & query_tokens), -index, paragraph))
+    return "\n".join(item[2] for item in sorted(scored, reverse=True)[:max_paragraphs])
+
+
+def _prev_contrast_block(previous_response: str) -> str:
+    previous = truncate_text_for_tokens(str(previous_response or "").strip(), 220)
+    if not previous:
+        return ""
+    return (
+        "Previous AI reply to avoid repeating:\n"
+        f"{previous}\n"
+        "Use a different structure and add one fresh, specific detail if context supports it."
+    )
+
+
+def _channel_tone_note(channel: str) -> str:
+    channel = str(channel or "").strip().lower()
+    if channel in {"whatsapp", "facebook", "instagram"}:
+        return "Channel tone: keep this short and conversational, ideally 1-2 sentences."
+    if channel == "email":
+        return "Channel tone: use a slightly more formal 3-4 sentence reply with a clear close."
+    if channel == "web_chat":
+        return "Channel tone: keep a balanced web-chat reply, concise but complete."
+    return "Channel tone: keep the reply concise, natural, and easy to act on."
+
+
+def build_pricing_response(query: str, *, ai_context: dict, intent_name: str = "") -> str:
+    products = list((ai_context or {}).get("products") or [])[:3]
+    priced = [p for p in products if str(p.get("price") or "").strip()]
+    if len(priced) == 1:
+        product = priced[0]
+        name = str(product.get("name") or product.get("product_title") or "This option").strip()
+        price = str(product.get("price") or "").strip()
+        currency = str(product.get("price_currency") or "USD").strip() or "USD"
+        features = [str(item).strip() for item in (product.get("features") or []) if str(item).strip()]
+        feature_text = f" and includes {', '.join(features[:2])}" if features else ""
+        return f"The {name} is {price} {currency}{feature_text}. Do you want details or help with the next step?"
+    if products and not priced:
+        name = str(products[0].get("name") or products[0].get("product_title") or "that option").strip()
+        return f"I found {name}, but the exact price is not listed in the available catalog context. Which product or service should I check next?"
+    if priced:
+        lines = ["Here are the available prices I found:"]
+        for index, product in enumerate(priced, start=1):
+            name = str(product.get("name") or product.get("product_title") or "Product").strip()
+            price = str(product.get("price") or "").strip()
+            currency = str(product.get("price_currency") or "USD").strip() or "USD"
+            lines.append(f"{index}. {name} - {price} {currency}.")
+        lines.append("Which option do you want details about?")
+        return "\n".join(lines)
+    return "Which product or service do you want pricing for? I can check the available details."
+
+
+def build_support_response(query: str, *, intent_name: str = "") -> str:
+    lowered = str(query or "").lower()
+    if any(term in lowered for term in ("delay", "delayed", "hasn't arrived", "not arrived", "late", "shipping")):
+        return "I understand the delivery has not arrived yet. Please share the order number or tracking reference so I can guide the next step."
+    if any(term in lowered for term in ("damaged", "broken", "cracked")):
+        return "I understand the item arrived damaged. Please share the order number and a photo of the damage so this can be reviewed."
+    if any(term in lowered for term in ("wrong item", "incorrect", "different item")):
+        return "I understand you received the wrong item. Please share the order number and what arrived so the next step can be checked."
+    if "refund" in lowered:
+        return "I can help start a refund check. Please send the order or payment reference so eligibility can be reviewed."
+    if any(term in lowered for term in ("billing", "charged", "payment")):
+        return "I understand there is a billing issue. Please share the payment or invoice reference so the charge can be checked."
+    return "I can help with this support issue. Please share the order, product, or account detail so I can guide the next step."
+
+
 def build_greeting_response(
     query: str,
     *,
     ai_context: dict,
     knowledge_context: str = "",
+    customer_id: str = "",
 ) -> str:
     """Return a warm, brief greeting that asks one relevant next question — never budget."""
     fields = _public_company_fields(
@@ -724,16 +869,25 @@ def build_greeting_response(
     )
     company = str(fields.get("company_name") or "").strip()
     services = str(fields.get("services") or "").strip()
+    openers = [
+        "Hi! Thanks for reaching out.",
+        "Hello, thanks for messaging.",
+        "Hi there, good to hear from you.",
+        "Welcome, thanks for reaching out.",
+        "Hey, thanks for contacting us.",
+    ]
+    seed = customer_id or query or company or services or "default"
+    opener = openers[int(hashlib.sha1(seed.encode("utf-8")).hexdigest(), 16) % len(openers)]
 
     if services:
         service_list = [s.strip() for s in re.split(r",|/| and ", services) if s.strip()][:3]
         if len(service_list) >= 2:
             options = ", ".join(service_list[:2])
-            return f"Hi! Thanks for reaching out. We can help with {options}, and more. What are you looking for today?"
-        return f"Hi! Thanks for reaching out. We offer {services}. What can I help you with?"
+            return f"{opener} We can help with {options}, and more. What are you looking for today?"
+        return f"{opener} We offer {services}. What can I help you with?"
     if company:
-        return f"Hi! Welcome to {company}. What can I help you with today?"
-    return "Hi! Thanks for reaching out. What can I help you with today?"
+        return f"{opener} Welcome to {company}. What can I help you with today?"
+    return f"{opener} What can I help you with today?"
 
 
 def build_degraded_response(
@@ -824,15 +978,47 @@ def build_product_response(
     intent_name: str = "",
     image_request: bool = False,
     share_website: bool = False,
+    intent_payload: dict | None = None,
+    conversation_context: list[dict] | None = None,
 ) -> dict:
     products = list((ai_context or {}).get("products") or [])[:3]
     attachments = _normalize_ai_attachments(list((ai_context or {}).get("product_attachments") or []))
     if not products:
+        last_topic = _get_last_topic(intent_payload or {}, conversation_context or [])
+        if last_topic:
+            return {
+                "response": f"I do not see catalog details for {last_topic} in the available context. Do you want services, products, or pricing help?",
+                "attachments": [],
+                "product_images": [],
+                "product_ids": [],
+            }
         return {
             "response": "I do not see product details in the available catalog context. Do you want services, products, or pricing help?",
             "attachments": [],
             "product_images": [],
             "product_ids": [],
+        }
+    if len(products) == 1:
+        product = products[0]
+        name = str(product.get("name") or product.get("product_title") or "This option").strip()
+        reason = _product_reason(product)
+        response = f"The {name} looks like a great fit - {reason}."
+        if not str(product.get("price") or "").strip() and _canonical_intent(intent_name) == "pricing_question":
+            response += " The price is not listed for this option."
+        if image_request and attachments:
+            response += " I can share the matching image with this reply."
+        elif image_request:
+            response += " I do not see an image available for this product, but these are the details I found."
+        else:
+            response += " Do you want details, prices, or pictures for this option?"
+        website_url = str((ai_context or {}).get("public_company", {}).get("website_address") or "").strip()
+        if share_website and website_url:
+            response += f" You can place the order here: {website_url}"
+        return {
+            "response": response,
+            "attachments": attachments,
+            "product_images": attachments,
+            "product_ids": [str(item).strip() for item in (ai_context or {}).get("product_ids", []) if str(item).strip()][:3],
         }
     lines = ["Here are the most relevant options I found."]
     for index, product in enumerate(products, start=1):
@@ -890,19 +1076,24 @@ def _has_internal_response_text(text: str) -> bool:
 
 
 def _clean_customer_response_text(text: str) -> str:
-    cleaned_lines: list[str] = []
-    for line in str(text or "").splitlines():
-        lowered = line.lower()
+    cleaned_sentences: list[str] = []
+    chunks = re.split(r"(?<=[.!?])\s+|\n+", str(text or ""))
+    for sentence in chunks:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        lowered = sentence.lower()
         if any(marker in lowered for marker in _INTERNAL_RESPONSE_MARKERS):
             continue
-        line = re.sub(r"\b(general_question|service_question|company_question|business_question|product_catalog_question|product_recommendation|pricing_question|follow_up_continue)\b", "", line, flags=re.I)
-        line = re.sub(r"\[[^\]]*(stage|intent|workflow|confidence)[^\]]*\]", "", line, flags=re.I)
-        line = re.sub(r"\s+([?.!,])", r"\1", line)
-        line = re.sub(r"([.!?]){2,}", r"\1", line)
-        line = re.sub(r"\s{2,}", " ", line).strip()
-        if line:
-            cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
+        sentence = re.sub(r"\b(general_question|service_question|company_question|business_question|product_catalog_question|product_recommendation|pricing_question|follow_up_continue)\b", "", sentence, flags=re.I)
+        sentence = re.sub(r"\[[^\]]*(stage|intent|workflow|confidence)[^\]]*\]", "", sentence, flags=re.I)
+        sentence = re.sub(r"\s+([?.!,])", r"\1", sentence)
+        sentence = re.sub(r"([.!?]){2,}", r"\1", sentence)
+        sentence = re.sub(r"\s{2,}", " ", sentence).strip()
+        sentence = _fix_grammar_errors(sentence)
+        if sentence:
+            cleaned_sentences.append(sentence)
+    return " ".join(cleaned_sentences).strip()
 
 
 def build_safe_unclear_response(
@@ -915,6 +1106,7 @@ def build_safe_unclear_response(
     conversation_state: dict | None = None,
 ) -> str:
     intent_name = _canonical_intent(intent_name)
+    last_topic = _get_last_topic({"entities": (conversation_state or {}).get("entities", {})}, [])
     if intent_name == "follow_up_continue" or _is_short_follow_up(query):
         return build_follow_up_response(
             query,
@@ -941,6 +1133,8 @@ def build_safe_unclear_response(
         "order_intent",
         "website_link_request",
     }:
+        if intent_name == "pricing_question":
+            return build_pricing_response(query, ai_context=ai_context, intent_name=intent_name)
         return build_product_response(
             query,
             ai_context=ai_context,
@@ -948,6 +1142,10 @@ def build_safe_unclear_response(
             image_request=_looks_like_image_request(query),
             share_website=_should_share_website_link(intent_name, query, conversation_state),
         )["response"]
+    if intent_name in {"support_request", "complaint", "refund", "cancel_request", "shipping_question"}:
+        return build_support_response(query, intent_name=intent_name)
+    if last_topic:
+        return f"I can still help with {last_topic}. Do you want details about services, products, pricing, or support?"
     return "I can still help. Are you looking for details about services, products, pricing, or support?"
 
 
@@ -974,7 +1172,7 @@ def _finalize_customer_response(
             previous_response=previous_response,
             conversation_state=conversation_state or {},
         )
-    if previous_response and text_similarity(cleaned, previous_response) >= 0.88:
+    if previous_response and text_similarity(cleaned, previous_response) >= 0.78:
         cleaned = build_safe_unclear_response(
             query,
             intent_name="follow_up_continue" if _is_short_follow_up(query) else intent_name,
@@ -983,12 +1181,12 @@ def _finalize_customer_response(
             previous_response=previous_response,
             conversation_state=conversation_state or {},
         )
-        if text_similarity(cleaned, previous_response) >= 0.88:
+        if text_similarity(cleaned, previous_response) >= 0.78:
             cleaned = f"{cleaned} I can narrow this down further if you choose services, products, or pricing."
     result["response"] = _clean_customer_response_text(cleaned) or "I can still help. Are you looking for services, products, pricing, or support?"
     next_step = build_customer_facing_next_step(intent_name, query, ai_context, conversation_state or {})
     result["next_step"] = next_step
-    result["next_action"] = next_step
+    result["next_action"] = _customer_safe_next_action(conversation_state or {}, intent_name)
     return result
 
 
@@ -1038,7 +1236,12 @@ def _compose_rule_based_response(
 
     if intent_name == "greeting":
         return {
-            "response": build_greeting_response(query, ai_context=ai_context, knowledge_context=knowledge_context),
+            "response": build_greeting_response(
+                query,
+                ai_context=ai_context,
+                knowledge_context=knowledge_context,
+                customer_id=str(customer_info.get("id") or ""),
+            ),
             "confidence": 0.97,
             "attachments": [],
             "product_images": [],
@@ -1177,7 +1380,7 @@ def _compose_rule_based_response(
         "complaint",
     } or (_looks_like_navigation_request(query) and not is_product_or_media_request):
         return {
-            "response": f"{direction_prefix}{continuation_prefix}{_natural_guidance_response(intent_name, response_prefix=response_prefix)}",
+            "response": f"{direction_prefix}{continuation_prefix}{build_support_response(query, intent_name=intent_name) if intent_name in {'shipping_question', 'support_request', 'refund', 'cancel_request', 'complaint'} else _natural_guidance_response(intent_name, response_prefix=response_prefix)}",
             "confidence": 0.94,
             "attachments": [],
             "product_images": [],
@@ -1233,6 +1436,8 @@ def _compose_rule_based_response(
                 image_request=image_request,
                 share_website=share_website,
             )
+            if intent_name == "pricing_question":
+                product_payload["response"] = build_pricing_response(query, ai_context=ai_context, intent_name=intent_name)
             return {
                 "response": f"{direction_prefix}{continuation_prefix}{product_payload['response']}",
                 "confidence": 0.95,
@@ -2059,6 +2264,8 @@ async def generate_ai_response(
                         " ".join(str(item.get("content", "")) for item in conversation_context[-8:]),
                     ]
                 ).strip(),
+                intent_name=intent_name,
+                has_history=bool(shown_product_ids),
             )
             if knowledge_context:
                 retrieved_context["knowledge_text"] = (
@@ -2261,8 +2468,18 @@ async def generate_ai_response(
         f"- Agent tone: {agent_profile['label']}.\n"
         f"- Agent operating guidance: {agent_profile['instruction']}\n"
         f"- Style guidance: {style_profile['instruction']}\n"
+        f"- {_channel_tone_note(channel_name)}\n"
         f"- Customer-facing next step if useful: {_next_step_for_prompt}\n"
         f"- Customer mood appears {observed_sentiment.get('emotion', 'neutral')}.\n"
+    )
+    system_prompt += (
+        "\n\nINTENT EXAMPLES:\n"
+        "- greeting: 'Hi' -> greet briefly and ask one useful question.\n"
+        "- service_question: 'What services do you provide?' -> summarize public services from context.\n"
+        "- product_catalog_question: 'What products do you have?' -> show grounded catalog options.\n"
+        "- pricing_question: 'How much is the starter plan?' -> give exact listed price or ask which item.\n"
+        "- support_request: 'My order is delayed' -> acknowledge the specific issue and ask for order reference.\n"
+        "- follow_up_continue: 'Next' -> continue the previous topic without repeating the last reply.\n"
     )
     if customer_info:
         system_prompt += (
@@ -2289,6 +2506,10 @@ async def generate_ai_response(
     if conversation_state.get("intent_shift"):
         system_prompt += (
             "\nThe latest message may have changed topic. Follow the latest customer message and adapt naturally without saying the topic changed."
+        )
+    if conversation_state.get("topic_exhausted"):
+        system_prompt += (
+            "\nThe same topic has repeated several turns without new details. Add a soft redirect to another useful next step."
         )
     previous_intent_name = str((last_response_context.get("intent") or {}).get("intent") or "").strip().lower()
     current_intent_name = str((observed_intent.get("intent") or "").strip().lower())
@@ -2320,11 +2541,14 @@ async def generate_ai_response(
     if prompt_context and getattr(prompt_context, "conversation_history", ""):
         conversation_text = prompt_context.conversation_history
     budget = ai_input_token_budget()
+    capped_knowledge_text = _cap_knowledge_context(ai_context.get("knowledge_text", ""), query)
+    contrast_block = _prev_contrast_block(previous_response)
     prompt = (
         f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
-        f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.35))}\n\n"
+        f"Company/Product Context:\n{truncate_text_for_tokens(capped_knowledge_text, int(budget * 0.35))}\n\n"
         f"Conversation so far:\n{truncate_text_for_tokens(conversation_text, int(budget * 0.3))}\n\n"
-        f"Latest customer message:\n{query}\n\n"
+        + (f"{contrast_block}\n\n" if contrast_block else "")
+        + f"Latest customer message:\n{query}\n\n"
         f"Respond naturally in 2-4 sentences using the {style_profile['name']} style."
         + (f" If useful, close with: {_next_step_for_prompt}" if _next_step_for_prompt else "")
     )
@@ -2332,10 +2556,11 @@ async def generate_ai_response(
         prompt = (
             f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
             f"Customer summary:\n{truncate_text_for_tokens(prompt_context.customer_summary, int(budget * 0.15))}\n\n"
-            f"Company/Product Context:\n{truncate_text_for_tokens(ai_context.get('knowledge_text', ''), int(budget * 0.30))}\n\n"
+            f"Company/Product Context:\n{truncate_text_for_tokens(capped_knowledge_text, int(budget * 0.30))}\n\n"
             f"Semantic context:\n{truncate_text_for_tokens(getattr(prompt_context, 'knowledge_context', ''), int(budget * 0.10))}\n\n"
             f"Conversation so far:\n{truncate_text_for_tokens(conversation_text, int(budget * 0.2))}\n\n"
-            f"Latest customer message:\n{query}\n\n"
+            + (f"{contrast_block}\n\n" if contrast_block else "")
+            + f"Latest customer message:\n{query}\n\n"
             f"Respond naturally in 2-4 sentences using the {style_profile['name']} style."
             + (f" If useful, close with: {_next_step_for_prompt}" if _next_step_for_prompt else "")
         )
@@ -2380,7 +2605,7 @@ async def generate_ai_response(
             (text_similarity(response_text, prior) for prior in prior_responses),
             default=0.0,
         )
-        if max_similarity >= 0.88:
+        if max_similarity >= 0.78:
             if not has_llm_budget_remaining():
                 logger.warning(
                     "response_retry_skipped_budget_exhausted company_id=%s conversation_id=%s similarity=%.3f purpose=%s",
@@ -2398,7 +2623,7 @@ async def generate_ai_response(
                     max_similarity,
                     response_call_purpose,
                 )
-        if max_similarity >= 0.88:
+        if max_similarity >= 0.78:
             logger.info(
                 "response_retry_executed=true company_id=%s conversation_id=%s purpose=%s",
                 company_id or "",
@@ -2629,6 +2854,27 @@ async def generate_combined_ai_analysis(
     FIX (latency 1): engine resolution is now parallelised with the batch call
     prep instead of awaited sequentially before the LLM call fires.
     """
+    context_budget = get_llm_context()
+    if context_budget is None:
+        set_llm_context(
+            company_id=company_id or "",
+            max_calls=5,
+            max_embedding_calls=2,
+            workflow_id=str(kwargs.get("workflow_id") or "combined_ai_analysis"),
+            conversation_id=str(kwargs.get("conversation_id") or ""),
+            message_id=str(kwargs.get("message_id") or ""),
+            agent_name="capture",
+        )
+    else:
+        if context_budget.max_calls < 5:
+            logger.info(
+                "combined_analysis_llm_budget_raised company_id=%s previous_max_calls=%s new_max_calls=5",
+                company_id or "",
+                context_budget.max_calls,
+            )
+            context_budget.max_calls = 5
+        if context_budget.max_embedding_calls < 2:
+            context_budget.max_embedding_calls = 2
     from services.ai_service.common import IntentResult, SentimentResult
     from services.ai_service.intent import _normalize_intent_payload, _render_history_context
 
@@ -2769,6 +3015,11 @@ async def generate_combined_ai_analysis(
 
     llm_budget_exhausted = not has_llm_budget_remaining()
     if llm_budget_exhausted:
+        logger.warning(
+            "combined_analysis_budget_exhausted_before_response company_id=%s conversation_id=%s",
+            company_id or "",
+            str(kwargs.get("conversation_id") or ""),
+        )
         ai_response = {}
         ai_response_error = "AI_BUDGET_EXCEEDED type=llm"
     else:
@@ -2790,6 +3041,11 @@ async def generate_combined_ai_analysis(
         except Exception as exc:
             if "AI_BUDGET_EXCEEDED" in str(exc):
                 llm_budget_exhausted = True
+                logger.warning(
+                    "combined_analysis_budget_exhausted_mid_workflow company_id=%s conversation_id=%s",
+                    company_id or "",
+                    str(kwargs.get("conversation_id") or ""),
+                )
             logger.warning(
                 "generate_combined_ai_analysis ai_response failed; support fallback may generate once if budget allows: %s",
                 exc,
@@ -2811,6 +3067,7 @@ async def generate_combined_ai_analysis(
 
 async def generate_product_description(
     name: str,
+    company_id: str = "",
     product_title: str = "",
     product_type: str = "",
     category: str = "",
@@ -2829,7 +3086,7 @@ async def generate_product_description(
     ordered_engines = [dict(engine) for engine in (engines or []) if isinstance(engine, dict)]
     ordered_engines.sort(key=lambda engine: 0 if engine.get("is_selected") else 1)
     if not ordered_engines:
-        ordered_engines = [await _resolve_engine_for_request()]
+        ordered_engines = [await _resolve_engine_for_request(company_id=company_id)]
     return (
         await call_with_engines(
             "You are an ecommerce product copywriter.\n"

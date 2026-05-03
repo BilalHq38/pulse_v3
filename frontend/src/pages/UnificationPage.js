@@ -267,18 +267,18 @@ export default function UnificationPage() {
                 type="button"
                 onClick={refreshAll}
                 disabled={loadingProfiles || loadingReviewQueue || actionInFlight}
-                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-800 shadow-sm hover:bg-slate-100 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-3 text-sm font-bold text-slate-800 shadow-md shadow-slate-200/70 hover:bg-slate-100 disabled:opacity-50"
               >
-                <RefreshCw size={16} className={loadingProfiles || loadingReviewQueue ? 'animate-spin' : ''} />
+                <RefreshCw size={18} className={loadingProfiles || loadingReviewQueue ? 'animate-spin' : ''} />
                 Refresh Data
               </button>
               <button
                 type="button"
                 onClick={runAutoDetect}
                 disabled={!isAdmin || actionInFlight}
-                className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white shadow-md shadow-blue-200 hover:bg-blue-500 disabled:opacity-50"
               >
-                <WandSparkles size={16} />
+                <WandSparkles size={18} />
                 Auto Detect Matches
               </button>
             </div>
@@ -328,7 +328,15 @@ export default function UnificationPage() {
         />
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.8fr),minmax(22rem,0.95fr)]">
+      <ReviewQueuePanel
+        queue={reviewQueue}
+        loading={loadingReviewQueue}
+        actionInFlight={actionInFlight}
+        isAdmin={isAdmin}
+        onResolve={handleResolveSuggestion}
+      />
+
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,2.15fr),minmax(20rem,0.85fr)]">
         <div className="space-y-6">
           <section className="rounded-2xl border border-slate-200 bg-white p-5">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -408,14 +416,6 @@ export default function UnificationPage() {
         </div>
 
         <div className="space-y-6">
-          <ReviewQueuePanel
-            queue={reviewQueue}
-            loading={loadingReviewQueue}
-            actionInFlight={actionInFlight}
-            isAdmin={isAdmin}
-            onResolve={handleResolveSuggestion}
-          />
-
           <SplitPanel
             profileDetail={selectedProfileDetail}
             loading={loadingDetails}

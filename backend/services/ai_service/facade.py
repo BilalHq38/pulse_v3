@@ -20,6 +20,7 @@ from services.ai_service.embedding_service import (
     store_embedding,
 )
 from services.ai_service.llm_client import (
+    # Re-exported for legacy direct imports; no confirmed external callers in current grep.
     call_gemini,
     call_gemini_json,
     call_model_json,
@@ -40,6 +41,7 @@ from services.ai_service.memory_service import (
 from services.ai_service.rag import get_company_knowledge as _local_get_company_knowledge
 from services.ai_service.response_generator import (
     auto_score_and_nurture_lead as _local_auto_score_and_nurture_lead,
+    # Used by: routers.customers customer profile enrichment.
     calculate_churn_risk,
     generate_ai_response as _local_generate_ai_response,
     generate_combined_ai_analysis as _local_generate_combined_ai_analysis,
@@ -175,7 +177,7 @@ def _safe_ai_reply_default(message_text: str, customer_info: dict | None = None)
     if any(token in lower for token in ("price", "buy", "recommend", "product", "available")):
         return (
             f"Thanks, {name}. I can help with product options. "
-            "Share your budget or preferred type and I will suggest the best matching choices."
+            "Which product or service are you most interested in? I can pull up the most relevant options."
         )
     if text:
         return (
@@ -698,6 +700,7 @@ async def generate_product_description(
     if _prefer_local_impl():
         return await _local_generate_product_description(
             name,
+            company_id=company_id,
             product_title=product_title,
             product_type=product_type,
             category=category,
@@ -732,6 +735,7 @@ async def generate_product_description(
         if _allow_local_fallback():
             return await _local_generate_product_description(
                 name,
+                company_id=company_id,
                 product_title=product_title,
                 product_type=product_type,
                 category=category,

@@ -5,6 +5,7 @@ import pytest
 from memory_engine.semantic import SemanticMemory
 from memory_engine.short_term import ShortTermMemory
 from services.ai_service import embedding_service, memory_service
+from services.ai_service.rag import _should_skip_rag_query
 from shared.config import normalize_gemini_embedding_model_name
 
 
@@ -62,6 +63,17 @@ def _install_embedding_fakes(monkeypatch, *, ready_providers):
 def test_gemini_embedding_model_name_is_normalized_for_sdk():
     assert normalize_gemini_embedding_model_name("models/text-embedding-004") == "text-embedding-004"
     assert normalize_gemini_embedding_model_name("gemini-embedding-exp-03-07") == "gemini-embedding-exp-03-07"
+
+
+def test_embedding_cache_key_is_company_scoped():
+    assert embedding_service._embedding_cache_key("same text", company_id="co_a") != embedding_service._embedding_cache_key(
+        "same text",
+        company_id="co_b",
+    )
+
+
+def test_rag_does_not_skip_short_followup_with_history():
+    assert _should_skip_rag_query("yes", intent_name="follow_up_continue", has_history=True) == (False, "")
 
 
 @pytest.mark.asyncio
@@ -163,3 +175,25 @@ async def test_semantic_interaction_search_is_scoped_to_current_customer(monkeyp
 
     assert captured["source_type"] == "interaction"
     assert captured["source_ids"] == ["conversation-1", "customer-1"]
+
+
+@pytest.mark.asyncio
+async def test_search_similar_embeddings_query_filters_by_company(monkeypatch):
+    captured_queries = []
+
+    class FakeDb:
+        async def fetch(self, query, *args):
+            captured_queries.append((query, args))
+            return []
+
+    async def fake_embedding(*_args, **_kwargs):
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(embedding_service, "_should_skip_embedding_search", lambda _text: False)
+    monkeypatch.setattr(embedding_service, "generate_embedding", fake_embedding)
+
+    await embedding_service.search_similar_embeddings(FakeDb(), "co_a", "find product", top_k=3)
+
+    assert captured_queries
+    assert "WHERE company_id=$2" in captured_queries[0][0]
+    assert captured_queries[0][1][1] == "co_a"

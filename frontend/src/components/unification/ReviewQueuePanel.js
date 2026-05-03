@@ -12,10 +12,31 @@ const scoreColor = (score) => {
 
 const scoreLabel = (score) => `${Math.round(Math.min(Math.max(Number(score || 0) || 0, 0), 1) * 100)}%`;
 
-const signalLabel = (signal) =>
-  String(signal || '')
+const SIGNAL_LABELS = {
+  phone: 'Phone',
+  phone_normalized: 'Phone',
+  email: 'Email',
+  email_normalized: 'Email',
+  name: 'Name',
+  name_similarity: 'Name',
+  profile_picture: 'Avatar',
+  profile_picture_url: 'Avatar',
+  channel_identity: 'Channel Identity',
+  description: 'Description',
+  description_similarity: 'Description',
+  company: 'Company',
+  company_similarity: 'Company',
+  device_fingerprint: 'Device',
+  ip_subnet: 'Location',
+};
+
+const signalLabel = (signal) => {
+  const key = String(signal || '').trim().toLowerCase();
+  if (SIGNAL_LABELS[key]) return SIGNAL_LABELS[key];
+  return key
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+};
 
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
@@ -35,10 +56,11 @@ function CandidateCard({ candidate, label }) {
   const id = normalize(profile.customer_id || profile.id);
   const avatarUrl = normalize(profile.avatar_url);
   const channels = asArray(profile.source_channels).filter(Boolean);
+  const description = normalize(profile.description || profile.bio);
   const initials = (name.charAt(0) || '?').toUpperCase();
 
   return (
-    <div className="min-w-0 rounded-xl border border-slate-200 bg-white p-3">
+    <div className="min-w-0 rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex items-start gap-3">
         {avatarUrl ? (
           <img
@@ -71,6 +93,11 @@ function CandidateCard({ candidate, label }) {
         {profile.company_name ? (
           <p className="truncate">
             <span className="font-semibold text-slate-500">Company:</span> {profile.company_name}
+          </p>
+        ) : null}
+        {description ? (
+          <p className="line-clamp-2">
+            <span className="font-semibold text-slate-500">Bio:</span> {description}
           </p>
         ) : null}
       </div>
@@ -111,7 +138,7 @@ export default function ReviewQueuePanel({
   }, [queue]);
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-4">
+    <section className="rounded-2xl border border-slate-200 bg-white p-5">
       <header className="mb-4 flex items-center justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-slate-900">Merge Candidates</h3>
@@ -134,7 +161,7 @@ export default function ReviewQueuePanel({
           No pending suggestions. Run auto-detect to refresh potential matches.
         </div>
       ) : (
-        <div className="max-h-[42rem] space-y-3 overflow-y-auto pr-0.5">
+        <div className="max-h-[44rem] space-y-4 overflow-y-auto pr-0.5">
           {pendingQueue.map((item) => {
             const id = normalize(item?.id || item?.review_id);
             const score = Number(item?.match_score || item?.confidence || 0) || 0;
@@ -151,20 +178,20 @@ export default function ReviewQueuePanel({
             const expanded = Boolean(expandedMap[id]);
 
             return (
-              <article key={id} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3" data-testid={`merge-candidate-${id}`}>
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <article key={id} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4" data-testid={`merge-candidate-${id}`}>
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <p className="text-xs font-semibold text-slate-900">Possible identity match</p>
-                    <p className="mt-0.5 text-[11px] text-slate-500">{item?.source || 'identity scan'}</p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">Detected from shared identity signals</p>
                   </div>
-                  <span className={`rounded-full border px-2.5 py-1 text-[11px] font-bold ${scoreColor(score)}`}>
+                  <span className={`rounded-full border px-3 py-1.5 text-xs font-bold ${scoreColor(score)}`}>
                     {scoreLabel(score)} match
                   </span>
                 </div>
 
-                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)]">
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)]">
                   <CandidateCard candidate={candidateA} label="Profile A" />
-                  <div className="hidden items-center justify-center px-1 text-[11px] font-semibold text-slate-400 lg:flex">
+                  <div className="hidden items-center justify-center px-1 text-[11px] font-semibold text-slate-400 md:flex">
                     vs
                   </div>
                   <CandidateCard candidate={candidateB} label="Profile B" />
@@ -215,7 +242,7 @@ export default function ReviewQueuePanel({
                       Admin role required for review decisions
                     </span>
                   ) : (
-                    <span className="text-[10px] text-slate-400">Merge and skip decisions are written to the review history.</span>
+                    <span className="text-[10px] text-slate-400">Decisions update the identity review history.</span>
                   )}
 
                   <div className="flex flex-wrap items-center gap-1.5">

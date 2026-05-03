@@ -83,6 +83,24 @@ async def analyze_message(
     )
 
 
+@router.post("/ai/classify")
+async def classify_message_intent(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    db = request.app.state.db
+    body = await request.json()
+    company_id = current_user.get("company_id", "") or str(body.get("company_id") or "")
+    text = body.get("text", "")
+    return await classify_intent(
+        str(text or ""),
+        db=db,
+        company_id=company_id,
+        conversation_context=body.get("conversation_context", []),
+        previous_intent=body.get("previous_intent", ""),
+    )
+
+
 @router.post("/ai/respond", response_model=RespondResponse)
 async def respond_to_customer(
     payload: RespondRequest,
@@ -334,6 +352,7 @@ async def product_description_route(
     return {
         "description": await generate_product_description(
             payload.name,
+            company_id=company_id,
             product_title=payload.product_title,
             product_type=payload.product_type,
             category=payload.category,
@@ -382,6 +401,8 @@ _SAFETY_PATTERNS = [
 
 def _validate_response_safety(text: str) -> dict:
     """Check AI response for unsafe content patterns."""
+    # Architectural gap: exposed as /ai/validate-response; grep shows no hot-path
+    # caller currently enforces this before outbound delivery.
     issues: list[str] = []
     for pattern in _SAFETY_PATTERNS:
         if pattern.search(text or ""):

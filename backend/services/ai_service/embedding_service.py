@@ -38,9 +38,9 @@ def _normalize_embedding_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
 
-def _embedding_cache_key(text: str, *, provider: str = "", model: str = "") -> str:
+def _embedding_cache_key(text: str, *, provider: str = "", model: str = "", company_id: str = "") -> str:
     normalized = _normalize_embedding_text(text)[:8000]
-    scope = f"{provider.strip().lower()}:{model.strip().lower()}:{normalized}"
+    scope = f"{company_id.strip()}:{provider.strip().lower()}:{model.strip().lower()}:{normalized}"
     return "embed:" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
 
 
@@ -165,7 +165,7 @@ def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
     return candidates
 
 
-async def generate_embedding(text: str, engine: dict | None = None) -> Optional[list[float]]:
+async def generate_embedding(text: str, engine: dict | None = None, *, company_id: str = "") -> Optional[list[float]]:
     if not text or not text.strip():
         return None
 
@@ -186,7 +186,7 @@ async def generate_embedding(text: str, engine: dict | None = None) -> Optional[
                 model,
             )
             continue
-        cache_key = _embedding_cache_key(text, provider=provider, model=model)
+        cache_key = _embedding_cache_key(text, provider=provider, model=model, company_id=company_id)
         cached = await _EMBEDDING_CACHE.get_json(cache_key)
         if isinstance(cached, list):
             logger.info(
@@ -298,7 +298,7 @@ async def store_embedding(
 ) -> Optional[str]:
     if not db or not company_id or not source_type or not source_id:
         return None
-    embedding = await generate_embedding(content, engine)
+    embedding = await generate_embedding(content, engine, company_id=company_id)
     if embedding is None:
         return None
     embedding_id = make_id()
@@ -368,7 +368,7 @@ async def search_similar_embeddings(
     if _should_skip_embedding_search(query_text):
         logger.info("embedding_search_skipped reason=low_value_query query_len=%s", len(query_text or ""))
         return []
-    embedding = await generate_embedding(query_text, engine)
+    embedding = await generate_embedding(query_text, engine, company_id=company_id)
     if embedding is None:
         return []
     vector_value = "[" + ",".join(str(item) for item in embedding) + "]"
