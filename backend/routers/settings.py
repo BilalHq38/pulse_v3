@@ -7,7 +7,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.utils import make_id, now_ts, parse_dt
 from services.db_helpers import get_company_id, get_current_user_flexible, r, rs
@@ -283,7 +283,7 @@ class CompanySettingsUpdate(BaseModel):
     description: Optional[str] = Field(default=None, max_length=5000)
     logo_url: Optional[str] = Field(default=None, max_length=5000)
     phone: Optional[str] = Field(default=None, max_length=64)
-    default_phone_region: Optional[str] = Field(default=None, min_length=2, max_length=2)
+    default_phone_region: Optional[str] = Field(default=None, max_length=2)
     support_email: Optional[str] = Field(default=None, max_length=255)
     website_address: Optional[str] = Field(default=None, max_length=500)
     address_line1: Optional[str] = Field(default=None, max_length=500)
@@ -304,6 +304,54 @@ class CompanySettingsUpdate(BaseModel):
     active_llm_engine_id: Optional[str] = Field(default=None, max_length=255)
     social_links: Optional[SocialLinks] = None
     business_hours: Optional[BusinessHours] = None
+
+    @field_validator("company_name", "industry", "timezone", "language", "preferred_language", mode="before")
+    @classmethod
+    def _blank_strings_to_none(cls, value):
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator("default_phone_region", mode="before")
+    @classmethod
+    def _normalize_default_phone_region(cls, value):
+        if value is None:
+            return None
+        cleaned = str(value).strip().upper()
+        if not cleaned:
+            return None
+        if len(cleaned) != 2 or not cleaned.isalpha():
+            raise ValueError("Default phone region must be a 2-letter country code, for example US or PK.")
+        return cleaned
+
+    @field_validator("support_email", mode="before")
+    @classmethod
+    def _validate_support_email(cls, value):
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        if not cleaned:
+            return None
+        if "@" not in cleaned or "." not in cleaned.rsplit("@", 1)[-1]:
+            raise ValueError("Support email must be a valid email address.")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_required_profile_fields(self):
+        missing: list[str] = []
+        if self.company_name is not None and not self.company_name.strip():
+            missing.append("Company name")
+        if self.industry is not None and not self.industry.strip():
+            missing.append("Industry")
+        if self.timezone is not None and not self.timezone.strip():
+            missing.append("Timezone")
+        language = self.language if self.language is not None else self.preferred_language
+        if language is not None and not str(language or "").strip():
+            missing.append("Language")
+        if missing:
+            raise ValueError(f"Required company profile field missing: {', '.join(missing)}.")
+        return self
 
 
 class ChannelSettingsUpdate(BaseModel):
@@ -495,6 +543,32 @@ async def update_company_settings(body: CompanySettingsUpdate, request: Request)
     # Build flat dict from validated Pydantic model
     payload: dict = body.model_dump(exclude_none=True)
     company_name = (payload.pop("company_name", "") or "").strip()
+    current_profile = await _fetch_company_settings_profile(db, cid) or {}
+    effective_required = {
+        "Company name": company_name or str(current_profile.get("company_name") or "").strip(),
+        "Industry": str(payload.get("industry") or current_profile.get("industry") or "").strip(),
+        "Timezone": str(payload.get("timezone") or current_profile.get("timezone") or "").strip(),
+        "Language": str(
+            payload.get("language")
+            or payload.get("preferred_language")
+            or current_profile.get("language")
+            or ""
+        ).strip(),
+    }
+    missing_required = [label for label, value in effective_required.items() if not value]
+    if missing_required:
+        logger.info(
+            "company settings validation failed company_id=%s missing_fields=%s",
+            cid,
+            ",".join(missing_required),
+        )
+        raise HTTPException(
+            400,
+            {
+                "message": f"Fill required company profile fields: {', '.join(missing_required)}.",
+                "fields": missing_required,
+            },
+        )
     if company_name:
         await db.execute(
             "UPDATE companies SET name=$1,updated_at=NOW() WHERE id=$2",

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -38,6 +39,49 @@ class CampaignCopyDraft(BaseModel):
     subject: str = Field(min_length=1, max_length=220)
     body: str = Field(min_length=1, max_length=6000)
     html_body: str = Field(default="", max_length=12000)
+
+
+class HtmlEmailBodyDraft(BaseModel):
+    html_body: str = Field(min_length=1, max_length=12000)
+
+
+class CampaignAIUnavailableError(RuntimeError):
+    """Raised when campaign AI generation cannot safely produce content."""
+
+
+class CampaignAIQuotaExceededError(CampaignAIUnavailableError):
+    """Raised when the provider has clearly exhausted quota/budget."""
+
+
+_UNSAFE_HTML_RE = re.compile(r"<\s*/?\s*(script|style|iframe|object|embed|form|input|button|link|meta)[^>]*>", re.I)
+_UNSAFE_ATTR_RE = re.compile(r"\s+on[a-z]+\s*=\s*(['\"]).*?\1", re.I | re.S)
+_JAVASCRIPT_URL_RE = re.compile(r"(href|src)\s*=\s*(['\"])\s*javascript:.*?\2", re.I | re.S)
+
+
+def _sanitize_email_html(value: str) -> str:
+    cleaned = str(value or "").strip()
+    cleaned = _UNSAFE_HTML_RE.sub("", cleaned)
+    cleaned = _UNSAFE_ATTR_RE.sub("", cleaned)
+    cleaned = _JAVASCRIPT_URL_RE.sub("", cleaned)
+    return cleaned[:12000]
+
+
+def _is_quota_exhausted_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    markers = (
+        "quota",
+        "resource_exhausted",
+        "insufficient_quota",
+        "billing hard limit",
+        "credit balance is too low",
+        "all ai providers exhausted",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _campaign_ai_unavailable_message(kind: str = "copy") -> str:
+    target = "campaign copy" if kind == "copy" else "HTML email body"
+    return f"AI/API issue: {target} could not be generated. Please write or paste the response manually."
 
 
 # --------------------------------------------------------------------------- #
@@ -336,23 +380,91 @@ async def generate_campaign_copy(
         ).model_dump()
         if not generated.get("html_body"):
             generated["html_body"] = _body_to_html(generated.get("body", ""))
+        generated["html_body"] = _sanitize_email_html(generated.get("html_body", ""))
         return generated
     except Exception as exc:
-        logger.warning("Campaign copy generation fell back to template mode: %s", exc)
-        product_name = str(product.get("name") or product.get("product_title") or "our product").strip()
-        subject = f"{product_name}: {campaign_goal.strip()}"[:220]
-        body = (
-            f"Hi there,\n\n"
-            f"We're reaching out about {product_name}. {str(product.get('description') or '').strip()}\n\n"
-            f"This campaign is focused on {campaign_goal.strip()} for {audience_description.strip()}. "
-            f"{str(offer_details or '').strip()}\n\n"
-            f"{call_to_action.strip()}"
-        ).strip()
-        return {
-            "subject": subject,
-            "body": body,
-            "html_body": _body_to_html(body),
-        }
+        logger.warning("Campaign copy AI generation unavailable company_id=%s product_id=%s error=%s", company_id, product_id, exc)
+        if _is_quota_exhausted_error(exc):
+            raise CampaignAIQuotaExceededError(
+                "AI/API quota exhausted. AI has been turned off for this workspace. Please handle the response manually."
+            ) from exc
+        raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("copy")) from exc
+
+
+async def generate_html_email_body(
+    db,
+    *,
+    company_id: str,
+    description: str,
+    product_id: str = "",
+    current_body: str = "",
+) -> dict:
+    if not company_id:
+        raise ValueError("company_id is required")
+
+    description = str(description or "").strip()
+    if not description:
+        raise ValueError("Describe what the HTML email body should say.")
+
+    product = await _load_campaign_product(db, company_id=company_id, product_id=product_id) if product_id else None
+    product_context = "No product selected."
+    if product:
+        feature_lines = "\n".join(f"- {feature}" for feature in product.get("features") or []) or "- No structured features stored"
+        product_context = (
+            f"Product name: {product.get('name') or product.get('product_title') or 'Product'}\n"
+            f"Product description: {product.get('description') or 'No description provided'}\n"
+            f"Product price: {product.get('price') or 'N/A'} {product.get('price_currency') or ''}\n"
+            f"Features:\n{feature_lines}"
+        )
+
+    prompt = (
+        "Generate a production-ready HTML email body for a CRM campaign.\n"
+        "Return JSON with key html_body only.\n"
+        "Constraints:\n"
+        "- Use safe email HTML with simple headings, paragraphs, bullet lists, and links only if requested.\n"
+        "- Do not include script, style, forms, tracking pixels, or external assets.\n"
+        "- Keep it concise and readable.\n"
+        "- Mention only facts supplied in the context.\n\n"
+        f"User description/context:\n{description}\n\n"
+        f"Current plain text/body draft:\n{str(current_body or '').strip() or 'None'}\n\n"
+        f"Product context:\n{product_context}\n"
+    )
+
+    try:
+        engine = await get_active_llm_engine(db, company_id)
+        generated = HtmlEmailBodyDraft.model_validate(
+            await call_model_json(prompt, HtmlEmailBodyDraft, engine=engine)
+        ).model_dump()
+        html_body = _sanitize_email_html(generated.get("html_body", ""))
+        if not html_body:
+            raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("html"))
+        return {"html_body": html_body}
+    except CampaignAIUnavailableError:
+        raise
+    except Exception as exc:
+        logger.warning("HTML email body AI generation unavailable company_id=%s product_id=%s error=%s", company_id, product_id, exc)
+        if _is_quota_exhausted_error(exc):
+            raise CampaignAIQuotaExceededError(
+                "AI/API quota exhausted. AI has been turned off for this workspace. Please handle the response manually."
+            ) from exc
+        raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("html")) from exc
+
+
+def _campaign_product_snapshot(product: dict | None) -> dict | None:
+    if not product:
+        return None
+    return {
+        "id": str(product.get("id") or "").strip(),
+        "name": str(product.get("name") or product.get("product_title") or "").strip(),
+        "product_title": str(product.get("product_title") or "").strip(),
+        "description": str(product.get("description") or "").strip(),
+        "price": str(product.get("price") or "").strip(),
+        "price_currency": str(product.get("price_currency") or "").strip(),
+        "category": str(product.get("category") or "").strip(),
+        "product_type": str(product.get("product_type") or "").strip(),
+        "features": list(product.get("features") or []),
+        "images": list(product.get("images") or []),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -376,6 +488,12 @@ async def create_campaign(
         raise ValueError("company_id, subject, and body (or html_body) are required")
 
     filters = dict(filters or {})
+    product_id = str(filters.get("product_id") or "").strip()
+    if product_id:
+        product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
+        if not product:
+            raise ValueError("Selected product was not found")
+        filters["product_snapshot"] = _campaign_product_snapshot(product)
     recipients = await resolve_recipients(db, company_id=company_id, filters=filters)
 
     campaign_id = make_id()

@@ -42,6 +42,7 @@ from services.ai_service.rag import get_company_knowledge as _local_get_company_
 from services.ai_service.response_generator import (
     auto_score_and_nurture_lead as _local_auto_score_and_nurture_lead,
     # Used by: routers.customers customer profile enrichment.
+    build_safe_lead_ai_context,
     calculate_churn_risk,
     generate_ai_response as _local_generate_ai_response,
     generate_combined_ai_analysis as _local_generate_combined_ai_analysis,
@@ -481,14 +482,15 @@ async def generate_combined_ai_analysis(
 
 
 async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") -> dict:
+    safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=False)
     if _prefer_local_impl():
-        return await _local_generate_lead_score(lead_data, db=db, company_id=company_id)
+        return await _local_generate_lead_score(safe_lead, db=db, company_id=company_id)
     try:
         return await _call_remote_ai(
             "POST",
             "/api/ai/score-lead",
             company_id=company_id or lead_data.get("company_id", ""),
-            json_body={"lead": lead_data, "company_id": company_id or lead_data.get("company_id", "")},
+            json_body={"lead": safe_lead, "company_id": company_id or lead_data.get("company_id", "")},
         )
     except Exception as exc:
         logger.warning(
@@ -497,8 +499,8 @@ async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") ->
             exc.__class__.__name__,
         )
         if _allow_local_fallback():
-            return await _local_generate_lead_score(lead_data, db=db, company_id=company_id)
-        return _safe_lead_score_default(lead_data)
+            return await _local_generate_lead_score(safe_lead, db=db, company_id=company_id)
+        return _safe_lead_score_default(safe_lead)
 
 
 async def generate_nurture_message(
@@ -508,9 +510,10 @@ async def generate_nurture_message(
     db=None,
     company_id: str = "",
 ) -> dict:
+    safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=True)
     if _prefer_local_impl():
         return await _local_generate_nurture_message(
-            lead_data,
+            safe_lead,
             stage,
             company_context=company_context,
             db=db,
@@ -522,7 +525,7 @@ async def generate_nurture_message(
             "/api/ai/nurture",
             company_id=company_id or lead_data.get("company_id", ""),
             json_body={
-                "lead": lead_data,
+                "lead": safe_lead,
                 "stage": stage,
                 "company_id": company_id or lead_data.get("company_id", ""),
                 "company_context": company_context,
@@ -536,24 +539,25 @@ async def generate_nurture_message(
         )
         if _allow_local_fallback():
             return await _local_generate_nurture_message(
-                lead_data,
+                safe_lead,
                 stage,
                 company_context=company_context,
                 db=db,
                 company_id=company_id,
             )
-        return _safe_nurture_default(lead_data, stage)
+        return _safe_nurture_default(safe_lead, stage)
 
 
 async def auto_score_and_nurture_lead(lead_data: dict, db=None, company_id: str | None = None) -> dict:
+    safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=True)
     if _prefer_local_impl():
-        return await _local_auto_score_and_nurture_lead(lead_data, db=db, company_id=company_id)
+        return await _local_auto_score_and_nurture_lead(safe_lead, db=db, company_id=company_id)
     try:
         return await _call_remote_ai(
             "POST",
             "/api/ai/lead-auto",
             company_id=company_id or lead_data.get("company_id", ""),
-            json_body={"lead": lead_data, "company_id": company_id or lead_data.get("company_id", "")},
+            json_body={"lead": safe_lead, "company_id": company_id or lead_data.get("company_id", "")},
         )
     except Exception as exc:
         logger.warning(
@@ -562,9 +566,9 @@ async def auto_score_and_nurture_lead(lead_data: dict, db=None, company_id: str 
             exc.__class__.__name__,
         )
         if _allow_local_fallback():
-            return await _local_auto_score_and_nurture_lead(lead_data, db=db, company_id=company_id)
-        score = _safe_lead_score_default(lead_data)
-        nurture = _safe_nurture_default(lead_data, score.get("phase", "awareness"))
+            return await _local_auto_score_and_nurture_lead(safe_lead, db=db, company_id=company_id)
+        score = _safe_lead_score_default(safe_lead)
+        nurture = _safe_nurture_default(safe_lead, score.get("phase", "awareness"))
         return {**score, "nurture_message": nurture["message"]}
 
 

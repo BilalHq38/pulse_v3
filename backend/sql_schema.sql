@@ -486,14 +486,9 @@ CREATE TABLE IF NOT EXISTS leads (
     id             TEXT PRIMARY KEY,
     company_id     TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
     name           TEXT NOT NULL,
-    father_name    TEXT NOT NULL DEFAULT '',
     email          TEXT NOT NULL DEFAULT '',
     phone          TEXT NOT NULL DEFAULT '',
     customer_company_name TEXT NOT NULL DEFAULT '',
-    address        TEXT NOT NULL DEFAULT '',
-    city           TEXT NOT NULL DEFAULT '',
-    state          TEXT NOT NULL DEFAULT '',
-    country        TEXT NOT NULL DEFAULT '',
     source         TEXT NOT NULL DEFAULT 'web_chat',
     source_id      TEXT NOT NULL DEFAULT '',
     status         TEXT NOT NULL DEFAULT 'new',
@@ -2132,6 +2127,12 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFA
 -- Adaptive qualification + onboarding flow state (JSONB, no schema drift required for callers).
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE leads DROP COLUMN IF EXISTS father_name;
+ALTER TABLE leads DROP COLUMN IF EXISTS address;
+ALTER TABLE leads DROP COLUMN IF EXISTS city;
+ALTER TABLE leads DROP COLUMN IF EXISTS state;
+ALTER TABLE leads DROP COLUMN IF EXISTS country;
 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS external_message_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';

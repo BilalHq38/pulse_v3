@@ -2428,22 +2428,12 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
     if existing:
         await db.execute(
             "UPDATE customers SET name=$1,email=$2,phone=$3,customer_company_name=$4,"
-            "father_name=COALESCE(NULLIF($5,''),father_name),"
-            "address=COALESCE(NULLIF($6,''),address),"
-            "city=COALESCE(NULLIF($7,''),city),"
-            "state=COALESCE(NULLIF($8,''),state),"
-            "country=COALESCE(NULLIF($9,''),country),"
-            "lead_id=COALESCE(NULLIF($10,''),lead_id),"
-            "lifecycle_stage='customer',updated_at=NOW() WHERE id=$11",
+            "lead_id=COALESCE(NULLIF($5,''),lead_id),"
+            "lifecycle_stage='customer',updated_at=NOW() WHERE id=$6",
             name or existing.get("name", "Unknown"),
             email or existing.get("email", ""),
             phone or existing.get("phone", ""),
             lead.get("customer_company_name") or existing.get("customer_company_name", ""),
-            lead.get("father_name", ""),
-            lead.get("address", ""),
-            lead.get("city", ""),
-            lead.get("state", ""),
-            lead.get("country", ""),
             lead.get("id", ""),
             existing["id"],
         )
@@ -2451,24 +2441,17 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
     else:
         nid = make_id()
         await db.execute(
-            "INSERT INTO customers(id,company_id,lead_id,name,father_name,email,phone,customer_company_name,"
-            "address,city,state,country,segment,avatar,lifecycle_stage,lifetime_value,"
-            "avg_sentiment,recent_tickets,complaint_count,days_since_last_contact,"
-            "total_conversations,created_at,updated_at) "
-            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'general','','customer',"
-            "0,0,0,0,0,NOW(),NOW())",
+            "INSERT INTO customers(id,company_id,lead_id,name,email,phone,customer_company_name,"
+            "segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,recent_tickets,complaint_count,"
+            "days_since_last_contact,total_conversations,created_at,updated_at) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,'general','','customer',0,0,0,0,0,0,NOW(),NOW())",
             nid,
             cid,
             lead.get("id", ""),
             name,
-            lead.get("father_name", ""),
             email,
             phone,
             lead.get("customer_company_name", ""),
-            lead.get("address", ""),
-            lead.get("city", ""),
-            lead.get("state", ""),
-            lead.get("country", ""),
         )
         await db.execute(
             "INSERT INTO customer_tags(customer_id,tag) VALUES($1,'converted-from-lead') ON CONFLICT DO NOTHING",

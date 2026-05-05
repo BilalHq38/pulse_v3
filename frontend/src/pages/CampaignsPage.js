@@ -54,6 +54,12 @@ const EMPTY_AI_DETAILS = {
   extra_context: '',
 };
 
+const getListPayload = (data) => {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.items)) return data.items;
+  return [];
+};
+
 export default function CampaignsPage() {
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [campaigns, setCampaigns] = useState([]);
@@ -69,6 +75,11 @@ export default function CampaignsPage() {
   const [selectedCustomerIds, setSelectedCustomerIds] = useState([]);
   const [aiDetails, setAiDetails] = useState(EMPTY_AI_DETAILS);
   const [generatingCopy, setGeneratingCopy] = useState(false);
+  const [htmlAiPrompt, setHtmlAiPrompt] = useState('');
+  const [generatingHtmlBody, setGeneratingHtmlBody] = useState(false);
+  const [aiGenerationError, setAiGenerationError] = useState('');
+  const [aiDisabled, setAiDisabled] = useState(false);
+  const [resourceError, setResourceError] = useState('');
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -90,14 +101,20 @@ export default function CampaignsPage() {
   useEffect(() => { loadCampaigns(); }, [loadCampaigns]);
 
   const loadCampaignResources = useCallback(async () => {
-    const [productRes, leadRes, customerRes] = await Promise.all([
-      api.get('/company-data/products').catch(() => ({ data: [] })),
-      api.get('/leads', { params: { limit: 100 } }).catch(() => ({ data: [] })),
-      api.get('/customers').catch(() => ({ data: [] })),
+    setResourceError('');
+    const [productRes, leadRes, customerRes] = await Promise.allSettled([
+      api.get('/company-data/products', { params: { page_size: 500 } }),
+      api.get('/leads', { params: { limit: 100 } }),
+      api.get('/customers'),
     ]);
-    setProducts(Array.isArray(productRes.data) ? productRes.data : []);
-    setLeads(Array.isArray(leadRes.data) ? leadRes.data.filter((lead) => lead.email) : []);
-    setCustomers(Array.isArray(customerRes.data) ? customerRes.data.filter((customer) => customer.email) : []);
+    if (productRes.status === 'fulfilled') {
+      setProducts(getListPayload(productRes.value.data));
+    } else {
+      setProducts([]);
+      setResourceError('Products could not be loaded. Check product access and refresh data.');
+    }
+    setLeads(leadRes.status === 'fulfilled' ? getListPayload(leadRes.value.data).filter((lead) => lead.email) : []);
+    setCustomers(customerRes.status === 'fulfilled' ? getListPayload(customerRes.value.data).filter((customer) => customer.email) : []);
   }, []);
 
   useEffect(() => { loadCampaignResources(); }, [loadCampaignResources]);
@@ -134,6 +151,14 @@ export default function CampaignsPage() {
     setSelectedCustomerIds((prev) => (prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]));
   };
 
+  const toggleAllLeads = (checked) => {
+    setSelectedLeadIds(checked ? leads.slice(0, 80).map((lead) => lead.id).filter(Boolean) : []);
+  };
+
+  const toggleAllCustomers = (checked) => {
+    setSelectedCustomerIds(checked ? customers.slice(0, 80).map((customer) => customer.id).filter(Boolean) : []);
+  };
+
   const aiGenerationReady = Boolean(
     form.product_id
     && aiDetails.campaign_goal.trim()
@@ -143,6 +168,10 @@ export default function CampaignsPage() {
   );
 
   const generateCampaignCopy = async () => {
+    if (aiDisabled) {
+      setAiGenerationError('AI is turned off for this workspace because the API quota is exhausted. Handle this campaign manually.');
+      return;
+    }
     if (!aiGenerationReady) {
       showToast({
         type: 'error',
@@ -152,6 +181,7 @@ export default function CampaignsPage() {
       return;
     }
     setGeneratingCopy(true);
+    setAiGenerationError('');
     try {
       const res = await api.post('/campaigns/generate', {
         product_id: form.product_id,
@@ -169,13 +199,57 @@ export default function CampaignsPage() {
         message: `AI created draft copy for ${form.name || form.subject || 'this campaign'}.`,
       });
     } catch (err) {
+      const message = getErrorMessage(err, 'AI/API issue: campaign copy could not be generated. Please write or paste the response manually.');
+      if (err?.response?.data?.detail?.ai_enabled === false) setAiDisabled(true);
+      setAiGenerationError(message);
       showToast({
         type: 'error',
         title: 'Copy Failed',
-        message: getErrorMessage(err, 'We could not generate campaign copy.'),
+        message,
       });
     } finally {
       setGeneratingCopy(false);
+    }
+  };
+
+  const generateHtmlBody = async () => {
+    if (aiDisabled) {
+      setAiGenerationError('AI is turned off for this workspace because the API quota is exhausted. Handle this campaign manually.');
+      return;
+    }
+    const description = htmlAiPrompt.trim();
+    if (!description) {
+      setAiGenerationError('Describe what the AI should create for the HTML email body.');
+      return;
+    }
+    setGeneratingHtmlBody(true);
+    setAiGenerationError('');
+    try {
+      const res = await api.post('/campaigns/generate-html-body', {
+        product_id: form.product_id,
+        description,
+        current_body: form.body,
+      });
+      setForm((prev) => ({
+        ...prev,
+        html_body: res.data?.html_body || prev.html_body,
+      }));
+      showToast({
+        type: 'success',
+        title: 'HTML Body Ready',
+        message: 'AI inserted the generated HTML body.',
+      });
+    } catch (err) {
+      const message = getErrorMessage(err, 'AI/API issue: HTML email body could not be generated. Please write or paste the response manually.');
+      if (err?.response?.data?.detail?.ai_enabled === false) setAiDisabled(true);
+      setAiGenerationError(message);
+      showToast({
+        type: 'error',
+        title: 'AI Unavailable',
+        message,
+      });
+    } finally {
+      setGeneratingHtmlBody(false);
     }
   };
 
@@ -206,6 +280,9 @@ export default function CampaignsPage() {
       setSelectedLeadIds([]);
       setSelectedCustomerIds([]);
       setAiDetails(EMPTY_AI_DETAILS);
+      setHtmlAiPrompt('');
+      setAiDisabled(false);
+      setAiGenerationError('');
       setPreview(null);
       const recipientCount = preview?.count ?? 0;
       const campaignName = form.name || form.subject || 'Campaign';
@@ -457,6 +534,16 @@ export default function CampaignsPage() {
                       </option>
                     ))}
                   </select>
+                  {!resourceError && products.length === 0 ? (
+                    <p className="mt-1 text-[11px] font-medium text-slate-500">
+                      No products are available in the existing product table for this workspace.
+                    </p>
+                  ) : null}
+                  {resourceError ? (
+                    <p className="mt-1 flex items-center gap-1 text-[11px] font-medium text-red-600">
+                      <AlertCircle size={12} /> {resourceError}
+                    </p>
+                  ) : null}
                 </Field>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -525,13 +612,18 @@ export default function CampaignsPage() {
                   <button
                     type="button"
                     onClick={generateCampaignCopy}
-                    disabled={!aiGenerationReady || generatingCopy}
+                    disabled={aiDisabled || !aiGenerationReady || generatingCopy}
                     className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-sky-600 text-white text-xs font-medium hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     data-testid="campaign-generate-ai"
                   >
                     <Wand2 size={13} /> {generatingCopy ? 'Generating...' : 'Generate with AI'}
                   </button>
                 </div>
+                {aiGenerationError ? (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700">
+                    {aiGenerationError}
+                  </div>
+                ) : null}
               </div>
 
               <Field label="Plain-text body *">
@@ -548,15 +640,43 @@ export default function CampaignsPage() {
 
               <details className="rounded-lg border border-slate-200 bg-slate-50/60">
                 <summary className="px-3 py-2 text-xs font-medium text-slate-600 cursor-pointer">
-                  HTML body (optional)
+                  HTML body
                 </summary>
-                <div className="px-3 pb-3">
+                <div className="space-y-3 px-3 pb-3">
+                  <div className="rounded-lg border border-slate-200 bg-white p-3">
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-xs font-semibold text-slate-700">Generate HTML with AI</p>
+                      <button
+                        type="button"
+                        onClick={generateHtmlBody}
+                        disabled={aiDisabled || generatingHtmlBody || !htmlAiPrompt.trim()}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        data-testid="campaign-generate-html-ai"
+                      >
+                        <Wand2 size={13} /> {generatingHtmlBody ? 'Generating...' : 'Generate with AI'}
+                      </button>
+                    </div>
+                    <textarea
+                      value={htmlAiPrompt}
+                      onChange={(e) => setHtmlAiPrompt(e.target.value)}
+                      placeholder="Describe the HTML email body, layout, offer, and CTA..."
+                      rows={3}
+                      className="w-full resize-y rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm"
+                      data-testid="campaign-html-ai-prompt"
+                    />
+                    {aiGenerationError ? (
+                      <p className="mt-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs font-medium text-red-700">
+                        {aiGenerationError}
+                      </p>
+                    ) : null}
+                  </div>
                   <textarea
                     value={form.html_body}
                     onChange={(e) => setForm({ ...form, html_body: e.target.value })}
                     placeholder="<p>Rich HTML content…</p>"
-                    rows={4}
+                    rows={7}
                     className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono resize-y"
+                    data-testid="campaign-html-body"
                   />
                 </div>
               </details>
@@ -621,6 +741,7 @@ export default function CampaignsPage() {
                     items={leads}
                     selectedIds={selectedLeadIds}
                     onToggle={toggleLead}
+                    onToggleAll={toggleAllLeads}
                     emptyText="No email-ready leads found."
                     testIdPrefix="lead-recipient"
                   />
@@ -630,6 +751,7 @@ export default function CampaignsPage() {
                     items={customers}
                     selectedIds={selectedCustomerIds}
                     onToggle={toggleCustomer}
+                    onToggleAll={toggleAllCustomers}
                     emptyText="No email-ready customers found."
                     testIdPrefix="customer-recipient"
                   />
@@ -706,7 +828,13 @@ function Field({ label, children }) {
   );
 }
 
-function RecipientPicker({ title, icon, items, selectedIds, onToggle, emptyText, testIdPrefix }) {
+function RecipientPicker({ title, icon, items, selectedIds, onToggle, onToggleAll, emptyText, testIdPrefix }) {
+  const visibleItems = items.slice(0, 80);
+  const visibleIds = visibleItems.map((item) => item.id).filter(Boolean);
+  const selectedVisibleCount = visibleIds.filter((id) => selectedIds.includes(id)).length;
+  const allSelected = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
+  const partiallySelected = selectedVisibleCount > 0 && !allSelected;
+
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-3">
       <div className="flex items-center justify-between mb-2">
@@ -719,7 +847,20 @@ function RecipientPicker({ title, icon, items, selectedIds, onToggle, emptyText,
         <p className="text-xs text-slate-400 py-2">{emptyText}</p>
       ) : (
         <div className="max-h-40 overflow-y-auto space-y-1 pr-1">
-          {items.slice(0, 80).map((item) => {
+          <label className="flex items-center gap-2 rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              ref={(input) => {
+                if (input) input.indeterminate = partiallySelected;
+              }}
+              onChange={(e) => onToggleAll?.(e.target.checked)}
+              className="mt-0.5"
+              data-testid={`${testIdPrefix}-select-all`}
+            />
+            Select all visible
+          </label>
+          {visibleItems.map((item) => {
             const selected = selectedIds.includes(item.id);
             return (
               <label

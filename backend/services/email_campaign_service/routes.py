@@ -25,8 +25,11 @@ from services.db_helpers import (
     rs,
 )
 from services.email_campaign_service.service import (
+    CampaignAIQuotaExceededError,
+    CampaignAIUnavailableError,
     create_campaign,
     generate_campaign_copy,
+    generate_html_email_body,
     resolve_recipients,
     schedule_campaign_send,
 )
@@ -37,6 +40,27 @@ router = APIRouter()
 
 def _db(request: Request):
     return request.app.state.db
+
+
+async def _disable_company_ai(db, company_id: str, reason: str) -> None:
+    if not company_id:
+        return
+    try:
+        await db.execute(
+            "UPDATE company_settings SET ai_enabled=FALSE,updated_at=NOW() WHERE company_id=$1",
+            company_id,
+        )
+        logger.warning("Company AI disabled after campaign AI failure company_id=%s reason=%s", company_id, reason)
+    except Exception as exc:  # pragma: no cover - defensive logging path
+        logger.exception("Failed to disable company AI after campaign AI failure company_id=%s error=%s", company_id, exc)
+
+
+def _manual_ai_response(message: str, *, ai_enabled: bool) -> dict:
+    return {
+        "message": message,
+        "ai_enabled": ai_enabled,
+        "manual_required": True,
+    }
 
 
 @router.get("/campaigns")
@@ -146,9 +170,61 @@ async def generate_campaign_route(request: Request):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CampaignAIQuotaExceededError as exc:
+        await _disable_company_ai(db, cid, str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=_manual_ai_response(str(exc), ai_enabled=False),
+        ) from exc
+    except CampaignAIUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=_manual_ai_response(str(exc), ai_enabled=True)) from exc
     except Exception as exc:
         logger.exception("Campaign copy generation failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to generate campaign copy")
+        raise HTTPException(
+            status_code=503,
+            detail=_manual_ai_response(
+                "AI/API issue: campaign copy could not be generated. Please write or paste the response manually.",
+                ai_enabled=True,
+            ),
+        ) from exc
+
+
+@router.post("/campaigns/generate-html-body")
+async def generate_campaign_html_body_route(request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    payload = await request.json()
+    try:
+        return await generate_html_email_body(
+            db,
+            company_id=cid,
+            product_id=str(payload.get("product_id") or "").strip(),
+            description=str(payload.get("description") or "").strip(),
+            current_body=str(payload.get("current_body") or "").strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CampaignAIQuotaExceededError as exc:
+        await _disable_company_ai(db, cid, str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=_manual_ai_response(str(exc), ai_enabled=False),
+        ) from exc
+    except CampaignAIUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=_manual_ai_response(str(exc), ai_enabled=True)) from exc
+    except Exception as exc:
+        logger.exception("HTML email body generation failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=_manual_ai_response(
+                "AI/API issue: HTML email body could not be generated. Please write or paste the response manually.",
+                ai_enabled=True,
+            ),
+        ) from exc
 
 
 @router.get("/campaigns/{campaign_id}")

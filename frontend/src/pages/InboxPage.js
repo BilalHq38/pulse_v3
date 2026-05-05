@@ -169,9 +169,28 @@ function normalizeMessage(message) {
   if (!message || typeof message !== 'object') return message;
   return {
     ...message,
+    content: normalizeMessageText(message.content),
+    sender_name: normalizeMessageText(message.sender_name) || 'Unknown sender',
     attachments: normalizeAttachments(message.attachments),
     reactions: normalizeReactions(message.reactions),
   };
+}
+
+function normalizeMessageText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'object') {
+    if (typeof value.content === 'string') return value.content;
+    if (typeof value.text === 'string') return value.text;
+  }
+  return '';
+}
+
+function formatMessageTimestamp(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function extractMessagesPayload(payload) {
@@ -774,7 +793,7 @@ export default function InboxPage() {
 
   const startEditMessage = (msg) => {
     setEditingMessageId(msg.id);
-    setEditingMessageContent(msg.content || '');
+    setEditingMessageContent(normalizeMessageText(msg.content));
   };
 
   const cancelEditMessage = () => {
@@ -1532,9 +1551,11 @@ export default function InboxPage() {
                 const imageAttachments = Array.isArray(msg.attachments) ? msg.attachments.filter((attachment) => attachment.type === 'image') : [];
                 const videoAttachments = Array.isArray(msg.attachments) ? msg.attachments.filter((attachment) => attachment.type === 'video') : [];
                 const reactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+                const messageTime = formatMessageTimestamp(msg.created_at);
+                const messageContent = normalizeMessageText(msg.content);
 
                 if (isSystem) {
-                  const isEscalationAlert = isEscalationSystemMessage(msg.content) || msg.is_alert;
+                  const isEscalationAlert = isEscalationSystemMessage(messageContent) || msg.is_alert;
                   return (
                     <div key={msg.id} className="flex justify-center animate-fadeIn" data-testid={`msg-${msg.id}`}>
                       <div className={`px-3 sm:px-4 py-2 rounded-full border max-w-[90%] sm:max-w-[80%] ${
@@ -1542,7 +1563,7 @@ export default function InboxPage() {
                       }`}>
                         <p className={`text-[10px] sm:text-[11px] text-center font-medium ${
                           isEscalationAlert ? 'text-red-700 uppercase tracking-wide' : 'text-slate-500'
-                        }`}>{msg.content}</p>
+                        }`}>{messageContent}</p>
                       </div>
                     </div>
                   );
@@ -1550,10 +1571,10 @@ export default function InboxPage() {
 
                 return (
                   <div key={msg.id} className={`flex ${isCustomer ? 'justify-start' : 'justify-end'} animate-fadeIn`} data-testid={`msg-${msg.id}`}>
-                    <div className="max-w-[85%] sm:max-w-[65%]">
+                    <div className={editingMessageId === msg.id ? 'w-full max-w-[92%] sm:max-w-[760px]' : 'max-w-[85%] sm:max-w-[65%]'}>
                       <div className={`flex items-center gap-1.5 mb-1 ${isCustomer ? '' : 'justify-end'}`}>
                         <span className="text-[10px] text-slate-400 font-medium">{msg.sender_name}</span>
-                        <span className="text-[10px] text-slate-300">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        {messageTime && <span className="text-[10px] text-slate-300">{messageTime}</span>}
                         {msg.edited_at && <span className="text-[10px] text-slate-300 italic">(edited)</span>}
                         {isAI && <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-50 text-purple-500 font-medium">AI {msg.ai_confidence ? `${Math.round(msg.ai_confidence * 100)}%` : ''}</span>}
                         {!isCustomer && !isAI && getDeliveryStatusMeta(msg.delivery_status) && (
@@ -1612,12 +1633,12 @@ export default function InboxPage() {
                         )}
                         <div className="px-3 sm:px-4 py-2.5 sm:py-3">
                           {editingMessageId === msg.id ? (
-                            <div className="space-y-2">
+                            <div className="w-full min-w-[min(72vw,420px)] space-y-2">
                               <textarea
                                 value={editingMessageContent}
                                 onChange={(e) => setEditingMessageContent(e.target.value)}
-                                rows={2}
-                                className="w-full px-2.5 py-2 text-sm rounded-lg border border-slate-300 text-slate-700 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+                                rows={4}
+                                className="w-full min-h-[112px] px-3 py-2.5 text-sm leading-relaxed rounded-lg border border-slate-300 text-slate-700 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y"
                               />
                               <div className="flex items-center justify-end gap-1.5">
                                 <button
@@ -1640,7 +1661,7 @@ export default function InboxPage() {
                           ) : (
                             <>
                               {isAI && <Sparkles size={12} className="inline-block text-purple-400 mr-1" />}
-                              {msg.content}
+                              {messageContent}
                             </>
                           )}
                         </div>

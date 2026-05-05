@@ -966,13 +966,14 @@ async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
                     update_fields["customer_company_name"] = company_name
                 if _row_has_any(row, "notes", "note", "comments"):
                     update_fields["notes"] = notes_value
-            if status_input:
-                try:
-                    status_input = normalize_lead_stage(status_input)
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc)) from exc
-                update_fields["status"] = status_input
-                update_fields["status_id"] = await resolve_company_reference_id(
+
+                if status_input:
+                    try:
+                        status_input = normalize_lead_stage(status_input)
+                    except ValueError as exc:
+                        raise HTTPException(400, str(exc)) from exc
+                    update_fields["status"] = status_input
+                    update_fields["status_id"] = await resolve_company_reference_id(
                         db,
                         cid,
                         "lead_statuses",

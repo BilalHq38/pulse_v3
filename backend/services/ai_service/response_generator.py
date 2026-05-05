@@ -1560,6 +1560,89 @@ def _lead_payload_shape(lead_data: dict) -> dict:
     }
 
 
+def sanitize_customer_facing_next_action(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    blocked_tokens = (
+        "internal",
+        "crm",
+        "assign",
+        "assignment",
+        "status",
+        "stage",
+        "pipeline",
+        "score",
+        "grading",
+        "metadata",
+        "source_id",
+        "status_id",
+        "agent",
+        "team",
+        "handoff",
+        "escalate",
+        "queue",
+        "log",
+        "review",
+        "triage",
+    )
+    if any(token in lowered for token in blocked_tokens):
+        return ""
+    if len(text) > 180:
+        trimmed = text[:177].rsplit(" ", 1)[0].strip()
+        return f"{trimmed}..." if trimmed else ""
+    return text
+
+
+def build_safe_lead_ai_context(lead_data: dict, *, include_next_action: bool = True) -> dict:
+    lead = lead_data if isinstance(lead_data, dict) else {}
+    payload: dict[str, object] = {}
+
+    name = str(lead.get("name") or "").strip()
+    if name:
+        payload["name"] = name
+
+    source = str(lead.get("source") or "").strip()
+    if source:
+        payload["source"] = source
+
+    status = str(lead.get("status") or lead.get("phase") or "").strip()
+    if status:
+        payload["status"] = status
+
+    phase = str(lead.get("phase") or "").strip()
+    if phase:
+        payload["phase"] = phase
+
+    score = lead.get("score")
+    if score not in (None, ""):
+        payload["score"] = score
+
+    scoring_reason = str(lead.get("scoring_reason") or "").strip()
+    if scoring_reason:
+        payload["scoring_reason"] = scoring_reason
+
+    notes = str(lead.get("notes") or "").strip()
+    if notes:
+        payload["notes"] = notes
+
+    company_name = str(lead.get("customer_company_name") or lead.get("company") or "").strip()
+    if company_name:
+        payload["customer_company_name"] = company_name
+
+    last_message = str(lead.get("message_text") or lead.get("raw_message") or "").strip()
+    if last_message:
+        payload["last_message"] = last_message
+
+    if include_next_action:
+        next_action = sanitize_customer_facing_next_action(str(lead.get("next_action") or ""))
+        if next_action:
+            payload["next_action"] = next_action
+
+    return payload
+
+
 def _lead_score_unavailable(
     lead_data: dict,
     *,
@@ -1584,6 +1667,7 @@ def _lead_score_unavailable(
 
 
 async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") -> dict:
+    safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=False)
     prompt = (
         "You are a lead-qualification analyst for a CRM.\n"
         "Task: score the sales readiness of one lead record using only the provided evidence.\n"
@@ -1596,7 +1680,7 @@ async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") ->
         "- reasoning must be concise and evidence-based.\n"
         "- next_action must be a concrete CRM follow-up, not a generic suggestion.\n"
         "- Do not invent missing facts or metrics.\n"
-        f"\nlead:\n{json.dumps(_json_safe(lead_data), ensure_ascii=True)}"
+        f"\nlead:\n{json.dumps(_json_safe(safe_lead), ensure_ascii=True)}"
     )
     engine: dict = {}
     try:
@@ -1625,10 +1709,10 @@ async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") ->
             error_type,
             error_reason,
             exc.__class__.__name__,
-            _lead_payload_shape(lead_data),
+            _lead_payload_shape(safe_lead),
         )
         return _lead_score_unavailable(
-            lead_data,
+            safe_lead,
             engine=engine,
             error_type=error_type,
             error_reason=error_reason,
@@ -1642,6 +1726,7 @@ async def generate_nurture_message(
     db=None,
     company_id: str = "",
 ) -> dict:
+    safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=True)
     prompt = (
         "You are a B2B sales nurture copywriter for CRM outreach.\n"
         f"Task: write one personalized follow-up message for the lead stage '{stage}'.\n"
@@ -1655,7 +1740,7 @@ async def generate_nurture_message(
         "- End with a soft CTA that suggests the next reply or meeting.\n"
         "- Sound natural and specific, not templated.\n"
         f"\ncompany_context:\n{truncate_text_for_tokens(company_context, 1200)}\n"
-        f"\nlead:\n{json.dumps(_json_safe(lead_data), ensure_ascii=True)}"
+        f"\nlead:\n{json.dumps(_json_safe(safe_lead), ensure_ascii=True)}"
     )
     engine: dict = {}
     try:
@@ -1685,7 +1770,7 @@ async def generate_nurture_message(
             error_type,
             error_reason,
             exc.__class__.__name__,
-            _lead_payload_shape(lead_data),
+            _lead_payload_shape(safe_lead),
         )
         return {
             "message": "",

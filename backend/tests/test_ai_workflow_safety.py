@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from shared.schemas.contracts import CombinedResponse
@@ -147,6 +149,120 @@ def test_adaptive_short_circuit_blocks_support_and_product_questions(text):
 
     assert used is False
     assert blocked
+
+
+@pytest.mark.asyncio
+async def test_lead_score_prompt_uses_safe_lead_context(monkeypatch):
+    captured = {}
+
+    async def fake_engine(**_kwargs):
+        return {"provider": "test", "model_name": "test"}
+
+    async def fake_call_model_json(prompt, *_args, **_kwargs):
+        captured["prompt"] = prompt
+        return {
+            "score": 55,
+            "grade": "warm",
+            "reasoning": "evidence",
+            "next_action": "Follow up",
+            "phase": "awareness",
+        }
+
+    monkeypatch.setattr(response_generator, "_resolve_engine_cached", fake_engine)
+    monkeypatch.setattr(response_generator, "call_model_json", fake_call_model_json)
+
+    lead = {
+        "id": "lead-1",
+        "company_id": "company-1",
+        "name": "Avery",
+        "email": "avery@example.com",
+        "phone": "+123",
+        "father_name": "Should not pass",
+        "address": "123 Main",
+        "city": "Town",
+        "state": "CA",
+        "country": "US",
+        "source": "web_chat",
+        "source_id": "src-1",
+        "status": "new",
+        "status_id": "stat-1",
+        "assigned_to": "user-1",
+        "assigned_name": "Agent",
+        "metadata": {"secret": "value"},
+        "notes": "Interested in pricing",
+        "scoring_reason": "Asked about features",
+        "score": 60,
+        "phase": "awareness",
+        "next_action": "Assign to agent and update CRM",
+        "customer_company_name": "Northstar",
+        "raw_message": "Last message",
+    }
+
+    await response_generator.generate_lead_score(lead, db=None, company_id="company-1")
+
+    payload = json.loads(captured["prompt"].split("\nlead:\n", 1)[1])
+    assert payload["name"] == "Avery"
+    assert payload["source"] == "web_chat"
+    assert payload.get("customer_company_name") == "Northstar"
+    assert "next_action" not in payload
+    for key in (
+        "father_name",
+        "address",
+        "city",
+        "state",
+        "country",
+        "source_id",
+        "status_id",
+        "assigned_to",
+        "assigned_name",
+        "metadata",
+        "id",
+        "company_id",
+    ):
+        assert key not in payload
+
+
+@pytest.mark.asyncio
+async def test_nurture_prompt_uses_safe_lead_context(monkeypatch):
+    captured = {}
+
+    async def fake_engine(**_kwargs):
+        return {"provider": "test", "model_name": "test"}
+
+    async def fake_call_model_text(prompt, *_args, **_kwargs):
+        captured["prompt"] = prompt
+        return "Hello from nurture"
+
+    monkeypatch.setattr(response_generator, "_resolve_engine_cached", fake_engine)
+    monkeypatch.setattr(response_generator, "call_model_text", fake_call_model_text)
+
+    lead = {
+        "name": "Avery",
+        "source": "web_chat",
+        "status": "new",
+        "score": 72,
+        "notes": "Asked for onboarding details",
+        "customer_company_name": "Northstar",
+        "next_action": "Schedule a quick call",
+        "assigned_to": "user-1",
+        "status_id": "stat-1",
+        "metadata": {"secret": "value"},
+    }
+
+    await response_generator.generate_nurture_message(
+        lead,
+        "new",
+        company_context="We help with CRM setup.",
+        db=None,
+        company_id="company-1",
+    )
+
+    payload = json.loads(captured["prompt"].split("\nlead:\n", 1)[1])
+    assert payload["name"] == "Avery"
+    assert payload["customer_company_name"] == "Northstar"
+    assert payload["next_action"] == "Schedule a quick call"
+    for key in ("assigned_to", "status_id", "metadata", "id", "company_id"):
+        assert key not in payload
 
 
 def test_embedding_cache_hits_do_not_need_budget_reservation():

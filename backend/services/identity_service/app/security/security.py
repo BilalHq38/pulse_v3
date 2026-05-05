@@ -244,7 +244,20 @@ def _is_admin_role(raw_role: str | None) -> bool:
 async def require_internal_admin(
     authorization: str | None = Header(default=None, alias="Authorization"),
     x_internal_service_secret: str | None = Header(default=None, alias="X-Internal-Service-Secret"),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+    x_user_role: str | None = Header(default=None, alias="X-User-Role"),
 ) -> dict[str, str]:
+    expected = (os.environ.get("INTERNAL_SERVICE_SECRET") or "").strip()
+    provided = (x_internal_service_secret or "").strip()
+    trusted_user_id = str(x_user_id or "").strip()
+    trusted_role = str(x_user_role or "").strip().lower()
+
+    if expected and provided == expected and trusted_user_id and _is_admin_role(trusted_role):
+        return {
+            "sub": trusted_user_id,
+            "role": trusted_role,
+        }
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
     if not JWT_SECRET:
@@ -259,8 +272,6 @@ async def require_internal_admin(
     if not _is_admin_role(payload.get("role")):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
 
-    expected = (os.environ.get("INTERNAL_SERVICE_SECRET") or "").strip()
-    provided = (x_internal_service_secret or "").strip()
     if expected and provided == expected:
         return {
             "sub": str(payload.get("sub") or "").strip(),

@@ -206,7 +206,13 @@ function getErrorMessage(error, fallback = "We couldn't finish that action.") {
     const joined = raw
       .map((item) => {
         if (typeof item === "string") return item.trim()
-        if (item && typeof item === "object") return String(item.msg || item.message || "").trim()
+        if (item && typeof item === "object") {
+          const message = String(item.msg || item.message || "").trim()
+          const loc = Array.isArray(item.loc)
+            ? item.loc.filter((part) => part !== "body").join(".")
+            : ""
+          return loc && message ? `${loc}: ${message}` : message
+        }
         return String(item || "").trim()
       })
       .filter(Boolean)

@@ -194,6 +194,7 @@ export default function SettingsPage() {
   };
   const [channels, setChannels] = useState([]);
   const [company, setCompany] = useState(null);
+  const [companyValidationErrors, setCompanyValidationErrors] = useState({});
   const [users, setUsers] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [showKeyMap, setShowKeyMap] = useState({});
@@ -856,11 +857,50 @@ export default function SettingsPage() {
     }
   };
 
+  const validateCompanyProfile = (draft = {}) => {
+    const checks = [
+      ['company_name', 'Company name is required.', ''],
+      ['industry', 'Industry is required.', ''],
+      ['timezone', 'Timezone is required.', 'UTC'],
+      ['language', 'Language is required.', 'en'],
+    ];
+    return checks.reduce((errors, [field, message, fallback]) => {
+      if (!String(draft?.[field] || fallback || '').trim()) errors[field] = message;
+      return errors;
+    }, {});
+  };
+
+  const updateCompanyField = (field, value) => {
+    setCompany((prev) => ({ ...(prev || {}), [field]: value }));
+    setCompanyValidationErrors((prev) => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  };
+
   const saveCompany = async () => {
+    const validationErrors = validateCompanyProfile(company);
+    if (Object.keys(validationErrors).length) {
+      setCompanyValidationErrors(validationErrors);
+      showToast({
+        type: 'error',
+        title: 'Company Profile Incomplete',
+        message: Object.values(validationErrors).join(' '),
+      });
+      return;
+    }
     setSaving('company');
     try {
-      const res = await api.put('/settings/company', company);
+      const payload = {
+        ...company,
+        timezone: company?.timezone || 'UTC',
+        language: company?.language || 'en',
+      };
+      const res = await api.put('/settings/company', payload);
       if (res?.data) setCompany(res.data);
+      setCompanyValidationErrors({});
       setSaving('company_done');
       showToast({
         type: 'success',
@@ -870,6 +910,21 @@ export default function SettingsPage() {
       setTimeout(() => setSaving(''), 2000);
     } catch (err) {
       console.error(err);
+      const detail = err?.response?.data?.detail;
+      if (detail && typeof detail === 'object' && Array.isArray(detail.fields)) {
+        const fieldMap = {
+          'Company name': 'company_name',
+          Industry: 'industry',
+          Timezone: 'timezone',
+          Language: 'language',
+        };
+        const nextErrors = {};
+        detail.fields.forEach((label) => {
+          const key = fieldMap[label] || String(label || '').toLowerCase().replace(/\s+/g, '_');
+          nextErrors[key] = `${label} is required.`;
+        });
+        setCompanyValidationErrors(nextErrors);
+      }
       showToast({
         type: 'error',
         title: 'Save Failed',
@@ -2116,13 +2171,29 @@ export default function SettingsPage() {
               {/* -- Brand Identity -- */}
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Briefcase size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Brand Identity</span></div>
-                <div><label className="text-xs text-slate-400 mb-1 block">Company Name <span className="text-red-400">*</span></label><input value={company.company_name || ''} onChange={(e) => setCompany({...company, company_name: e.target.value})} placeholder="Acme Corp" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div>
+                  <label className="text-xs text-slate-400 mb-1 block">Company Name <span className="text-red-400">*</span></label>
+                  <input
+                    value={company.company_name || ''}
+                    onChange={(e) => updateCompanyField('company_name', e.target.value)}
+                    placeholder="Acme Corp"
+                    aria-invalid={Boolean(companyValidationErrors.company_name)}
+                    className={`w-full px-3 py-2 bg-slate-50 border rounded-lg text-sm focus:outline-none focus:ring-2 ${companyValidationErrors.company_name ? 'border-red-300 focus:ring-red-100' : 'border-slate-200 focus:ring-blue-200'}`}
+                  />
+                  {companyValidationErrors.company_name && <p className="mt-1 text-xs text-red-600">{companyValidationErrors.company_name}</p>}
+                </div>
                 <div><label className="text-xs text-slate-400 mb-1 block">Tagline</label><input value={company.tagline || ''} onChange={(e) => setCompany({...company, tagline: e.target.value})} placeholder="A short catchy phrase that describes your brand" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
-                <div><label className="text-xs text-slate-400 mb-1 block">Industry</label>
-                  <select value={company.industry || ''} onChange={(e) => setCompany({...company, industry: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">
+                <div><label className="text-xs text-slate-400 mb-1 block">Industry <span className="text-red-400">*</span></label>
+                  <select
+                    value={company.industry || ''}
+                    onChange={(e) => updateCompanyField('industry', e.target.value)}
+                    aria-invalid={Boolean(companyValidationErrors.industry)}
+                    className={`w-full px-3 py-2 bg-slate-50 border rounded-lg text-sm focus:outline-none focus:ring-2 ${companyValidationErrors.industry ? 'border-red-300 focus:ring-red-100' : 'border-slate-200 focus:ring-blue-200'}`}
+                  >
                     <option value="">Select industry</option>
                     {['Technology', 'E-commerce', 'Finance & Banking', 'Healthcare', 'Education', 'Real Estate', 'Marketing & Advertising', 'Logistics', 'Hospitality', 'Retail', 'Manufacturing', 'Consulting', 'Other'].map(i => <option key={i} value={i}>{i}</option>)}
                   </select>
+                  {companyValidationErrors.industry && <p className="mt-1 text-xs text-red-600">{companyValidationErrors.industry}</p>}
                 </div>
                 <div>
                   <label className="text-xs text-slate-400 mb-1 block">Description</label>
@@ -2199,7 +2270,7 @@ export default function SettingsPage() {
               <div className="bg-white border border-slate-100 rounded-xl p-6 space-y-4">
                 <div className="flex items-center gap-2 mb-1"><Globe size={13} className="text-slate-400" /><span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Locale</span></div>
                 <div className="grid grid-cols-2 gap-4">
-                  <div><label className="text-xs text-slate-400 mb-1 block">Timezone</label><select value={company.timezone || 'UTC'} onChange={(e) => setCompany({...company, timezone: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">{[
+                  <div><label className="text-xs text-slate-400 mb-1 block">Timezone <span className="text-red-400">*</span></label><select value={company.timezone || 'UTC'} onChange={(e) => updateCompanyField('timezone', e.target.value)} aria-invalid={Boolean(companyValidationErrors.timezone)} className={`w-full px-3 py-2 bg-slate-50 border rounded-lg text-sm focus:outline-none focus:ring-2 ${companyValidationErrors.timezone ? 'border-red-300 focus:ring-red-100' : 'border-slate-200 focus:ring-blue-200'}`}>{[
                         { value: 'UTC', label: 'UTC / GMT (+00:00)' },
                         { value: 'Pacific/Honolulu', label: 'Hawaii (HST, -10:00)' },
                         { value: 'America/Anchorage', label: 'Alaska (AKST, -09:00)' },
@@ -2283,8 +2354,8 @@ export default function SettingsPage() {
                         { value: 'Australia/Melbourne', label: 'Melbourne (AEST, +10:00)' },
                         { value: 'Pacific/Auckland', label: 'Auckland (NZST, +12:00)' },
                         { value: 'Pacific/Fiji', label: 'Fiji (FJT, +12:00)' },
-                      ].map(tz => <option key={tz.value} value={tz.value}>{tz.label}</option>)}</select></div>
-                  <div><label className="text-xs text-slate-400 mb-1 block">Language</label><select value={company.language || 'en'} onChange={(e) => setCompany({...company, language: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200">{[['en','English'],['es','Spanish'],['fr','French'],['de','German'],['pt','Portuguese'],['ar','Arabic'],['ja','Japanese'],['ko','Korean'],['zh','Chinese']].map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></div>
+                      ].map(tz => <option key={tz.value} value={tz.value}>{tz.label}</option>)}</select>{companyValidationErrors.timezone && <p className="mt-1 text-xs text-red-600">{companyValidationErrors.timezone}</p>}</div>
+                  <div><label className="text-xs text-slate-400 mb-1 block">Language <span className="text-red-400">*</span></label><select value={company.language || 'en'} onChange={(e) => updateCompanyField('language', e.target.value)} aria-invalid={Boolean(companyValidationErrors.language)} className={`w-full px-3 py-2 bg-slate-50 border rounded-lg text-sm focus:outline-none focus:ring-2 ${companyValidationErrors.language ? 'border-red-300 focus:ring-red-100' : 'border-slate-200 focus:ring-blue-200'}`}>{[['en','English'],['es','Spanish'],['fr','French'],['de','German'],['pt','Portuguese'],['ar','Arabic'],['ja','Japanese'],['ko','Korean'],['zh','Chinese']].map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select>{companyValidationErrors.language && <p className="mt-1 text-xs text-red-600">{companyValidationErrors.language}</p>}</div>
                 </div>
               </div>
 

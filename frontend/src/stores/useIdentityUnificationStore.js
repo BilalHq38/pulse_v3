@@ -12,6 +12,9 @@ const getErrorMessage = (error, fallbackMessage) => {
     error?.response?.data?.error ||
     error?.message ||
     '';
+  if (isTenantConfigUnavailableError(error)) {
+    return 'Identity unification is not available for this workspace yet. Refresh after workspace setup is complete.';
+  }
   return String(detail || fallbackMessage || 'Request failed.');
 };
 
@@ -318,24 +321,6 @@ export const useIdentityUnificationStore = create((set, get) => ({
       return result;
     } catch (error) {
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
-      if (isTenantConfigUnavailableError(error)) {
-        try {
-          const publicResult = await identityUnificationApi.submitPublic(payload);
-          set({
-            lastOperation: {
-              type: 'public-unification',
-              requestPayload: payload,
-              response: publicResult,
-              timestamp: Date.now(),
-            },
-            errorMessage: '',
-          });
-          return publicResult;
-        } catch (publicError) {
-          set({ errorMessage: getErrorMessage(publicError, 'Public unification submission failed.') });
-          return null;
-        }
-      }
       set({ errorMessage: getErrorMessage(error, 'Identity resolve failed.') });
       return null;
     } finally {
@@ -378,24 +363,6 @@ export const useIdentityUnificationStore = create((set, get) => ({
       return result;
     } catch (error) {
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
-      if (isTenantConfigUnavailableError(error)) {
-        try {
-          const publicResult = await identityUnificationApi.submitPublic(payload);
-          set({
-            lastOperation: {
-              type: 'public-unification',
-              requestPayload: payload,
-              response: publicResult,
-              timestamp: Date.now(),
-            },
-            errorMessage: '',
-          });
-          return publicResult;
-        } catch (publicError) {
-          set({ errorMessage: getErrorMessage(publicError, 'Public unification submission failed.') });
-          return null;
-        }
-      }
       set({ errorMessage: getErrorMessage(error, 'Identity unification failed.') });
       return null;
     } finally {
