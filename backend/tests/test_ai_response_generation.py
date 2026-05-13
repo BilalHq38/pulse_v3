@@ -4,6 +4,45 @@ from services.ai_service import response_generator
 from services.ai_service.facade import _safe_ai_reply_default
 
 
+def _latest_from_prompt(prompt: str) -> str:
+    if "Latest customer message:\n" not in prompt:
+        return ""
+    return prompt.rsplit("Latest customer message:\n", 1)[1].split("\n\nRespond naturally", 1)[0].strip()
+
+
+def _fake_llm_response_from_prompt(prompt: str) -> str:
+    latest = _latest_from_prompt(prompt).lower()
+    if "Starter CRM" in prompt:
+        return "Starter CRM is available for 49 USD and includes WhatsApp inbox and lead tracking. Would you like setup details?"
+    if "Desk Lamp" in prompt:
+        return "Desk Lamp is 35 USD and includes adjustable brightness. I do not see an image for it, but I can still help with details."
+    if "Custom Plan" in prompt:
+        return "Custom Plan pricing is not listed. It includes tailored setup, and a specialist can confirm the final price."
+    if "Blue Sneakers" in prompt:
+        return "Blue Sneakers are available for 95 USD with blue leather and sizes 38-46. I can share the attached image for review."
+    if "Red Shoes" in prompt:
+        return "Red Shoes are available for 80 USD with red leather. I can share the attached image for review."
+    if "Solar Kit" in prompt and "shop.example.test" in prompt:
+        if "where can i order" in latest:
+            return "You can order the Solar Kit from https://shop.example.test. A team member can also help you choose the right setup."
+        return "Solar Kit is available for 120 USD. Tell me where you plan to use it and I can guide you on the best next step."
+    if "Solar Kit" in prompt:
+        return "Solar Kit is available for 120 USD and is a portable backup power option. I can share the attached image for review."
+    if "Pulse Solar" in prompt:
+        return "Pulse Solar provides Clean energy products and installation support. Which solution would you like to explore?"
+    if "Nexora Labs" in prompt:
+        if "services or products" in latest:
+            return "We can cover services, products, or both. Nexora Labs offers software development, cloud services, and AI automation."
+        return "Nexora Labs provides software development, cloud services, and AI automation. Which area would you like details about first?"
+    if "CRM implementation" in prompt:
+        return "Services include CRM implementation, support automation, and reporting dashboards. Which service should I explain first?"
+    if latest in {"hi", "hello"}:
+        return "Hi, thanks for reaching out. How can I help today?"
+    if "support" in latest:
+        return "I can help with support. Please share what happened and I will guide you through the next step."
+    return "Thanks for your message. I can help with services, products, pricing, or support."
+
+
 @pytest.fixture(autouse=True)
 def fast_ai_response_memory(monkeypatch):
     async def empty_dict(*_args, **_kwargs):
@@ -15,10 +54,18 @@ def fast_ai_response_memory(monkeypatch):
     async def noop(*_args, **_kwargs):
         return None
 
+    async def fake_engine(**_kwargs):
+        return {"provider": "test", "model_name": "test-model", "id": "llm-test"}
+
+    async def fake_generate_response_text(prompt, *_args, **_kwargs):
+        return _fake_llm_response_from_prompt(prompt)
+
     monkeypatch.setattr(response_generator, "get_last_ai_response_context", empty_dict)
     monkeypatch.setattr(response_generator, "get_conversation_state_memory", empty_dict)
     monkeypatch.setattr(response_generator, "get_last_shown_product_ids", empty_list)
     monkeypatch.setattr(response_generator, "_persist_response_memory", noop)
+    monkeypatch.setattr(response_generator, "_resolve_engine_cached", fake_engine)
+    monkeypatch.setattr(response_generator, "_generate_response_text", fake_generate_response_text)
 
 
 @pytest.mark.asyncio
@@ -48,7 +95,8 @@ async def test_generate_ai_response_provider_failure_returns_degraded_payload(mo
     assert result["error_type"] == "quota_exhausted"
     assert result["provider"] == "fallback"
     assert result["provider_error"]["provider"] == "gemini"
-    assert "CRM setup" in result["response"]
+    assert result["static_fallback_served"] is True
+    assert result["response"] == "Thanks for your message. A team member will respond shortly."
     assert "budget" not in result["response"].lower()
 
 
@@ -488,7 +536,7 @@ async def test_llm_internal_text_is_sanitized_before_return(monkeypatch):
     assert "Next action" not in result["response"]
     assert "focused on general question" not in result["response"].lower()
     assert "general_question" not in result["response"]
-    assert "services, products, pricing, or support" in result["response"]
+    assert result["response"] == "Thanks for your message, Home Sweet Home."
 
 
 @pytest.mark.asyncio
@@ -518,9 +566,10 @@ async def test_provider_failure_fallback_for_next_is_customer_facing(monkeypatch
     )
 
     assert result["degraded"] is True
+    assert result["static_fallback_served"] is True
     assert "Next action" not in result["response"]
     assert "focused on" not in result["response"].lower()
-    assert "software development" in result["response"] or "cloud services" in result["response"]
+    assert result["response"] == "Thanks for your message. A team member will respond shortly."
 
 
 @pytest.mark.asyncio

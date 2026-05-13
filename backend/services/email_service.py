@@ -29,6 +29,18 @@ _ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(_ROOT / ".env", override=False)
 
 
+def _email_send_timeout_seconds(default: float = 60.0) -> float:
+    try:
+        return max(10.0, float(os.environ.get("EMAIL_SEND_TIMEOUT_SECONDS", default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _email_http_timeout() -> httpx.Timeout:
+    read_timeout = _email_send_timeout_seconds()
+    return httpx.Timeout(read_timeout, connect=3.0, read=read_timeout, write=10.0, pool=5.0)
+
+
 # ── Logo helper ────────────────────────────────────────────────────────────────
 def get_platform_logo_data_uri() -> str:
     """
@@ -186,7 +198,7 @@ def send_email_via_smtp(to_email: str, subject: str, body: str, html_body: str =
         msg.add_alternative(html_body, subtype="html")
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=_email_send_timeout_seconds()) as server:
             server.ehlo()
             if use_tls:
                 server.starttls()
@@ -205,7 +217,6 @@ def send_email_via_brevo(to_email: str, subject: str, body: str, html_body: str 
     api_key = os.environ.get("BREVO_API_KEY", "").strip()
     sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip() or os.environ.get("SMTP_FROM", "").strip()
     sender_name = os.environ.get("BREVO_SENDER_NAME", "Pulse Engine").strip() or "Pulse Engine"
-    api_url = os.environ.get("BREVO_API_URL", "https://api.brevo.com/v3/smtp/email").strip()
 
     if not api_key:
         logger.error("Brevo email delivery is not configured: missing BREVO_API_KEY.")
@@ -214,34 +225,21 @@ def send_email_via_brevo(to_email: str, subject: str, body: str, html_body: str 
         logger.error("Brevo email delivery is not configured: missing sender email.")
         raise HTTPException(status_code=500, detail="Email delivery is not configured.")
 
-    payload = {
-        "sender": {"name": sender_name, "email": sender_email},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "textContent": body,
-    }
-    if html_body:
-        payload["htmlContent"] = html_body
-
-    headers = {
-        "accept": "application/json",
-        "api-key": api_key,
-        "content-type": "application/json",
-    }
     try:
-        resp = httpx.post(api_url, json=payload, headers=headers, timeout=20)
+        asyncio.run(
+            _send_brevo_async(
+                api_key=api_key,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                html_body=html_body,
+            )
+        )
     except httpx.HTTPError:
         logger.exception("Brevo email request failed for %s", to_email)
         raise HTTPException(status_code=500, detail="Email delivery failed.")
-    if resp.status_code >= 400:
-        logger.error(
-            "Brevo email send failed for %s with status %s: %s",
-            to_email,
-            resp.status_code,
-            (resp.text or "")[:300],
-        )
-        raise HTTPException(status_code=500, detail="Email delivery failed.")
-    logger.info("Brevo email sent to %s", to_email)
 
 
 def send_email(to_email: str, subject: str, body: str, html_body: str = "") -> None:
@@ -287,8 +285,90 @@ def send_email(to_email: str, subject: str, body: str, html_body: str = "") -> N
     )
 
 
-async def send_email_async(to_email: str, subject: str, body: str, html_body: str = "") -> None:
-    await asyncio.to_thread(send_email, to_email, subject, body, html_body)
+async def _send_brevo_async(
+    *,
+    api_key: str,
+    sender_email: str,
+    sender_name: str,
+    to_email: str,
+    subject: str,
+    body: str,
+    html_body: str = "",
+    label: str = "Brevo",
+) -> None:
+    api_url = os.environ.get("BREVO_API_URL", "https://api.brevo.com/v3/smtp/email").strip()
+    payload = {
+        "sender": {"name": sender_name or "Pulse Engine", "email": sender_email},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    if html_body:
+        payload["htmlContent"] = html_body
+    headers = {
+        "accept": "application/json",
+        "api-key": api_key,
+        "content-type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=_email_http_timeout()) as client:
+        resp = await client.post(api_url, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        logger.error(
+            "%s email send failed for %s with status %s: %s",
+            label,
+            to_email,
+            resp.status_code,
+            (resp.text or "")[:300],
+        )
+        raise HTTPException(status_code=500, detail="Email delivery failed.")
+    logger.info("%s email sent to %s", label, to_email)
+
+
+async def _run_email_with_retries(operation, *, label: str, raise_on_failure: bool = False) -> bool:
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            await operation()
+            return True
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 2:
+                logger.error("Email failed after 3 attempts label=%s error=%s", label, exc)
+                break
+            await asyncio.sleep(2**attempt)
+    if raise_on_failure and last_exc:
+        raise last_exc
+    return False
+
+
+async def send_email_async(
+    to_email: str,
+    subject: str,
+    body: str,
+    html_body: str = "",
+    *,
+    raise_on_failure: bool = False,
+) -> bool:
+    async def _send() -> None:
+        brevo_key = os.environ.get("BREVO_API_KEY", "").strip()
+        if brevo_key:
+            sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip() or os.environ.get("SMTP_FROM", "").strip()
+            sender_name = os.environ.get("BREVO_SENDER_NAME", "Pulse Engine").strip() or "Pulse Engine"
+            if not sender_email:
+                raise HTTPException(status_code=500, detail="Email delivery is not configured.")
+            await _send_brevo_async(
+                api_key=brevo_key,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                html_body=html_body,
+            )
+            return
+        await asyncio.to_thread(send_email, to_email, subject, body, html_body)
+
+    return await _run_email_with_retries(_send, label="platform", raise_on_failure=raise_on_failure)
 
 
 def _send_brevo_tenant(
@@ -301,34 +381,22 @@ def _send_brevo_tenant(
     body: str,
     html_body: str,
 ) -> None:
-    api_url = os.environ.get("BREVO_API_URL", "https://api.brevo.com/v3/smtp/email").strip()
-    payload = {
-        "sender": {"name": sender_name or "Business", "email": sender_email},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "textContent": body,
-    }
-    if html_body:
-        payload["htmlContent"] = html_body
-    headers = {
-        "accept": "application/json",
-        "api-key": api_key,
-        "content-type": "application/json",
-    }
     try:
-        resp = httpx.post(api_url, json=payload, headers=headers, timeout=20)
+        asyncio.run(
+            _send_brevo_async(
+                api_key=api_key,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                html_body=html_body,
+                label="Tenant Brevo",
+            )
+        )
     except httpx.HTTPError:
         logger.exception("Tenant Brevo request failed for %s", to_email)
         raise HTTPException(status_code=500, detail="Email delivery failed.") from None
-    if resp.status_code >= 400:
-        logger.error(
-            "Tenant Brevo send failed for %s status=%s body=%s",
-            to_email,
-            resp.status_code,
-            (resp.text or "")[:300],
-        )
-        raise HTTPException(status_code=500, detail="Email delivery failed.")
-    logger.info("Tenant Brevo email sent to %s", to_email)
 
 
 def _send_smtp_tenant(
@@ -352,7 +420,7 @@ def _send_smtp_tenant(
     if html_body:
         msg.add_alternative(html_body, subtype="html")
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=_email_send_timeout_seconds()) as server:
             server.ehlo()
             if use_tls:
                 server.starttls()
@@ -375,7 +443,7 @@ def _send_tenant_email_from_credentials(creds: dict, to_email: str, subject: str
         if not api_key or not sender_email:
             raise HTTPException(
                 status_code=400,
-                detail="Configure Brevo API key and sender email on the Email channel before sending.",
+                detail="Email channel is not configured.",
             )
         _send_brevo_tenant(
             api_key=api_key,
@@ -399,7 +467,7 @@ def _send_tenant_email_from_credentials(creds: dict, to_email: str, subject: str
     if not smtp_host or not smtp_from:
         raise HTTPException(
             status_code=400,
-            detail="Configure SMTP host and from address (mailbox email) on the Email channel before sending.",
+            detail="Email channel is not configured.",
         )
     _send_smtp_tenant(
         smtp_host=smtp_host,
@@ -423,7 +491,8 @@ async def send_tenant_email_async(
     subject: str,
     body: str,
     html_body: str = "",
-) -> None:
+    raise_on_failure: bool = True,
+) -> bool:
     """
     Send inbox/tenant email using channel_settings for company_id (Brevo or SMTP).
     """
@@ -437,9 +506,30 @@ async def send_tenant_email_async(
         company_id,
     )
     if not row:
-        raise HTTPException(status_code=400, detail="Email channel is not enabled for this workspace.")
+        raise HTTPException(status_code=400, detail="Email channel is not configured.")
     creds = dict(row)
     if creds.get("email_send_enabled") is False:
-        raise HTTPException(status_code=400, detail="Email sending is disabled for this channel.")
+        raise HTTPException(status_code=400, detail="Email channel is not configured.")
 
-    await asyncio.to_thread(_send_tenant_email_from_credentials, creds, to_email, subject, body, html_body)
+    async def _send() -> None:
+        prov = str(creds.get("email_provider") or "smtp_imap").strip().lower()
+        if prov == "brevo":
+            api_key = str(creds.get("api_key") or "").strip()
+            sender_email = str(creds.get("email_address") or creds.get("smtp_user") or "").strip()
+            sender_name = str(creds.get("display_name") or "").strip() or "Business"
+            if not api_key or not sender_email:
+                raise HTTPException(status_code=400, detail="Email channel is not configured.")
+            await _send_brevo_async(
+                api_key=api_key,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                html_body=html_body,
+                label="Tenant Brevo",
+            )
+            return
+        await asyncio.to_thread(_send_tenant_email_from_credentials, creds, to_email, subject, body, html_body)
+
+    return await _run_email_with_retries(_send, label="tenant", raise_on_failure=raise_on_failure)

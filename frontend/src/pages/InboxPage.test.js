@@ -36,3 +36,9 @@ test('Inbox handles realtime message reaction updates and renders reactions on b
   expect(source).toContain('normalizeReactions');
   expect(source).toContain("data-testid={`msg-${msg.id}-reactions`}");
 });
+
+test('Inbox renders AI paused warning state returned by backend', () => {
+  expect(source).toContain('selectedConvo.ai_auto_paused');
+  expect(source).toContain('data-testid="ai-paused-warning"');
+  expect(source).toContain('AI auto-response is paused because the AI provider is unavailable. Please respond manually.');
+});

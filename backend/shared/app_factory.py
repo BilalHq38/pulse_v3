@@ -110,12 +110,26 @@ def _register_security_handlers(app: FastAPI) -> None:
         logger.exception("service=%s unhandled_error path=%s", request.app.state.service_name, request.url.path)
         trace = current_trace_context()
         trace_id = trace.trace_id if trace else ""
+        if request.app.state.service_name == "ai-service":
+            return _apply_security_headers(
+                JSONResponse(
+                    status_code=500,
+                    content={"error": "AI service error", "fallback": True, "trace_id": trace_id},
+                )
+            )
         return _apply_security_headers(
             JSONResponse(
                 status_code=500,
                 content={"success": False, "error": "Internal Server Error", "data": None, "trace_id": trace_id},
             )
         )
+
+
+def _should_release_request_connection_for_provider_wait(service_name: str, path: str) -> bool:
+    return service_name == "email-campaign-service" and path in {
+        "/api/campaigns/generate",
+        "/api/campaigns/generate-html-body",
+    }
 
 
 def create_service_app(
@@ -167,6 +181,27 @@ def create_service_app(
                     "/metrics",
                     "/api/metrics",
                 } or request.url.path.startswith("/health/"):
+                    response = await call_next(request)
+                elif _should_release_request_connection_for_provider_wait(service_name, request.url.path):
+                    pool = await db._get_pool()
+                    async with pool.acquire() as conn:
+                        company_id = extract_company_id_from_request(request)
+                        auth_context = getattr(request.state, "auth_context", None)
+                        conn_token, company_token = await db.bind_request_connection(
+                            conn,
+                            company_id,
+                            auth_context=auth_context,
+                        )
+                        try:
+                            try:
+                                from shared.billing_guard import enforce_access_gates, enforce_billing
+
+                                await enforce_access_gates(request)
+                                await enforce_billing(request)
+                            except Exception as billing_exc:
+                                raise billing_exc
+                        finally:
+                            await db.unbind_request_connection(conn, conn_token, company_token)
                     response = await call_next(request)
                 else:
                     pool = await db._get_pool()
@@ -232,6 +267,7 @@ def create_service_app(
             require_secret("INTERNAL_SERVICE_SECRET", min_length=24)
         logger.info("Starting %s", service_name)
         await db.initialize()
+        app.state.db_pool = await db._get_pool()
         set_socket_db(db)
         for task in startup_tasks:
             await task(db)

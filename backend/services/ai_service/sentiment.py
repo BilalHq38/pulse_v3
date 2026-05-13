@@ -183,11 +183,6 @@ def _normalize_breakdown(values: Any, score: float) -> dict[str, float]:
     return merged
 
 
-def _preview_text(text: str, limit: int = 160) -> str:
-    compact = " ".join(str(text or "").split())
-    return compact[:limit]
-
-
 def _log_sentiment_payload(
     stage: str,
     *,
@@ -196,13 +191,13 @@ def _log_sentiment_payload(
     payload: dict[str, Any],
     engine: dict[str, Any] | None = None,
 ) -> None:
+    _ = source_text
     logger.debug(
-        "sentiment_%s scope=%s provider=%s model=%s text_preview=%r",
+        "sentiment_%s scope=%s provider=%s model=%s",
         stage,
         scope,
         str((engine or {}).get("provider") or payload.get("provider") or "").strip(),
         str((engine or {}).get("model_name") or payload.get("model_name") or "").strip(),
-        _preview_text(source_text),
     )
 
 

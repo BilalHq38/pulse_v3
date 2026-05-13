@@ -25,6 +25,8 @@ const GRADE_COLORS = { hot: 'bg-red-50 text-red-500 border-red-500/30', warm: 'b
 const STATUS_COLORS = { new: 'bg-blue-50 text-blue-600', contacted: 'bg-cyan-50 text-cyan-600', qualified: 'bg-emerald-50 text-emerald-600', proposal: 'bg-amber-50 text-amber-600', negotiation: 'bg-fuchsia-50 text-fuchsia-600', converted: 'bg-indigo-50 text-indigo-600', won: 'bg-green-500/10 text-green-600', lost: 'bg-red-50 text-red-500' };
 const LEAD_BULK_TEMPLATE_HEADERS = ['name', 'email', 'phone', 'company', 'source', 'status', 'notes', 'tags', 'channels'];
 const LEAD_BULK_TEMPLATE_SAMPLE = ['Avery Stone', 'avery@northstar.io', '+1 415 555 0188', 'Northstar Labs', 'whatsapp', 'new', 'Requested a pricing follow-up', 'hot_lead, interested', 'whatsapp, email'];
+const LEAD_SOURCE_OPTIONS = ['web_chat', 'whatsapp', 'email', 'instagram', 'facebook'];
+const LONG_REQUEST_TIMEOUT_MS = 120000;
 const LEAD_BULK_GUIDE_ROWS = [
   { column: 'name', help: 'Lead name. Use full name when possible.' },
   { column: 'email', help: 'Optional, but recommended for matching and follow-up.' },
@@ -427,6 +429,7 @@ export default function LeadsPage() {
       formData.append('file', file);
       const res = await api.post('/leads/bulk-upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: LONG_REQUEST_TIMEOUT_MS,
       });
       const result = res.data || {};
       await loadLeads();
@@ -496,8 +499,16 @@ export default function LeadsPage() {
     });
   };
 
-  const openLeadEmailComposer = (lead) => {
+  const openLeadEmailComposer = (lead, { warnOnly = false } = {}) => {
     if (!lead?.email) {
+      if (warnOnly) {
+        showToast({
+          type: 'warning',
+          title: 'Email Missing',
+          message: 'No email address found for this lead.',
+        });
+        return;
+      }
       askForContacts(lead, 'email');
       return;
     }
@@ -537,7 +548,7 @@ export default function LeadsPage() {
         to_email: lead.email,
         subject,
         body,
-      });
+      }, { timeout: LONG_REQUEST_TIMEOUT_MS });
       showToast({
         type: 'success',
         title: 'Email Sent',
@@ -621,8 +632,40 @@ export default function LeadsPage() {
     }
   };
 
-  const openMessagePicker = (lead) => {
+  const isEmailChannelConfigured = async () => {
+    try {
+      const res = await api.get('/settings/channels');
+      const channels = Array.isArray(res.data) ? res.data : [];
+      const email = channels.find((item) => String(item?.channel || '').toLowerCase() === 'email');
+      if (!email || email.enabled === false || email.email_send_enabled === false) return false;
+      const provider = String(email.email_provider || 'smtp_imap').toLowerCase();
+      if (provider === 'brevo') {
+        return Boolean(String(email.api_key || '').trim() && String(email.email_address || email.smtp_user || '').trim());
+      }
+      if (provider === 'oauth_google') {
+        return Boolean(email.enabled);
+      }
+      return Boolean(String(email.smtp_host || '').trim() && String(email.email_address || email.smtp_user || '').trim());
+    } catch {
+      return false;
+    }
+  };
+
+  const buildLeadMessageMethods = (lead) => {
     const methods = buildLeadMethods(lead);
+    if (!methods.some((method) => method.channel === 'email')) {
+      methods.push({
+        channel: 'email',
+        profileUrl: lead?.email || '',
+        source: 'lead_email',
+        isPrimaryContact: false,
+      });
+    }
+    return methods;
+  };
+
+  const openMessagePicker = (lead) => {
+    const methods = buildLeadMessageMethods(lead);
     if (methods.length === 0) {
       showToast({
         type: 'error',
@@ -640,11 +683,24 @@ export default function LeadsPage() {
     setContactPrompt({ open: true, mode, lead, method });
   };
 
-  const handlePickMethod = (method) => {
+  const handlePickMethod = async (method) => {
     if (!selectedLead) return;
     setShowMethodPicker(false);
     if (method.channel === 'email') {
-      openLeadEmailComposer(selectedLead);
+      if (!selectedLead.email) {
+        openLeadEmailComposer(selectedLead, { warnOnly: true });
+        return;
+      }
+      const configured = await isEmailChannelConfigured();
+      if (!configured) {
+        showToast({
+          type: 'warning',
+          title: 'Email Not Configured',
+          message: 'Email channel is not configured.',
+        });
+        return;
+      }
+      openLeadEmailComposer(selectedLead, { warnOnly: true });
       return;
     }
     if (!method.isPrimaryContact) {
@@ -872,8 +928,9 @@ export default function LeadsPage() {
     ? leadStatuses.map((item) => item.status_name)
     : ['new', 'contacted', 'qualified', 'proposal', 'negotiation', 'converted', 'won', 'lost'];
   const availableLeadSources = leadSources.length
-    ? leadSources.map((item) => item.source_name)
-    : ['web_chat', 'whatsapp', 'instagram', 'facebook', 'referral', 'organic'];
+    ? Array.from(new Set([...LEAD_SOURCE_OPTIONS, ...leadSources.map((item) => item.source_name)]))
+        .filter((source) => LEAD_SOURCE_OPTIONS.includes(source))
+    : LEAD_SOURCE_OPTIONS;
   const grouped = availableLeadStatuses.reduce((acc, status) => ({ ...acc, [status]: [] }), {});
   leads.forEach((lead) => {
     const statusKey = lead?.status || availableLeadStatuses[0] || 'new';
@@ -883,7 +940,7 @@ export default function LeadsPage() {
 
   return (
     <>
-    <div className="p-6 lg:p-8 space-y-6" data-testid="leads-page">
+    <div className="p-4 lg:p-6 space-y-4 overflow-x-hidden" data-testid="leads-page">
       {loadError && (
         <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">
           <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
@@ -898,15 +955,15 @@ export default function LeadsPage() {
           </button>
         </div>
       )}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Lead Pipeline</h1>
           <p className="text-slate-400 text-sm mt-1">{leads.length} leads total</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => setShowBulkUpload(true)}
-            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition-all hover:bg-slate-50"
+            className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition-all hover:bg-slate-50"
             data-testid="bulk-upload-leads-btn"
           >
             Bulk Upload
@@ -914,14 +971,14 @@ export default function LeadsPage() {
           <button
             onClick={nurtureAllLeads}
             disabled={nurturingAll}
-            className="flex items-center gap-2 px-4 py-2.5 bg-purple-50 border border-purple-200 text-purple-600 rounded-xl text-sm font-medium hover:bg-purple-100 transition-all disabled:opacity-50"
+            className="flex items-center gap-2 px-3 py-2 bg-purple-50 border border-purple-200 text-purple-600 rounded-lg text-sm font-medium hover:bg-purple-100 transition-all disabled:opacity-50"
             data-testid="auto-nurture-all-btn"
           >
             <Sparkles size={16} className={nurturingAll ? 'animate-spin' : ''} /> {nurturingAll ? 'Nurturing All...' : 'AI Auto-Nurture All'}
           </button>
           <button
             onClick={() => { setShowForm(true); setCreateLeadError(''); setForm({ name: '', email: '', phone: '', company: '', source: 'web_chat', notes: '' }); }}
-            className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl text-sm font-medium hover:from-blue-500 hover:to-blue-600 transition-all shadow-lg shadow-blue-600/15"
+            className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-all"
             data-testid="add-lead-btn"
           >
             <Plus size={16} /> Add Lead
@@ -929,7 +986,7 @@ export default function LeadsPage() {
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 max-w-md">
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
@@ -948,22 +1005,6 @@ export default function LeadsPage() {
             data-testid={`filter-grade-${g || 'all'}`}
           >
             {g || 'All'}
-          </button>
-        ))}
-        {[
-          { key: '', label: 'Any tag' },
-          { key: 'social_lead', label: 'Social lead' },
-          { key: 'interested', label: 'Interested' },
-          { key: 'hot_lead', label: 'Hot' },
-          { key: 'contact_shared', label: 'Contact shared' },
-        ].map((t) => (
-          <button
-            key={`tag-${t.key || 'all'}`}
-            onClick={() => setFilterTag(t.key)}
-            className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${filterTag === t.key ? 'bg-fuchsia-50 text-fuchsia-600 border border-fuchsia-200' : 'text-slate-400 hover:text-slate-600 border border-slate-200'}`}
-            data-testid={`filter-tag-${t.key || 'all'}`}
-          >
-            {t.label}
           </button>
         ))}
         {[
@@ -998,9 +1039,9 @@ export default function LeadsPage() {
         </div>
       )}
 
-      <div className="flex gap-4 overflow-x-auto pb-4" data-testid="lead-pipeline">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4" data-testid="lead-pipeline">
         {Object.entries(grouped).map(([status, items]) => (
-          <div key={status} className="w-72 flex-shrink-0">
+          <div key={status} className="min-w-0">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <span className={`text-xs px-2 py-0.5 rounded-md font-medium capitalize ${STATUS_COLORS[status] || 'bg-slate-100 text-slate-500'}`}>{status}</span>
@@ -1346,7 +1387,7 @@ export default function LeadsPage() {
                 <h3 className="text-lg font-bold text-slate-900">Choose Message Method</h3>
                 <button onClick={() => setShowMethodPicker(false)} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
               </div>
-              <p className="text-sm text-slate-500 mb-4">Email is available from the separate Email button.</p>
+              <p className="text-sm text-slate-500 mb-4">Choose the channel for this lead.</p>
               <div className="space-y-2">
                 {messageMethods.map((method, idx) => {
                   const meta = CHANNEL_META[method.channel] || CHANNEL_META.whatsapp;
@@ -1356,7 +1397,7 @@ export default function LeadsPage() {
                       key={`${method.channel}-${idx}`}
                       onClick={() => handlePickMethod(method)}
                       className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border border-slate-200 hover:border-blue-200 hover:bg-blue-50/40"
-                      data-testid={`lead-method-${method.channel}-${idx}`}
+                      data-testid={`lead-method-${method.channel}`}
                     >
                       <span className="inline-flex items-center gap-2 text-sm text-slate-700"><Icon size={14} /> {meta.label}</span>
                       <span className="text-xs text-slate-400">{method.isPrimaryContact ? `Person is on ${meta.label}` : 'Open'}</span>

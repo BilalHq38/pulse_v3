@@ -41,6 +41,7 @@ from services.ai_service.llm_client import (
     validate_live_engine,
 )
 from services.ai_service.llm_tracking import get_llm_context, has_llm_budget_remaining, set_llm_context
+from services.ai_service.model_catalog import DEFAULT_GEMINI_MODEL, is_supported_model
 from services.ai_service.memory_service import (
     get_conversation_state_memory,
     get_last_ai_response_context,
@@ -57,8 +58,14 @@ from services.ai_service.sentiment import (
     # generate_combined_ai_analysis. Import removed to prevent accidental use.
     analyze_sentiment,
 )
-from services.db_helpers import is_data_url_image, resolve_active_ai_agent
+from services.db_helpers import (
+    get_ai_static_fallback_message,
+    is_ai_api_exhaustion_payload,
+    is_data_url_image,
+    resolve_active_ai_agent,
+)
 from core.utils import is_valid_image_url
+from shared.database import create_detached_task
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +78,27 @@ logger = logging.getLogger(__name__)
 import functools
 
 _ENGINE_CACHE: dict[str, tuple[float, dict]] = {}
-_ENGINE_CACHE_TTL = 60.0  # seconds
+# Reduce the engine cache TTL so changes to the active engine propagate much sooner.
+_ENGINE_CACHE_TTL = 10.0  # seconds
+
+
+def clear_engine_cache(company_id: str = "", *, reason: str = "", use_pro: bool | None = None) -> None:
+    company_key = str(company_id or "").strip()
+    removed = 0
+    for cache_key in list(_ENGINE_CACHE.keys()):
+        cached_company, _, cached_use_pro = cache_key.partition(":")
+        if company_key and cached_company != company_key:
+            continue
+        if use_pro is not None and cached_use_pro.lower() != str(bool(use_pro)).lower():
+            continue
+        _ENGINE_CACHE.pop(cache_key, None)
+        removed += 1
+    logger.info(
+        "llm_engine_cache_invalidated company_id=%s reason=%s removed=%s",
+        company_key or "<all>",
+        reason or "manual",
+        removed,
+    )
 
 
 async def _resolve_engine_cached(db, company_id: str, use_pro: bool = False) -> dict:
@@ -163,6 +190,30 @@ AGENT_RUNTIME_PROFILES = {
 
 def _allow_rule_based_recovery() -> bool:
     return ai_enable_rule_based_recovery()
+
+
+def build_system_prompt(company_info: dict) -> str:
+    return f"""
+You are a helpful, friendly sales and support assistant for {company_info.get('name', 'this business')}.
+
+Your primary job is to have natural conversations, answer questions accurately using
+the business data provided, and guide interested customers toward a purchase or next step.
+
+Rules you must follow:
+1. Always respond to the customer's latest message first. Never ignore it.
+2. If the customer asks about products, services, pricing, or availability —
+   answer using the retrieved business data. Do not invent details.
+3. If the data is not available, say so honestly and offer to connect them with a specialist.
+4. After your main answer, you may ask ONE natural follow-up question if it helps
+   move the conversation forward. Never interrogate the customer.
+5. Never send a qualification question as your entire response unless the message
+   was completely empty or meaningless.
+6. Keep tone warm, professional, and persuasive without being pushy.
+7. If the customer shows buying intent, clearly explain next steps.
+8. Never repeat a question you already asked in this conversation.
+
+Business context will be provided to you. Use it.
+""".strip()
 
 
 def _sentiment_label(sentiment: dict | None) -> str:
@@ -362,7 +413,7 @@ def _build_generation_config(
         base_temperature += repetition_delta
     jitter = random.randint(0, jitter_steps) / 100.0
     temperature = max(min_temperature, min(max_temperature, base_temperature + jitter))
-    return {"temperature": round(temperature, 2)}
+    return {"temperature": round(temperature, 2), "max_output_tokens": 1024}
 
 
 def _agent_configuration(agent: dict | None) -> dict[str, str]:
@@ -793,6 +844,34 @@ def _cap_knowledge_context(knowledge_text: str, query: str = "", *, max_paragrap
     return "\n".join(item[2] for item in sorted(scored, reverse=True)[:max_paragraphs])
 
 
+def _format_products_for_prompt(products: list[dict]) -> str:
+    lines: list[str] = []
+    for product in list(products or [])[:5]:
+        if not isinstance(product, dict):
+            continue
+        name = str(product.get("name") or product.get("product_title") or "").strip()
+        if not name:
+            continue
+        parts = [f"Product: {name}"]
+        category = str(product.get("category") or "").strip()
+        price = str(product.get("price") or "").strip()
+        currency = str(product.get("price_currency") or "USD").strip() or "USD"
+        features = [str(item).strip() for item in (product.get("features") or []) if str(item).strip()]
+        description = str(product.get("description") or product.get("short_description") or "").strip()
+        if category:
+            parts.append(f"Category: {category}")
+        if price:
+            parts.append(f"Price: {price} {currency}")
+        elif "price" in product:
+            parts.append("Price: not listed")
+        if features:
+            parts.append(f"Features: {', '.join(features[:4])}")
+        if description:
+            parts.append(f"Description: {truncate_text_for_tokens(description, 80)}")
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
 def _prev_contrast_block(previous_response: str) -> str:
     previous = truncate_text_for_tokens(str(previous_response or "").strip(), 220)
     if not previous:
@@ -844,16 +923,16 @@ def build_pricing_response(query: str, *, ai_context: dict, intent_name: str = "
 def build_support_response(query: str, *, intent_name: str = "") -> str:
     lowered = str(query or "").lower()
     if any(term in lowered for term in ("delay", "delayed", "hasn't arrived", "not arrived", "late", "shipping")):
-        return "I understand the delivery has not arrived yet. Please share the order number or tracking reference so I can guide the next step."
+        return "I understand the delivery has not arrived yet. Share the order number or tracking reference so I can guide the next step."
     if any(term in lowered for term in ("damaged", "broken", "cracked")):
-        return "I understand the item arrived damaged. Please share the order number and a photo of the damage so this can be reviewed."
+        return "I understand the item arrived damaged. Share the order number and a photo of the damage so this can be reviewed."
     if any(term in lowered for term in ("wrong item", "incorrect", "different item")):
-        return "I understand you received the wrong item. Please share the order number and what arrived so the next step can be checked."
+        return "I understand you received the wrong item. Share the order number and what arrived so the next step can be checked."
     if "refund" in lowered:
-        return "I can help start a refund check. Please send the order or payment reference so eligibility can be reviewed."
+        return "I can help start a refund check. Send the order or payment reference so eligibility can be reviewed."
     if any(term in lowered for term in ("billing", "charged", "payment")):
-        return "I understand there is a billing issue. Please share the payment or invoice reference so the charge can be checked."
-    return "I can help with this support issue. Please share the order, product, or account detail so I can guide the next step."
+        return "I understand there is a billing issue. Share the payment or invoice reference so the charge can be checked."
+    return "I can help with this support issue. Share the order, product, or account detail so I can guide the next step."
 
 
 def build_greeting_response(
@@ -927,7 +1006,7 @@ def build_customer_facing_next_step(
     if intent_name in {"buying_intent", "order_intent", "website_link_request"}:
         return "Do you want to confirm the option before ordering?"
     if intent_name in {"shipping_question", "support_request", "complaint", "refund", "cancel_request"}:
-        return "Please share the order, product, or account detail so I can check the next step."
+        return "Share the order, product, or account detail so I can check the next step."
     return "Do you want details about services, products, pricing, or support?"
 
 
@@ -1064,8 +1143,8 @@ def build_follow_up_response(
         product_payload = build_product_response(query, ai_context=ai_context, image_request=_looks_like_image_request(query))
         return product_payload["response"]
     if topic in {"buying", "buying_intent", "order_intent", "website_link_request"}:
-        return "Sure. I can help you proceed with the next buying step. Which product or service should I help you confirm first?"
-    return "Sure. Do you want me to continue with services, products, pricing, or support?"
+        return "I can help you proceed with the next buying step. Which product or service should I help you confirm first?"
+    return "Do you want me to continue with services, products, pricing, or support?"
 
 
 def _has_internal_response_text(text: str) -> bool:
@@ -1162,28 +1241,7 @@ def _finalize_customer_response(
     result = dict(payload or {})
     response = str(result.get("response") or "").strip()
     cleaned = _clean_customer_response_text(response)
-    unsafe = _has_internal_response_text(response) or not cleaned
-    if unsafe:
-        cleaned = build_safe_unclear_response(
-            query,
-            intent_name=intent_name,
-            knowledge_context=knowledge_context,
-            ai_context=ai_context,
-            previous_response=previous_response,
-            conversation_state=conversation_state or {},
-        )
-    if previous_response and text_similarity(cleaned, previous_response) >= 0.78:
-        cleaned = build_safe_unclear_response(
-            query,
-            intent_name="follow_up_continue" if _is_short_follow_up(query) else intent_name,
-            knowledge_context=knowledge_context,
-            ai_context=ai_context,
-            previous_response=previous_response,
-            conversation_state=conversation_state or {},
-        )
-        if text_similarity(cleaned, previous_response) >= 0.78:
-            cleaned = f"{cleaned} I can narrow this down further if you choose services, products, or pricing."
-    result["response"] = _clean_customer_response_text(cleaned) or "I can still help. Are you looking for services, products, pricing, or support?"
+    result["response"] = cleaned
     next_step = build_customer_facing_next_step(intent_name, query, ai_context, conversation_state or {})
     result["next_step"] = next_step
     result["next_action"] = _customer_safe_next_action(conversation_state or {}, intent_name)
@@ -1194,15 +1252,15 @@ def _natural_guidance_response(intent_name: str, *, response_prefix: str = "") -
     if intent_name == "shipping_question":
         return f"{response_prefix}I can help with delivery or tracking. Share the order number or tracking reference and I will check the next step."
     if intent_name == "refund":
-        return f"{response_prefix}I can help start a refund check. Please send the order or payment reference so eligibility can be reviewed."
+        return f"{response_prefix}I can help start a refund check. Send the order or payment reference so eligibility can be reviewed."
     if intent_name == "cancel_request":
-        return f"{response_prefix}I can help with cancellation. Please share what you want to cancel and the related order, booking, or account detail."
+        return f"{response_prefix}I can help with cancellation. Share what you want to cancel and the related order, booking, or account detail."
     if intent_name == "complaint":
         return f"{response_prefix}I am sorry about that. Tell me what happened and the related order or product detail, and I will help move it toward a resolution."
     if intent_name == "support_request":
         return f"{response_prefix}I can help with that. Share the product, order, or account detail and what happened, and I will guide the next step."
     if intent_name == "human_handoff":
-        return f"{response_prefix}I can hand this to a human agent. Please share the key detail they should review first."
+        return f"{response_prefix}I can hand this to a human agent. Share the key detail they should review first."
     if intent_name == "rejection_or_opt_out":
         return f"{response_prefix}Understood. I will not continue with sales follow-up unless you ask for something else."
     return f"{response_prefix}I can help with that. Share one detail about what you need and I will guide the next step."
@@ -1514,14 +1572,44 @@ def calculate_churn_risk(customer_data: dict) -> dict:
 def _safe_ai_error_reason(exc: Exception) -> tuple[str, str]:
     text = str(exc or "").replace("\n", " ").strip()
     upper = text.upper()
+    lowered = text.lower()
+    if "PERMISSION_DENIED" in upper or "PERMISSION DENIED" in upper or "403" in upper:
+        return "permission_denied", "AI provider permission denied"
+    if "SUSPENDED" in upper and ("API" in upper or "KEY" in upper):
+        return "api_key_suspended", "AI provider API key is suspended"
     if "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper:
         return "quota_exhausted", "AI provider quota exhausted"
     if "429" in upper or "RATE LIMIT" in upper:
         return "rate_limited", "AI provider rate limit reached"
     if "API_KEY" in upper or "NOT CONFIGURED" in upper:
         return "provider_not_configured", text[:240] or "AI provider is not configured"
+    if "ALL PROVIDERS EXHAUSTED" in upper or "ALL AI PROVIDERS EXHAUSTED" in upper:
+        return "all_providers_exhausted", "No usable AI provider fallback is available"
+    if "SAFETY" in upper or "CONFIG FAILURE" in upper or "CONFIGURATION FAILURE" in upper:
+        return "safety_config_failure", "AI provider safety/configuration failure"
+    if "TIMEOUT" in upper or "TIMED OUT" in upper or "DEADLINE" in upper:
+        return "provider_timeout", "AI provider request timed out"
+    if (
+        "INVALID MODEL" in upper
+        or "MODEL NOT FOUND" in upper
+        or ("MODEL" in upper and "IS NOT FOUND" in upper)
+        or ("GENERATECONTENT" in upper and "NOT SUPPORTED" in upper)
+    ):
+        return "invalid_model", "Selected AI model is invalid"
+    if "UNSUPPORTED MODEL" in upper or "DOES NOT SUPPORT IMAGE" in upper or "DOES NOT SUPPORT AUDIO" in upper:
+        if "image" in lowered:
+            return "unsupported_model", "Selected model does not support image recognition."
+        if "audio" in lowered:
+            return "unsupported_model", "Selected model does not support audio recognition."
+        return "unsupported_model", "Selected AI model is unsupported"
     if "UNSUPPORTED PROVIDER" in upper:
         return "unsupported_provider", text[:240]
+    if "NO ACTIVE LLM ENGINE" in upper:
+        return "no_active_llm_engine", "No active LLM engine is configured"
+    if "NO USABLE PROVIDER" in upper or "NO PROVIDER FALLBACK" in upper:
+        return "no_usable_provider_fallback", "No usable AI provider fallback is available"
+    if any(marker in upper for marker in ("500", "502", "503", "504", "INTERNAL SERVER")):
+        return "provider_5xx", "AI provider is unavailable"
     return exc.__class__.__name__, text[:240] or exc.__class__.__name__
 
 
@@ -1545,6 +1633,7 @@ def _degraded_error_payload(exc: Exception, engine: dict | None) -> dict:
         "provider": provider or "fallback",
         "model_name": model_name or "rule-recovery",
         "fallback_used": True,
+        "fallback_reason": "invalid_model_no_fallback" if error_type == "invalid_model" else error_type,
     }
 
 
@@ -1666,7 +1755,12 @@ def _lead_score_unavailable(
     }
 
 
-async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") -> dict:
+async def generate_lead_score(
+    lead_data: dict,
+    db=None,
+    company_id: str = "",
+    count_against_budget: bool = True,
+) -> dict:
     safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=False)
     prompt = (
         "You are a lead-qualification analyst for a CRM.\n"
@@ -1693,6 +1787,7 @@ async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") ->
             call_purpose="lead_scoring",
             function_name="generate_lead_score",
             agent_name="qualification",
+            count_against_budget=count_against_budget,
         )
         result.setdefault("scoring_status", "completed")
         result.setdefault("provider", str(engine.get("provider") or ""))
@@ -1898,6 +1993,23 @@ def _apply_agent_engine_overrides(engine: dict, agent: dict | None) -> dict:
     return resolved
 
 
+def _coerce_supported_generation_engine(engine: dict, *, company_id: str = "") -> dict:
+    resolved = dict(engine or {})
+    provider = str(resolved.get("provider") or "").strip().lower()
+    model_name = str(resolved.get("model_name") or "").strip()
+    if provider == "gemini" and model_name and not is_supported_model("gemini", model_name):
+        clear_engine_cache(company_id, reason="invalid_model")
+        logger.warning(
+            "invalid_model_configured_for_generation company_id=%s provider=gemini configured_model=%s fallback_model=%s error_type=invalid_model",
+            company_id or "",
+            model_name,
+            DEFAULT_GEMINI_MODEL,
+        )
+        resolved["configured_model_name"] = model_name
+        resolved["model_name"] = DEFAULT_GEMINI_MODEL
+    return resolved
+
+
 async def _generate_response_text(
     prompt: str,
     *,
@@ -1906,6 +2018,7 @@ async def _generate_response_text(
     generation_config: dict | None = None,
     call_purpose: str = "support_response",
 ) -> str:
+    engine.update(_coerce_supported_generation_engine(engine, company_id=str(engine.get("company_id") or "")))
     validate_live_engine(engine, require_vision=bool(image_urls))
     return await call_model_text(
         prompt,
@@ -1939,6 +2052,12 @@ async def _persist_response_memory(
     if not (db and company_id and memory_entity_id and response):
         return
     try:
+        logger.debug(
+            "detached_task_db_acquire task=response_memory_persist company_id=%s conversation_id=%s message_id=%s",
+            company_id,
+            convo_id,
+            message_id,
+        )
         await remember_ai_response(
             db,
             company_id,
@@ -2153,28 +2272,22 @@ async def generate_ai_response(
     async def _fetch_memory_safe():
         if not (db and company_id and memory_entity_id):
             return {}, {}, []
-        results = await asyncio.gather(
-            get_last_ai_response_context(db, company_id, memory_entity_id, convo_id=conversation_id),
-            get_conversation_state_memory(db, company_id, memory_entity_id, convo_id=conversation_id),
-            get_last_shown_product_ids(db, company_id, memory_entity_id, convo_id=conversation_id),
-            return_exceptions=True,
-        )
-        last_resp = results[0] if isinstance(results[0], dict) else {}
-        prev_state = results[1] if isinstance(results[1], dict) else {}
-        shown_ids = results[2] if isinstance(results[2], list) else []
+        try:
+            last_resp = await get_last_ai_response_context(db, company_id, memory_entity_id, convo_id=conversation_id)
+        except Exception:
+            last_resp = {}
+        try:
+            prev_state = await get_conversation_state_memory(db, company_id, memory_entity_id, convo_id=conversation_id)
+        except Exception:
+            prev_state = {}
+        try:
+            shown_ids = await get_last_shown_product_ids(db, company_id, memory_entity_id, convo_id=conversation_id)
+        except Exception:
+            shown_ids = []
         return last_resp, prev_state, shown_ids
 
-    # Parallel: context builder + memory reads run simultaneously
-    _ctx_result, _mem_result = await asyncio.gather(
-        _build_prompt_context_safe(),
-        _fetch_memory_safe(),
-        return_exceptions=True,
-    )
-    prompt_context = _ctx_result if not isinstance(_ctx_result, Exception) else None
-    if isinstance(_mem_result, Exception):
-        last_response_context, previous_state, shown_product_ids = {}, {}, []
-    else:
-        last_response_context, previous_state, shown_product_ids = _mem_result
+    prompt_context = await _build_prompt_context_safe()
+    last_response_context, previous_state, shown_product_ids = await _fetch_memory_safe()
 
     previous_response = latest_ai_message(conversation_context)
     if not previous_response:
@@ -2211,7 +2324,9 @@ async def generate_ai_response(
         previous_state=previous_state,
         last_response_context=last_response_context,
     )
-    rule_recovery_enabled = _allow_rule_based_recovery()
+    # Customer responses must come from the LLM; rule helpers remain only for
+    # post-generation cleanup/failure handling and must not preempt the model.
+    rule_recovery_enabled = False
 
     quick_response = None
     if rule_recovery_enabled and str((observed_intent or {}).get("intent") or "").lower() not in {
@@ -2263,21 +2378,26 @@ async def generate_ai_response(
         # FIX (latency 2): fire memory persistence as a detached background task.
         # The response is already available — no need to await persistence before
         # returning it to the caller. Saves 50-200ms off perceived response time.
-        asyncio.ensure_future(_persist_response_memory(
-            db=db,
-            company_id=company_id,
-            memory_entity_id=memory_entity_id,
-            convo_id=conversation_id,
-            prompt=query,
-            response=str(quick_response.get("response") or ""),
-            intent=observed_intent,
-            sentiment=observed_sentiment,
-            product_ids=[str(item).strip() for item in quick_response.get("product_ids", []) if str(item).strip()][:3],
-            response_style=str(quick_response.get("provider") or "rule"),
-            channel=channel_name,
-            conversation_state=conversation_state,
-            message_id=message_id,
-        ))
+        create_detached_task(
+            _persist_response_memory(
+                db=db,
+                company_id=company_id,
+                memory_entity_id=memory_entity_id,
+                convo_id=conversation_id,
+                prompt=query,
+                response=str(quick_response.get("response") or ""),
+                intent=observed_intent,
+                sentiment=observed_sentiment,
+                product_ids=[
+                    str(item).strip() for item in quick_response.get("product_ids", []) if str(item).strip()
+                ][:3],
+                response_style=str(quick_response.get("provider") or "rule"),
+                channel=channel_name,
+                conversation_state=conversation_state,
+                message_id=message_id,
+            ),
+            name=f"persist-response-memory-{message_id or conversation_id or 'rule'}",
+        )
         quick_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
         _record_outcome("success", "rule", str(quick_response.get("provider") or "rule"))
         return quick_response
@@ -2338,7 +2458,7 @@ async def generate_ai_response(
                 company_id=company_id,
                 current_query=query,
                 exclude_product_ids=shown_product_ids,
-                max_products=3,
+                max_products=5,
                 history_product_ids=shown_product_ids,
                 customer_id=memory_entity_id,
                 conversation_id=conversation_id,
@@ -2420,21 +2540,24 @@ async def generate_ai_response(
         product_rule_response["attachments"] = response_attachments
         product_rule_response["product_images"] = response_attachments
         # FIX (latency 2): detached background task — don't block the return path
-        asyncio.ensure_future(_persist_response_memory(
-            db=db,
-            company_id=company_id,
-            memory_entity_id=memory_entity_id,
-            convo_id=conversation_id,
-            prompt=query,
-            response=str(product_rule_response.get("response") or ""),
-            intent=observed_intent,
-            sentiment=observed_sentiment,
-            product_ids=response_product_ids,
-            response_style=str(product_rule_response.get("provider") or "rule"),
-            channel=channel_name,
-            conversation_state=conversation_state,
-            message_id=message_id,
-        ))
+        create_detached_task(
+            _persist_response_memory(
+                db=db,
+                company_id=company_id,
+                memory_entity_id=memory_entity_id,
+                convo_id=conversation_id,
+                prompt=query,
+                response=str(product_rule_response.get("response") or ""),
+                intent=observed_intent,
+                sentiment=observed_sentiment,
+                product_ids=response_product_ids,
+                response_style=str(product_rule_response.get("provider") or "rule"),
+                channel=channel_name,
+                conversation_state=conversation_state,
+                message_id=message_id,
+            ),
+            name=f"persist-response-memory-{message_id or conversation_id or 'product-rule'}",
+        )
         product_rule_response.setdefault(
             "conversation_sentiment", observed_conversation_sentiment or observed_sentiment
         )
@@ -2459,113 +2582,36 @@ async def generate_ai_response(
     # that contains internal routing language (e.g. "Answer the service question directly using...").
     _next_step_for_prompt = customer_next_step if len(customer_next_step) <= 120 else ""
 
+    company_info_for_prompt = dict(kwargs.get("company_info") or {})
+    public_company = dict(ai_context.get("public_company") or {})
+    if public_company:
+        company_info_for_prompt = {**public_company, **company_info_for_prompt}
+    if not str(company_info_for_prompt.get("name") or "").strip():
+        company_info_for_prompt["name"] = (
+            company_info_for_prompt.get("company_name")
+            or customer_info.get("company_name")
+            or customer_info.get("company")
+            or "this business"
+        )
+    extra_context = str(kwargs.get("extra_context") or "").strip()
+    extra_instruction = str(kwargs.get("extra_instruction") or "").strip()
+    base_system_prompt = str(kwargs.get("system_prompt") or "").strip() or build_system_prompt(company_info_for_prompt)
     system_prompt = (
-        "You are the customer-facing AI assistant inside a CRM workspace.\n"
-        "You represent the business in active customer conversations across channels such as WhatsApp, website chat, email, Facebook, and Instagram.\n"
-        "Your job is to understand the customer's latest message, use the available CRM context, and send one helpful, accurate, human-sounding reply.\n\n"
-
-        "PRIMARY ROLE:\n"
-        "- Answer customer questions clearly.\n"
-        "- Resolve support issues calmly and efficiently.\n"
-        "- Help with sales inquiries, product discovery, recommendations, pricing questions, and next steps.\n"
-        "- Use CRM memory, customer history, product data, previous messages, and company knowledge only when relevant.\n"
-        "- Move the conversation forward with one practical next action.\n\n"
-
-        "INPUT CONTEXT YOU MAY RECEIVE:\n"
-        "- structured customer memory\n"
-        "- customer profile and segment\n"
-        "- long-term summary or historical sentiment\n"
-        "- company/product knowledge context\n"
-        "- relevant products and product images\n"
-        "- recent conversation history\n"
-        "- latest customer message\n"
-        "- observed intent, urgency, and sentiment\n"
-        "- active agent mode and operating instruction\n\n"
-
-        "OUTPUT FORMAT:\n"
-        "- Return plain text only.\n"
-        "- Do not return JSON, markdown tables, code blocks, or internal labels.\n"
-        "- Write 2-4 sentences unless the customer only needs a very short answer.\n"
-        "- Send only one response for the latest customer message.\n"
-        "- End with one clear next step, question, or action aligned with the customer's latest need.\n\n"
-
-        "STYLE RULES:\n"
-        "- Sound human, concise, helpful, and confident.\n"
-        "- Be warm, but avoid over-apologizing or sounding scripted.\n"
-        "- Do not use robotic filler such as 'I'm happy to help', 'How can I assist you today?', or repeated generic openings.\n"
-        "- Do not repeat the same answer, same sentence structure, or same CTA from previous AI replies.\n"
-        "- Continue the conversation naturally instead of restarting from the beginning.\n"
-        "- If the customer already gave enough context, answer directly instead of asking another broad question.\n"
-        "- Ask a follow-up question only when a required detail is missing.\n\n"
-
-        "ACCURACY AND GROUNDING RULES:\n"
-        "- Use only the supplied CRM, memory, company, and product context.\n"
-        "- Do not invent policies, prices, discounts, inventory, delivery times, order status, warranties, or account details.\n"
-        "- If the answer is not available in the context, say what you can confirm and ask for the missing detail.\n"
-        "- If product information is available, keep recommendations grounded in the provided product data.\n"
-        "- If product images are available and the customer asks for pictures, mention that you can share the relevant image or option.\n"
-        "- Never claim that an action was completed unless the system context confirms it.\n\n"
-
-        "PRODUCT AND SALES RULES:\n"
-        "- Recommend products only when the customer asks for products, pricing, options, availability, photos, or buying guidance.\n"
-        "- Recommend at most 3 products.\n"
-        "- Explain briefly why each recommended product fits the customer's need.\n"
-        "- If the customer asks for a product image, photo, catalog, or visual, prioritize products with available image attachments.\n"
-        "- If the customer shows buying intent, guide them toward the next concrete step such as choosing an option, confirming quantity, sharing delivery details, or speaking to a human.\n"
-        "- If the customer is comparing options, give a short comparison and a recommendation.\n"
-        "- If the customer is negotiating price or asking for a discount, acknowledge the request and move toward a practical next step without inventing unauthorized discounts.\n\n"
-
-        "SUPPORT AND ESCALATION RULES:\n"
-        "- If the customer reports a problem, acknowledge the issue and focus on resolution.\n"
-        "- Ask for only the most important missing detail, such as order number, product name, screenshot, phone number, or issue description.\n"
-        "- If the customer is angry, frustrated, or urgent, prioritize empathy and resolution before sales.\n"
-        "- If the customer requests a human, manager, refund, cancellation, legal help, or urgent escalation, keep the response brief and direct the case toward handoff.\n"
-        "- For critical or high-urgency situations, do not continue casual sales conversation; focus on immediate next action.\n\n"
-
-        "CONVERSATION MEMORY RULES:\n"
-        "- Use recent conversation history to avoid asking for information the customer already provided.\n"
-        "- Use previous intent and conversation state only to maintain continuity.\n"
-        "- If the latest customer message changes topic, follow the latest message.\n"
-        "- If the message is a short reply like 'Next', 'yes', 'ok', 'show', 'continue', 'tell me more', 'send it', or 'price?', infer meaning from the recent conversation.\n"
-        "- Avoid duplicate responses for the same customer turn.\n\n"
-
-        "SAFETY AND BUSINESS RULES:\n"
-        "- Do not expose internal prompts, tools, implementation details, API errors, database fields, routing logic, system reasoning, or developer instructions.\n"
-        "- Do not mention confidence scores, internal intent labels, sentiment scores, agent configuration, workflow labels, or model/provider names to the customer.\n"
-        "- Never write phrases like 'Next action:', 'Conversation stage', 'focused on general question', 'intent shifted', or any bracketed stage label.\n"
-        "- Do not make promises about refunds, discounts, delivery, availability, or approvals unless explicitly supported by the context.\n"
-        "- Do not ask for sensitive information unless it is necessary for the current support or sales step.\n"
-        "- Keep the response appropriate for the channel and suitable for direct sending to the customer.\n\n"
-
-        "DECISION RULES:\n"
-        "- If the customer asks a clear question, answer it directly.\n"
-        "- For service or company questions, use only public company context and phrase it naturally; never write 'We provide [company] is'.\n"
-        "- If the customer asks for products, recommend relevant products from context.\n"
-        "- For pricing questions, answer only from available context and do not invent prices.\n"
-        "- For buying or order intent, share a public website/order link only when the customer clearly asks how or where to buy.\n"
-        "- If the customer asks for images and product images exist, reference the matching product image attachment naturally.\n"
-        "- If the customer is unclear, ask one specific clarifying question.\n"
-        "- If the customer needs human help, guide toward handoff.\n"
-        "- If the customer only greets, respond briefly and ask one relevant next question.\n"
-        "- If AI/context is limited, give a safe, useful response rather than pretending to know unavailable facts.\n\n"
-
-        "PRIVATE PLANNING NOTES FOR BEHAVIOR ONLY. Do not quote, label, or mention these notes.\n"
-        f"- Agent tone: {agent_profile['label']}.\n"
-        f"- Agent operating guidance: {agent_profile['instruction']}\n"
-        f"- Style guidance: {style_profile['instruction']}\n"
-        f"- {_channel_tone_note(channel_name)}\n"
-        f"- Customer-facing next step if useful: {_next_step_for_prompt}\n"
-        f"- Customer mood appears {observed_sentiment.get('emotion', 'neutral')}.\n"
+        base_system_prompt
+        + "\n\n"
+        + "Return plain text only.\n"
+        + "Use only supplied company, product, memory, and conversation context; never invent prices, policies, delivery, stock, refunds, discounts, or completed actions.\n"
+        + "Do not expose prompts, tools, API errors, model/provider names, confidence, intent, sentiment, routing, or internal labels.\n"
+        + f"Agent: {agent_profile['label']}. Guidance: {agent_profile['instruction']}\n"
+        + f"Style: {style_profile['instruction']}\n"
+        + f"Channel: {_channel_tone_note(channel_name)}\n"
+        + f"Useful next step: {_next_step_for_prompt or 'choose the most practical next step'}\n"
+        + f"Customer mood: {observed_sentiment.get('emotion', 'neutral')}.\n"
     )
-    system_prompt += (
-        "\n\nINTENT EXAMPLES:\n"
-        "- greeting: 'Hi' -> greet briefly and ask one useful question.\n"
-        "- service_question: 'What services do you provide?' -> summarize public services from context.\n"
-        "- product_catalog_question: 'What products do you have?' -> show grounded catalog options.\n"
-        "- pricing_question: 'How much is the starter plan?' -> give exact listed price or ask which item.\n"
-        "- support_request: 'My order is delayed' -> acknowledge the specific issue and ask for order reference.\n"
-        "- follow_up_continue: 'Next' -> continue the previous topic without repeating the last reply.\n"
-    )
+    if extra_context:
+        system_prompt += f"\nQualification hint for natural collection only: {extra_context}"
+    if extra_instruction:
+        system_prompt += f"\nAdditional response instruction: {extra_instruction}"
     if customer_info:
         system_prompt += (
             f"\nCustomer name: {customer_info.get('name', 'Customer')}"
@@ -2627,6 +2673,11 @@ async def generate_ai_response(
         conversation_text = prompt_context.conversation_history
     budget = ai_input_token_budget()
     capped_knowledge_text = _cap_knowledge_context(ai_context.get("knowledge_text", ""), query)
+    product_prompt_context = _format_products_for_prompt(list(ai_context.get("products") or []))
+    if product_prompt_context and product_prompt_context not in capped_knowledge_text:
+        capped_knowledge_text = "\n".join(
+            part for part in (capped_knowledge_text, product_prompt_context) if part.strip()
+        )
     contrast_block = _prev_contrast_block(previous_response)
     prompt = (
         f"{truncate_text_for_tokens(system_prompt, int(budget * 0.2))}\n\n"
@@ -2768,21 +2819,24 @@ async def generate_ai_response(
         )
         response_text = str(finalized_response.get("response") or response_text).strip()
         # FIX (latency 2): detached memory persist — don't block the return path
-        asyncio.ensure_future(_persist_response_memory(
-            db=db,
-            company_id=company_id,
-            memory_entity_id=memory_entity_id,
-            convo_id=conversation_id,
-            prompt=query,
-            response=response_text,
-            intent=observed_intent,
-            sentiment=observed_sentiment,
-            product_ids=response_product_ids,
-            response_style=style_profile["name"],
-            channel=channel_name,
-            conversation_state=conversation_state,
-            message_id=message_id,
-        ))
+        create_detached_task(
+            _persist_response_memory(
+                db=db,
+                company_id=company_id,
+                memory_entity_id=memory_entity_id,
+                convo_id=conversation_id,
+                prompt=query,
+                response=response_text,
+                intent=observed_intent,
+                sentiment=observed_sentiment,
+                product_ids=response_product_ids,
+                response_style=style_profile["name"],
+                channel=channel_name,
+                conversation_state=conversation_state,
+                message_id=message_id,
+            ),
+            name=f"persist-response-memory-{message_id or conversation_id or 'llm'}",
+        )
         _record_outcome("success", "llm", str(engine.get("provider") or "unknown"))
         return {
             "response": response_text,
@@ -2811,77 +2865,45 @@ async def generate_ai_response(
         }
     except Exception as exc:
         error_payload = _degraded_error_payload(exc, engine)
-        logger.error(
-            "AI response failed via %s/%s error_type=%s error_reason=%s",
+        if error_payload.get("error_type") == "invalid_model":
+            clear_engine_cache(company_id or "", reason="invalid_model")
+        logger.exception(
+            "AI response failed function=generate_ai_response provider=%s model=%s error_type=%s error_reason=%s",
             engine.get("provider", "?"),
             engine.get("model_name", "?"),
             error_payload.get("error_type", ""),
             error_payload.get("error_reason", ""),
         )
         _record_outcome("error", "llm", str(engine.get("provider") or "unknown"))
-        fallback_response = _compose_rule_based_response(
-            query,
-            customer_info=customer_info,
-            knowledge_context=knowledge_context,
-            ai_context=ai_context,
-            observed_sentiment=observed_sentiment,
-            observed_intent=observed_intent,
-            previous_response=previous_response,
-            last_response_context=last_response_context,
-            conversation_state=conversation_state,
-        )
-        if not fallback_response:
-            fallback_response = {
-                "response": build_safe_unclear_response(
-                    query,
-                    intent_name=str(observed_intent.get("intent") or ""),
-                    knowledge_context=knowledge_context,
-                    ai_context=ai_context,
-                    previous_response=previous_response,
-                    conversation_state=conversation_state,
-                ),
-                "confidence": 0.82,
-                "attachments": [],
-                "product_images": [],
-                "product_ids": [],
-                "llm_id": "",
-                "agent_id": selected_agent_id,
-                "agent_type": selected_agent_type,
-                "intent_name": str(observed_intent.get("intent") or ""),
-                "conversation_stage": conversation_state.get("stage", "discovery"),
-                "next_action": conversation_state.get("next_action", ""),
-                "intent_shift": bool(conversation_state.get("intent_shift")),
-            }
-        else:
-            fallback_response["confidence"] = max(float(fallback_response.get("confidence", 0) or 0), 0.82)
-            fallback_response.setdefault("llm_id", "")
-            fallback_response.setdefault("agent_id", selected_agent_id)
-            fallback_response.setdefault("agent_type", selected_agent_type)
-            fallback_response.setdefault("intent_name", str(observed_intent.get("intent") or ""))
-            fallback_response["attachments"] = _align_product_attachments(
-                [str(item).strip() for item in fallback_response.get("product_ids", []) if str(item).strip()],
-                list(
-                    fallback_response.get("attachments")
-                    or fallback_response.get("product_images")
-                    or ai_context.get("product_attachments", [])
-                ),
+        provider_failure = is_ai_api_exhaustion_payload(error_payload)
+        # When an upstream provider fails, attempt to load a custom static fallback message.
+        static_message = await get_ai_static_fallback_message(db, company_id or "") if provider_failure else ""
+        # Guarantee a non-empty fallback message: if nothing is configured in the DB, use a safe default.
+        if provider_failure and not str(static_message or "").strip():
+            static_message = (
+                "Hi there, I'm having trouble connecting right now. "
+                "A team member will follow up with you shortly. Thank you for your patience."
             )
-            fallback_response["product_images"] = list(fallback_response.get("attachments", []))
-            fallback_response.setdefault("conversation_stage", conversation_state.get("stage", "discovery"))
-            fallback_response.setdefault("next_action", conversation_state.get("next_action", ""))
-            fallback_response.setdefault("intent_shift", bool(conversation_state.get("intent_shift")))
-        fallback_response = _finalize_customer_response(
-            fallback_response,
-            query=query,
-            intent_name=str(observed_intent.get("intent") or ""),
-            knowledge_context=knowledge_context,
-            ai_context=ai_context,
-            previous_response=previous_response,
-            conversation_state=conversation_state,
-        )
+        fallback_response = {
+            "response": static_message,
+            "confidence": 0.9 if provider_failure else 0.0,
+            "attachments": [],
+            "product_images": [],
+            "product_ids": [],
+            "llm_id": "",
+            "agent_id": selected_agent_id,
+            "agent_type": selected_agent_type,
+            "intent_name": str(observed_intent.get("intent") or ""),
+            "conversation_stage": conversation_state.get("stage", "discovery"),
+            "next_action": _customer_safe_next_action(conversation_state, str(observed_intent.get("intent") or "")),
+            "next_step": "static_fallback",
+            "intent_shift": bool(conversation_state.get("intent_shift")),
+        }
         fallback_response.update(error_payload)
-        fallback_response["provider"] = "fallback"
-        fallback_response["model_name"] = "rule-recovery"
+        fallback_response["static_fallback_served"] = provider_failure
+        if provider_failure:
+            fallback_response["provider"] = "fallback"
+            fallback_response["model_name"] = "static-fallback"
         if not str(fallback_response.get("next_action") or "").strip():
             fallback_response["next_action"] = (
                 "manual_review"
@@ -2889,23 +2911,26 @@ async def generate_ai_response(
                 else "send_safe_fallback"
             )
         # FIX (latency 2): detached memory persist on fallback path too
-        asyncio.ensure_future(_persist_response_memory(
-            db=db,
-            company_id=company_id,
-            memory_entity_id=memory_entity_id,
-            convo_id=conversation_id,
-            prompt=query,
-            response=str(fallback_response.get("response") or ""),
-            intent=observed_intent,
-            sentiment=observed_sentiment,
-            product_ids=[str(item).strip() for item in fallback_response.get("product_ids", []) if str(item).strip()][
-                :3
-            ],
-            response_style="fallback",
-            channel=channel_name,
-            conversation_state=conversation_state,
-            message_id=message_id,
-        ))
+        create_detached_task(
+            _persist_response_memory(
+                db=db,
+                company_id=company_id,
+                memory_entity_id=memory_entity_id,
+                convo_id=conversation_id,
+                prompt=query,
+                response=str(fallback_response.get("response") or ""),
+                intent=observed_intent,
+                sentiment=observed_sentiment,
+                product_ids=[
+                    str(item).strip() for item in fallback_response.get("product_ids", []) if str(item).strip()
+                ][:3],
+                response_style="fallback",
+                channel=channel_name,
+                conversation_state=conversation_state,
+                message_id=message_id,
+            ),
+            name=f"persist-response-memory-{message_id or conversation_id or 'fallback'}",
+        )
         fallback_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
         logger.warning(
             "ai_response_fallback company_id=%s intent=%s channel=%s provider=%s",
@@ -3160,6 +3185,7 @@ async def generate_product_description(
     price_currency: str = "USD",
     images: list | None = None,
     engines: list[dict] | None = None,
+    db=None,
 ) -> str:
     lines = (
         [f"Product Name: {name}"]
@@ -3171,7 +3197,7 @@ async def generate_product_description(
     ordered_engines = [dict(engine) for engine in (engines or []) if isinstance(engine, dict)]
     ordered_engines.sort(key=lambda engine: 0 if engine.get("is_selected") else 1)
     if not ordered_engines:
-        ordered_engines = [await _resolve_engine_for_request(company_id=company_id)]
+        ordered_engines = [await _resolve_engine_for_request(db=db, company_id=company_id)]
     return (
         await call_with_engines(
             "You are an ecommerce product copywriter.\n"
@@ -3187,6 +3213,9 @@ async def generate_product_description(
             f"\nproduct_metadata:\n{chr(10).join(lines)}",
             engines=ordered_engines,
             image_parts=[url for url in (images or [])[:2] if is_data_url_image(str(url))] or None,
+            call_purpose="product_description",
+            function_name="generate_product_description",
+            agent_name="support",
         )
     ).strip()
 
@@ -3197,9 +3226,11 @@ __all__ = [
     "build_greeting_response",
     "build_product_response",
     "build_service_response",
+    "build_system_prompt",
     "build_follow_up_response",
     "build_safe_unclear_response",
     "calculate_churn_risk",
+    "clear_engine_cache",
     "generate_ai_response",
     "generate_combined_ai_analysis",
     "generate_lead_score",

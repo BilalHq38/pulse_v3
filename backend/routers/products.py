@@ -797,6 +797,7 @@ async def generate_product_desc_endpoint(body: ProductDescriptionRequest, reques
         images=payload.get("images", []),
         engines=active_engines,
         company_id=cid,
+        db=db,
     )
     return {"description": desc}
 

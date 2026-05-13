@@ -300,6 +300,15 @@ class Conversation(Base):
     assigned_to: Mapped[str] = mapped_column(String(64), default="", nullable=False, index=True)
     assigned_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     ai_handled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    ai_auto_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    ai_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ai_paused_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    ai_paused_error_type: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    ai_paused_provider: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    ai_paused_model: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    ai_paused_scope: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    ai_disabled_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ai_failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     sentiment_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     sentiment_label: Mapped[str] = mapped_column(String(64), default="neutral", nullable=False)
     message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -428,6 +437,11 @@ class CompanySetting(Base):
     timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
     ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     ai_confidence_threshold: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)
+    ai_static_fallback_message: Mapped[str] = mapped_column(
+        Text,
+        default="Thanks for your message. A team member will respond shortly.",
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     raw_data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

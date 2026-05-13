@@ -10,7 +10,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from fastapi import HTTPException, Request
+from fastapi import BackgroundTasks, HTTPException, Request
 from shared.auth.jwt import (
     REFRESH_TOKEN_EXPIRE_DAYS,
     create_access_token,
@@ -36,6 +36,13 @@ from channel_layer.channel_identity import normalize_whatsapp_phone
 from core.utils import make_id, parse_dt
 from models.reference_data import ensure_company_reference_data, resolve_role_id
 from services.email_service import render_platform_email_html, send_email_async
+from services.ai_service.model_catalog import (
+    DEFAULT_GEMINI_MODEL,
+    capability_labels,
+    model_capabilities as catalog_model_capabilities,
+    model_supports as catalog_model_supports,
+    supported_model_names,
+)
 from services.media_storage import store_image_data_url
 from shared.database import company_context
 from shared.auth.dependencies import forbidden_exception, resolve_request_user, unauthorized_exception
@@ -45,11 +52,17 @@ _auth_security_ready = False
 _auth_security_lock = asyncio.Lock()
 _embedding_vector_ready = False
 _embedding_vector_lock = asyncio.Lock()
+_conversation_ai_pause_schema_ready = False
+_conversation_ai_pause_schema_lock = asyncio.Lock()
 _message_attachment_schema_ready = False
 _message_attachment_schema_lock = asyncio.Lock()
 _message_reaction_schema_ready: set[str] = set()
 _message_reaction_schema_lock = asyncio.Lock()
 _SUPER_ADMIN_COMPANY_ID_FALLBACK = "00000000-0000-0000-0000-000000000001"
+AI_STATIC_FALLBACK_DEFAULT = (
+    os.environ.get("AI_STATIC_FALLBACK_MESSAGE", "").strip()
+    or "Thanks for your message. A team member will respond shortly."
+)
 
 
 def _normalize_lookup_email(value: str | None) -> str:
@@ -488,9 +501,37 @@ async def ensure_auth_security_primitives(db) -> None:
             await db.execute(
                 "ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS preferred_channels JSONB NOT NULL DEFAULT '[]'::jsonb"  # noqa: E501
             )
+            await db.execute(
+                "ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS ai_static_fallback_message TEXT NOT NULL "
+                "DEFAULT 'Thanks for your message. A team member will respond shortly.'"
+            )
         except Exception:
-            logger.debug("company_settings.preferred_channels migration skipped", exc_info=True)
+            logger.debug("company_settings lightweight migration skipped", exc_info=True)
         _auth_security_ready = True
+
+
+async def ensure_conversation_ai_pause_schema(db) -> None:
+    global _conversation_ai_pause_schema_ready
+    if _conversation_ai_pause_schema_ready or not db:
+        return
+    async with _conversation_ai_pause_schema_lock:
+        if _conversation_ai_pause_schema_ready:
+            return
+        statements = (
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFAULT 'generic'",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_auto_paused BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_at TIMESTAMPTZ",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_error_type TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_provider TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_model TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_scope TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_disabled_until TIMESTAMPTZ",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_failure_count INT DEFAULT 0",
+        )
+        for statement in statements:
+            await db.execute(statement)
+        _conversation_ai_pause_schema_ready = True
 
 
 async def ensure_super_admin_user(db) -> Optional[dict]:
@@ -811,21 +852,20 @@ async def record_system_log(
 
 
 async def ensure_default_llm_engine(db) -> dict:
-    provider = (os.environ.get("AI_PROVIDER", "openai") or "openai").strip().lower()
-    model_defaults = {
-        "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-        "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
-        "gemini": "gemini-2.5-flash",
-    }
-    if provider not in model_defaults:
-        provider = "openai"
-    model_name = (os.environ.get("AI_MODEL_NAME") or model_defaults[provider] or "gpt-4o-mini").strip()
+    await repair_unsupported_gemini_llm_engines(db)
+    await ensure_gemini_llm_engines(db)
+    provider = "gemini"
+    model_name = DEFAULT_GEMINI_MODEL
     row = await db.fetchrow(
         "SELECT * FROM llm_engines WHERE provider=$1 AND model_name=$2 AND company_id='' LIMIT 1",
         provider,
         model_name,
     )
     if row:
+        await db.execute(
+            "UPDATE llm_engines SET is_active=TRUE,updated_at=NOW(),last_updated=NOW() WHERE id=$1",
+            row["id"],
+        )
         return dict(row)
     new_id = make_id()
     await db.execute(
@@ -836,9 +876,105 @@ async def ensure_default_llm_engine(db) -> dict:
         os.environ.get("AI_API_ENDPOINT", "").strip(),
         float(os.environ.get("AI_TEMPERATURE", "0.7")),
         int(os.environ.get("AI_MAX_TOKENS", "2048")),
-        os.environ.get("AI_MODEL_VERSION", "current").strip() or "current",
+        "Gemini 2.5 Flash",
     )
     return dict(await db.fetchrow("SELECT * FROM llm_engines WHERE id=$1", new_id))
+
+
+async def ensure_gemini_llm_engines(db) -> None:
+    await db.execute(
+        "DELETE FROM llm_engines WHERE company_id='' AND NOT (provider='gemini' AND model_name=$1)",
+        DEFAULT_GEMINI_MODEL,
+    )
+    if await db.fetchval(
+        "SELECT id FROM llm_engines WHERE company_id='' AND provider='gemini' AND model_name=$1 LIMIT 1",
+        DEFAULT_GEMINI_MODEL,
+    ):
+        await db.execute(
+            "UPDATE llm_engines SET is_active=TRUE,version=$2,updated_at=NOW(),last_updated=NOW() "
+            "WHERE company_id='' AND provider='gemini' AND model_name=$1",
+            DEFAULT_GEMINI_MODEL,
+            "Gemini 2.5 Flash",
+        )
+        return
+    await db.execute(
+        "INSERT INTO llm_engines(id,company_id,model_name,provider,api_endpoint,temperature,max_tokens,is_active,version,last_updated,created_at,updated_at) "
+        "VALUES($1,'',$2,'gemini','',$3,$4,TRUE,$5,NOW(),NOW(),NOW()) ON CONFLICT DO NOTHING",
+        make_id(),
+        DEFAULT_GEMINI_MODEL,
+        float(os.environ.get("AI_TEMPERATURE", "0.7")),
+        int(os.environ.get("AI_MAX_TOKENS", "2048")),
+        "Gemini 2.5 Flash",
+    )
+
+
+async def repair_unsupported_gemini_llm_engines(db) -> None:
+    if not db or not hasattr(db, "fetch"):
+        return
+    supported = sorted(supported_model_names("gemini"))
+    if not supported:
+        return
+    try:
+        invalid_rows = [
+            dict(row)
+            for row in await db.fetch(
+                "SELECT * FROM llm_engines WHERE provider='gemini' AND NOT (model_name = ANY($1::text[]))",
+                supported,
+            )
+        ]
+    except Exception as exc:
+        logger.debug("Unsupported Gemini engine repair skipped: %s", exc)
+        return
+    for row in invalid_rows:
+        row_id = str(row.get("id") or "").strip()
+        company_id = str(row.get("company_id") or "").strip()
+        old_model = str(row.get("model_name") or "").strip()
+        if not row_id:
+            continue
+        try:
+            existing = await db.fetchrow(
+                "SELECT id FROM llm_engines WHERE company_id=$1 AND provider='gemini' AND model_name=$2 LIMIT 1",
+                company_id,
+                DEFAULT_GEMINI_MODEL,
+            )
+            if existing and str(existing.get("id") or "") != row_id:
+                replacement_id = str(existing.get("id") or "")
+                await db.execute(
+                    "UPDATE company_settings SET active_llm_engine_id=$1,updated_at=NOW() "
+                    "WHERE company_id=$2 AND active_llm_engine_id=$3",
+                    replacement_id,
+                    company_id,
+                    row_id,
+                )
+                await db.execute(
+                    "UPDATE ai_agents SET llm_id=$1,updated_at=NOW() WHERE company_id=$2 AND llm_id=$3",
+                    replacement_id,
+                    company_id,
+                    row_id,
+                )
+                await db.execute("DELETE FROM llm_engines WHERE id=$1", row_id)
+            else:
+                await db.execute(
+                    "UPDATE llm_engines SET model_name=$1,version=$2,updated_at=NOW(),last_updated=NOW() WHERE id=$3",
+                    DEFAULT_GEMINI_MODEL,
+                    "Gemini 2.5 Flash",
+                    row_id,
+                )
+            logger.warning(
+                "llm_engine_invalid_model_repaired company_id=%s engine_id=%s old_model=%s new_model=%s",
+                company_id,
+                row_id,
+                old_model,
+                DEFAULT_GEMINI_MODEL,
+            )
+        except Exception as exc:
+            logger.warning(
+                "llm_engine_invalid_model_repair_failed company_id=%s engine_id=%s old_model=%s error=%s",
+                company_id,
+                row_id,
+                old_model,
+                exc,
+            )
 
 
 async def ensure_embedding_vector_optimizations(db) -> None:
@@ -918,15 +1054,19 @@ def provider_configuration_status(provider: str, *, is_active: bool = True) -> t
 
 
 def model_supports_vision(provider: str, model_name: str) -> bool:
-    provider = (provider or "").strip().lower()
-    model = (model_name or "").strip().lower()
-    if provider == "gemini":
-        return model.startswith("gemini-")
-    if provider == "openai":
-        return model.startswith("gpt-4o") or model in {"gpt-4-turbo", "gpt-4"}
-    if provider == "anthropic":
-        return model.startswith("claude-3")
-    return False
+    return catalog_model_supports(provider, model_name, "vision")
+
+
+def model_supports_audio(provider: str, model_name: str) -> bool:
+    return catalog_model_supports(provider, model_name, "audio")
+
+
+def model_supports_capability(provider: str, model_name: str, capability: str) -> bool:
+    return catalog_model_supports(provider, model_name, capability)
+
+
+def model_capabilities(provider: str, model_name: str) -> dict:
+    return catalog_model_capabilities(provider, model_name)
 
 
 def enrich_llm_engine(engine: Optional[dict], selected_id: str = "") -> dict:
@@ -938,7 +1078,9 @@ def enrich_llm_engine(engine: Optional[dict], selected_id: str = "") -> dict:
     data["provider_ready"] = provider_status == "configured"
     data["provider_status"] = provider_status
     data["provider_status_detail"] = provider_status_detail
-    data["supports_vision"] = model_supports_vision(provider, model_name)
+    caps = model_capabilities(provider, model_name)
+    data.update(caps)
+    data["capabilities"] = capability_labels(provider, model_name)
     data["is_selected"] = bool(selected_id) and data.get("id", "") == selected_id
     data["scope"] = "global" if not str(data.get("company_id") or "").strip() else "tenant"
     return data
@@ -962,6 +1104,26 @@ async def ensure_company_settings_row(db, company_id: str = "") -> dict:
         company_id or "",
     )
     return dict(await db.fetchrow("SELECT * FROM company_settings WHERE id=$1", settings_id))
+
+
+async def get_ai_static_fallback_message(db=None, company_id: str = "") -> str:
+    fallback = AI_STATIC_FALLBACK_DEFAULT
+    if not db or not str(company_id or "").strip():
+        return fallback
+    try:
+        row_message = await db.fetchval(
+            "SELECT NULLIF(BTRIM(ai_static_fallback_message), '') "
+            "FROM company_settings WHERE company_id=$1 LIMIT 1",
+            str(company_id or "").strip(),
+        )
+        return str(row_message or fallback).strip() or fallback
+    except Exception as exc:
+        logger.warning(
+            "AI static fallback lookup failed company_id=%s error=%s",
+            str(company_id or "").strip(),
+            exc,
+        )
+        return fallback
 
 
 async def resolve_active_llm_engine(db, company_id: str = "") -> dict:
@@ -1054,16 +1216,162 @@ async def resolve_active_ai_agent(
 
 async def is_company_ai_enabled(db, company_id: str = "") -> bool:
     settings = await ensure_company_settings_row(db, company_id or "")
-    if bool(settings.get("ai_enabled", True)):
-        return True
-    active_agent = await resolve_active_ai_agent(db, company_id or "")
-    if active_agent:
-        await db.execute(
-            "UPDATE company_settings SET ai_enabled=TRUE,updated_at=NOW() WHERE id=$1",
-            settings["id"],
+    return bool(settings.get("ai_enabled", True))
+
+
+AI_API_EXHAUSTED_MANUAL_MESSAGE = (
+    "AI auto-response is paused because the AI provider is unavailable. Please respond manually."
+)
+
+SERIOUS_AI_PROVIDER_ERROR_TYPES = {
+    "permission_denied",
+    "api_key_suspended",
+    "quota_exhausted",
+    "rate_limited",
+    "provider_not_configured",
+    "all_providers_exhausted",
+    "safety_config_failure",
+    "provider_5xx",
+    "provider_timeout",
+    "invalid_model",
+    "unsupported_model",
+    "unsupported_provider",
+    "no_active_llm_engine",
+    "no_usable_provider_fallback",
+}
+
+
+def classify_ai_provider_failure(payload: Optional[dict]) -> str:
+    data = dict(payload or {})
+    provider_error = data.get("provider_error") if isinstance(data.get("provider_error"), dict) else {}
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            data.get("error_type"),
+            data.get("error_reason"),
+            data.get("message"),
+            provider_error.get("status"),
+            provider_error.get("error_type"),
+            provider_error.get("error_reason"),
+            provider_error.get("message"),
         )
-        return True
-    return False
+    )
+    if any(marker in text for marker in ("permission_denied", "permission denied", "403")):
+        return "permission_denied"
+    if "suspended" in text and ("api" in text or "key" in text):
+        return "api_key_suspended"
+    if any(marker in text for marker in ("quota", "resource_exhausted", "quota_exhausted")):
+        return "quota_exhausted"
+    if any(marker in text for marker in ("rate_limited", "rate limit", "429")):
+        return "rate_limited"
+    if any(marker in text for marker in ("not configured", "missing api key", "api_key", "provider_not_configured")):
+        return "provider_not_configured"
+    if any(marker in text for marker in ("all providers exhausted", "all ai providers exhausted")):
+        return "all_providers_exhausted"
+    if any(marker in text for marker in ("safety", "configuration failure", "config failure")):
+        return "safety_config_failure"
+    if any(marker in text for marker in ("timeout", "timed out", "deadline")):
+        return "provider_timeout"
+    if any(marker in text for marker in ("invalid model", "model not found", "is not found")) or (
+        "generatecontent" in text and "not supported" in text
+    ):
+        return "invalid_model"
+    if any(marker in text for marker in ("unsupported model", "does not support image", "does not support audio")):
+        return "unsupported_model"
+    if "unsupported provider" in text:
+        return "unsupported_provider"
+    if "no active llm engine" in text:
+        return "no_active_llm_engine"
+    if "no usable provider" in text or "no provider fallback" in text:
+        return "no_usable_provider_fallback"
+    if any(marker in text for marker in ("500", "502", "503", "504", "internal server")):
+        return "provider_5xx"
+    if data.get("api_error") or provider_error:
+        return str(data.get("error_type") or provider_error.get("error_type") or "provider_error").strip().lower()
+    return ""
+
+
+def is_ai_api_exhaustion_payload(payload: Optional[dict]) -> bool:
+    return classify_ai_provider_failure(payload) in SERIOUS_AI_PROVIDER_ERROR_TYPES
+
+
+def conversation_ai_auto_paused(conversation: Optional[dict]) -> bool:
+    convo = dict(conversation or {})
+    return bool(convo.get("ai_auto_paused") or (convo.get("ai_handled") is False and convo.get("ai_paused_reason")))
+
+
+async def pause_ai_auto_response(
+    db,
+    company_id: str,
+    conversation_id: str,
+    *,
+    reason: str = "",
+    error_type: str = "",
+    provider: str = "",
+    model: str = "",
+    scope: str = "conversation",
+    status: str = "open",
+) -> None:
+    if not company_id or not conversation_id:
+        return
+    clean_reason = str(reason or AI_API_EXHAUSTED_MANUAL_MESSAGE).strip()[:500]
+    clean_error_type = str(error_type or "provider_error").strip()[:120]
+    clean_provider = str(provider or "").strip()[:80]
+    clean_model = str(model or "").strip()[:120]
+    clean_scope = str(scope or "conversation").strip()[:40]
+    next_status = "escalated" if status == "escalated" else "open"
+    await db.execute(
+        "UPDATE conversations SET ai_handled=FALSE,ai_auto_paused=TRUE,ai_paused_at=NOW(),"
+        "ai_paused_reason=$1,ai_paused_error_type=$2,ai_paused_provider=$3,ai_paused_model=$4,"
+        "ai_paused_scope=$5,escalation_notice=$1,status=$6,updated_at=NOW() "
+        "WHERE id=$7 AND company_id=$8",
+        clean_reason,
+        clean_error_type,
+        clean_provider,
+        clean_model,
+        clean_scope,
+        next_status,
+        conversation_id,
+        company_id,
+    )
+
+
+async def disable_company_ai_after_api_exhaustion(
+    db,
+    company_id: str,
+    *,
+    conversation_id: str = "",
+    reason: str = "",
+    error_type: str = "",
+    provider: str = "",
+    model: str = "",
+) -> None:
+    if not company_id:
+        return
+    if conversation_id:
+        await pause_ai_auto_response(
+            db,
+            company_id,
+            conversation_id,
+            reason=AI_API_EXHAUSTED_MANUAL_MESSAGE,
+            error_type=error_type or classify_ai_provider_failure({"error_reason": reason}) or "provider_error",
+            provider=provider,
+            model=model,
+            scope="conversation",
+            status="open",
+        )
+    else:
+        logger.warning(
+            "AI provider failure without conversation context; company AI left unchanged company_id=%s reason=%s",
+            company_id,
+            str(reason or "")[:300],
+        )
+    logger.warning(
+        "AI auto-response paused after provider failure company_id=%s conversation_id=%s reason=%s",
+        company_id,
+        conversation_id,
+        str(reason or "")[:300],
+    )
 
 
 async def persist_ai_session_record(
@@ -1892,10 +2200,14 @@ async def escalate_conversation_to_human(
     automatic: bool = False,
 ):
     escalation_notice = "Conversation escalated"
+    pause_reason = str(reason or "Conversation escalated to human. AI auto-response is paused.").strip()
     await db.execute(
-        "UPDATE conversations SET ai_handled=FALSE,status='escalated',"
-        "escalation_notice=$1,escalated_at=NOW(),escalated_to=$2,escalated_to_name=$3,updated_at=NOW() "
-        "WHERE id=$4",
+        "UPDATE conversations SET ai_handled=FALSE,ai_auto_paused=TRUE,ai_paused_at=COALESCE(ai_paused_at,NOW()),"
+        "ai_paused_reason=$1,ai_paused_error_type=COALESCE(NULLIF(ai_paused_error_type,''),'conversation_escalated'),"
+        "ai_paused_scope='conversation',"
+        "status='escalated',escalation_notice=$2,escalated_at=NOW(),escalated_to=$3,escalated_to_name=$4,updated_at=NOW() "
+        "WHERE id=$5",
+        pause_reason[:500],
         escalation_notice,
         agent_id or "",
         agent_name or "Human Agent",
@@ -2115,7 +2427,13 @@ def build_email_verification_meta(
     }
 
 
-async def send_email_verification_message(db, user: dict, request: Request, reason: str = "register"):
+async def send_email_verification_message(
+    db,
+    user: dict,
+    request: Request,
+    reason: str = "register",
+    background_tasks: BackgroundTasks | None = None,
+):
     ver = await create_email_verification_record(db, user, request)
     html = render_platform_email_html(
         title="Verify Your Email",
@@ -2129,12 +2447,17 @@ async def send_email_verification_message(db, user: dict, request: Request, reas
         cta_url=ver["verify_link"],
         footer_note="Automated security email from Pulse Engine.",
     )
-    await send_email_async(
-        to_email=ver["email"],
-        subject="Verify your Pulse Engine email address",
-        body=f"Verify here: {ver['verify_link']}",
-        html_body=html,
-    )
+    email_kwargs = {
+        "to_email": ver["email"],
+        "subject": "Verify your Pulse Engine email address",
+        "body": f"Verify here: {ver['verify_link']}",
+        "html_body": html,
+        "raise_on_failure": False,
+    }
+    if background_tasks is not None:
+        background_tasks.add_task(send_email_async, **email_kwargs)
+    else:
+        await send_email_async(**email_kwargs)
     now = datetime.now(timezone.utc)
     if reason == "register":
         avail = now + timedelta(seconds=VERIFICATION_RESEND_COOLDOWN_SECONDS)
@@ -2407,7 +2730,7 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
     phone = ""
     if _raw_phone:
         identity = normalize_whatsapp_phone(_raw_phone)
-        phone = identity.canonical_value if identity.is_valid else ""
+        phone = identity.canonical_value if identity.is_valid else (normalize_to_e164_digits(_raw_phone) or "")
     name = (lead.get("name") or "").strip() or "Unknown"
     cid = current_user.get("company_id", "")
     wp, args = [], [cid]
@@ -2417,6 +2740,9 @@ async def convert_lead_to_customer_state(db, lead: dict, current_user: dict) -> 
     if phone:
         wp.append(f"phone=${len(args) + 1}")
         args.append(phone)
+    if _raw_phone and _raw_phone != phone:
+        wp.append(f"phone=${len(args) + 1}")
+        args.append(_raw_phone)
     existing = None
     if wp:
         existing = r(

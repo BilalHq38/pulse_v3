@@ -177,10 +177,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
       const profiles = await identityUnificationApi.listProfiles();
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return;
 
-      set((state) => {
-        const merged = profiles.reduce((acc, profile) => upsertProfile(acc, profile), state.profiles);
-        return { profiles: merged };
-      });
+      set({ profiles });
     } catch (error) {
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return;
       if (isTenantConfigUnavailableError(error)) {
@@ -409,7 +406,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
         },
       }));
 
-      await get().fetchProfiles();
+      await Promise.all([get().fetchProfiles(), get().fetchReviewQueue()]);
       return profile;
     } catch (error) {
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;
@@ -460,7 +457,11 @@ export const useIdentityUnificationStore = create((set, get) => ({
         },
       });
 
-      await Promise.all([get().fetchProfiles(), get().fetchProfileDetail(safeProfileId, { force: true })]);
+      await Promise.all([
+        get().fetchProfiles(),
+        get().fetchReviewQueue(),
+        get().fetchProfileDetail(safeProfileId, { force: true }),
+      ]);
       return response;
     } catch (error) {
       if (normalizeId(get().tenantContext.tenantId) !== requestTenant) return null;

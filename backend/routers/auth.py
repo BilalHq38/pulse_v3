@@ -8,7 +8,7 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from shared.auth.jwt import (
     REFRESH_TOKEN_EXPIRE_DAYS,
@@ -266,7 +266,12 @@ def _workspace_candidates(users: list[dict]) -> list[dict]:
     return workspaces
 
 
-async def _issue_password_reset_email(db, user: dict, request: Request) -> None:
+async def _issue_password_reset_email(
+    db,
+    user: dict,
+    request: Request,
+    background_tasks: BackgroundTasks | None = None,
+) -> None:
     norm = (user.get("email", "") or "").strip().lower()
     token = generate_reset_token()
     expires = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES)
@@ -292,23 +297,24 @@ async def _issue_password_reset_email(db, user: dict, request: Request) -> None:
         cta_url=link,
         accent="#059669",
     )
-    try:
-        await send_email_async(
-            to_email=norm,
-            subject="Reset your Pulse Engine password",
-            body=link,
-            html_body=html,
-        )
-    except Exception as e:
-        logger.error("Password reset email failed: %s", e)
-        raise HTTPException(500, "Failed to send password reset email") from e
+    email_kwargs = {
+        "to_email": norm,
+        "subject": "Reset your Pulse Engine password",
+        "body": link,
+        "html_body": html,
+        "raise_on_failure": False,
+    }
+    if background_tasks is not None:
+        background_tasks.add_task(send_email_async, **email_kwargs)
+    else:
+        await send_email_async(**email_kwargs)
 
 
 @router.post("/auth/register")
-async def register(request: Request):
+async def register(request: Request, background_tasks: BackgroundTasks):
     db = _db(request)
     body = await _json_body(request)
-    return await prepare_public_registration(db, request, body)
+    return await prepare_public_registration(db, request, body, background_tasks=background_tasks)
 
 
 @router.get("/auth/signup-billing-info")
@@ -488,7 +494,7 @@ async def refresh_token(request: Request):
 
 
 @router.post("/auth/forgot-password")
-async def forgot_password(request: Request):
+async def forgot_password(request: Request, background_tasks: BackgroundTasks):
     db = _db(request)
     body = await _json_body(request)
     norm = (body.get("email", "") or "").strip().lower()
@@ -503,7 +509,7 @@ async def forgot_password(request: Request):
         prov = (user.get("auth_provider") or "").lower()
         if prov in ("google", "facebook"):
             raise HTTPException(400, f"{prov.capitalize()} sign-in users cannot reset password via email.")
-        await _issue_password_reset_email(db, user, request)
+        await _issue_password_reset_email(db, user, request, background_tasks)
         return {"message": "If the email exists, a password reset email has been sent."}
     for user in users:
         user = await ensure_user_company_assignment(db, user)
@@ -512,7 +518,7 @@ async def forgot_password(request: Request):
             continue
         await set_company_context(db, user.get("company_id", ""))
         try:
-            await _issue_password_reset_email(db, user, request)
+            await _issue_password_reset_email(db, user, request, background_tasks)
         except HTTPException:
             logger.warning(
                 "Password reset email failed for workspace company_id=%s",
@@ -624,7 +630,7 @@ async def verify_email(request: Request, token: str):
 
 
 @router.post("/auth/resend-verification")
-async def resend_verification(request: Request):
+async def resend_verification(request: Request, background_tasks: BackgroundTasks):
     db = _db(request)
     body = await _json_body(request)
     norm = (body.get("email", "") or "").strip().lower()
@@ -663,7 +669,7 @@ async def resend_verification(request: Request):
                 },
             )
         try:
-            _, meta = await send_email_verification_message(db, user, request, "resend")
+            _, meta = await send_email_verification_message(db, user, request, "resend", background_tasks)
         except HTTPException:
             raise
         except Exception as e:
@@ -689,7 +695,7 @@ async def resend_verification(request: Request):
         if (lu and seconds_until(lu) > 0) or (avail and seconds_until(avail) > 0):
             continue
         try:
-            await send_email_verification_message(db, user, request, "resend")
+            await send_email_verification_message(db, user, request, "resend", background_tasks)
         except HTTPException:
             logger.warning(
                 "Verification resend skipped for workspace company_id=%s",
@@ -1208,7 +1214,7 @@ async def facebook_callback_post(request: Request):
 
 
 @router.post("/auth/invitations/accept")
-async def accept_invitation(request: Request):
+async def accept_invitation(request: Request, background_tasks: BackgroundTasks):
     db = _db(request)
     body = await _json_body(request)
     token = body.get("token", "").strip()
@@ -1306,7 +1312,7 @@ async def accept_invitation(request: Request):
     invited = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", user_id))
     if invited and not invited.get("email_verified", False):
         try:
-            _, verification_meta = await send_email_verification_message(db, invited, request, "register")
+            _, verification_meta = await send_email_verification_message(db, invited, request, "register", background_tasks)
         except Exception as exc:
             verification_error = str(exc)[:300]
             logger.error("Invitation verification email failed: %s", exc)
@@ -1580,7 +1586,7 @@ async def select_billing_plan(request: Request):
 
 
 @router.post("/auth/onboarding/invite")
-async def invite_team_member(request: Request):
+async def invite_team_member(request: Request, background_tasks: BackgroundTasks):
     db = _db(request)
     current_user = await require_roles(request, ["admin"])
     body = await _json_body(request)
@@ -1640,16 +1646,14 @@ async def invite_team_member(request: Request):
         cta_url=invite_url,
         accent="#2563eb",
     )
-    try:
-        await send_email_async(
-            to_email=email,
-            subject="Your Pulse Engine invitation",
-            body=invite_url,
-            html_body=html,
-        )
-    except Exception as exc:
-        logger.error("Invitation email failed: %s", exc)
-        raise HTTPException(500, "Failed to send invitation email")
+    background_tasks.add_task(
+        send_email_async,
+        to_email=email,
+        subject="Your Pulse Engine invitation",
+        body=invite_url,
+        html_body=html,
+        raise_on_failure=False,
+    )
     sub_row = r(await db.fetchrow("SELECT plan_code FROM subscriptions WHERE company_id=$1 LIMIT 1", company_id))
     if sub_row and str(sub_row.get("plan_code") or "").strip().lower() == "enterprise":
         await db.execute(
@@ -1670,7 +1674,7 @@ async def invite_team_member(request: Request):
 
 
 @router.post("/account/delete/request-verification")
-async def request_account_deletion_verification(request: Request):
+async def request_account_deletion_verification(request: Request, background_tasks: BackgroundTasks):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", cu["sub"]))
@@ -1707,15 +1711,14 @@ async def request_account_deletion_verification(request: Request):
         highlight_label="Verification fingerprint",
         highlight_value=fp,
     )
-    try:
-        await send_email_async(
-            to_email=email,
-            subject="Verify your Pulse Engine account deletion",
-            body=fp,
-            html_body=html,
-        )
-    except Exception:
-        raise HTTPException(500, "Failed to send account deletion verification email")
+    background_tasks.add_task(
+        send_email_async,
+        to_email=email,
+        subject="Verify your Pulse Engine account deletion",
+        body=fp,
+        html_body=html,
+        raise_on_failure=False,
+    )
     return {
         "status": "verification_sent",
         "message": "A verification fingerprint has been sent to your email.",

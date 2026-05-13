@@ -250,7 +250,7 @@ test('Email button opens the email composer and sends through the communications
     to_email: 'avery@example.com',
     subject: expect.any(String),
     body: expect.any(String),
-  });
+  }, expect.objectContaining({ timeout: expect.any(Number) }));
 
   await act(async () => root.unmount());
 });

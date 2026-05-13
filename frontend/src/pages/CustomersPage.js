@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { buildCustomerMethods, CHANNEL_META } from '@/lib/channelUtils';
 
+const LONG_REQUEST_TIMEOUT_MS = 120000;
 const SEGMENT_COLORS = { vip: 'bg-amber-50 text-amber-600 border-amber-500/30', enterprise: 'bg-blue-50 text-blue-600 border-blue-200', growth: 'bg-cyan-50 text-cyan-600 border-cyan-500/30', general: 'bg-gray-700/50 text-slate-500 border-gray-600/30' };
 const CUSTOMER_BULK_TEMPLATE_HEADERS = ['name', 'email', 'phone', 'company', 'segment', 'tags', 'channels'];
 const CUSTOMER_BULK_TEMPLATE_SAMPLE = ['Jordan Reyes', 'jordan@brightworks.com', '+1 646 555 0199', 'BrightWorks', 'growth', 'vip, beta', 'email, whatsapp'];
@@ -348,7 +349,7 @@ export default function CustomersPage() {
         to_email: customer.email,
         subject,
         body,
-      });
+      }, { timeout: LONG_REQUEST_TIMEOUT_MS });
       closeEmailComposer();
       showToast({
         type: 'success',
@@ -523,6 +524,7 @@ export default function CustomersPage() {
       formData.append('file', file);
       const res = await api.post('/customers/bulk-upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: LONG_REQUEST_TIMEOUT_MS,
       });
       const result = res.data || {};
       await loadCustomers();

@@ -4,6 +4,7 @@ import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
   AlertCircle,
+  Pencil,
   Mail,
   Package,
   Plus,
@@ -26,18 +27,13 @@ const STATUS_STYLES = {
 
 const DEFAULT_FILTERS = {
   audience: 'both',
-  lifecycle_stage: '',
-  tags: '',
-  source: '',
   channel: '',
 };
+const LONG_REQUEST_TIMEOUT_MS = 120000;
 
 function toFiltersPayload(f, selectedLeadIds = [], selectedCustomerIds = [], productId = '') {
   const out = {};
   if (f.audience && f.audience !== 'both') out.audience = f.audience;
-  if (f.lifecycle_stage) out.lifecycle_stage = f.lifecycle_stage.split(',').map((s) => s.trim()).filter(Boolean);
-  if (f.tags) out.tags = f.tags.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (f.source) out.source = f.source.split(',').map((s) => s.trim()).filter(Boolean);
   if (f.channel) out.channel = f.channel.split(',').map((s) => s.trim()).filter(Boolean);
   if (selectedLeadIds.length) out.selected_lead_ids = selectedLeadIds;
   if (selectedCustomerIds.length) out.selected_customer_ids = selectedCustomerIds;
@@ -54,10 +50,28 @@ const EMPTY_AI_DETAILS = {
   extra_context: '',
 };
 
+const AI_EXHAUSTION_STORAGE_KEY = 'pulse:campaign-ai-exhausted';
+const AI_EXHAUSTION_WAIT_MS = 30 * 60 * 1000;
+const AI_EXHAUSTION_WARNING = 'AI/API quota has been exhausted. Please wait 30 minutes. AI responses are stopped and this campaign must be handled manually.';
+
 const getListPayload = (data) => {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.items)) return data.items;
   return [];
+};
+
+const isAiExhaustionError = (err) => err?.response?.data?.detail?.ai_enabled === false;
+
+const aiExhaustionActive = () => {
+  try {
+    const exhaustedAt = Number(localStorage.getItem(AI_EXHAUSTION_STORAGE_KEY) || 0);
+    if (!exhaustedAt) return false;
+    if (Date.now() - exhaustedAt < AI_EXHAUSTION_WAIT_MS) return true;
+    localStorage.removeItem(AI_EXHAUSTION_STORAGE_KEY);
+    return false;
+  } catch {
+    return false;
+  }
 };
 
 export default function CampaignsPage() {
@@ -66,6 +80,7 @@ export default function CampaignsPage() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [showForm, setShowForm] = useState(false);
+  const [editingCampaignId, setEditingCampaignId] = useState('');
   const [form, setForm] = useState({ name: '', subject: '', body: '', html_body: '', product_id: '' });
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [products, setProducts] = useState([]);
@@ -78,12 +93,26 @@ export default function CampaignsPage() {
   const [htmlAiPrompt, setHtmlAiPrompt] = useState('');
   const [generatingHtmlBody, setGeneratingHtmlBody] = useState(false);
   const [aiGenerationError, setAiGenerationError] = useState('');
-  const [aiDisabled, setAiDisabled] = useState(false);
+  const [aiDisabled, setAiDisabled] = useState(() => aiExhaustionActive());
   const [resourceError, setResourceError] = useState('');
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [sendNow, setSendNow] = useState(true);
+
+  const resetComposer = useCallback(() => {
+    setEditingCampaignId('');
+    setShowForm(false);
+    setForm({ name: '', subject: '', body: '', html_body: '', product_id: '' });
+    setFilters(DEFAULT_FILTERS);
+    setSelectedLeadIds([]);
+    setSelectedCustomerIds([]);
+    setAiDetails(EMPTY_AI_DETAILS);
+    setHtmlAiPrompt('');
+    setAiGenerationError('');
+    setPreview(null);
+    setSendNow(true);
+  }, []);
 
   const loadCampaigns = useCallback(async () => {
     setLoadError('');
@@ -167,10 +196,34 @@ export default function CampaignsPage() {
     && aiDetails.call_to_action.trim(),
   );
 
+  const stopAiForExhaustion = useCallback((message = AI_EXHAUSTION_WARNING) => {
+    let alreadyWarned = false;
+    try {
+      alreadyWarned = aiExhaustionActive();
+      localStorage.setItem(AI_EXHAUSTION_STORAGE_KEY, String(Date.now()));
+    } catch {
+      alreadyWarned = aiDisabled;
+    }
+    setAiDisabled(true);
+    setAiGenerationError(message);
+    if (!alreadyWarned) {
+      showToast({
+        type: 'warning',
+        title: 'AI quota exhausted',
+        message,
+        dedupeKey: 'campaign-ai-quota-exhausted',
+      });
+    }
+  }, [aiDisabled]);
+
   const generateCampaignCopy = async () => {
     if (aiDisabled) {
-      setAiGenerationError('AI is turned off for this workspace because the API quota is exhausted. Handle this campaign manually.');
-      return;
+      if (!aiExhaustionActive()) {
+        setAiDisabled(false);
+      } else {
+        setAiGenerationError(AI_EXHAUSTION_WARNING);
+        return;
+      }
     }
     if (!aiGenerationReady) {
       showToast({
@@ -200,7 +253,10 @@ export default function CampaignsPage() {
       });
     } catch (err) {
       const message = getErrorMessage(err, 'AI/API issue: campaign copy could not be generated. Please write or paste the response manually.');
-      if (err?.response?.data?.detail?.ai_enabled === false) setAiDisabled(true);
+      if (isAiExhaustionError(err)) {
+        stopAiForExhaustion(message || AI_EXHAUSTION_WARNING);
+        return;
+      }
       setAiGenerationError(message);
       showToast({
         type: 'error',
@@ -214,8 +270,12 @@ export default function CampaignsPage() {
 
   const generateHtmlBody = async () => {
     if (aiDisabled) {
-      setAiGenerationError('AI is turned off for this workspace because the API quota is exhausted. Handle this campaign manually.');
-      return;
+      if (!aiExhaustionActive()) {
+        setAiDisabled(false);
+      } else {
+        setAiGenerationError(AI_EXHAUSTION_WARNING);
+        return;
+      }
     }
     const description = htmlAiPrompt.trim();
     if (!description) {
@@ -241,7 +301,10 @@ export default function CampaignsPage() {
       });
     } catch (err) {
       const message = getErrorMessage(err, 'AI/API issue: HTML email body could not be generated. Please write or paste the response manually.');
-      if (err?.response?.data?.detail?.ai_enabled === false) setAiDisabled(true);
+      if (isAiExhaustionError(err)) {
+        stopAiForExhaustion(message || AI_EXHAUSTION_WARNING);
+        return;
+      }
       setAiGenerationError(message);
       showToast({
         type: 'error',
@@ -273,27 +336,23 @@ export default function CampaignsPage() {
         filters: toFiltersPayload(filters, selectedLeadIds, selectedCustomerIds, form.product_id),
         send_now: sendNow,
       };
-      await api.post('/campaigns', payload);
-      setShowForm(false);
-      setForm({ name: '', subject: '', body: '', html_body: '', product_id: '' });
-      setFilters(DEFAULT_FILTERS);
-      setSelectedLeadIds([]);
-      setSelectedCustomerIds([]);
-      setAiDetails(EMPTY_AI_DETAILS);
-      setHtmlAiPrompt('');
-      setAiDisabled(false);
-      setAiGenerationError('');
-      setPreview(null);
+      const res = editingCampaignId
+        ? await api.put(`/campaigns/${editingCampaignId}`, payload)
+        : await api.post('/campaigns', payload);
+      if (sendNow && (res.data?.id || editingCampaignId)) {
+        await api.post(`/campaigns/${res.data?.id || editingCampaignId}/send`, {}, { timeout: LONG_REQUEST_TIMEOUT_MS });
+      }
+      resetComposer();
       const recipientCount = preview?.count ?? 0;
       const campaignName = form.name || form.subject || 'Campaign';
       showToast({
         type: 'success',
-        title: sendNow ? 'Campaign Queued' : 'Draft Saved',
+        title: sendNow ? 'Campaign Queued' : (editingCampaignId ? 'Draft Updated' : 'Draft Saved'),
         message: sendNow
           ? `${campaignName} is queued for ${recipientCount} recipient${recipientCount === 1 ? '' : 's'}.`
           : `${campaignName} was saved${recipientCount ? ` with ${recipientCount} planned recipient${recipientCount === 1 ? '' : 's'}` : ''}.`,
       });
-      loadCampaigns();
+      await loadCampaigns();
     } catch (err) {
       showToast({
         type: 'error',
@@ -308,7 +367,7 @@ export default function CampaignsPage() {
   const sendCampaign = async (id) => {
     const campaign = campaigns.find((item) => item.id === id);
     try {
-      await api.post(`/campaigns/${id}/send`);
+      await api.post(`/campaigns/${id}/send`, {}, { timeout: LONG_REQUEST_TIMEOUT_MS });
       loadCampaigns();
       const recipientCount = campaign?.total_recipients || 0;
       showToast({
@@ -323,6 +382,29 @@ export default function CampaignsPage() {
         message: getErrorMessage(err, 'We could not queue that campaign.'),
       });
     }
+  };
+
+  const openCampaignEditor = (campaign) => {
+    const campaignFilters = campaign?.filters && typeof campaign.filters === 'object' ? campaign.filters : {};
+    setEditingCampaignId(campaign?.id || '');
+    setForm({
+      name: campaign?.name || '',
+      subject: campaign?.subject || '',
+      body: campaign?.body || '',
+      html_body: campaign?.html_body || '',
+      product_id: campaignFilters.product_id || '',
+    });
+    setFilters({
+      audience: campaignFilters.audience || 'both',
+      channel: Array.isArray(campaignFilters.channel) ? campaignFilters.channel.join(', ') : '',
+    });
+    setSelectedLeadIds(Array.isArray(campaignFilters.selected_lead_ids) ? campaignFilters.selected_lead_ids : []);
+    setSelectedCustomerIds(
+      Array.isArray(campaignFilters.selected_customer_ids) ? campaignFilters.selected_customer_ids : [],
+    );
+    setPreview(null);
+    setSendNow(false);
+    setShowForm(true);
   };
 
   const deleteCampaign = async (id) => {
@@ -381,7 +463,7 @@ export default function CampaignsPage() {
               <RefreshCw size={14} />
             </button>
             <button
-              onClick={() => { setShowForm(true); }}
+              onClick={() => { resetComposer(); setShowForm(true); }}
               className="inline-flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-2 text-sm font-semibold text-blue-700 transition-all hover:bg-blue-100"
               data-testid="new-campaign-btn"
             >
@@ -440,7 +522,25 @@ export default function CampaignsPage() {
                   <div className="col-span-1 text-right text-sm text-emerald-600">{c.sent_count || 0}</div>
                   <div className="col-span-1 text-right text-sm text-red-500">{c.failed_count || 0}</div>
                   <div className="col-span-2 flex items-center justify-end gap-1">
-                    {(c.status === 'draft' || c.status === 'failed') && (c.total_recipients || 0) > 0 && (
+                    {c.status === 'draft' && (
+                      <button
+                        onClick={() => openCampaignEditor(c)}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-slate-200 text-slate-500 text-xs hover:bg-slate-50"
+                        data-testid={`edit-campaign-${c.id}`}
+                      >
+                        <Pencil size={11} /> Edit
+                      </button>
+                    )}
+                    {c.status === 'draft' ? (
+                      <button
+                        onClick={() => sendCampaign(c.id)}
+                        disabled={(c.total_recipients || 0) <= 0}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-blue-600 text-white text-xs hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-testid={`send-campaign-${c.id}`}
+                      >
+                        <Send size={11} /> Start Campaign
+                      </button>
+                    ) : c.status === 'failed' && (c.total_recipients || 0) > 0 ? (
                       <button
                         onClick={() => sendCampaign(c.id)}
                         className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-blue-600 text-white text-xs hover:bg-blue-700"
@@ -448,7 +548,7 @@ export default function CampaignsPage() {
                       >
                         <Send size={11} /> Send
                       </button>
-                    )}
+                    ) : null}
                     <button
                       onClick={() => deleteCampaign(c.id)}
                       className="p-1.5 rounded-md border border-slate-200 text-slate-400 hover:text-red-500 hover:bg-red-50"
@@ -469,10 +569,10 @@ export default function CampaignsPage() {
           <div className="w-full max-w-2xl max-h-[90vh] rounded-xl border border-slate-100 bg-white shadow-xl shadow-slate-900/10 flex flex-col overflow-hidden">
             <div className="flex-none flex items-center justify-between border-b border-slate-100 px-5 py-3.5">
               <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800">
-                <Mail size={16} className="text-sky-500" /> New email campaign
+                <Mail size={16} className="text-sky-500" /> {editingCampaignId ? 'Edit draft campaign' : 'New email campaign'}
               </h2>
               <button
-                onClick={() => setShowForm(false)}
+                onClick={resetComposer}
                 className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
                 aria-label="Close"
               >
@@ -620,8 +720,8 @@ export default function CampaignsPage() {
                   </button>
                 </div>
                 {aiGenerationError ? (
-                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700">
-                    {aiGenerationError}
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 flex items-start gap-2">
+                    <AlertCircle size={13} className="mt-0.5 flex-none" /> <span>{aiGenerationError}</span>
                   </div>
                 ) : null}
               </div>
@@ -696,33 +796,6 @@ export default function CampaignsPage() {
                       <option value="customers">Customers only</option>
                     </select>
                   </Field>
-                  <Field label="Lifecycle stage (comma-sep)">
-                    <input
-                      value={filters.lifecycle_stage}
-                      onChange={(e) => setFilters({ ...filters, lifecycle_stage: e.target.value })}
-                      placeholder="lead, prospect, customer"
-                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
-                      data-testid="filter-lifecycle"
-                    />
-                  </Field>
-                  <Field label="Tags (comma-sep)">
-                    <input
-                      value={filters.tags}
-                      onChange={(e) => setFilters({ ...filters, tags: e.target.value })}
-                      placeholder="interested, social_lead, hot_lead"
-                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
-                      data-testid="filter-tags"
-                    />
-                  </Field>
-                  <Field label="Source (comma-sep)">
-                    <input
-                      value={filters.source}
-                      onChange={(e) => setFilters({ ...filters, source: e.target.value })}
-                      placeholder="facebook, instagram, web_chat"
-                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm"
-                      data-testid="filter-source"
-                    />
-                  </Field>
                   <Field label="Channel (comma-sep)">
                     <input
                       value={filters.channel}
@@ -790,7 +863,7 @@ export default function CampaignsPage() {
               <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 sticky bottom-0 bg-white">
                 <button
                   type="button"
-                  onClick={() => setShowForm(false)}
+                  onClick={resetComposer}
                   className="px-3 py-2 rounded-lg border border-slate-200 text-slate-600 text-sm hover:bg-slate-50"
                 >
                   Cancel

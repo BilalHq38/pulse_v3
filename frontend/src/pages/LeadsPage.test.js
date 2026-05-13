@@ -113,6 +113,20 @@ function changeValue(element, value) {
 function installApiMocks(lead = cloneLead()) {
   mockApi.get.mockImplementation((url) => {
     if (url === '/leads') return Promise.resolve({ data: [lead] });
+    if (url === '/settings/channels') {
+      return Promise.resolve({
+        data: [
+          {
+            channel: 'email',
+            enabled: true,
+            email_send_enabled: true,
+            email_provider: 'smtp_imap',
+            smtp_host: 'smtp.example.com',
+            email_address: 'sales@example.com',
+          },
+        ],
+      });
+    }
     if (url === '/reference-data') {
       return Promise.resolve({
         data: {
@@ -188,8 +202,56 @@ test('lead Email opens an editable composer and sends edited content', async () 
     to_email: 'avery@example.com',
     subject: 'Edited lead subject',
     body: 'Edited lead body that the sender reviewed.',
-  });
+  }, expect.objectContaining({ timeout: expect.any(Number) }));
   await waitForNoSelector('[data-testid="lead-email-composer-modal"]', container);
+
+  await act(async () => root.unmount());
+});
+
+test('lead Message method modal includes Email and opens the email composer', async () => {
+  const lead = cloneLead();
+  installApiMocks(lead);
+  const { container, root } = await renderPage();
+
+  await openLeadDetail(container);
+  const messageButton = await waitForSelector('[data-testid="message-lead-btn"]', container);
+  await act(async () => {
+    messageButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  await waitForSelector('[data-testid="lead-message-methods-modal"]', container);
+  const emailMethod = await waitForSelector('[data-testid="lead-method-email"]', container);
+  expect(emailMethod.textContent).toContain('Email');
+
+  await act(async () => {
+    emailMethod.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  await waitForSelector('[data-testid="lead-email-composer-modal"]', container);
+  expect(container.textContent).toContain('To avery@example.com');
+
+  await act(async () => root.unmount());
+});
+
+test('lead Message Email warns when the lead has no email address', async () => {
+  installApiMocks(cloneLead({ email: '', channels: ['whatsapp'] }));
+  const { container, root } = await renderPage();
+
+  await openLeadDetail(container);
+  const messageButton = await waitForSelector('[data-testid="message-lead-btn"]', container);
+  await act(async () => {
+    messageButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  const emailMethod = await waitForSelector('[data-testid="lead-method-email"]', container);
+  await act(async () => {
+    emailMethod.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  expect(mockToast).toHaveBeenCalledWith(expect.objectContaining({
+    message: 'No email address found for this lead.',
+  }));
+  expect(container.querySelector('[data-testid="lead-email-composer-modal"]')).toBeNull();
 
   await act(async () => root.unmount());
 });

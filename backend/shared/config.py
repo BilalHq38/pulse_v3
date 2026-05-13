@@ -290,7 +290,7 @@ def allow_local_ai_fallback() -> bool:
     }
 
 
-def ai_service_timeout_seconds(default: float = 45.0) -> float:
+def ai_service_timeout_seconds(default: float = 60.0) -> float:
     try:
         return float(os.environ.get("AI_SERVICE_TIMEOUT_SECONDS", str(default)))
     except ValueError:
@@ -304,14 +304,14 @@ def ai_service_retry_attempts(default: int = 3) -> int:
         return default
 
 
-def orchestrator_request_timeout_seconds(default: float = 30.0) -> float:
+def orchestrator_request_timeout_seconds(default: float = 60.0) -> float:
     try:
         return float(os.environ.get("ORCHESTRATOR_REQUEST_TIMEOUT_SECONDS", str(default)))
     except ValueError:
         return default
 
 
-def ai_fallback_timeout_seconds(default: float = 15.0) -> float:
+def ai_fallback_timeout_seconds(default: float = 60.0) -> float:
     try:
         return float(os.environ.get("AI_FALLBACK_TIMEOUT_SECONDS", str(default)))
     except ValueError:
@@ -342,19 +342,26 @@ def ai_temperature(default: float = 0.7) -> float:
         return default
 
 
-def ai_max_tokens(default: int = 2048) -> int:
+def ai_max_tokens(default: int = 1024) -> int:
     try:
         return int(os.environ.get("AI_MAX_TOKENS", str(default)) or default)
     except ValueError:
         return default
 
 
-def ai_provider_name(default: str = "openai") -> str:
+def ai_provider_name(default: str = "gemini") -> str:
     return (os.environ.get("AI_PROVIDER", default) or default).strip().lower()
 
 
 def ai_model_name(default: str = "") -> str:
     return (os.environ.get("AI_MODEL_NAME", default) or default).strip()
+
+
+def ai_api_call_timeout_seconds(default: float = 15.0) -> float:
+    try:
+        return max(1.0, min(15.0, float(os.environ.get("AI_API_CALL_TIMEOUT_SECONDS", str(default)) or default)))
+    except ValueError:
+        return default
 
 
 def openai_api_key() -> str:
@@ -385,7 +392,9 @@ def gemini_pro_model_name(default: str = "gemini-2.5-pro") -> str:
     return (os.environ.get("GEMINI_PRO_MODEL", default) or default).strip()
 
 
-def gemini_fallback_models(default: str = "gemini-2.5-flash-lite,gemini-2.5-flash") -> list[str]:
+def gemini_fallback_models(
+    default: str = "gemini-2.5-flash,gemini-2.0-flash,gemini-2.0-flash-lite",
+) -> list[str]:
     return [
         model.strip()
         for model in (os.environ.get("GEMINI_FALLBACK_MODELS", default) or default).split(",")
@@ -544,7 +553,7 @@ def ai_enable_provider_fallback() -> bool:
     }
 
 
-def ai_max_provider_attempts(default: int = 1) -> int:
+def ai_max_provider_attempts(default: int = 3) -> int:
     try:
         return max(1, int(os.environ.get("AI_MAX_PROVIDER_ATTEMPTS", str(default)) or default))
     except ValueError:

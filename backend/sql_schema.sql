@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS company_settings (
     ai_confidence_threshold NUMERIC(4,2) NOT NULL DEFAULT 0.70,
     auto_assign             BOOLEAN NOT NULL DEFAULT TRUE,
     active_llm_engine_id    TEXT NOT NULL DEFAULT '',
+    ai_static_fallback_message TEXT NOT NULL DEFAULT 'Thanks for your message. A team member will respond shortly.',
     preferred_channels      JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -102,6 +103,7 @@ CREATE INDEX IF NOT EXISTS idx_company_settings_company_id ON company_settings(c
 CREATE INDEX IF NOT EXISTS idx_company_settings_created_at ON company_settings(company_id, created_at);
 
 ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS preferred_channels JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS ai_static_fallback_message TEXT NOT NULL DEFAULT 'Thanks for your message. A team member will respond shortly.';
 -- Per-tenant default region (ISO 3166-1 alpha-2) for parsing local phone numbers; empty = use env WHATSAPP_DEFAULT_COUNTRY only.
 ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS default_phone_region TEXT NOT NULL DEFAULT '';
 
@@ -700,6 +702,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     assigned_to       TEXT NOT NULL DEFAULT '',
     assigned_name     TEXT NOT NULL DEFAULT '',
     ai_handled        BOOLEAN NOT NULL DEFAULT TRUE,
+    ai_auto_paused    BOOLEAN NOT NULL DEFAULT FALSE,
+    ai_paused_at      TIMESTAMPTZ,
+    ai_paused_reason  TEXT NOT NULL DEFAULT '',
+    ai_paused_error_type TEXT NOT NULL DEFAULT '',
+    ai_paused_provider TEXT NOT NULL DEFAULT '',
+    ai_paused_model   TEXT NOT NULL DEFAULT '',
+    ai_paused_scope   TEXT NOT NULL DEFAULT '',
+    ai_disabled_until TIMESTAMPTZ,
+    ai_failure_count  INTEGER NOT NULL DEFAULT 0,
     agent_type        TEXT NOT NULL DEFAULT 'generic',
     sentiment_score   NUMERIC(5,4) NOT NULL DEFAULT 0,
     sentiment_label   TEXT NOT NULL DEFAULT 'neutral',
@@ -2123,6 +2134,15 @@ END $$;
 -- ============================================================================
 
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFAULT 'generic';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_auto_paused BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_at TIMESTAMPTZ;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_error_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_scope TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_disabled_until TIMESTAMPTZ;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_failure_count INT DEFAULT 0;
 
 -- Adaptive qualification + onboarding flow state (JSONB, no schema drift required for callers).
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;

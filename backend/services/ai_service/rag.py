@@ -669,12 +669,12 @@ async def build_ai_context(
     }
 
 
-async def get_company_knowledge(db, company_id: str | None = None, current_query: str = "", top_k: int = 3) -> str:
+async def get_company_knowledge(db, company_id: str | None = None, current_query: str = "", top_k: int = 5) -> str:
     context = await build_ai_context(
         db,
         company_id=company_id,
         current_query=current_query,
-        max_products=max(1, min(top_k, 3)),
+        max_products=max(5, int(top_k or 5)),
     )
     return context["knowledge_text"]
 

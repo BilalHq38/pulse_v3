@@ -49,6 +49,10 @@ class RespondRequest(BaseModel):
     historical_sentiment: str = ""
     actor_user_id: str = ""
     conversation_id: str = ""
+    system_prompt: str = ""
+    extra_context: str = ""
+    company_info: dict[str, Any] = Field(default_factory=dict)
+    context_package: dict[str, Any] = Field(default_factory=dict)
 
 
 class RespondResponse(BaseModel):
@@ -76,6 +80,13 @@ class RespondResponse(BaseModel):
     error_type: str = ""
     error_reason: str = ""
     fallback_used: bool = False
+    static_fallback_served: bool = False
+    ai_auto_paused: bool = False
+    ai_paused_reason: str = ""
+    ai_paused_error_type: str = ""
+    ai_paused_provider: str = ""
+    ai_paused_model: str = ""
+    ai_paused_scope: str = ""
 
 
 class LeadScoreRequest(BaseModel):

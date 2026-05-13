@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -103,6 +104,33 @@ def _log_background_task_result(task: asyncio.Task) -> None:
         logger.warning("Background task failed", exc_info=exc)
 
 
+def _close_unstarted_coroutines(value, seen: set[int] | None = None) -> None:
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return
+    seen.add(value_id)
+    if inspect.iscoroutine(value):
+        try:
+            if inspect.getcoroutinestate(value) != "CORO_CREATED":
+                return
+        except Exception:
+            return
+        frame = getattr(value, "cr_frame", None)
+        if frame is not None:
+            for local_value in list(frame.f_locals.values()):
+                _close_unstarted_coroutines(local_value, seen)
+        value.close()
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _close_unstarted_coroutines(item, seen)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            _close_unstarted_coroutines(item, seen)
+
+
 async def _dispatch_detached_task(
     coro,
     *,
@@ -124,10 +152,7 @@ async def _dispatch_detached_task(
                 idempotency_key=idempotency_key,
                 timeout_seconds=timeout_seconds,
             )
-            # enqueue_coroutine serialised the coroutine object; do NOT call
-            # coro.close() here — closing a never-started coroutine is exactly
-            # what triggers "coroutine was never awaited" RuntimeWarning.
-            # Just return; the GC will collect the coroutine naturally.
+            _close_unstarted_coroutines(coro)
             return
         except Exception as exc:
             logger.warning("Background queue enqueue failed, falling back locally: %s", exc)

@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import BackgroundTasks, HTTPException, Request
 
 from core.request_helpers import resolve_frontend_base_url
 from core.utils import make_id, validate_password
@@ -200,6 +200,8 @@ async def prepare_public_registration(
     db,
     request: Request,
     payload: dict[str, Any],
+    *,
+    background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     await ensure_pending_signup_primitives(db)
     await _expire_stale_pending_signups(db)
@@ -449,6 +451,7 @@ async def _complete_pending_signup_workspace(
                     existing_user,
                     request,
                     "register",
+                    background_tasks,
                 )
             except Exception as exc:
                 verification_error = _stringify_error(exc)
@@ -568,6 +571,7 @@ async def _complete_pending_signup_workspace(
             user,
             request,
             "register",
+            background_tasks,
         )
         verification_sent_at = _utc_now()
     except Exception as exc:

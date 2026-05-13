@@ -1,14 +1,13 @@
 """Adaptive qualification helper.
 
 Progressive, per-interaction collection of qualification fields
-(budget, timeline, need, role) using lightweight regex/keyword extraction
+(budget, timeline, role) using lightweight regex/keyword extraction
 plus the entities returned by the intent classifier.
 
 State is persisted on ``leads.metadata -> qualification`` (JSONB) so no
-additional table is required. When all required fields are collected the
-helper returns ``ready_for_scoring=True`` and the QualificationAgent is
-allowed to invoke ``generate_lead_score``. Until then the next best
-question is returned so the SupportAgent can ask it.
+additional table is required. When enough information is collected, or the
+three-turn escape hatch is reached, background scoring can update the lead
+after the customer response has been delivered.
 """
 
 from __future__ import annotations
@@ -18,10 +17,12 @@ import logging
 import re
 from typing import Any
 
+from services.ai_service.facade import generate_lead_score
+
 logger = logging.getLogger(__name__)
 
 
-REQUIRED_FIELDS: tuple[str, ...] = ("need", "budget", "timeline", "role")
+REQUIRED_FIELDS: tuple[str, ...] = ("budget", "timeline", "role")
 
 
 FIELD_QUESTIONS: dict[str, str] = {
@@ -250,7 +251,8 @@ async def advance_adaptive_qualification(
     completed = [f for f in REQUIRED_FIELDS if str(answers.get(f) or "").strip()]
 
     next_field, next_question = ("", "")
-    ready_for_scoring = not missing
+    turns_count = len(asked)
+    ready_for_scoring = (not missing) or (turns_count >= 3)
     if not ready_for_scoring:
         next_field, next_question = _next_question(answers, asked)
         if next_field and next_field not in asked:
@@ -271,3 +273,67 @@ async def advance_adaptive_qualification(
         await _save_lead_qualification(db, lead_id, company_id, qualification)
 
     return qualification
+
+
+async def _update_qualification_silently(
+    db, company_id: str, lead: dict, message_text: str, intent: str | dict
+) -> None:
+    try:
+        qualification = await advance_adaptive_qualification(
+            db=db,
+            company_id=company_id,
+            lead=lead,
+            message_text=message_text,
+            intent=intent if isinstance(intent, dict) else {"intent": str(intent or "")},
+        )
+        if qualification.get("ready_for_scoring"):
+            await _score_lead_silently(
+                db=db,
+                company_id=company_id,
+                lead=lead,
+                message_text=message_text,
+            )
+    except Exception as exc:
+        logger.debug("Background qualification update failed (non-critical): %s", exc)
+
+
+async def _score_lead_silently(db, company_id: str, lead: dict, message_text: str) -> None:
+    lead = dict(lead or {})
+    lead_id = str(lead.get("id") or "").strip()
+    if not (db and company_id and lead_id):
+        return
+    scoring_lead = dict(lead)
+    if message_text and not str(scoring_lead.get("notes") or "").strip():
+        scoring_lead["notes"] = message_text
+    score_result = await generate_lead_score(
+        scoring_lead,
+        db=db,
+        company_id=company_id,
+        count_against_budget=False,
+    )
+    if score_result.get("fallback_used") and score_result.get("error_type"):
+        logger.debug(
+            "Background lead scoring skipped result persistence lead_id=%s error_type=%s",
+            lead_id,
+            score_result.get("error_type"),
+        )
+        return
+    await db.execute(
+        """
+        UPDATE leads
+           SET score=$1,
+               grade=$2,
+               phase=$3,
+               scoring_reason=$4,
+               next_action=$5,
+               updated_at=NOW()
+         WHERE id=$6 AND company_id=$7
+        """,
+        int(score_result.get("score", 0) or 0),
+        str(score_result.get("grade") or ""),
+        str(score_result.get("phase") or "awareness"),
+        str(score_result.get("reasoning") or ""),
+        str(score_result.get("next_action") or ""),
+        lead_id,
+        company_id,
+    )

@@ -266,11 +266,13 @@ async def _message_workflow_fallback(
         "status": str((payload.customer or {}).get("lifecycle_stage") or "new"),
         "notes": payload.message_text,
     }
-    qualification = await generate_lead_score(
-        lead_candidate,
-        db=db,
-        company_id=payload.company_id,
-    )
+    qualification = {
+        "score": 0,
+        "grade": "scoring_deferred",
+        "phase": "awareness",
+        "reasoning": "Qualification/scoring runs after response delivery.",
+        "next_action": "continue_conversation",
+    }
     confidence = float(support.get("confidence", 0.0) or 0.0)
     escalate = bool(
         not sentiment_gate.get("ai_response_allowed", True)
@@ -328,6 +330,7 @@ async def _message_workflow_fallback(
                 "route_to_support": True,
                 "reasoning": str(qualification.get("reasoning") or ""),
                 "next_action": str(qualification.get("next_action") or ""),
+                "qualification_scoring_called": False,
             },
             support=support_payload,
             analytics={"queued": bool(payload.run_async_analytics)},
@@ -348,7 +351,7 @@ async def _lead_workflow_fallback(
                     db,
                     company_id=payload.company_id,
                     current_query=str(lead.get("notes") or lead.get("name") or ""),
-                    top_k=3,
+                    top_k=5,
                 )
             }
         )

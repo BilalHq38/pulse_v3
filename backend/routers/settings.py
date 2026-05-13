@@ -172,6 +172,7 @@ ALLOWED_COMPANY_SETTINGS_FIELDS = {
     "bh_days",
     "ai_enabled",
     "ai_confidence_threshold",
+    "ai_static_fallback_message",
     "auto_assign",
     "active_llm_engine_id",
     "updated_at",
@@ -300,6 +301,7 @@ class CompanySettingsUpdate(BaseModel):
     currency: Optional[str] = Field(default=None, max_length=10)
     ai_enabled: Optional[bool] = None
     ai_confidence_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    ai_static_fallback_message: Optional[str] = Field(default=None, max_length=1000)
     auto_assign: Optional[bool] = None
     active_llm_engine_id: Optional[str] = Field(default=None, max_length=255)
     social_links: Optional[SocialLinks] = None

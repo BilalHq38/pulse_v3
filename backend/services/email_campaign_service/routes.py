@@ -27,12 +27,15 @@ from services.db_helpers import (
 from services.email_campaign_service.service import (
     CampaignAIQuotaExceededError,
     CampaignAIUnavailableError,
+    campaign_ai_quota_message,
     create_campaign,
     generate_campaign_copy,
     generate_html_email_body,
     resolve_recipients,
     schedule_campaign_send,
+    update_campaign,
 )
+from shared.database import company_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -42,25 +45,22 @@ def _db(request: Request):
     return request.app.state.db
 
 
-async def _disable_company_ai(db, company_id: str, reason: str) -> None:
-    if not company_id:
-        return
-    try:
-        await db.execute(
-            "UPDATE company_settings SET ai_enabled=FALSE,updated_at=NOW() WHERE company_id=$1",
-            company_id,
-        )
-        logger.warning("Company AI disabled after campaign AI failure company_id=%s reason=%s", company_id, reason)
-    except Exception as exc:  # pragma: no cover - defensive logging path
-        logger.exception("Failed to disable company AI after campaign AI failure company_id=%s error=%s", company_id, exc)
-
-
 def _manual_ai_response(message: str, *, ai_enabled: bool) -> dict:
     return {
         "message": message,
         "ai_enabled": ai_enabled,
         "manual_required": True,
     }
+
+
+async def _ensure_company_ai_available(db, company_id: str) -> None:
+    async with company_context(db, company_id):
+        enabled = await db.fetchval(
+            "SELECT COALESCE(ai_enabled, TRUE) FROM company_settings WHERE company_id=$1 LIMIT 1",
+            company_id,
+        )
+    if enabled is False:
+        raise CampaignAIQuotaExceededError(campaign_ai_quota_message())
 
 
 @router.get("/campaigns")
@@ -147,6 +147,44 @@ async def create_campaign_route(request: Request):
     return campaign
 
 
+@router.put("/campaigns/{campaign_id}")
+async def update_campaign_route(campaign_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    payload = await request.json()
+    name = str(payload.get("name") or "").strip()
+    subject = str(payload.get("subject") or "").strip()
+    body = str(payload.get("body") or "").strip()
+    html_body = str(payload.get("html_body") or "").strip()
+    filters = dict(payload.get("filters") or {})
+
+    if not subject:
+        raise HTTPException(status_code=400, detail="Subject is required")
+    if not (body or html_body):
+        raise HTTPException(status_code=400, detail="Body or html_body is required")
+
+    try:
+        return await update_campaign(
+            db,
+            campaign_id=campaign_id,
+            company_id=cid,
+            name=name or subject,
+            subject=subject,
+            body=body,
+            html_body=html_body,
+            filters=filters,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Campaign update failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to update campaign") from exc
+
+
 @router.post("/campaigns/generate")
 async def generate_campaign_route(request: Request):
     db = _db(request)
@@ -157,6 +195,7 @@ async def generate_campaign_route(request: Request):
 
     payload = await request.json()
     try:
+        await _ensure_company_ai_available(db, cid)
         return await generate_campaign_copy(
             db,
             company_id=cid,
@@ -171,7 +210,7 @@ async def generate_campaign_route(request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CampaignAIQuotaExceededError as exc:
-        await _disable_company_ai(db, cid, str(exc))
+        logger.warning("Campaign copy generation unavailable company_id=%s reason=%s", cid, exc)
         raise HTTPException(
             status_code=503,
             detail=_manual_ai_response(str(exc), ai_enabled=False),
@@ -199,6 +238,7 @@ async def generate_campaign_html_body_route(request: Request):
 
     payload = await request.json()
     try:
+        await _ensure_company_ai_available(db, cid)
         return await generate_html_email_body(
             db,
             company_id=cid,
@@ -209,7 +249,7 @@ async def generate_campaign_html_body_route(request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CampaignAIQuotaExceededError as exc:
-        await _disable_company_ai(db, cid, str(exc))
+        logger.warning("HTML email body generation unavailable company_id=%s reason=%s", cid, exc)
         raise HTTPException(
             status_code=503,
             detail=_manual_ai_response(str(exc), ai_enabled=False),

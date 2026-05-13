@@ -10,6 +10,8 @@ from services.ai_service.facade import (
     get_provider_runtime_info,
     validate_live_engine,
 )
+from services.ai_service.model_catalog import validate_model_selection
+from services.ai_service.response_generator import clear_engine_cache
 from core.utils import make_id, now_ts, normalize_reference_key
 from services.db_helpers import (
     enrich_llm_engine,
@@ -18,6 +20,7 @@ from services.db_helpers import (
     get_current_user_flexible,
     r,
     require_roles,
+    resolve_active_llm_engine,
     rs,
 )
 
@@ -91,6 +94,17 @@ def _filter_update_fields(body: dict, allowed: set[str]) -> dict:
     return {k: v for k, v in body.items() if k in allowed}
 
 
+def _validate_llm_model_or_400(provider: str, model_name: str) -> None:
+    try:
+        validate_model_selection(provider, model_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _invalidate_llm_engine_cache(company_id: str, reason: str) -> None:
+    clear_engine_cache(company_id, reason=reason)
+
+
 async def _load_agent_runtime_fields(db, agent: dict, company_id: str) -> dict:
     data = dict(agent or {})
     llm_id = str(data.get("llm_id") or "").strip()
@@ -134,18 +148,25 @@ async def list_llm_engines(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
-    settings = await ensure_company_settings_row(db, cid)
-    selected_id = settings.get("active_llm_engine_id", "")
+    selected = await resolve_active_llm_engine(db, cid)
+    selected_id = selected.get("id", "")
     return [
         enrich_llm_engine(engine, selected_id=selected_id)
-        for engine in rs(await db.fetch("SELECT * FROM llm_engines ORDER BY provider, model_name"))
+        for engine in rs(
+            await db.fetch(
+                "SELECT * FROM llm_engines WHERE is_active=TRUE AND (company_id='' OR company_id=$1) "
+                "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, provider, model_name",
+                cid,
+            )
+        )
     ]
 
 
 @router.post("/ai/llm-engines")
 async def create_llm_engine(request: Request):
     db = _db(request)
-    await require_roles(request, ["admin", "super_admin"])
+    current_user = await require_roles(request, ["admin", "super_admin"])
+    cid = (current_user.get("company_id", "") or "").strip()
     body = await request.json()
     model_name = str(body.get("model_name", "") or "").strip()
     provider = normalize_reference_key(body.get("provider", ""))
@@ -153,10 +174,12 @@ async def create_llm_engine(request: Request):
         raise HTTPException(400, "model_name is required")
     if provider not in {"gemini", "openai", "anthropic"}:
         raise HTTPException(400, "provider must be gemini, openai, or anthropic")
+    _validate_llm_model_or_400(provider, model_name)
     eid = make_id()
     await db.execute(
-        "INSERT INTO llm_engines(id,model_name,provider,api_endpoint,temperature,max_tokens,is_active,version,last_updated,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW(),NOW())",  # noqa: E501
+        "INSERT INTO llm_engines(id,company_id,model_name,provider,api_endpoint,temperature,max_tokens,is_active,version,last_updated,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),NOW())",  # noqa: E501
         eid,
+        cid,
         model_name,
         provider,
         (body.get("api_endpoint", "") or "").strip(),
@@ -165,6 +188,7 @@ async def create_llm_engine(request: Request):
         bool(body.get("is_active", True)),
         (body.get("version", "current") or "current").strip(),
     )
+    _invalidate_llm_engine_cache(cid, "settings_update")
     return r(await db.fetchrow("SELECT * FROM llm_engines WHERE id=$1", eid))
 
 
@@ -178,12 +202,19 @@ async def update_llm_engine(llm_id: str, request: Request):
         body["provider"] = normalize_reference_key(body["provider"])
         if body["provider"] not in {"openai", "anthropic", "gemini"}:
             raise HTTPException(400, "provider must be openai, anthropic, or gemini")
+    current = r(await db.fetchrow("SELECT provider,model_name,company_id FROM llm_engines WHERE id=$1 LIMIT 1", llm_id))
+    if not current:
+        raise HTTPException(404, "LLM engine not found")
+    final_provider = normalize_reference_key(body.get("provider", current.get("provider", "")))
+    final_model = str(body.get("model_name", current.get("model_name", "")) or "").strip()
+    _validate_llm_model_or_400(final_provider, final_model)
     if not body:
         raise HTTPException(400, "No valid fields provided")
     body["updated_at"] = now_ts()
     body["last_updated"] = now_ts()
     set_parts = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(body))
     await db.execute(f"UPDATE llm_engines SET {set_parts} WHERE id=$1", llm_id, *body.values())
+    _invalidate_llm_engine_cache(str(current.get("company_id") or ""), "settings_update")
     return r(await db.fetchrow("SELECT * FROM llm_engines WHERE id=$1", llm_id))
 
 
@@ -192,14 +223,20 @@ async def select_llm_engine(llm_id: str, request: Request):
     db = _db(request)
     cu = await require_roles(request, ["admin", "super_admin"])
     cid = cu.get("company_id", "")
-    engine = r(await db.fetchrow("SELECT * FROM llm_engines WHERE id=$1", llm_id))
+    engine = r(
+        await db.fetchrow(
+            "SELECT * FROM llm_engines WHERE id=$1 AND (company_id='' OR company_id=$2) LIMIT 1",
+            llm_id,
+            cid,
+        )
+    )
     if not engine:
         raise HTTPException(404, "LLM engine not found")
     ready, reason = get_provider_runtime_info(engine.get("provider", ""))
     if not ready:
         raise HTTPException(400, reason)
     try:
-        validate_live_engine(engine, require_vision=True)
+        validate_live_engine(engine, require_vision=False)
     except Exception as exc:
         raise HTTPException(400, str(exc))
     settings = await ensure_company_settings_row(db, cid)
@@ -208,6 +245,7 @@ async def select_llm_engine(llm_id: str, request: Request):
         llm_id,
         settings["id"],
     )
+    _invalidate_llm_engine_cache(cid, "settings_update")
     return {"ok": True, "engine": enrich_llm_engine(engine, selected_id=llm_id)}
 
 
@@ -218,6 +256,7 @@ async def delete_llm_engine(llm_id: str, request: Request):
     res = await db.execute("DELETE FROM llm_engines WHERE id=$1", llm_id)
     if res == "DELETE 0":
         raise HTTPException(404, "LLM engine not found")
+    _invalidate_llm_engine_cache("", "settings_update")
     return {"ok": True}
 
 

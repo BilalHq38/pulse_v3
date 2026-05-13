@@ -6,13 +6,34 @@ import {
   Save, Plus, Trash2, Edit, Bot, Wand2, RefreshCw, Activity,
 } from 'lucide-react';
 
-const LLM_MODELS = {
-  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o3-mini'],
-  anthropic: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
-  gemini: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'],
+const MODEL_CATEGORIES = [
+  { value: 'text_generation', label: 'Text generation' },
+  { value: 'vision', label: 'Vision / image understanding' },
+  { value: 'audio_understanding', label: 'Audio understanding' },
+  { value: 'text_to_speech', label: 'Text-to-speech' },
+  { value: 'embeddings', label: 'Embeddings' },
+];
+
+const LLM_MODEL_OPTIONS = {
+  openai: [
+    { id: 'gpt-4o', label: 'GPT-4o', category: 'text_generation', caps: ['Text', 'Vision'] },
+    { id: 'gpt-4o-mini', label: 'GPT-4o mini', category: 'text_generation', caps: ['Text', 'Vision'] },
+    { id: 'gpt-4-turbo', label: 'GPT-4 Turbo', category: 'text_generation', caps: ['Text', 'Vision'] },
+  ],
+  anthropic: [
+    { id: 'claude-3-7-sonnet-20250219', label: 'Claude 3.7 Sonnet', category: 'text_generation', caps: ['Text', 'Vision'] },
+    { id: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet', category: 'text_generation', caps: ['Text', 'Vision'] },
+    { id: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku', category: 'text_generation', caps: ['Text', 'Vision'] },
+  ],
+  gemini: [
+    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', category: 'text_generation', caps: ['Text', 'Vision', 'Audio'], default: true },
+    { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite', category: 'text_generation', caps: ['Text'], recommended: true },
+    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', category: 'text_generation', caps: ['Text', 'Vision'], recommended: true },
+  ],
 };
-const DEFAULT_LLM_PROVIDER = 'openai';
-const DEFAULT_LLM_MODEL = LLM_MODELS[DEFAULT_LLM_PROVIDER][0];
+const DEFAULT_LLM_PROVIDER = 'gemini';
+const DEFAULT_MODEL_CATEGORY = 'text_generation';
+const DEFAULT_LLM_MODEL = 'gemini-2.5-flash';
 
 const MODEL_MAX_TOKENS = {
   'gpt-4o': 16384, 'gpt-4o-mini': 16384,
@@ -20,7 +41,7 @@ const MODEL_MAX_TOKENS = {
   'o1': 32768, 'o1-mini': 65536, 'o3-mini': 100000,
   'claude-3-7-sonnet-20250219': 8192, 'claude-3-5-sonnet-20241022': 8192,
   'claude-3-5-haiku-20241022': 8192, 'claude-3-opus-20240229': 4096, 'claude-3-haiku-20240307': 4096,
-  'gemini-2.5-flash': 8192, 'gemini-2.5-pro': 8192, 'gemini-2.5-flash-lite': 8192,
+  'gemini-2.5-flash': 1024, 'gemini-2.5-pro': 2048, 'gemini-2.5-flash-lite': 1024,
 };
 
 const AGENT_RUNTIME_PROFILES = {
@@ -63,6 +84,74 @@ function providerStatusMeta(engine) {
     return { label: 'Unavailable', className: 'bg-red-50 text-red-700' };
   }
   return { label: 'Missing API key', className: 'bg-amber-50 text-amber-700' };
+}
+
+function modelOptions(provider, category = '') {
+  const options = LLM_MODEL_OPTIONS[provider] || [];
+  return category ? options.filter((option) => option.category === category) : options;
+}
+
+function findModelOption(provider, modelName, category = '') {
+  const model = String(modelName || '').trim();
+  const scoped = modelOptions(provider, category).find((option) => option.id === model);
+  if (scoped) return scoped;
+  return (LLM_MODEL_OPTIONS[provider] || []).find((option) => option.id === model) || null;
+}
+
+function firstModel(provider, category = DEFAULT_MODEL_CATEGORY) {
+  return modelOptions(provider, category)[0] || (LLM_MODEL_OPTIONS[provider] || [])[0] || { id: '', caps: [] };
+}
+
+function coerceModelDraft(provider, modelName, category = DEFAULT_MODEL_CATEGORY) {
+  const selectedProvider = provider || DEFAULT_LLM_PROVIDER;
+  const current = findModelOption(selectedProvider, modelName, category);
+  if (current) {
+    return {
+      model_name: current.id,
+      model_category: current.category,
+      max_tokens: MODEL_MAX_TOKENS[current.id] || 2048,
+    };
+  }
+  const fallback = firstModel(selectedProvider, category);
+  return {
+    model_name: fallback.id,
+    model_category: fallback.category || category,
+    max_tokens: MODEL_MAX_TOKENS[fallback.id] || 2048,
+  };
+}
+
+function categoriesForProvider(provider) {
+  return MODEL_CATEGORIES.filter((category) => modelOptions(provider, category.value).length > 0);
+}
+
+function modelCategory(provider, modelName, fallback = DEFAULT_MODEL_CATEGORY) {
+  return findModelOption(provider, modelName)?.category || fallback;
+}
+
+function capsForEngine(engine) {
+  if (Array.isArray(engine?.capabilities) && engine.capabilities.length) return engine.capabilities;
+  const caps = [];
+  if (engine?.supports_text !== false) caps.push('Text');
+  if (engine?.supports_vision) caps.push('Vision');
+  if (engine?.supports_audio) caps.push('Audio');
+  if (engine?.supports_tts) caps.push('TTS');
+  if (engine?.supports_embeddings) caps.push('Embedding');
+  if (engine?.supports_image_generation) caps.push('Image Generation');
+  return caps.length ? caps : ['Text'];
+}
+
+function capsForDraft(draft) {
+  return findModelOption(draft?.provider, draft?.model_name, draft?.model_category)?.caps || ['Text'];
+}
+
+function CapabilityBadges({ caps }) {
+  return (
+    <div className="flex flex-wrap gap-1.5" data-testid="model-capability-badges">
+      {caps.map((cap) => (
+        <span key={cap} className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 font-medium">{cap}</span>
+      ))}
+    </div>
+  );
 }
 
 export default function AiSettingsTab({
@@ -370,7 +459,7 @@ export default function AiSettingsTab({
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2"><Wand2 size={14} className="text-violet-500" /> LLM Engines ({llmEngines.length})</h3>
           {isAdmin && (
-            <button onClick={() => { const m = DEFAULT_LLM_MODEL; setShowAddLlmForm(true); setAddLlmForm({ model_name: m, provider: DEFAULT_LLM_PROVIDER, temperature: 0.7, max_tokens: MODEL_MAX_TOKENS[m] || 2048 }); }}
+            <button data-testid="add-llm-engine-btn" onClick={() => { const m = DEFAULT_LLM_MODEL; setShowAddLlmForm(true); setAddLlmForm({ model_name: m, model_category: DEFAULT_MODEL_CATEGORY, provider: DEFAULT_LLM_PROVIDER, temperature: 0.7, max_tokens: MODEL_MAX_TOKENS[m] || 2048 }); }}
               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-500">
               <Plus size={12} /> Add Engine
             </button>
@@ -388,7 +477,7 @@ export default function AiSettingsTab({
             {llmEngines.map(e => {
               const providerStatus = providerStatusMeta(e);
               return (
-              <div key={e.id} className="border border-slate-200 rounded-lg overflow-hidden">
+              <div key={e.id} className="border border-slate-200 rounded-lg overflow-hidden" data-testid="llm-engine-card">
                 <div className="flex items-center justify-between p-3 bg-slate-50">
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-slate-700">{e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : '—'} — {e.model_name || 'No model'}</p>
@@ -396,7 +485,7 @@ export default function AiSettingsTab({
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.is_selected ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{e.is_selected ? 'Live now' : 'Catalog only'}</span>
                       <span title={e.provider_status_detail || ''} className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${providerStatus.className}`}>{providerStatus.label}</span>
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.supports_vision ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-500'}`}>{e.supports_vision ? 'Vision capable' : 'Text only'}</span>
+                      <CapabilityBadges caps={capsForEngine(e)} />
                     </div>
                   </div>
                   <div className="flex items-center gap-2 ml-3 flex-shrink-0">
@@ -428,7 +517,7 @@ export default function AiSettingsTab({
                       </button>
                     )}
                     {isAdmin && (
-                      <button onClick={() => { setEditingLlmId(editingLlmId === e.id ? null : e.id); setLlmDraft({ model_name: e.model_name || DEFAULT_LLM_MODEL, provider: e.provider || DEFAULT_LLM_PROVIDER, temperature: e.temperature ?? 0.7, max_tokens: e.max_tokens ?? 2048 }); }}
+                      <button onClick={() => { const provider = e.provider || DEFAULT_LLM_PROVIDER; const model = e.model_name || DEFAULT_LLM_MODEL; const validModel = coerceModelDraft(provider, model, modelCategory(provider, model)); setEditingLlmId(editingLlmId === e.id ? null : e.id); setLlmDraft({ model_name: validModel.model_name, model_category: validModel.model_category, provider, temperature: e.temperature ?? 0.7, max_tokens: validModel.max_tokens || e.max_tokens || 2048 }); }}
                         className="p-1.5 hover:bg-slate-200 rounded text-slate-500"><Edit size={13} /></button>
                     )}
                     {isAdmin && (
@@ -467,14 +556,27 @@ export default function AiSettingsTab({
                       <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider</label>
                         <select value={llmDraft.provider}
-                          onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setLlmDraft(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
+                          data-testid="llm-edit-provider"
+                          onChange={ev => { const first = firstModel(ev.target.value, DEFAULT_MODEL_CATEGORY); setLlmDraft(p => ({ ...p, provider: ev.target.value, model_category: DEFAULT_MODEL_CATEGORY, model_name: first.id, max_tokens: MODEL_MAX_TOKENS[first.id] || 2048 })); }}
                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
                           <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option>
                         </select>
                       </div>
                       <div>
+                        <label className="text-[10px] text-slate-400 font-medium mb-1 block">Category</label>
+                        <select value={llmDraft.model_category || modelCategory(llmDraft.provider, llmDraft.model_name)}
+                          data-testid="llm-edit-category"
+                          onChange={ev => { const first = firstModel(llmDraft.provider, ev.target.value); setLlmDraft(p => ({ ...p, model_category: ev.target.value, model_name: first.id, max_tokens: MODEL_MAX_TOKENS[first.id] || p.max_tokens })); }}
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
+                          {categoriesForProvider(llmDraft.provider).map(category => <option key={category.value} value={category.value}>{category.label}</option>)}
+                        </select>
+                      </div>
+                      <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model</label>
-                        <select value={llmDraft.model_name} onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[llmDraft.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>
+                        <select value={llmDraft.model_name} data-testid="llm-edit-model" onChange={ev => setLlmDraft(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">{modelOptions(llmDraft.provider, llmDraft.model_category || modelCategory(llmDraft.provider, llmDraft.model_name)).map(m => <option key={`${m.category}-${m.id}`} value={m.id}>{m.label}{m.default ? ' (Default)' : m.recommended ? ' (Recommended)' : ''}</option>)}</select>
+                      </div>
+                      <div className="flex items-end pb-1">
+                        <CapabilityBadges caps={capsForDraft(llmDraft)} />
                       </div>
                       <div>
                         <label className="text-[10px] text-slate-400 font-medium mb-1 block">Temperature ({llmDraft.temperature})</label>
@@ -486,7 +588,18 @@ export default function AiSettingsTab({
                       </div>
                     </div>
                     <div className="flex gap-2">
-                      <button onClick={async () => { const r = await api.put(`/ai/llm-engines/${e.id}`, llmDraft).catch(() => null); if (r) { await refreshAiConfig(); setEditingLlmId(null); } }}
+                      <button onClick={async () => {
+                        try {
+                          const r = await api.put(`/ai/llm-engines/${e.id}`, llmDraft);
+                          if (r) { await refreshAiConfig(); setEditingLlmId(null); }
+                        } catch (err) {
+                          showToast({
+                            type: 'error',
+                            title: 'Unsupported Gemini model',
+                            message: getErrorMessage(err, 'Unsupported Gemini model. Please select a valid model.'),
+                          });
+                        }
+                      }}
                         disabled={saving === 'llm' + e.id}
                         className="px-4 py-2 bg-violet-600 text-white rounded-lg text-xs font-medium hover:bg-violet-500 disabled:opacity-50">
                         {saving === 'llm' + e.id ? 'Saving…' : 'Save Changes'}
@@ -508,18 +621,43 @@ export default function AiSettingsTab({
               <div>
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">Provider *</label>
                 <select value={addLlmForm.provider}
-                  onChange={ev => { const first = (LLM_MODELS[ev.target.value] || [])[0] || ''; setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_name: first, max_tokens: MODEL_MAX_TOKENS[first] || 2048 })); }}
+                  data-testid="llm-add-provider"
+                  onChange={ev => { const first = firstModel(ev.target.value, DEFAULT_MODEL_CATEGORY); setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_category: DEFAULT_MODEL_CATEGORY, model_name: first.id, max_tokens: MODEL_MAX_TOKENS[first.id] || 2048 })); }}
                   className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
                   <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option>
                 </select>
               </div>
               <div>
+                <label className="text-[10px] text-slate-400 font-medium mb-1 block">Category *</label>
+                <select value={addLlmForm.model_category || DEFAULT_MODEL_CATEGORY}
+                  data-testid="llm-add-category"
+                  onChange={ev => { const first = firstModel(addLlmForm.provider, ev.target.value); setAddLlmForm(p => ({ ...p, model_category: ev.target.value, model_name: first.id, max_tokens: MODEL_MAX_TOKENS[first.id] || p.max_tokens || 2048 })); }}
+                  className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+                  {categoriesForProvider(addLlmForm.provider).map(category => <option key={category.value} value={category.value}>{category.label}</option>)}
+                </select>
+              </div>
+              <div>
                 <label className="text-[10px] text-slate-400 font-medium mb-1 block">Model *</label>
-                <select value={addLlmForm.model_name} onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">{(LLM_MODELS[addLlmForm.provider] || []).map(m => <option key={m} value={m}>{m}</option>)}</select>
+                <select value={addLlmForm.model_name} data-testid="llm-add-model" onChange={ev => setAddLlmForm(p => ({ ...p, model_name: ev.target.value, max_tokens: MODEL_MAX_TOKENS[ev.target.value] || p.max_tokens }))} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">{modelOptions(addLlmForm.provider, addLlmForm.model_category || DEFAULT_MODEL_CATEGORY).map(m => <option key={`${m.category}-${m.id}`} value={m.id}>{m.label}{m.default ? ' (Default)' : m.recommended ? ' (Recommended)' : ''}</option>)}</select>
+              </div>
+              <div className="flex items-end pb-1">
+                <CapabilityBadges caps={capsForDraft(addLlmForm)} />
               </div>
             </div>
             <div className="flex gap-2">
-              <button onClick={async () => { if (!addLlmForm.model_name.trim()) return; const r = await api.post('/ai/llm-engines', addLlmForm).catch(() => null); if (r?.data) { await refreshAiConfig(); setShowAddLlmForm(false); } }}
+              <button onClick={async () => {
+                if (!addLlmForm.model_name.trim()) return;
+                try {
+                  const r = await api.post('/ai/llm-engines', addLlmForm);
+                  if (r?.data) { await refreshAiConfig(); setShowAddLlmForm(false); }
+                } catch (err) {
+                  showToast({
+                    type: 'error',
+                    title: 'Unsupported Gemini model',
+                    message: getErrorMessage(err, 'Unsupported Gemini model. Please select a valid model.'),
+                  });
+                }
+              }}
                 className="px-4 py-2 bg-violet-600 text-white rounded-lg text-xs font-medium hover:bg-violet-500">Add Engine</button>
               <button onClick={() => setShowAddLlmForm(false)} className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs">Cancel</button>
             </div>

@@ -3,8 +3,7 @@ import json
 import pytest
 
 from shared.schemas.contracts import CombinedResponse
-from agent_orchestrator.agents.capture_agent import _adaptive_short_circuit_decision
-from agent_orchestrator.agents.support_agent import _deterministic_budget_fallback
+from agent_orchestrator.agents import capture_agent, support_agent
 from agent_orchestrator.schemas import MessageWorkflowRequest
 from agent_orchestrator.workflows.workflow_manager import WorkflowManager
 from services.ai_service.llm_tracking import (
@@ -112,43 +111,10 @@ def test_manual_ai_workflow_request_without_identity_material_is_rejected():
         )
 
 
-def test_adaptive_short_circuit_allows_clear_qualification_answer():
-    used, reason, blocked = _adaptive_short_circuit_decision(
-        "Our budget is $5000 and we need this next month",
-        {"score": 0.1, "emotion": "neutral"},
-        {
-            "ready_for_scoring": False,
-            "next_question": "What is your budget?",
-            "completed_fields": ["budget", "timeline"],
-        },
-    )
-
-    assert used is True
-    assert reason == "adaptive_qualification"
-    assert blocked == ""
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "I need a refund now",
-        "What is the price of your product?",
-        "I cannot login to my account",
-    ],
-)
-def test_adaptive_short_circuit_blocks_support_and_product_questions(text):
-    used, _, blocked = _adaptive_short_circuit_decision(
-        text,
-        {"score": 0.0, "emotion": "neutral"},
-        {
-            "ready_for_scoring": False,
-            "next_question": "What is your budget?",
-            "completed_fields": [],
-        },
-    )
-
-    assert used is False
-    assert blocked
+def test_adaptive_keyword_short_circuit_is_removed():
+    assert not hasattr(capture_agent, "_adaptive_short_circuit_decision")
+    assert not hasattr(capture_agent, "_ADAPTIVE_BLOCK_KEYWORDS")
+    assert not hasattr(capture_agent, "_PRODUCT_QUERY_KEYWORDS")
 
 
 @pytest.mark.asyncio
@@ -284,12 +250,8 @@ def test_embedding_cache_hits_do_not_need_budget_reservation():
     assert snapshot["total_ai_api_call_count"] == 1
 
 
-def test_support_budget_fallback_is_deliverable():
-    result = _deterministic_budget_fallback("I need a refund", {"intent": "refund"}, {"name": "Sam"})
-
-    assert result["provider"] == "deterministic_fallback"
-    assert result["llm_budget_exhausted"] is True
-    assert result["response"]
+def test_support_budget_fallback_is_removed():
+    assert not hasattr(support_agent, "_deterministic_budget_fallback")
 
 
 def test_combined_response_preserves_degraded_metadata():

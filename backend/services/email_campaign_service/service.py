@@ -2,7 +2,7 @@
 email_campaign_service.service — recipient resolution + async batch sender.
 
 Design goals:
-- Reuse ``services.email_service.send_email_async`` (Brevo or SMTP).
+- Reuse tenant email channel delivery for campaign sends.
 - Reuse identity fields already present on ``leads`` / ``customers`` tables
   (email, lifecycle_stage, source, tags). Never duplicate CRM logic.
 - Filtering is declarative (lifecycle_stage, tags, source, channel), so the
@@ -23,8 +23,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from core.utils import make_id
+from services.db_helpers import get_ai_static_fallback_message
 from services.ai_service.llm_client import call_model_json, get_active_llm_engine
-from services.email_service import send_email_async
+from services.email_service import send_tenant_email_async
+from shared.database import company_context
 from shared.webhook_task_runner import create_safe_detached_task
 
 logger = logging.getLogger(__name__)
@@ -75,6 +77,9 @@ def _is_quota_exhausted_error(exc: Exception) -> bool:
         "billing hard limit",
         "credit balance is too low",
         "all ai providers exhausted",
+        "rate limit",
+        "rate_limited",
+        "429",
     )
     return any(marker in text for marker in markers)
 
@@ -82,6 +87,14 @@ def _is_quota_exhausted_error(exc: Exception) -> bool:
 def _campaign_ai_unavailable_message(kind: str = "copy") -> str:
     target = "campaign copy" if kind == "copy" else "HTML email body"
     return f"AI/API issue: {target} could not be generated. Please write or paste the response manually."
+
+
+def campaign_ai_quota_message() -> str:
+    return "AI auto-response is paused because the AI provider is unavailable. Please respond manually."
+
+
+async def _campaign_static_fallback(db, company_id: str) -> str:
+    return await get_ai_static_fallback_message(db, company_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -332,7 +345,9 @@ async def generate_campaign_copy(
     if not company_id:
         raise ValueError("company_id is required")
 
-    product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
+    async with company_context(db, company_id):
+        product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
+        engine = await get_active_llm_engine(db, company_id)
     if not product:
         raise ValueError("Selected product was not found")
 
@@ -374,21 +389,30 @@ async def generate_campaign_copy(
     )
 
     try:
-        engine = await get_active_llm_engine(db, company_id)
+        tuned_engine = dict(engine or {})
+        tuned_engine["max_tokens"] = min(int(tuned_engine.get("max_tokens") or 900), 900)
         generated = CampaignCopyDraft.model_validate(
-            await call_model_json(prompt, CampaignCopyDraft, engine=engine)
+            await call_model_json(prompt, CampaignCopyDraft, engine=tuned_engine, call_purpose="email_campaign_copy")
         ).model_dump()
         if not generated.get("html_body"):
             generated["html_body"] = _body_to_html(generated.get("body", ""))
         generated["html_body"] = _sanitize_email_html(generated.get("html_body", ""))
         return generated
     except Exception as exc:
-        logger.warning("Campaign copy AI generation unavailable company_id=%s product_id=%s error=%s", company_id, product_id, exc)
-        if _is_quota_exhausted_error(exc):
-            raise CampaignAIQuotaExceededError(
-                "AI/API quota exhausted. AI has been turned off for this workspace. Please handle the response manually."
-            ) from exc
-        raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("copy")) from exc
+        logger.exception(
+            "Campaign copy AI generation failed function=generate_campaign_copy company_id=%s product_id=%s error=%s",
+            company_id,
+            product_id,
+            exc,
+        )
+        fallback = await _campaign_static_fallback(db, company_id)
+        return {
+            "subject": "A quick update",
+            "body": fallback,
+            "html_body": _body_to_html(fallback),
+            "fallback_used": True,
+            "error_type": "quota_exhausted" if _is_quota_exhausted_error(exc) else "provider_error",
+        }
 
 
 async def generate_html_email_body(
@@ -406,7 +430,9 @@ async def generate_html_email_body(
     if not description:
         raise ValueError("Describe what the HTML email body should say.")
 
-    product = await _load_campaign_product(db, company_id=company_id, product_id=product_id) if product_id else None
+    async with company_context(db, company_id):
+        product = await _load_campaign_product(db, company_id=company_id, product_id=product_id) if product_id else None
+        engine = await get_active_llm_engine(db, company_id)
     product_context = "No product selected."
     if product:
         feature_lines = "\n".join(f"- {feature}" for feature in product.get("features") or []) or "- No structured features stored"
@@ -431,9 +457,10 @@ async def generate_html_email_body(
     )
 
     try:
-        engine = await get_active_llm_engine(db, company_id)
+        tuned_engine = dict(engine or {})
+        tuned_engine["max_tokens"] = min(int(tuned_engine.get("max_tokens") or 700), 700)
         generated = HtmlEmailBodyDraft.model_validate(
-            await call_model_json(prompt, HtmlEmailBodyDraft, engine=engine)
+            await call_model_json(prompt, HtmlEmailBodyDraft, engine=tuned_engine, call_purpose="email_html_body")
         ).model_dump()
         html_body = _sanitize_email_html(generated.get("html_body", ""))
         if not html_body:
@@ -442,12 +469,18 @@ async def generate_html_email_body(
     except CampaignAIUnavailableError:
         raise
     except Exception as exc:
-        logger.warning("HTML email body AI generation unavailable company_id=%s product_id=%s error=%s", company_id, product_id, exc)
-        if _is_quota_exhausted_error(exc):
-            raise CampaignAIQuotaExceededError(
-                "AI/API quota exhausted. AI has been turned off for this workspace. Please handle the response manually."
-            ) from exc
-        raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("html")) from exc
+        logger.exception(
+            "HTML email body AI generation failed function=generate_html_email_body company_id=%s product_id=%s error=%s",
+            company_id,
+            product_id,
+            exc,
+        )
+        fallback = await _campaign_static_fallback(db, company_id)
+        return {
+            "html_body": _body_to_html(fallback),
+            "fallback_used": True,
+            "error_type": "quota_exhausted" if _is_quota_exhausted_error(exc) else "provider_error",
+        }
 
 
 def _campaign_product_snapshot(product: dict | None) -> dict | None:
@@ -553,15 +586,110 @@ async def create_campaign(
     return dict(row) if row else {"id": campaign_id}
 
 
+async def update_campaign(
+    db,
+    *,
+    campaign_id: str,
+    company_id: str,
+    name: str,
+    subject: str,
+    body: str,
+    html_body: str = "",
+    filters: dict | None = None,
+) -> dict:
+    if not (campaign_id and company_id and subject and (body or html_body)):
+        raise ValueError("campaign_id, company_id, subject, and body (or html_body) are required")
+
+    existing = await db.fetchrow(
+        "SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2 LIMIT 1",
+        campaign_id,
+        company_id,
+    )
+    if not existing:
+        raise ValueError("Campaign not found")
+    existing = dict(existing)
+    if str(existing.get("status") or "").strip().lower() != "draft":
+        raise ValueError("Only draft campaigns can be edited")
+
+    filters = dict(filters or {})
+    product_id = str(filters.get("product_id") or "").strip()
+    if product_id:
+        product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
+        if not product:
+            raise ValueError("Selected product was not found")
+        filters["product_snapshot"] = _campaign_product_snapshot(product)
+    recipients = await resolve_recipients(db, company_id=company_id, filters=filters)
+
+    import json as _json
+
+    await db.execute(
+        "UPDATE email_campaigns SET name=$1,subject=$2,body=$3,html_body=$4,filters=$5::jsonb,"
+        "total_recipients=$6,sent_count=0,failed_count=0,last_error='',updated_at=NOW() "
+        "WHERE id=$7 AND company_id=$8",
+        (name or subject)[:240],
+        subject[:500],
+        body or "",
+        html_body or "",
+        _json.dumps(filters),
+        len(recipients),
+        campaign_id,
+        company_id,
+    )
+    await db.execute(
+        "DELETE FROM email_campaign_recipients WHERE campaign_id=$1 AND company_id=$2",
+        campaign_id,
+        company_id,
+    )
+
+    if recipients:
+        values_sql = []
+        flat: list = []
+        for idx, rec in enumerate(recipients):
+            base = idx * 6
+            values_sql.append(
+                f"(${base + 1},${base + 2},${base + 3},${base + 4},${base + 5},${base + 6},'pending',NOW())"
+            )
+            flat.extend(
+                [
+                    make_id(),
+                    campaign_id,
+                    company_id,
+                    rec.get("customer_id", ""),
+                    rec.get("lead_id", ""),
+                    rec["email"],
+                ]
+            )
+        await db.execute(
+            "INSERT INTO email_campaign_recipients(id,campaign_id,company_id,customer_id,lead_id,email,status,created_at) "
+            f"VALUES {','.join(values_sql)}",
+            *flat,
+        )
+        for rec in recipients:
+            if rec.get("name"):
+                await db.execute(
+                    "UPDATE email_campaign_recipients SET name=$1 WHERE campaign_id=$2 AND email=$3 AND name=''",
+                    rec["name"],
+                    campaign_id,
+                    rec["email"],
+                )
+
+    row = await db.fetchrow("SELECT * FROM email_campaigns WHERE id=$1", campaign_id)
+    return dict(row) if row else {"id": campaign_id}
+
+
 async def _send_single(
     recipient: dict,
     *,
+    db,
+    company_id: str,
     subject: str,
     body: str,
     html_body: str,
 ) -> tuple[bool, str]:
     try:
-        await send_email_async(
+        await send_tenant_email_async(
+            db,
+            company_id,
             to_email=recipient["email"],
             subject=subject,
             body=body,
@@ -593,11 +721,12 @@ async def _dispatch_campaign(
         logger.error("Campaign dispatch: no DB available for campaign %s", campaign_id)
         return
 
-    campaign = await db.fetchrow(
-        "SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2",
-        campaign_id,
-        company_id,
-    )
+    async with company_context(db, company_id):
+        campaign = await db.fetchrow(
+            "SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2",
+            campaign_id,
+            company_id,
+        )
     if not campaign:
         logger.warning("Campaign dispatch: missing campaign %s", campaign_id)
         return
@@ -605,26 +734,29 @@ async def _dispatch_campaign(
     if campaign.get("status") in {"sending", "completed"}:
         return
 
-    await db.execute(
-        "UPDATE email_campaigns SET status='sending',started_at=NOW() WHERE id=$1",
-        campaign_id,
-    )
+    async with company_context(db, company_id):
+        await db.execute(
+            "UPDATE email_campaigns SET status='sending',started_at=NOW() WHERE id=$1",
+            campaign_id,
+        )
 
     subject = str(campaign.get("subject") or "")
     body = str(campaign.get("body") or "")
     html_body = str(campaign.get("html_body") or "")
 
-    pending = await db.fetch(
-        "SELECT id,email,name FROM email_campaign_recipients "
-        "WHERE campaign_id=$1 AND status='pending' ORDER BY created_at",
-        campaign_id,
-    )
-    pending = [dict(p) for p in pending]
-    if not pending:
-        await db.execute(
-            "UPDATE email_campaigns SET status='completed',completed_at=NOW() WHERE id=$1",
+    async with company_context(db, company_id):
+        pending = await db.fetch(
+            "SELECT id,email,name FROM email_campaign_recipients "
+            "WHERE campaign_id=$1 AND status='pending' ORDER BY created_at",
             campaign_id,
         )
+    pending = [dict(p) for p in pending]
+    if not pending:
+        async with company_context(db, company_id):
+            await db.execute(
+                "UPDATE email_campaigns SET status='completed',completed_at=NOW() WHERE id=$1",
+                campaign_id,
+            )
         return
 
     sem = asyncio.Semaphore(concurrency)
@@ -636,24 +768,27 @@ async def _dispatch_campaign(
         async with sem:
             ok, err = await _send_single(
                 rec,
+                db=db,
+                company_id=company_id,
                 subject=subject,
                 body=body,
                 html_body=html_body,
             )
             try:
-                if ok:
-                    await db.execute(
-                        "UPDATE email_campaign_recipients SET status='sent',sent_at=NOW(),error='' WHERE id=$1",
-                        rec["id"],
-                    )
-                    sent_total += 1
-                else:
-                    await db.execute(
-                        "UPDATE email_campaign_recipients SET status='failed',error=$2 WHERE id=$1",
-                        rec["id"],
-                        err,
-                    )
-                    failed_total += 1
+                async with company_context(db, company_id):
+                    if ok:
+                        await db.execute(
+                            "UPDATE email_campaign_recipients SET status='sent',sent_at=NOW(),error='' WHERE id=$1",
+                            rec["id"],
+                        )
+                        sent_total += 1
+                    else:
+                        await db.execute(
+                            "UPDATE email_campaign_recipients SET status='failed',error=$2 WHERE id=$1",
+                            rec["id"],
+                            err,
+                        )
+                        failed_total += 1
             except Exception as track_exc:
                 logger.warning(
                     "Campaign %s recipient %s status update failed: %s",
@@ -666,24 +801,26 @@ async def _dispatch_campaign(
         await asyncio.gather(*[_process(r) for r in pending])
     except Exception as exc:
         logger.exception("Campaign %s send loop failed: %s", campaign_id, exc)
-        await db.execute(
-            "UPDATE email_campaigns SET status='failed',last_error=$2,"
-            "sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1",
-            campaign_id,
-            str(exc)[:500],
-            sent_total,
-            failed_total,
-        )
+        async with company_context(db, company_id):
+            await db.execute(
+                "UPDATE email_campaigns SET status='failed',last_error=$2,"
+                "sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1",
+                campaign_id,
+                str(exc)[:500],
+                sent_total,
+                failed_total,
+            )
         return
 
     final_status = "completed" if failed_total == 0 else ("completed" if sent_total > 0 else "failed")
-    await db.execute(
-        "UPDATE email_campaigns SET status=$2,sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1",
-        campaign_id,
-        final_status,
-        sent_total,
-        failed_total,
-    )
+    async with company_context(db, company_id):
+        await db.execute(
+            "UPDATE email_campaigns SET status=$2,sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1",
+            campaign_id,
+            final_status,
+            sent_total,
+            failed_total,
+        )
     logger.info(
         "Campaign %s dispatched: sent=%d failed=%d",
         campaign_id,

@@ -302,7 +302,7 @@ export default function SettingsPage() {
   const [editingAgentId, setEditingAgentId] = useState(null);
   const [agentDraft, setAgentDraft] = useState({});
   const [showAddLlmForm, setShowAddLlmForm] = useState(false);
-  const [addLlmForm, setAddLlmForm] = useState({ model_name: '', provider: 'openai', temperature: 0.7, max_tokens: 2048 });
+  const [addLlmForm, setAddLlmForm] = useState({ model_name: 'gemini-2.5-flash', model_category: 'text_generation', provider: 'gemini', temperature: 0.7, max_tokens: 2048 });
   const [showAddAgentForm, setShowAddAgentForm] = useState(false);
   const [addAgentForm, setAddAgentForm] = useState({ agent_type: 'support', llm_id: '', is_active: true, mcp_server_id: '' });
 

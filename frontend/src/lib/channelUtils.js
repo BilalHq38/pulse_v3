@@ -6,14 +6,13 @@
  * building logic.
  */
 
-import { Facebook, Globe, Instagram, Mail, MessageSquare, Twitter } from 'lucide-react';
+import { Facebook, Globe, Instagram, Mail, MessageSquare } from 'lucide-react';
 
 export const CHANNEL_META = {
   whatsapp: { label: 'WhatsApp', icon: MessageSquare, color: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200' },
   instagram: { label: 'Instagram', icon: Instagram, color: 'text-pink-600', bg: 'bg-pink-50', border: 'border-pink-200' },
   facebook: { label: 'Facebook', icon: Facebook, color: 'text-blue-600', bg: 'bg-blue-50', border: 'border-blue-200' },
   email: { label: 'Email', icon: Mail, color: 'text-sky-600', bg: 'bg-sky-50', border: 'border-sky-200' },
-  twitter: { label: 'X / Twitter', icon: Twitter, color: 'text-slate-700', bg: 'bg-slate-100', border: 'border-slate-200' },
   web_chat: { label: 'Website', icon: Globe, color: 'text-violet-600', bg: 'bg-violet-50', border: 'border-violet-200' },
 };
 
@@ -83,7 +82,6 @@ export function buildLeadMethods(lead) {
 
   addMethod('instagram', lead?.instagram_profile_url || '', 'lead_instagram');
   addMethod('facebook', lead?.facebook_profile_url || '', 'lead_facebook');
-  addMethod('twitter', lead?.twitter_profile_url || '', 'lead_twitter');
   addMethod('whatsapp', lead?.whatsapp_profile_url || '', 'lead_whatsapp');
   if (lead?.email) addMethod('email', lead.email, 'lead_email');
 
@@ -145,7 +143,6 @@ export function buildCustomerMethods(customer) {
 
   if (customer?.instagram_profile_url) addMethod('instagram', customer.instagram_profile_url, 'customer_instagram');
   if (customer?.facebook_profile_url) addMethod('facebook', customer.facebook_profile_url, 'customer_facebook');
-  if (customer?.twitter_profile_url) addMethod('twitter', customer.twitter_profile_url, 'customer_twitter');
   if (customer?.whatsapp_profile_url || customer?.phone) addMethod('whatsapp', customer?.whatsapp_profile_url || '', 'customer_whatsapp');
 
   return dedupeMethods(methods).sort((a, b) => {

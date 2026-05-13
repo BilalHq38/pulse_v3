@@ -1201,7 +1201,12 @@ async def nurture_lead(lead_id: str, request: Request):
     lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
     if not lead:
         raise HTTPException(404, "Lead not found")
-    company_context = await get_company_knowledge(db, cid)
+    company_context = await get_company_knowledge(
+        db,
+        cid,
+        current_query=str(lead.get("notes") or lead.get("name") or ""),
+        top_k=5,
+    )
     result = await generate_nurture_message(lead, lead.get("status", "new"), company_context, db=db)
     await db.execute(
         "INSERT INTO lead_activities(id,lead_id,company_id,type,content,stage,created_at) VALUES($1,$2,$3,'nurture',$4,$5,NOW())",  # noqa: E501

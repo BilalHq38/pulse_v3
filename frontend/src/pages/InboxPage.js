@@ -40,6 +40,7 @@ const CHANNELS = [
 const CHAT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const MAX_CHAT_IMAGE_SIZE_MB = 8;
 const MAX_CHAT_IMAGES = 4;
+const LONG_REQUEST_TIMEOUT_MS = 120000;
 
 function isLikelyValidDisplayPhone(value) {
   const text = String(value || '').trim();
@@ -187,6 +188,11 @@ function normalizeMessageText(value) {
   return '';
 }
 
+function isManualAiWithheldSystemMessage(content) {
+  const text = normalizeMessageText(content).trim();
+  return text === 'AI response withheld for manual review.' || /^AI confidence\b/i.test(text);
+}
+
 function formatMessageTimestamp(value) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return '';
@@ -225,6 +231,12 @@ function getDeliveryStatusMeta(status) {
 function formatInboxChannel(channelKey) {
   const match = CHANNELS.find((channel) => channel.key === channelKey);
   return match?.label || String(channelKey || 'message').replace(/_/g, ' ');
+}
+
+function getChannelDisconnectMessage(conversation) {
+  if (!conversation || conversation.channel_connected !== false) return '';
+  const channelName = formatInboxChannel(conversation.channel);
+  return String(conversation.channel_error || `${channelName} is not connected. Reconnect the channel before sending.`).trim();
 }
 
 function fileToDataUrl(file) {
@@ -336,6 +348,7 @@ export default function InboxPage() {
   const [composerError, setComposerError] = useState('');
   const [sending, setSending] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
+  const aiLoadingRef = useRef(aiLoading);
   const [customerInfo, setCustomerInfo] = useState(null);
   const [maximized, setMaximized] = useState(false);
   const [tooltipChannel, setTooltipChannel] = useState(null);
@@ -406,6 +419,10 @@ export default function InboxPage() {
     selectedConvoIdRef.current = selectedConvo?.id || '';
   }, [selectedConvo?.id]);
 
+  useEffect(() => {
+    aiLoadingRef.current = aiLoading;
+  }, [aiLoading]);
+
   // Socket event dispatcher — passed to useSocket hook below
   const handleSocketEvent = useCallback((eventName, data) => {
     if (eventName === 'new_message') {
@@ -428,6 +445,23 @@ export default function InboxPage() {
         }
         return;
       }
+      const senderType = String(data.message?.sender_type || '').toLowerCase();
+      if (senderType === 'system' && isManualAiWithheldSystemMessage(data.message?.content)) {
+        setAiLoading(false);
+        showToast({
+          type: 'warning',
+          title: 'AI Draft Needs Review',
+          message: normalizeMessageText(data.message?.content) || 'Please review the conversation and respond manually.',
+        });
+        return;
+      }
+      if (aiLoadingRef.current && senderType === 'ai') {
+        const normalized = normalizeMessage(data.message);
+        setNewMessage(normalized.content || '');
+        setComposerAttachments(normalizeAttachments(normalized.attachments || []));
+        setAiLoading(false);
+        return;
+      }
       setMessages(prev => {
         const nextMessage = normalizeMessage(data.message);
         if (prev.some(m => m.id === nextMessage.id)) {
@@ -435,6 +469,9 @@ export default function InboxPage() {
         }
         return [...prev, nextMessage];
       });
+      if (['ai', 'system'].includes(senderType)) {
+        setAiLoading(false);
+      }
     } else if (eventName === 'conversation_updated') {
       loadConversations(data?.conversation_id || '');
     } else if (eventName === 'message_updated') {
@@ -459,7 +496,7 @@ export default function InboxPage() {
         }));
       }
     }
-  }, [loadConversations, notifyNewMessage]);
+  }, [loadConversations, notifyNewMessage, setNewMessage, setComposerAttachments]);
 
   const { joinConversation } = useSocket(handleSocketEvent, { conversationId: selectedConvo?.id || '' });
 
@@ -642,7 +679,11 @@ export default function InboxPage() {
       if (channel === 'whatsapp') payload.phone = phone;
       else payload.recipient_id = recipientId;
 
-      const res = await api.post('/conversations/start-outbound', payload);
+      const res = await api.post(
+        '/conversations/start-outbound',
+        payload,
+        channel === 'email' ? { timeout: LONG_REQUEST_TIMEOUT_MS } : undefined,
+      );
       const convo = res.data?.conversation;
       if (convo?.id) {
         setSelectedConvo(convo);
@@ -739,14 +780,27 @@ export default function InboxPage() {
 
   const sendMessage = async () => {
     if ((!newMessage.trim() && composerAttachments.length === 0) || !selectedConvo || sending) return;
+    const channelError = getChannelDisconnectMessage(selectedConvo);
+    if (channelError) {
+      showToast({
+        type: 'warning',
+        title: 'Channel Disconnected',
+        message: channelError,
+      });
+      return;
+    }
 
     setSending(true);
     try {
-      const res = await api.post(`/conversations/${selectedConvo.id}/messages`, {
-        content: newMessage,
-        sender_type: 'agent',
-        attachments: composerAttachments,
-      });
+      const res = await api.post(
+        `/conversations/${selectedConvo.id}/messages`,
+        {
+          content: newMessage,
+          sender_type: 'agent',
+          attachments: composerAttachments,
+        },
+        selectedConvo.channel === 'email' ? { timeout: LONG_REQUEST_TIMEOUT_MS } : undefined,
+      );
       if (res.data.message) {
         setMessages(prev => {
           const nextMessage = normalizeMessage(res.data.message);
@@ -864,20 +918,92 @@ export default function InboxPage() {
 
   const triggerAI = async () => {
     if (!selectedConvo || aiLoading) return;
-    setAiLoading(true);
-    try {
-      const res = await api.post(`/conversations/${selectedConvo.id}/ai-respond`);
-      setMessages(prev => {
-        const nextMessage = normalizeMessage(res.data);
-        if (prev.some(m => m.id === nextMessage.id)) return prev;
-        return [...prev, nextMessage];
-      });
-      loadConversations();
+    const channelError = getChannelDisconnectMessage(selectedConvo);
+    if (channelError) {
       showToast({
-        type: 'success',
-        title: 'AI Reply Ready',
-        message: `AI generated a reply for ${selectedConvo.customer_name || 'this conversation'}.`,
+        type: 'warning',
+        title: 'Channel Disconnected',
+        message: channelError,
       });
+      return;
+    }
+    setAiLoading(true);
+    let keepLoading = false;
+    const queuedConvoId = selectedConvo.id;
+    try {
+      const res = await api.post(
+        `/conversations/${selectedConvo.id}/ai-respond`,
+        {},
+        { timeout: LONG_REQUEST_TIMEOUT_MS },
+      );
+      if (res.status === 202 || res.data?.status === 'processing') {
+        keepLoading = true;
+        loadConversations();
+        showToast({
+          type: 'info',
+          title: 'AI Reply Queued',
+          message: `AI is preparing a reply for ${selectedConvo.customer_name || 'this conversation'}.`,
+        });
+        setTimeout(() => {
+          if (selectedConvoIdRef.current === queuedConvoId) {
+            setAiLoading(false);
+          }
+        }, 45000);
+        return;
+      }
+      const aiData = res.data || {};
+      if (aiData.status === 'draft_ready') {
+        const draft = normalizeMessageText(aiData.draft || aiData.response || '');
+        setNewMessage(draft);
+        setComposerAttachments(normalizeAttachments(aiData.attachments || aiData.product_images || []));
+        loadConversations();
+        const fallbackReason = normalizeMessageText(aiData.fallback_reason || aiData.error_type || '');
+        showToast({
+          type: aiData.fallback_used ? 'warning' : 'info',
+          title: aiData.fallback_used ? 'Fallback Draft Inserted' : 'AI Draft Ready',
+          message: aiData.fallback_used
+            ? (fallbackReason ? `Provider issue: ${fallbackReason}. Review before sending.` : 'Review this fallback before sending.')
+            : 'Review and edit the draft before sending.',
+        });
+        return;
+      }
+      const isSystemFallback = aiData.sender_type === 'system';
+      const isAiMessage = aiData.sender_type === 'ai';
+      if (isAiMessage) {
+        // If the AI returned a message, place it into the composer for editing instead of auto-sending.
+        const normalized = normalizeMessage(aiData);
+        setNewMessage(normalized.content || '');
+        setComposerAttachments(normalizeAttachments(normalized.attachments || []));
+        loadConversations();
+        showToast({
+          type: 'info',
+          title: 'AI Draft Ready',
+          message: `AI drafted a reply for ${selectedConvo.customer_name || 'this conversation'}. Review and edit before sending.`,
+        });
+      } else {
+        if (isSystemFallback && isManualAiWithheldSystemMessage(aiData.content)) {
+          showToast({
+            type: 'warning',
+            title: 'AI Draft Needs Review',
+            message: normalizeMessageText(aiData.content) || 'Please review the conversation and respond manually.',
+          });
+          return;
+        }
+        // Handle system fallback or other types of messages normally.
+        setMessages(prev => {
+          const nextMessage = normalizeMessage(aiData);
+          if (prev.some(m => m.id === nextMessage.id)) return prev;
+          return [...prev, nextMessage];
+        });
+        loadConversations();
+        showToast({
+          type: isSystemFallback ? 'warning' : 'success',
+          title: isSystemFallback ? 'AI Unavailable' : 'AI Reply Ready',
+          message: isSystemFallback
+            ? 'The inbox is still available. Please respond manually.'
+            : `AI generated a reply for ${selectedConvo.customer_name || 'this conversation'}.`,
+        });
+      }
     } catch (err) {
       console.error(err);
       showToast({
@@ -886,7 +1012,9 @@ export default function InboxPage() {
         message: getErrorMessage(err, 'We could not generate an AI reply.'),
       });
     }
-    finally { setAiLoading(false); }
+    finally {
+      if (!keepLoading) setAiLoading(false);
+    }
   };
 
   const toggleAIMode = async () => {
@@ -1064,6 +1192,8 @@ export default function InboxPage() {
     ? CHANNELS.find(c => c.key === selectedConvo.channel) || CHANNELS.find(c => c.key === 'web_chat')
     : null;
   const selectedConvoSentiment = getSentimentMeta(selectedConvo?.sentiment_score, selectedConvo?.sentiment_label);
+  const channelDisconnectMessage = getChannelDisconnectMessage(selectedConvo);
+  const channelDisconnected = Boolean(channelDisconnectMessage);
 
   // Get filtered conversations for mobile
   const displayChannel = platformView || activeChannel;
@@ -1487,6 +1617,27 @@ export default function InboxPage() {
               </div>
             )}
 
+            {selectedConvo.ai_auto_paused && (
+              <div className="px-3 sm:px-4 py-2 bg-amber-50 border-b border-amber-200 flex items-center gap-2" data-testid="ai-paused-warning">
+                <AlertTriangle size={13} className="text-amber-600 flex-shrink-0" />
+                <span className="text-xs text-amber-800 font-medium">
+                  {selectedConvo.ai_paused_reason || 'AI auto-response is paused because the AI provider is unavailable. Please respond manually.'}
+                </span>
+              </div>
+            )}
+
+            {channelDisconnected && (
+              <div className="px-3 sm:px-4 py-2 bg-amber-50 border-b border-amber-200 flex items-center justify-between gap-3" data-testid="channel-disconnected-warning">
+                <div className="flex min-w-0 items-center gap-2">
+                  <AlertTriangle size={13} className="text-amber-600 flex-shrink-0" />
+                  <span className="text-xs text-amber-800 font-medium truncate">{channelDisconnectMessage}</span>
+                </div>
+                <a href="/settings?tab=channels" className="text-xs font-semibold text-amber-900 underline decoration-amber-400 underline-offset-2">
+                  Reconnect
+                </a>
+              </div>
+            )}
+
             {/* Unification Match Banner */}
             {unificationMatch && unificationPanelOpen && (
               <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-200">
@@ -1553,6 +1704,10 @@ export default function InboxPage() {
                 const reactions = Array.isArray(msg.reactions) ? msg.reactions : [];
                 const messageTime = formatMessageTimestamp(msg.created_at);
                 const messageContent = normalizeMessageText(msg.content);
+
+                if (isSystem && isManualAiWithheldSystemMessage(messageContent)) {
+                  return null;
+                }
 
                 if (isSystem) {
                   const isEscalationAlert = isEscalationSystemMessage(messageContent) || msg.is_alert;
@@ -1715,7 +1870,7 @@ export default function InboxPage() {
                 </Alert>
               )}
               <div className="flex items-center gap-2">
-                <button onClick={triggerAI} disabled={aiLoading} className="p-2 sm:p-2.5 rounded-lg bg-purple-50 border border-purple-200 text-purple-500 hover:bg-purple-100 transition-colors disabled:opacity-50 flex-shrink-0" data-testid="ai-respond-btn" title="Generate AI response">
+                <button onClick={triggerAI} disabled={aiLoading || channelDisconnected} className="p-2 sm:p-2.5 rounded-lg bg-purple-50 border border-purple-200 text-purple-500 hover:bg-purple-100 transition-colors disabled:opacity-50 flex-shrink-0" data-testid="ai-respond-btn" title={channelDisconnected ? 'Channel not connected' : 'Generate AI response'}>
                   {aiLoading ? <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div> : <Sparkles size={16} />}
                 </button>
                 <input
@@ -1742,7 +1897,7 @@ export default function InboxPage() {
                   className="flex-1 px-3 sm:px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
                   data-testid="message-input"
                 />
-                <button onClick={sendMessage} disabled={(!newMessage.trim() && composerAttachments.length === 0) || sending} className="p-2 sm:p-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50 shadow-sm flex-shrink-0" data-testid="send-message-btn">
+                <button onClick={sendMessage} disabled={(!newMessage.trim() && composerAttachments.length === 0) || sending || channelDisconnected} className="p-2 sm:p-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50 shadow-sm flex-shrink-0" data-testid="send-message-btn" title={channelDisconnected ? 'Channel not connected' : 'Send message'}>
                   {sending ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <Send size={16} />}
                 </button>
               </div>

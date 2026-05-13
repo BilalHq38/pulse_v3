@@ -150,6 +150,21 @@ async def _bridge_session_status(*, company_id: str = "", user_id: str = "") -> 
     return str(snapshot.get("state") or snapshot.get("status") or "").strip().lower() or "unknown"
 
 
+def _bridge_not_ready_error(snapshot: dict[str, Any]) -> str:
+    state = str(snapshot.get("state") or snapshot.get("status") or "").strip().lower()
+    if state in {"", "ready"}:
+        return ""
+    if state == "initializing":
+        return "WHATSAPP_SESSION_NOT_READY: WhatsApp session is still starting."
+    if state == "qr_required":
+        return "WHATSAPP_SESSION_NOT_READY: WhatsApp session is not connected for this account. Please scan the QR code first."
+    if state == "not_configured":
+        return "WhatsApp bridge is not configured."
+    if state == "offline":
+        return "WhatsApp bridge is not reachable."
+    return "WHATSAPP_SESSION_NOT_READY: WhatsApp session is not ready."
+
+
 def _extract_meta_message_id(payload: Any) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -369,7 +384,14 @@ async def _send_via_bridge(
             )
             return True, "", _extract_meta_message_id(data)
         error_text = _extract_bridge_error(data, resp.text[:300])
-        logger.error(
+        failure_code = (
+            str(data.get("code") or "WHATSAPP_BRIDGE_SEND_FAILED")
+            if isinstance(data, dict)
+            else "WHATSAPP_BRIDGE_SEND_FAILED"
+        )
+        bridge_state = str(data.get("state") or data.get("status") or "") if isinstance(data, dict) else ""
+        log_func = logger.warning if failure_code == "WHATSAPP_SESSION_NOT_READY" else logger.error
+        log_func(
             "whatsapp_outbound_bridge_failed company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s bridge_scope=%s selected_whatsapp_scope=%s bridge_state=%s bridge_connected_phone=%s recipient_id=%s send_attempt=%s idempotency_key=%s delivery_status=failed failure_code=%s status_code=%s error=%s",
             company_id,
             user_id,
@@ -378,12 +400,12 @@ async def _send_via_bridge(
             db_message_id,
             str(data.get("scope") or _bridge_scope_for(company_id=company_id, user_id=user_id)) if isinstance(data, dict) else _bridge_scope_for(company_id=company_id, user_id=user_id),
             _bridge_scope_for(company_id=company_id, user_id=user_id),
-            str(data.get("state") or data.get("status") or "") if isinstance(data, dict) else "",
+            bridge_state,
             str(data.get("phone") or "") if isinstance(data, dict) else "",
             phone,
             send_attempt,
             idempotency_key,
-            str(data.get("code") or "WHATSAPP_BRIDGE_SEND_FAILED") if isinstance(data, dict) else "WHATSAPP_BRIDGE_SEND_FAILED",
+            failure_code,
             resp.status_code,
             error_text or resp.text[:300],
         )
@@ -402,6 +424,106 @@ async def _bridge_health() -> dict:
         return resp.json() if resp.status_code == 200 else {"status": "error"}
     except Exception:
         return {"status": "offline"}
+
+
+async def get_channel_connection_status(
+    db,
+    *,
+    company_id: str,
+    channel: str,
+    user_id: str = "",
+) -> dict[str, Any]:
+    scoped_company_id = (company_id or "").strip()
+    channel_name = (channel or "").strip().lower()
+    scoped_user_id = (user_id or "").strip()
+    if channel_name in {"", "web_chat", "website"}:
+        return {"connected": True, "status": "ready", "error": ""}
+    if not scoped_company_id:
+        return {"connected": False, "status": "missing_company", "error": "Company context is required."}
+
+    if channel_name == "whatsapp":
+        meta_error = ""
+        try:
+            config = await get_meta_config(db, scoped_company_id, channel="whatsapp", include_secrets=False)
+            if (
+                config.get("is_active", True)
+                and config.get("access_token_configured")
+                and str(config.get("phone_number_id") or "").strip()
+            ):
+                return {"connected": True, "status": "ready", "provider": "meta", "error": ""}
+            meta_error = "WhatsApp Meta configuration is incomplete."
+        except HTTPException as exc:
+            meta_error = str(exc.detail or "WhatsApp Meta configuration is missing.")
+        except Exception as exc:
+            meta_error = str(exc or "WhatsApp Meta configuration could not be checked.")
+
+        snapshot = await _bridge_session_snapshot(company_id=scoped_company_id, user_id=scoped_user_id)
+        state = str(snapshot.get("state") or snapshot.get("status") or "").strip().lower()
+        if state == "ready":
+            return {
+                "connected": True,
+                "status": "ready",
+                "provider": "bridge",
+                "scope": str(snapshot.get("scope") or ""),
+                "phone": str(snapshot.get("phone") or ""),
+                "error": "",
+            }
+        return {
+            "connected": False,
+            "status": state or "not_configured",
+            "provider": "bridge",
+            "scope": str(snapshot.get("scope") or ""),
+            "phone": str(snapshot.get("phone") or ""),
+            "error": _bridge_not_ready_error(snapshot) or meta_error or "WhatsApp is not connected.",
+        }
+
+    if channel_name in {"facebook", "instagram"}:
+        try:
+            config = await get_meta_config(db, scoped_company_id, channel=channel_name, include_secrets=False)
+            if (
+                config.get("is_active", True)
+                and config.get("access_token_configured")
+                and str(config.get("page_id") or "").strip()
+            ):
+                return {"connected": True, "status": "ready", "provider": "meta", "error": ""}
+        except Exception:
+            pass
+        row = await db.fetchrow(
+            "SELECT enabled, access_token, page_id FROM channel_settings WHERE company_id=$1 AND channel=$2 LIMIT 1",
+            scoped_company_id,
+            channel_name,
+        )
+        data = dict(row) if row else {}
+        if data.get("enabled") and str(data.get("access_token") or "").strip() and str(data.get("page_id") or "").strip():
+            return {"connected": True, "status": "ready", "provider": "legacy", "error": ""}
+        return {
+            "connected": False,
+            "status": "not_configured",
+            "error": f"{channel_name.capitalize()} is not connected.",
+        }
+
+    if channel_name == "email":
+        row = await db.fetchrow(
+            "SELECT * FROM channel_settings WHERE company_id=$1 AND channel='email' AND enabled=TRUE LIMIT 1",
+            scoped_company_id,
+        )
+        data = dict(row) if row else {}
+        provider = str(data.get("email_provider") or "smtp_imap").strip().lower()
+        if provider == "brevo":
+            connected = bool(str(data.get("api_key") or "").strip() and str(data.get("email_address") or "").strip())
+        else:
+            connected = bool(
+                str(data.get("smtp_host") or "").strip()
+                and str(data.get("email_address") or data.get("smtp_user") or "").strip()
+            )
+        return {
+            "connected": connected,
+            "status": "ready" if connected else "not_configured",
+            "provider": provider,
+            "error": "" if connected else "Email is not connected.",
+        }
+
+    return {"connected": True, "status": "ready", "error": ""}
 
 
 async def _send_via_meta(
@@ -654,6 +776,31 @@ async def send_whatsapp_message(
         except Exception as exc:
             logger.warning("[MetaTenant] fallback triggered: %s", exc)
     if bridge_preferred or _use_bridge():
+        bridge_error = _bridge_not_ready_error(bridge_snapshot) if bridge_snapshot else ""
+        if bridge_error:
+            logger.warning(
+                "whatsapp_outbound_bridge_not_ready company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s bridge_scope=%s selected_whatsapp_scope=%s bridge_state=%s recipient_id=%s idempotency_key=%s delivery_status=failed failure_code=%s error=%s",
+                scoped_company_id,
+                scoped_user_id,
+                scoped_conversation_id,
+                scoped_customer_id,
+                local_message_id,
+                str(bridge_snapshot.get("scope") or _bridge_scope_for(company_id=scoped_company_id, user_id=scoped_user_id)),
+                _bridge_scope_for(company_id=scoped_company_id, user_id=scoped_user_id),
+                bridge_status,
+                to_phone,
+                scoped_idempotency_key,
+                "WHATSAPP_SESSION_NOT_READY",
+                bridge_error,
+            )
+            if db and scoped_company_id and local_message_id:
+                await _persist_outbound_message_state(
+                    db,
+                    company_id=scoped_company_id,
+                    db_message_id=local_message_id,
+                    delivery_status="failed",
+                )
+            return False, bridge_error
         sent, error, external_message_id = await _send_via_bridge(
             to_phone,
             message_text,

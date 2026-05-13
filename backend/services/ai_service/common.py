@@ -189,17 +189,14 @@ def utc_now_iso() -> str:
 
 
 def get_ai_reply_delay_seconds(source_text: str) -> float:
-    text = " ".join((source_text or "").split())
-    if not text:
-        return 1.5
-    return max(
-        1.2,
-        min(1.2 + min((len(text.split()) * 0.18) + (len(text) / 80.0), 8.8), 10.0),
-    )
+    _ = source_text
+    return 0.0
 
 
 async def wait_for_ai_response_timing(source_text: str, started_at: float | None = None) -> None:
     delay = get_ai_reply_delay_seconds(source_text)
+    if delay <= 0:
+        return
     if started_at is None:
         await asyncio.sleep(delay)
         return

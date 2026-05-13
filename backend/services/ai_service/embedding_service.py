@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -8,7 +9,7 @@ import time
 from typing import Optional
 
 from core.utils import make_id
-from shared.config import ai_embedding_unsupported_cooldown_seconds
+from shared.config import ai_api_call_timeout_seconds, ai_embedding_unsupported_cooldown_seconds
 from shared.cache import get_cache_client
 from services.ai_service.llm_client import (
     GEMINI_EMBEDDING_MODEL,
@@ -121,23 +122,49 @@ def _should_skip_embedding_search(text: str) -> bool:
     return False
 
 
-def _log_embedding_attempt(provider: str, model: str, attempt_number: int, text: str) -> None:
+def _log_embedding_call(
+    *,
+    outcome: str,
+    provider: str,
+    model: str,
+    attempt_number: int,
+    text: str,
+    latency_ms: float,
+    company_id: str = "",
+    fallback_used: bool = False,
+    error: Exception | None = None,
+) -> None:
     context = get_llm_context()
-    logger.info(
-        "llm_call outcome=attempt message_id=%s conversation_id=%s workflow_id=%s company_id=%s "
-        "agent=%s function=generate_embedding provider=%s model=%s purpose=embedding "
-        "call_type=embedding attempt=%s fallback_used=%s token_estimate=%s",
-        (context.message_id if context else "") or "-",
-        (context.conversation_id if context else "") or "-",
-        (context.workflow_id if context else "") or "-",
-        (context.company_id if context else "") or "-",
-        (context.agent_name if context else "") or "-",
-        provider or "-",
-        model or "-",
-        attempt_number,
-        attempt_number > 1,
-        len(text.strip()) // 4,
-    )
+    prompt_tokens = max(0, len(str(text or "").strip()) // 4)
+    payload = {
+        "event": "llm_call",
+        "outcome": outcome,
+        "model": model or "-",
+        "provider": provider or "-",
+        "function": "generate_embedding",
+        "company_id": company_id or (context.company_id if context else "") or "-",
+        "latency_ms": round(float(latency_ms or 0.0), 2),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": 0,
+        "total_tokens": prompt_tokens,
+        "attempt": attempt_number,
+        "fallback_used": bool(fallback_used),
+        "message_id": (context.message_id if context else "") or "-",
+        "conversation_id": (context.conversation_id if context else "") or "-",
+        "workflow_id": (context.workflow_id if context else "") or "-",
+        "agent": (context.agent_name if context else "") or "-",
+        "purpose": "embedding",
+        "call_type": "embedding",
+    }
+    if error is None:
+        logger.info(payload)
+        return
+    payload["error_type"] = error.__class__.__name__
+    payload["error"] = str(error).splitlines()[0][:240]
+    if outcome == "timeout":
+        logger.warning(payload)
+    else:
+        logger.error(payload)
 
 
 def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
@@ -169,7 +196,7 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
     if not text or not text.strip():
         return None
 
-    from services.ai_service.llm_client import _gemini_client, _openai_client
+    from services.ai_service.llm_client import _gemini_client, _gemini_client_for_model, _openai_client
 
     candidates = _embedding_candidate_engines(engine)
     if not _EMBEDDING_PROVIDER_FALLBACK:
@@ -204,9 +231,10 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
             cache_key[6:18],
             len(text or ""),
         )
+        started = time.perf_counter()
         try:
-            if provider == "gemini" and _gemini_client:
-                _log_embedding_attempt(provider, model, attempt_number, text)
+            gemini_client = (_gemini_client or _gemini_client_for_model(model)) if provider == "gemini" else None
+            if provider == "gemini" and gemini_client:
                 try:
                     reserve_embedding_call(
                         function_name="generate_embedding",
@@ -224,22 +252,26 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
                         model,
                     )
                     return None
-                result = await _gemini_client.aio.models.embed_content(
-                    model=model,
-                    contents=text.strip()[:8000],
-                )
+                async with asyncio.timeout(ai_api_call_timeout_seconds()):
+                    result = await gemini_client.aio.models.embed_content(
+                        model=model,
+                        contents=text.strip()[:8000],
+                    )
                 values = getattr((getattr(result, "embeddings", []) or [None])[0], "values", None)
                 if isinstance(values, list):
-                    logger.info(
-                        "embedding_generated provider=%s model=%s dimensions=%s",
-                        provider,
-                        model,
-                        len(values),
+                    _log_embedding_call(
+                        outcome="success",
+                        provider=provider,
+                        model=model,
+                        attempt_number=attempt_number,
+                        text=text,
+                        latency_ms=(time.perf_counter() - started) * 1000.0,
+                        company_id=company_id,
+                        fallback_used=attempt_number > 1,
                     )
                     await _EMBEDDING_CACHE.set_json(cache_key, values, ttl_seconds=_EMBEDDING_CACHE_TTL_SECONDS)
                     return values
             if provider == "openai" and _openai_client:
-                _log_embedding_attempt(provider, model, attempt_number, text)
                 try:
                     reserve_embedding_call(
                         function_name="generate_embedding",
@@ -257,29 +289,38 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
                         model,
                     )
                     return None
-                response = await _openai_client.embeddings.create(
-                    model=model,
-                    input=text.strip()[:8000],
-                )
+                async with asyncio.timeout(ai_api_call_timeout_seconds()):
+                    response = await _openai_client.embeddings.create(
+                        model=model,
+                        input=text.strip()[:8000],
+                    )
                 values = response.data[0].embedding
                 if isinstance(values, list):
-                    logger.info(
-                        "embedding_generated provider=%s model=%s dimensions=%s",
-                        provider,
-                        model,
-                        len(values),
+                    _log_embedding_call(
+                        outcome="success",
+                        provider=provider,
+                        model=model,
+                        attempt_number=attempt_number,
+                        text=text,
+                        latency_ms=(time.perf_counter() - started) * 1000.0,
+                        company_id=company_id,
+                        fallback_used=attempt_number > 1,
                     )
                     await _EMBEDDING_CACHE.set_json(cache_key, values, ttl_seconds=_EMBEDDING_CACHE_TTL_SECONDS)
                     return values
         except Exception as exc:
             error_type = _classify_embedding_error(exc)
             _mark_embedding_model_cooldown(provider, model, error_type, exc)
-            logger.warning(
-                "embedding_generation_failed provider=%s model=%s error_type=%s error=%s",
-                provider,
-                model,
-                error_type,
-                exc,
+            _log_embedding_call(
+                outcome="timeout" if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else "error",
+                provider=provider,
+                model=model,
+                attempt_number=attempt_number,
+                text=text,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                company_id=company_id,
+                fallback_used=attempt_number > 1,
+                error=exc,
             )
             continue
     logger.warning("Embedding generation unavailable for current runtime")

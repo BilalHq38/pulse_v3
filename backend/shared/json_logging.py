@@ -25,13 +25,16 @@ class StructuredJsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         trace = current_trace_context()
+        structured_message = record.msg if isinstance(record.msg, dict) else None
         entry: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": structured_message.get("event", "structured") if structured_message else record.getMessage(),
             "service": self._service_name,
         }
+        if structured_message:
+            entry.update(structured_message)
         if trace:
             entry["trace_id"] = trace.trace_id
             entry["span_id"] = trace.span_id

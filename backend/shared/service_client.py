@@ -135,9 +135,9 @@ class ServiceClient:
         self.service_name = service_name or self.base_url.split("//", 1)[-1]
         self._timeout = httpx.Timeout(
             self.timeout,
-            connect=min(5.0, self.timeout),
+            connect=min(3.0, self.timeout),
             read=self.timeout,
-            write=self.timeout,
+            write=min(10.0, self.timeout),
             pool=min(5.0, self.timeout),
         )
         self._client = httpx.AsyncClient(

@@ -9,16 +9,18 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from core.utils import make_id, normalize_reference_key, now_ts
 from services.ai_service.intent import classify_intent
 from services.ai_service.llm_client import get_provider_runtime_info, validate_live_engine
+from services.ai_service.model_catalog import supported_model_catalog, validate_model_selection
+from services.ai_service.response_generator import clear_engine_cache
 from services.ai_service.sentiment import analyze_sentiment, build_sentiment_gate
 from services.db_helpers import (
     enrich_llm_engine,
     ensure_company_settings_row,
     ensure_default_llm_engine,
     get_current_user_flexible,
-    model_supports_vision,
     provider_configuration_status,
     r,
     require_roles,
+    resolve_active_llm_engine,
     rs,
 )
 
@@ -82,6 +84,17 @@ def _filter_update_fields(body: dict, allowed: set[str]) -> dict:
     return {k: v for k, v in body.items() if k in allowed}
 
 
+def _validate_llm_model_or_400(provider: str, model_name: str) -> None:
+    try:
+        validate_model_selection(provider, model_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _invalidate_llm_engine_cache(company_id: str, reason: str) -> None:
+    clear_engine_cache(company_id, reason=reason)
+
+
 async def _enable_company_ai_if_agent_active(db, company_id: str, should_enable: bool) -> None:
     if not should_enable or not str(company_id or "").strip():
         return
@@ -108,54 +121,10 @@ def _super_admin_requested_company_id(request: Request, current_user: dict) -> s
     return (request.query_params.get("company_id", "") or "").strip()
 
 
-def _unique_model_names(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        model_name = str(value or "").strip()
-        if not model_name or model_name in seen:
-            continue
-        seen.add(model_name)
-        out.append(model_name)
-    return out
-
-
-def _supported_model_catalog() -> dict[str, list[str]]:
-    gemini_fallbacks = [
-        item.strip()
-        for item in (os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash")).split(",")
-        if item.strip()
-    ]
-    return {
-        "openai": _unique_model_names(
-            [
-                os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-                "gpt-4o-mini",
-                "gpt-4o",
-                "gpt-4-turbo",
-            ]
-        ),
-        "anthropic": _unique_model_names(
-            [
-                os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
-                "claude-3-5-sonnet-20241022",
-                "claude-3-5-haiku-20241022",
-            ]
-        ),
-        "gemini": _unique_model_names(
-            [
-                os.environ.get("GEMINI_FLASH_MODEL", "gemini-2.5-flash"),
-                os.environ.get("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
-                *gemini_fallbacks,
-            ]
-        ),
-    }
-
-
 async def _list_scoped_llm_engines(db, company_id: str, selected_id: str = "") -> list[dict]:
     rows = await db.fetch(
         "SELECT * FROM llm_engines "
-        "WHERE company_id='' OR company_id=$1 "
+        "WHERE is_active=TRUE AND (company_id='' OR company_id=$1) "
         "ORDER BY CASE WHEN company_id='' THEN 0 ELSE 1 END, provider, model_name",
         company_id,
     )
@@ -320,11 +289,12 @@ async def list_llm_engines(request: Request):
     cid = _super_admin_requested_company_id(request, cu)
     if _is_super_admin(cu) and not cid:
         raise HTTPException(400, "company_id query parameter is required for super_admin LLM engine queries")
-    await ensure_default_llm_engine(db)
     selected_id = ""
     if cid:
-        settings = await ensure_company_settings_row(db, cid)
-        selected_id = settings.get("active_llm_engine_id", "")
+        selected = await resolve_active_llm_engine(db, cid)
+        selected_id = selected.get("id", "")
+    else:
+        await ensure_default_llm_engine(db)
     return await _list_scoped_llm_engines(db, cid, selected_id=selected_id)
 
 
@@ -335,15 +305,17 @@ async def list_supported_llm_models(request: Request):
     cid = _super_admin_requested_company_id(request, cu)
     if _is_super_admin(cu) and not cid:
         raise HTTPException(400, "company_id query parameter is required for super_admin LLM model queries")
-    await ensure_default_llm_engine(db)
     selected_id = ""
     if cid:
-        settings = await ensure_company_settings_row(db, cid)
-        selected_id = settings.get("active_llm_engine_id", "")
+        selected = await resolve_active_llm_engine(db, cid)
+        selected_id = selected.get("id", "")
+    else:
+        await ensure_default_llm_engine(db)
     engines = await _list_scoped_llm_engines(db, cid, selected_id=selected_id)
     providers = []
     models = []
-    for provider, provider_models in _supported_model_catalog().items():
+    catalog = supported_model_catalog()
+    for provider in sorted({item["provider"] for item in catalog}):
         status, status_detail = provider_configuration_status(provider)
         providers.append(
             {
@@ -353,18 +325,17 @@ async def list_supported_llm_models(request: Request):
                 "configured": status == "configured",
             }
         )
-        for model_name in provider_models:
-            models.append(
-                {
-                    "provider": provider,
-                    "model_name": model_name,
-                    "status": status,
-                    "status_detail": status_detail,
-                    "configured": status == "configured",
-                    "supports_vision": model_supports_vision(provider, model_name),
-                    "source": "catalog",
-                }
-            )
+    for item in catalog:
+        status, status_detail = provider_configuration_status(item["provider"])
+        models.append(
+            {
+                **item,
+                "status": status,
+                "status_detail": status_detail,
+                "configured": status == "configured",
+                "source": "catalog",
+            }
+        )
     return {"providers": providers, "models": models, "engines": engines}
 
 
@@ -380,6 +351,7 @@ async def create_llm_engine(request: Request):
         raise HTTPException(400, "model_name is required")
     if provider not in {"openai", "anthropic", "gemini"}:
         raise HTTPException(400, "provider must be openai, anthropic, or gemini")
+    _validate_llm_model_or_400(provider, model_name)
     eid = make_id()
     await db.execute(
         "INSERT INTO llm_engines(id,company_id,model_name,provider,api_endpoint,temperature,max_tokens,is_active,version,last_updated,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),NOW())",  # noqa: E501
@@ -393,6 +365,7 @@ async def create_llm_engine(request: Request):
         bool(body.get("is_active", True)),
         (body.get("version", "current") or "current").strip(),
     )
+    _invalidate_llm_engine_cache(engine_company_id, "settings_update")
     return r(await db.fetchrow("SELECT * FROM llm_engines WHERE id=$1", eid))
 
 
@@ -407,8 +380,6 @@ async def update_llm_engine(llm_id: str, request: Request):
         body["provider"] = normalize_reference_key(body["provider"])
         if body["provider"] not in {"openai", "anthropic", "gemini"}:
             raise HTTPException(400, "provider must be openai, anthropic, or gemini")
-    if not body:
-        raise HTTPException(400, "No valid fields provided")
     engine = await _fetch_scoped_llm_engine(
         db,
         llm_id,
@@ -418,10 +389,16 @@ async def update_llm_engine(llm_id: str, request: Request):
     )
     if not engine:
         raise HTTPException(404, "LLM engine not found")
+    final_provider = normalize_reference_key(body.get("provider", engine.get("provider", "")))
+    final_model = str(body.get("model_name", engine.get("model_name", "")) or "").strip()
+    _validate_llm_model_or_400(final_provider, final_model)
+    if not body:
+        raise HTTPException(400, "No valid fields provided")
     body["updated_at"] = now_ts()
     body["last_updated"] = now_ts()
     set_parts = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(body))
     await db.execute(f"UPDATE llm_engines SET {set_parts} WHERE id=$1", llm_id, *body.values())
+    _invalidate_llm_engine_cache(str(engine.get("company_id") or cid), "settings_update")
     return r(await db.fetchrow("SELECT * FROM llm_engines WHERE id=$1", llm_id))
 
 
@@ -454,6 +431,7 @@ async def select_llm_engine(llm_id: str, request: Request):
         llm_id,
         settings["id"],
     )
+    _invalidate_llm_engine_cache(cid, "settings_update")
     return {"ok": True, "engine": enrich_llm_engine(engine, selected_id=llm_id)}
 
 
@@ -473,6 +451,7 @@ async def delete_llm_engine(llm_id: str, request: Request):
     )
     if res == "DELETE 0":
         raise HTTPException(404, "LLM engine not found")
+    _invalidate_llm_engine_cache(cid, "settings_update")
     return {"ok": True}
 
 

@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
+from agent_orchestrator.agents.adaptive_qualification import _update_qualification_silently
 from agent_orchestrator.schemas import MessageWorkflowRequest
 from channel_layer.channel_identity import (
     company_default_phone_region,
@@ -27,7 +28,10 @@ from core.utils import make_id, now_ts
 from shared.tracing import current_trace_context
 from shared.webhook_task_runner import create_safe_detached_task
 from services.db_helpers import (
+    AI_API_EXHAUSTED_MANUAL_MESSAGE,
     _notify_agents_handoff,
+    conversation_ai_auto_paused,
+    disable_company_ai_after_api_exhaustion,
     escalate_conversation_to_human,
     fetch_messages_with_attachments,
     get_company_id,
@@ -35,6 +39,7 @@ from services.db_helpers import (
     get_or_create_contact_conversation,
     get_or_create_customer_from_contact,
     is_company_ai_enabled,
+    is_ai_api_exhaustion_payload,
     persist_ai_session_record,
     persist_chat_history,
     persist_user_ai_memory,
@@ -62,6 +67,13 @@ CONVERSATION_UPDATE_FIELDS = {
     "channel",
     "customer_name",
     "ai_handled",
+    "ai_auto_paused",
+    "ai_paused_at",
+    "ai_paused_reason",
+    "ai_paused_error_type",
+    "ai_paused_provider",
+    "ai_paused_model",
+    "ai_paused_scope",
     "sentiment_score",
     "sentiment_label",
     "last_message",
@@ -286,6 +298,53 @@ async def _load_scoped_conversation(db, convo_id: str, current_user: dict) -> di
     return convo
 
 
+async def _channel_statuses_for_conversations(db, company_id: str, current_user: dict, conversations: list[dict]) -> dict:
+    from services.messaging_service import get_channel_connection_status
+
+    channels = {
+        str((convo or {}).get("channel") or "").strip().lower()
+        for convo in conversations or []
+        if str((convo or {}).get("channel") or "").strip()
+    }
+    statuses = {}
+    for channel_name in channels:
+        try:
+            statuses[channel_name] = await get_channel_connection_status(
+                db,
+                company_id=company_id,
+                channel=channel_name,
+                user_id=str(current_user.get("sub") or ""),
+            )
+        except Exception as exc:
+            statuses[channel_name] = {
+                "connected": False,
+                "status": "error",
+                "error": f"{format_channel_name(channel_name)} status could not be checked.",
+            }
+            logger.warning(
+                "Channel status lookup failed company_id=%s channel=%s error=%s",
+                company_id,
+                channel_name,
+                exc,
+            )
+    return statuses
+
+
+def format_channel_name(channel_name: str) -> str:
+    return str(channel_name or "channel").replace("_", " ").strip().title()
+
+
+def _decorate_conversation_channel_status(conversation: dict, statuses: dict) -> dict:
+    item = dict(conversation or {})
+    channel_name = str(item.get("channel") or "").strip().lower()
+    status = dict(statuses.get(channel_name) or {"connected": True, "status": "ready", "error": ""})
+    item["channel_connected"] = bool(status.get("connected"))
+    item["channel_status"] = str(status.get("status") or ("ready" if item["channel_connected"] else "not_connected"))
+    item["channel_error"] = str(status.get("error") or "")
+    item["channel_connection"] = status
+    return item
+
+
 @router.get("/conversations")
 async def list_conversations(request: Request, status: Optional[str] = None, channel: Optional[str] = None):
     db = _db(request)
@@ -308,7 +367,9 @@ async def list_conversations(request: Request, status: Optional[str] = None, cha
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY c.last_message_at DESC LIMIT 500"
-    return rs(await db.fetch(sql, *args))
+    conversations = rs(await db.fetch(sql, *args))
+    statuses = await _channel_statuses_for_conversations(db, cid, cu, conversations)
+    return [_decorate_conversation_channel_status(convo, statuses) for convo in conversations]
 
 
 @router.post("/conversations/start")
@@ -503,7 +564,9 @@ async def update_conversation(convo_id: str, request: Request):
         convo_id,
         cu.get("sub", ""),
     )
-    return r(await db.fetchrow("SELECT * FROM conversations WHERE id=$1 AND company_id=$2", convo_id, cid))
+    updated = r(await db.fetchrow("SELECT * FROM conversations WHERE id=$1 AND company_id=$2", convo_id, cid))
+    statuses = await _channel_statuses_for_conversations(db, cid, cu, [updated])
+    return _decorate_conversation_channel_status(updated, statuses)
 
 
 @router.put("/conversations/{convo_id}/mark-read")
@@ -560,7 +623,9 @@ async def toggle_ai_mode(convo_id: str, request: Request):
     else:
         await db.execute(
             "UPDATE conversations SET ai_handled=TRUE,status='open',escalation_notice=NULL,escalated_at=NULL,"
-            "escalated_to='',escalated_to_name='',updated_at=NOW() WHERE id=$1 AND company_id=$2",
+            "escalated_to='',escalated_to_name='',ai_auto_paused=FALSE,ai_paused_at=NULL,ai_paused_reason='',"
+            "ai_paused_error_type='',ai_paused_provider='',ai_paused_model='',ai_paused_scope='',updated_at=NOW() "
+            "WHERE id=$1 AND company_id=$2",
             convo_id,
             cid,
         )
@@ -584,14 +649,16 @@ async def toggle_ai_mode(convo_id: str, request: Request):
                 "created_at": str(now_ts()),
             },
         )
+    updated = r(
+        await db.fetchrow(
+            "SELECT * FROM conversations WHERE id=$1 AND company_id=$2",
+            convo_id,
+            cid,
+        )
+    )
+    statuses = await _channel_statuses_for_conversations(db, cid, cu, [updated])
     return {
-        "conversation": r(
-            await db.fetchrow(
-                "SELECT * FROM conversations WHERE id=$1 AND company_id=$2",
-                convo_id,
-                cid,
-            )
-        ),
+        "conversation": _decorate_conversation_channel_status(updated, statuses),
         "escalation_notice": escalation_notice,
     }
 
@@ -719,6 +786,8 @@ async def send_message(convo_id: str, request: Request):
             )
     workflow = None
     support_plan: dict = {}
+    capture: dict = {}
+    intent: dict = {}
     if sender_type == "customer":
         try:
             cust_full = r(
@@ -907,7 +976,12 @@ async def send_message(convo_id: str, request: Request):
 
     ai_response = None
     cust_full = None
-    if sender_type == "customer" and convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
+    if (
+        sender_type == "customer"
+        and convo.get("ai_handled", True)
+        and not conversation_ai_auto_paused(convo)
+        and await is_company_ai_enabled(db, company_id)
+    ):
         try:
             result = dict(support_plan or {})
             cust_full = r(
@@ -927,19 +1001,31 @@ async def send_message(convo_id: str, request: Request):
                     "api_error": True,
                 }
 
-            if result.get("api_error") and not result.get("response"):
-                sys_id = make_id()
-                sys_msg = "AI service unavailable - Please respond manually"
-                await db.execute(
-                    "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "  # noqa: E501
-                    "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
-                    sys_id,
+            if (
+                result.get("api_error")
+                and not result.get("static_fallback_served")
+                and (is_ai_api_exhaustion_payload(result) or not result.get("response"))
+            ):
+                sys_msg = AI_API_EXHAUSTED_MANUAL_MESSAGE
+                await disable_company_ai_after_api_exhaustion(
+                    db,
                     company_id,
-                    convo_id,
-                    sys_msg,
+                    conversation_id=convo_id,
+                    reason=str(result.get("error_reason") or result.get("error_type") or "AI service unavailable"),
+                    error_type=str(result.get("error_type") or ""),
+                    provider=str(result.get("provider") or ""),
+                    model=str(result.get("model_name") or ""),
                 )
-                sys_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", sys_id))
-                await emit_new_message(convo_id, sys_message)
+                escalation = await escalate_conversation_to_human(
+                    db,
+                    convo_id,
+                    company_id,
+                    (cust_full or {}).get("name", "Customer"),
+                    convo.get("channel", "web_chat"),
+                    reason=sys_msg,
+                    automatic=True,
+                )
+                await emit_new_message(convo_id, escalation["message"])
                 return {
                     "message": message,
                     "ai_response": None,
@@ -1087,6 +1173,24 @@ async def send_message(convo_id: str, request: Request):
                                 outbound_channel,
                                 error,
                             )
+                lead_for_qualification = dict(capture.get("lead") or {})
+                if not lead_for_qualification and cust_full:
+                    lead_for_qualification = {"id": str(cust_full.get("lead_id") or "")}
+                create_safe_detached_task(
+                    db,
+                    _update_qualification_silently(
+                        db,
+                        company_id,
+                        lead_for_qualification,
+                        content,
+                        intent,
+                    ),
+                    name=f"qualification-update-{convo_id}",
+                    company_id=company_id,
+                    channel=str(convo.get("channel") or ""),
+                    trace_id=trace_id,
+                    event_id=ai_id,
+                )
             else:
                 escalation = await escalate_conversation_to_human(
                     db,
@@ -1200,22 +1304,192 @@ async def delete_message(convo_id: str, message_id: str, request: Request):
     return {"status": "deleted", "message_id": message_id}
 
 
-@router.post("/conversations/{convo_id}/ai-respond")
-async def trigger_ai_response(convo_id: str, request: Request):
-    db = _db(request)
-    cu = await get_current_user_flexible(request)
-    cid = get_company_id(cu)
-    convo = r(
-        await db.fetchrow(
-            "SELECT * FROM conversations WHERE id=$1 AND company_id=$2 LIMIT 1",
-            convo_id,
-            cid,
-        )
+async def _persist_manual_ai_system_alert(
+    db,
+    *,
+    company_id: str,
+    convo_id: str,
+    message: str,
+) -> dict:
+    if not company_id or not convo_id:
+        return {}
+    sys_id = make_id()
+    text = str(message or "AI response withheld for manual review.").strip()
+    await db.execute(
+        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "
+        "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
+        sys_id,
+        company_id,
+        convo_id,
+        text,
     )
-    if not convo:
-        raise HTTPException(404, "Conversation not found")
+    await db.execute(
+        "UPDATE conversations SET ai_handled=FALSE,status='open',escalation_notice=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+        text,
+        convo_id,
+        company_id,
+    )
+    sys_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", sys_id))
+    await emit_new_message(convo_id, sys_message)
+    return sys_message
+
+
+def _manual_ai_safe_fallback_draft() -> str:
+    return "Hi, thanks for reaching out. Let me check this and get back to you shortly."
+
+
+def _build_manual_ai_draft_payload(result: dict, convo_id: str, threshold: float = 0.7) -> dict:
+    payload = dict(result or {})
+    confidence = float(payload.get("confidence", 0.0) or 0.0)
+    confidence_threshold = float(payload.get("confidence_threshold", threshold) or threshold)
+    review_reason = str(
+        payload.get("review_reason")
+        or payload.get("escalation_reason")
+        or payload.get("error_reason")
+        or ""
+    ).strip()
+    fallback_reason = str(payload.get("fallback_reason") or "").strip()
+    if not fallback_reason and payload.get("fallback_used"):
+        fallback_reason = str(payload.get("error_type") or "").strip()
+    draft = str(payload.get("response") or payload.get("draft") or "").strip()
+    if not draft:
+        draft = _manual_ai_safe_fallback_draft()
+        fallback_reason = fallback_reason or "empty_model_response"
+        review_reason = review_reason or "AI returned an empty response. A safe editable fallback draft was provided."
+        payload["fallback_used"] = True
+
+    requires_review = bool(
+        payload.get("requires_review")
+        or payload.get("escalate")
+        or confidence < confidence_threshold
+        or payload.get("api_error")
+        or payload.get("fallback_used")
+    )
+    if requires_review and not review_reason and confidence < confidence_threshold:
+        review_reason = "Low confidence; review before sending."
+
+    attachments = list(payload.get("attachments") or payload.get("product_images") or [])
+    return {
+        "status": "draft_ready",
+        "conversation_id": convo_id,
+        "draft": draft,
+        "response": draft,
+        "confidence": confidence,
+        "confidence_threshold": confidence_threshold,
+        "requires_review": requires_review,
+        "reason": review_reason,
+        "review_reason": review_reason,
+        "attachments": attachments,
+        "product_images": list(payload.get("product_images") or []),
+        "provider": str(payload.get("provider") or ""),
+        "model_name": str(payload.get("model_name") or ""),
+        "llm_id": str(payload.get("llm_id") or ""),
+        "api_error": bool(payload.get("api_error")),
+        "error_type": str(payload.get("error_type") or ""),
+        "error_reason": str(payload.get("error_reason") or ""),
+        "provider_error": dict(payload.get("provider_error") or {}),
+        "fallback_used": bool(payload.get("fallback_used")),
+        "fallback_reason": fallback_reason,
+        "static_fallback_served": bool(payload.get("static_fallback_served")),
+        "manual_draft_nonce": str(payload.get("manual_draft_nonce") or ""),
+    }
+
+
+async def _process_manual_ai_response_background(
+    db,
+    *,
+    convo_id: str,
+    current_user: dict,
+    authorization: str = "",
+    trace_id: str = "",
+) -> None:
+    cu = dict(current_user or {})
+    cid = get_company_id(cu)
+    company_id = cid
+    try:
+        convo = r(
+            await db.fetchrow(
+                "SELECT * FROM conversations WHERE id=$1 AND company_id=$2 LIMIT 1",
+                convo_id,
+                cid,
+            )
+        )
+        if not convo:
+            logger.warning("Queued manual AI response skipped; conversation not found conversation_id=%s", convo_id)
+            return
+        company_id = cu.get("company_id", "") or convo.get("company_id", "")
+        await _run_manual_ai_response_workflow(
+            db,
+            convo_id=convo_id,
+            current_user=cu,
+            authorization=authorization,
+            trace_id=trace_id,
+            convo=convo,
+            draft_only=True,
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "Queued manual AI response withheld company_id=%s conversation_id=%s status_code=%s detail=%s",
+            company_id,
+            convo_id,
+            exc.status_code,
+            exc.detail,
+        )
+        if company_id and exc.status_code != 404:
+            await _persist_manual_ai_system_alert(
+                db,
+                company_id=company_id,
+                convo_id=convo_id,
+                message=str(exc.detail or "AI response withheld for manual review."),
+            )
+    except Exception as exc:
+        logger.exception("Queued manual AI response failed company_id=%s conversation_id=%s error=%s", company_id, convo_id, exc)
+        if company_id:
+            await disable_company_ai_after_api_exhaustion(
+                db,
+                company_id,
+                conversation_id=convo_id,
+                reason=str(exc) or "AI response failed",
+                error_type=type(exc).__name__,
+            )
+            await _persist_manual_ai_system_alert(
+                db,
+                company_id=company_id,
+                convo_id=convo_id,
+                message="AI response failed. Please respond manually.",
+            )
+
+
+async def _run_manual_ai_response_workflow(
+    db,
+    *,
+    convo_id: str,
+    current_user: dict,
+    authorization: str,
+    trace_id: str,
+    convo: dict,
+    draft_only: bool = False,
+) -> dict:
+    cu = dict(current_user or {})
     company_id = cu.get("company_id", "") or convo.get("company_id", "")
-    trace_id = _trace_id_from_context()
+    if conversation_ai_auto_paused(convo):
+        if draft_only:
+            return _build_manual_ai_draft_payload(
+                {
+                    "response": _manual_ai_safe_fallback_draft(),
+                    "confidence": 0.0,
+                    "confidence_threshold": 0.7,
+                    "requires_review": True,
+                    "review_reason": convo.get("ai_paused_reason") or AI_API_EXHAUSTED_MANUAL_MESSAGE,
+                    "api_error": True,
+                    "error_reason": convo.get("ai_paused_reason") or AI_API_EXHAUSTED_MANUAL_MESSAGE,
+                    "fallback_used": True,
+                },
+                convo_id,
+                0.7,
+            )
+        raise HTTPException(409, convo.get("ai_paused_reason") or AI_API_EXHAUSTED_MANUAL_MESSAGE)
+    trace_id = trace_id or _trace_id_from_context()
     msgs_history = await fetch_messages_with_attachments(db, convo_id, limit=20)
     cust = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 LIMIT 1", convo.get("customer_id", "")))
     last_cust_msg_record = next(
@@ -1224,23 +1498,33 @@ async def trigger_ai_response(convo_id: str, request: Request):
     )
     last_cust_msg = str(last_cust_msg_record.get("content") or "").strip() or "(manual trigger)"
     last_cust_msg_id = str(last_cust_msg_record.get("id") or "").strip()
-    last_external_msg_id = str(last_cust_msg_record.get("external_message_id") or "").strip()
     sender_contact = _resolve_conversation_recipient(str(convo.get("channel") or "web_chat"), convo, cust or {})
+    manual_draft_nonce = make_id()
     manual_idempotency_key = (
-        f"manual_ai_respond:{company_id}:{convo_id}:{last_external_msg_id or last_cust_msg_id or trace_id or make_id()}"
+        f"manual_ai_draft:{company_id}:{convo_id}:{trace_id or manual_draft_nonce}:{manual_draft_nonce}"
     )
     request_metadata = {
         "source": "manual_ai_respond",
+        "manual_draft": True,
+        "manual_draft_nonce": manual_draft_nonce,
         "trace_id": trace_id,
         "message_id": manual_idempotency_key,
-        "external_message_id": last_external_msg_id,
-        "provider_event_id": last_external_msg_id,
+        "external_message_id": "",
+        "provider_event_id": manual_idempotency_key,
         "idempotency_key": manual_idempotency_key,
         "raw_sender_id": str(convo.get("channel_id") or sender_contact or ""),
         "normalized_sender_id": sender_contact,
         "selected_outbound_recipient": sender_contact,
         "customer_id": str(convo.get("customer_id") or ""),
     }
+    logger.info(
+        "manual_ai_draft_request company_id=%s conversation_id=%s manual_draft_nonce=%s message_id=%s last_customer_message_id=%s",
+        company_id,
+        convo_id,
+        manual_draft_nonce,
+        manual_idempotency_key,
+        last_cust_msg_id,
+    )
     logger.info(
         "Manual AI response workflow request trace_id=%s company_id=%s conversation_id=%s customer_id=%s "
         "channel=%s message_id=%s raw_identity=%s normalized_identity=%s selected_outbound_recipient=%s",
@@ -1261,8 +1545,8 @@ async def trigger_ai_response(convo_id: str, request: Request):
             conversation_id=convo_id,
             customer_id=convo.get("customer_id", ""),
             message_id=manual_idempotency_key,
-            external_message_id=last_external_msg_id,
-            provider_event_id=last_external_msg_id,
+            external_message_id="",
+            provider_event_id=manual_idempotency_key,
             idempotency_key=manual_idempotency_key,
             channel=str(convo.get("channel") or "web_chat"),
             source="manual_ai_respond",
@@ -1275,18 +1559,95 @@ async def trigger_ai_response(convo_id: str, request: Request):
             customer=cust or {},
             metadata=request_metadata,
         ),
-        authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
+        authorization=authorization,
         db=db,
     )
     result = dict(workflow.agent_outputs.support or {})
-    if result.get("api_error") and not result.get("response"):
-        raise HTTPException(503, "AI service unavailable")
-    if result.get("escalate"):
-        raise HTTPException(
-            409,
-            str(result.get("escalation_reason") or "AI response withheld for manual review."),
+    result["manual_draft_nonce"] = manual_draft_nonce
+    if (
+        result.get("api_error")
+        and not result.get("static_fallback_served")
+        and (is_ai_api_exhaustion_payload(result) or not result.get("response"))
+    ):
+        sys_msg = AI_API_EXHAUSTED_MANUAL_MESSAGE
+        await disable_company_ai_after_api_exhaustion(
+            db,
+            company_id,
+            conversation_id=convo_id,
+            reason=str(result.get("error_reason") or result.get("error_type") or "AI service unavailable"),
+            error_type=str(result.get("error_type") or ""),
+            provider=str(result.get("provider") or ""),
+            model=str(result.get("model_name") or ""),
         )
-    if not result.get("deliver_response") or not result.get("response"):
+        if draft_only:
+            result["response"] = str(result.get("response") or _manual_ai_safe_fallback_draft())
+            result["requires_review"] = True
+            result["review_reason"] = sys_msg
+            result["fallback_used"] = True
+            draft_payload = _build_manual_ai_draft_payload(
+                result,
+                convo_id,
+                float(result.get("confidence_threshold", 0.7) or 0.7),
+            )
+            logger.warning(
+                "manual_ai_draft_generated company_id=%s conversation_id=%s confidence=%.2f requires_review=%s provider=%s model=%s api_error=%s",
+                company_id,
+                convo_id,
+                float(draft_payload.get("confidence", 0.0) or 0.0),
+                bool(draft_payload.get("requires_review")),
+                draft_payload.get("provider", ""),
+                draft_payload.get("model_name", ""),
+                True,
+            )
+            return draft_payload
+        sys_id = make_id()
+        await db.execute(
+            "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "
+            "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
+            sys_id,
+            company_id,
+            convo_id,
+            sys_msg,
+        )
+        await db.execute(
+            "UPDATE conversations SET ai_handled=FALSE,status='open',escalation_notice=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+            sys_msg,
+            convo_id,
+            company_id,
+        )
+        sys_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", sys_id))
+        await emit_new_message(convo_id, sys_message)
+        return sys_message
+    if draft_only and result.get("static_fallback_served") and str(result.get("provider") or "") == "static_fallback":
+        await disable_company_ai_after_api_exhaustion(
+            db,
+            company_id,
+            conversation_id=convo_id,
+            reason=str(result.get("review_reason") or result.get("error_reason") or AI_API_EXHAUSTED_MANUAL_MESSAGE),
+            error_type=str(result.get("error_type") or "static_fallback"),
+            provider=str(result.get("provider") or ""),
+            model=str(result.get("model_name") or ""),
+        )
+    if draft_only:
+        draft_payload = _build_manual_ai_draft_payload(
+            result,
+            convo_id,
+            float(result.get("confidence_threshold", 0.7) or 0.7),
+        )
+        logger.info(
+            "manual_ai_draft_generated company_id=%s conversation_id=%s confidence=%.2f requires_review=%s provider=%s model=%s",
+            company_id,
+            convo_id,
+            float(draft_payload.get("confidence", 0.0) or 0.0),
+            bool(draft_payload.get("requires_review")),
+            draft_payload.get("provider", ""),
+            draft_payload.get("model_name", ""),
+        )
+        return draft_payload
+    # For manual AI responses, do not block on low confidence or escalations.
+    # If the AI returned a response, allow it to be delivered for human review/editing
+    # even when confidence is below the threshold. Only block if the response is empty.
+    if not result.get("response"):
         raise HTTPException(409, "AI response withheld for manual review.")
     ai_id = make_id()
     await db.execute(
@@ -1386,6 +1747,32 @@ async def trigger_ai_response(convo_id: str, request: Request):
     return ai_msg
 
 
+@router.post("/conversations/{convo_id}/ai-respond")
+async def trigger_ai_response(convo_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    convo = r(
+        await db.fetchrow(
+            "SELECT * FROM conversations WHERE id=$1 AND company_id=$2 LIMIT 1",
+            convo_id,
+            cid,
+        )
+    )
+    if not convo:
+        raise HTTPException(404, "Conversation not found")
+    trace_id = _trace_id_from_context()
+    return await _run_manual_ai_response_workflow(
+        db,
+        convo_id=convo_id,
+        current_user=dict(cu or {}),
+        authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
+        trace_id=trace_id,
+        convo=convo,
+        draft_only=True,
+    )
+
+
 @router.post("/conversations/{convo_id}/summarize")
 async def get_conversation_summary(convo_id: str, request: Request):
     db = _db(request)
@@ -1421,24 +1808,38 @@ async def list_message_attachments(message_id: str, request: Request):
 
 @router.post("/communications/email/send")
 async def send_email_message(request: Request):
-    from services.email_service import send_email_async
+    from services.email_service import send_tenant_email_async
 
-    await get_current_user_flexible(request)
+    db = _db(request)
+    current_user = await get_current_user_flexible(request)
     body = await request.json()
     to_email = (body.get("to_email", "") or "").strip()
     subject = (body.get("subject", "") or "").strip()
     content = (body.get("body", "") or "").strip()
+    html_body = (body.get("html_body", "") or "").strip()
     if not to_email:
         raise HTTPException(400, "Recipient email is required")
     if not subject:
         raise HTTPException(400, "Email subject is required")
     if not content:
         raise HTTPException(400, "Email body is required")
-    try:
-        await send_email_async(to_email=to_email, subject=subject, body=content)
-        return {"status": "sent", "to_email": to_email}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Email send failed: {e}")
-        raise HTTPException(500, "Failed to send email")
+    company_id = get_company_id(current_user)
+    email_task_id = make_id()
+    create_safe_detached_task(
+        db,
+        send_tenant_email_async(
+            db,
+            company_id,
+            to_email=to_email,
+            subject=subject,
+            body=content,
+            html_body=html_body,
+            raise_on_failure=False,
+        ),
+        name=f"tenant-email-send-{email_task_id}",
+        event_id=email_task_id,
+        company_id=company_id,
+        channel="email",
+        metadata={"source": "manual_email_send"},
+    )
+    return {"status": "queued", "to_email": to_email}

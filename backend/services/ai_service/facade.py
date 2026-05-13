@@ -43,6 +43,7 @@ from services.ai_service.response_generator import (
     auto_score_and_nurture_lead as _local_auto_score_and_nurture_lead,
     # Used by: routers.customers customer profile enrichment.
     build_safe_lead_ai_context,
+    build_system_prompt,
     calculate_churn_risk,
     generate_ai_response as _local_generate_ai_response,
     generate_combined_ai_analysis as _local_generate_combined_ai_analysis,
@@ -173,7 +174,7 @@ def _safe_ai_reply_default(message_text: str, customer_info: dict | None = None)
     if any(token in lower for token in ("refund", "cancel", "complaint", "angry", "issue", "problem", "broken")):
         return (
             f"I understand, {name}. I can help with this right now. "
-            "Please share your order or account detail and I will guide the fastest resolution path."
+            "Share your order or account detail and I will guide the fastest resolution path."
         )
     if any(token in lower for token in ("price", "buy", "recommend", "product", "available")):
         return (
@@ -383,6 +384,10 @@ async def generate_ai_response(
                 "actor_user_id": actor_user_id,
                 "conversation_id": kwargs.get("conversation_id", ""),
                 "channel": kwargs.get("channel", "web_chat"),
+                "system_prompt": kwargs.get("system_prompt", ""),
+                "extra_context": kwargs.get("extra_context", ""),
+                "company_info": kwargs.get("company_info") or {},
+                "context_package": kwargs.get("context_package") or {},
             },
         )
         return {
@@ -481,10 +486,20 @@ async def generate_combined_ai_analysis(
         )
 
 
-async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") -> dict:
+async def generate_lead_score(
+    lead_data: dict,
+    db=None,
+    company_id: str = "",
+    count_against_budget: bool = True,
+) -> dict:
     safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=False)
     if _prefer_local_impl():
-        return await _local_generate_lead_score(safe_lead, db=db, company_id=company_id)
+        return await _local_generate_lead_score(
+            safe_lead,
+            db=db,
+            company_id=company_id,
+            count_against_budget=count_against_budget,
+        )
     try:
         return await _call_remote_ai(
             "POST",
@@ -499,7 +514,12 @@ async def generate_lead_score(lead_data: dict, db=None, company_id: str = "") ->
             exc.__class__.__name__,
         )
         if _allow_local_fallback():
-            return await _local_generate_lead_score(safe_lead, db=db, company_id=company_id)
+            return await _local_generate_lead_score(
+                safe_lead,
+                db=db,
+                company_id=company_id,
+                count_against_budget=count_against_budget,
+            )
         return _safe_lead_score_default(safe_lead)
 
 
@@ -700,6 +720,7 @@ async def generate_product_description(
     images: list | None = None,
     engines: Optional[list[dict]] = None,
     company_id: str = "",
+    db=None,
 ) -> str:
     if _prefer_local_impl():
         return await _local_generate_product_description(
@@ -712,6 +733,7 @@ async def generate_product_description(
             price_currency=price_currency,
             images=images,
             engines=engines,
+            db=db,
         )
     try:
         result = await _call_remote_ai(
@@ -747,6 +769,7 @@ async def generate_product_description(
                 price_currency=price_currency,
                 images=images,
                 engines=engines,
+                db=db,
             )
         return _safe_product_description_default(
             name,
@@ -758,7 +781,7 @@ async def generate_product_description(
         )
 
 
-async def get_company_knowledge(db, company_id: str | None = None, current_query: str = "", top_k: int = 3) -> str:
+async def get_company_knowledge(db, company_id: str | None = None, current_query: str = "", top_k: int = 5) -> str:
     if _prefer_local_impl():
         return await _local_get_company_knowledge(db, company_id=company_id, current_query=current_query, top_k=top_k)
     try:
@@ -827,6 +850,7 @@ __all__ = [
     "auto_score_and_nurture_lead",
     "batch_store_embeddings",
     "build_sentiment_gate",
+    "build_system_prompt",
     "calculate_churn_risk",
     "call_gemini",
     "call_gemini_json",

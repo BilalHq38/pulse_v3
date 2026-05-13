@@ -958,6 +958,44 @@ async def accuracy_report(db: AsyncSession, tenant_id: str) -> AccuracyReportRes
     )
 
 
+def _first_customer_phone(customer: UnifiedCustomer) -> str | None:
+    for mapping in customer.mappings or []:
+        normalized = normalize_phone(mapping.phone)
+        if normalized:
+            return normalized
+    profile = customer.signal_profile or {}
+    for key in ("phone", "phone_number", "primary_phone", "whatsapp_phone", "mobile"):
+        normalized = normalize_phone(profile.get(key))
+        if normalized:
+            return normalized
+    return normalize_phone(customer.primary_identity)
+
+
+def _first_customer_email(customer: UnifiedCustomer) -> str | None:
+    for mapping in customer.mappings or []:
+        normalized = normalize_email(mapping.email)
+        if normalized:
+            return normalized
+    profile = customer.signal_profile or {}
+    for key in ("email", "email_address", "primary_email"):
+        normalized = normalize_email(profile.get(key))
+        if normalized:
+            return normalized
+    return normalize_email(customer.primary_identity)
+
+
+def _hydrate_candidate_hashes(customer: UnifiedCustomer, tenant_id: str) -> tuple[str | None, str | None]:
+    phone = _first_customer_phone(customer)
+    email = _first_customer_email(customer)
+    phone_hash = customer.primary_phone_hash or hash_with_tenant_salt(tenant_id, phone)
+    email_hash = customer.primary_email_hash or hash_with_tenant_salt(tenant_id, email)
+    if phone_hash and not customer.primary_phone_hash:
+        customer.primary_phone_hash = phone_hash
+    if email_hash and not customer.primary_email_hash:
+        customer.primary_email_hash = email_hash
+    return phone_hash, email_hash
+
+
 async def auto_detect_review_candidates(
     db: AsyncSession,
     tenant_id: str,
@@ -965,6 +1003,9 @@ async def auto_detect_review_candidates(
     max_suggestions: int = 50,
 ) -> dict[str, Any]:
     customers = await _load_probabilistic_candidates(db, tenant_id)
+    for customer in customers:
+        _hydrate_candidate_hashes(customer, tenant_id)
+    logger.info("identity auto-detect candidates loaded tenant_id=%s total_customers=%s", tenant_id, len(customers))
     if len(customers) < 2:
         return {"new_suggestions": 0, "processed_customers": len(customers)}
 
@@ -999,13 +1040,16 @@ async def auto_detect_review_candidates(
         primary_mapping = customer.mappings[0] if customer.mappings else None
         latest_fingerprint = customer.fingerprints[-1] if customer.fingerprints else None
         signal_profile = customer.signal_profile or {}
+        source_phone = _first_customer_phone(customer)
+        source_email = _first_customer_email(customer)
+        source_phone_hash, source_email_hash = _hydrate_candidate_hashes(customer, tenant_id)
         payload = ResolveRequest(
             platform=(primary_mapping.platform if primary_mapping else "pulse_customer") or "pulse_customer",
             platform_user_id=(primary_mapping.platform_user_id if primary_mapping else str(customer.customer_id))
             or str(customer.customer_id),
             consent_token="auto_detect",
-            phone_number=primary_mapping.phone if primary_mapping else None,
-            email_address=primary_mapping.email if primary_mapping else None,
+            phone_number=source_phone,
+            email_address=source_email,
             full_name=(customer.primary_name or (primary_mapping.name if primary_mapping else "")) or None,
             username=(
                 (primary_mapping.platform_username if primary_mapping else "") or signal_profile.get("username") or None
@@ -1037,12 +1081,16 @@ async def auto_detect_review_candidates(
                 tenant_id,
                 candidate,
                 payload,
-                customer.primary_phone_hash,
-                customer.primary_email_hash,
+                source_phone_hash,
+                source_email_hash,
                 latest_fingerprint.fingerprint_hash if latest_fingerprint else None,
             )
             scored.breakdown.pop("_has_anchor", None)
-            if scored.score < 200 or len(scored.independent_signals) < 2:
+            has_strong_anchor = any(
+                signal in scored.independent_signals
+                for signal in ("phone", "email", "channel_identity")
+            ) and scored.score >= 450
+            if not has_strong_anchor and (scored.score < 200 or len(scored.independent_signals) < 2):
                 continue
             if best_candidate is None or scored.score > best_candidate.score:
                 best_candidate = scored
@@ -1056,8 +1104,8 @@ async def auto_detect_review_candidates(
             "customer_id": str(customer.customer_id),
             "platform": payload.platform,
             "platform_user_id": payload.platform_user_id,
-            "phone_hash": customer.primary_phone_hash,
-            "email_hash": customer.primary_email_hash,
+            "phone_hash": source_phone_hash,
+            "email_hash": source_email_hash,
             "full_name": payload.full_name,
             "username": payload.username,
             "fingerprint_hash": latest_fingerprint.fingerprint_hash if latest_fingerprint else None,
@@ -1098,6 +1146,12 @@ async def auto_detect_review_candidates(
         existing_pairs.add(best_pair)
         new_suggestions += 1
 
+    logger.info(
+        "identity auto-detect completed tenant_id=%s processed_customers=%s new_suggestions=%s",
+        tenant_id,
+        len(customers),
+        new_suggestions,
+    )
     return {"new_suggestions": new_suggestions, "processed_customers": len(customers)}
 
 

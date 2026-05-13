@@ -28,37 +28,32 @@ class QualificationAgent(BaseAgent):
         ready_for_scoring = qualification_hint.get("ready_for_scoring") is True
         next_question = str(qualification_hint.get("next_question") or "").strip()
 
-        # Defer scoring until adaptive questioning has collected enough info,
-        # but never defer for existing customers or LEAD workflows where the
-        # lead object already exists.
-        if (
-            context.workflow_kind == WorkflowKind.MESSAGE
-            and lifecycle_stage != "customer"
-            and not ready_for_scoring
-        ):
+        # Message workflows must not run qualification scoring in the response
+        # path. Support always responds first; background tasks update
+        # qualification/scoring after delivery.
+        if context.workflow_kind == WorkflowKind.MESSAGE and lifecycle_stage != "customer":
             logger.info(
-                "qualification_scoring_skipped workflow_id=%s company_id=%s reason=adaptive_incomplete missing_fields=%s",
+                "qualification_scoring_deferred workflow_id=%s company_id=%s reason=message_response_first missing_fields=%s",
                 context.workflow_id,
                 context.company_id,
                 list(qualification_hint.get("missing_fields") or []),
             )
+            ready_label = "ready_for_background_scoring" if ready_for_scoring else "in_discovery"
             payload = {
                 "score": 0,
-                "grade": "in_discovery",
+                "grade": ready_label,
                 "phase": str(structured_lead.get("phase") or "awareness"),
-                "classification": "needs_more_info",
+                "classification": "scoring_deferred",
                 "lead_status": str(structured_lead.get("status") or "new"),
                 "route_to_support": True,
-                "reasoning": (
-                    "Adaptive qualification is still collecting required fields "
-                    f"({', '.join(qualification_hint.get('missing_fields', []))})."
-                ),
-                "next_action": next_question or "Continue support conversation",
+                "reasoning": "Qualification/scoring runs after response delivery.",
+                "next_action": "continue_conversation",
                 "structured_lead": structured_lead,
-                "adaptive_question": next_question,
+                "qualification_hint_for_ai": next_question,
+                "adaptive_question": "",
                 "missing_fields": list(qualification_hint.get("missing_fields") or []),
                 "completed_fields": list(qualification_hint.get("completed_fields") or []),
-                "ready_for_scoring": False,
+                "ready_for_scoring": ready_for_scoring,
                 "qualification_scoring_called": False,
             }
             return AgentRunResult(agent_name=self.name, payload=payload)
@@ -78,6 +73,7 @@ class QualificationAgent(BaseAgent):
                 "route_to_support": True,
                 "reasoning": "Existing customer conversation routed directly to support.",
                 "next_action": "Respond to customer",
+                "adaptive_question": "",
                 "qualification_scoring_called": False,
             }
             return AgentRunResult(agent_name=self.name, payload=payload)
@@ -101,6 +97,7 @@ class QualificationAgent(BaseAgent):
                 "next_action": "Continue support conversation; score lead asynchronously later.",
                 "structured_lead": structured_lead,
                 "ready_for_scoring": True,
+                "adaptive_question": "",
                 "qualification_scoring_called": False,
             }
             return AgentRunResult(agent_name=self.name, payload=payload)
@@ -135,6 +132,7 @@ class QualificationAgent(BaseAgent):
             "structured_lead": structured_lead,
             "ready_for_scoring": True,
             "completed_fields": list(qualification_hint.get("completed_fields") or []),
+            "adaptive_question": "",
             "qualification_scoring_called": True,
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
@@ -200,6 +198,7 @@ class QualificationAgent(BaseAgent):
             "reasoning": "Fallback qualification was used because the scoring agent failed.",
             "next_action": "Review manually",
             "structured_lead": structured_lead,
+            "adaptive_question": "",
         }
         return AgentRunResult(
             agent_name=self.name,

@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 import time
+from agent_orchestrator.agents.adaptive_qualification import _update_qualification_silently
 from agent_orchestrator.schemas import LeadWorkflowRequest, MessageWorkflowRequest
 from channel_layer.normalizer import MessageNormalizer
 from channel_layer.router import get_channel_registry, get_outbound_router
@@ -71,11 +72,15 @@ from shared.usage_guard import (
     insert_conversation_usage_row,
 )
 from services.db_helpers import (
+    AI_API_EXHAUSTED_MANUAL_MESSAGE,
+    conversation_ai_auto_paused,
     convert_lead_to_customer_state,
+    disable_company_ai_after_api_exhaustion,
     escalate_conversation_to_human,
     fetch_messages_with_attachments,
     get_current_user_flexible,
     is_company_ai_enabled,
+    is_ai_api_exhaustion_payload,
     insert_chat_history_record,
     normalize_attachment_row,
     normalize_customer_contact_phone,
@@ -4436,7 +4441,11 @@ async def _process_incoming_message(
             recent_human_agent_message.get("id", ""),
             recent_human_agent_message.get("sender_name", ""),
         )
-    elif convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
+    elif (
+        convo.get("ai_handled", True)
+        and not conversation_ai_auto_paused(convo)
+        and await is_company_ai_enabled(db, company_id)
+    ):
         try:
             support_result = dict(support_plan or {})
             if not support_result:
@@ -4449,18 +4458,30 @@ async def _process_incoming_message(
                     "next_action": "manual_review",
                     "api_error": True,
                 }
-            if support_result.get("api_error") and not support_result.get("response"):
-                system_id = make_id()
-                await db.execute(
-                    "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "  # noqa: E501
-                    "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
-                    system_id,
+            if (
+                support_result.get("api_error")
+                and not support_result.get("static_fallback_served")
+                and (is_ai_api_exhaustion_payload(support_result) or not support_result.get("response"))
+            ):
+                await disable_company_ai_after_api_exhaustion(
+                    db,
                     company_id,
-                    convo_id,
-                    "AI service unavailable - Please respond manually",
+                    conversation_id=convo_id,
+                    reason=str(support_result.get("error_reason") or support_result.get("error_type") or "AI service unavailable"),
+                    error_type=str(support_result.get("error_type") or ""),
+                    provider=str(support_result.get("provider") or ""),
+                    model=str(support_result.get("model_name") or ""),
                 )
-                system_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", system_id))
-                await emit_new_message(convo_id, system_message)
+                escalation = await escalate_conversation_to_human(
+                    db,
+                    convo_id,
+                    company_id,
+                    customer.get("name", "Customer"),
+                    channel,
+                    reason=AI_API_EXHAUSTED_MANUAL_MESSAGE,
+                    automatic=True,
+                )
+                await emit_new_message(convo_id, escalation["message"])
                 return {
                     "conversation_id": convo_id,
                     "message_id": msg_id,
@@ -4717,6 +4738,21 @@ async def _process_incoming_message(
                         channel,
                         trace_id,
                     )
+                create_safe_detached_task(
+                    db,
+                    _update_qualification_silently(
+                        db,
+                        company_id,
+                        lead,
+                        message_text,
+                        intent,
+                    ),
+                    name=f"qualification-update-{convo_id}",
+                    company_id=company_id,
+                    channel=channel,
+                    trace_id=trace_id,
+                    event_id=ai_id,
+                )
             else:
                 escalation = await escalate_conversation_to_human(
                     db,
@@ -4802,38 +4838,26 @@ async def whatsapp_webhook(request: Request):
         bridge_secret and provided_bridge_secret and hmac.compare_digest(provided_bridge_secret, bridge_secret)
     )
     if trusted_bridge and _is_whatsapp_web_bridge_payload(payload):
-        result = await _handle_whatsapp_webhook_payload(
+        create_safe_detached_task(
             db,
-            payload,
+            _handle_whatsapp_webhook_payload(
+                db,
+                payload,
+                event_id=event_id,
+                allow_direct_company_id=True,
+            ),
+            name="webhook-whatsapp-bridge",
+            channel="whatsapp",
             event_id=event_id,
-            allow_direct_company_id=True,
-            return_results=True,
+            payload=payload,
         )
-        results = result.get("results") if isinstance(result, dict) else []
-        first = results[0] if results else {}
-        customer_message = first.get("customer_message") if isinstance(first, dict) else {}
-        response = {
-            "status": result.get("status", "processed" if results else "skipped") if isinstance(result, dict) else "processed",
-            "source": "whatsapp_web_bridge",
-            "processed": bool(result.get("processed")) if isinstance(result, dict) else bool(results),
-            "conversation_id": str(first.get("conversation_id") or ""),
-            "message_id": str(first.get("message_id") or (customer_message or {}).get("id") or ""),
-            "customer_id": str(first.get("customer_id") or ""),
-            "lead_id": str(first.get("lead_id") or ""),
-            "ai_message_id": str(((first.get("ai_message") or {}) if isinstance(first, dict) else {}).get("id") or ""),
-        }
         logger.info(
-            "WhatsApp bridge webhook processed status=%s processed=%s company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s ai_message_id=%s",
-            response["status"],
-            response["processed"],
+            "WhatsApp bridge webhook queued company_id=%s user_id=%s event_id=%s",
             request.headers.get("X-Bridge-Company-Id", ""),
             request.headers.get("X-Bridge-User-Id", ""),
-            response["conversation_id"],
-            response["customer_id"],
-            response["message_id"],
-            response["ai_message_id"],
+            event_id,
         )
-        return response
+        return {"status": "received", "source": "whatsapp_web_bridge", "processed": False, "queued": True}
     create_safe_detached_task(
         db,
         _handle_whatsapp_webhook_payload(
@@ -5305,7 +5329,11 @@ async def web_chat_webhook(request: Request):
                 recent_human_agent_message.get("id", ""),
                 recent_human_agent_message.get("sender_name", ""),
             )
-        elif convo.get("ai_handled", True) and await is_company_ai_enabled(db, company_id):
+        elif (
+            convo.get("ai_handled", True)
+            and not conversation_ai_auto_paused(convo)
+            and await is_company_ai_enabled(db, company_id)
+        ):
             try:
                 support_result = dict(support_plan or {})
                 if not support_result:
@@ -5318,24 +5346,36 @@ async def web_chat_webhook(request: Request):
                         "next_action": "manual_review",
                         "api_error": True,
                     }
-                if support_result.get("api_error") and not support_result.get("response"):
-                    system_id = make_id()
-                    await db.execute(
-                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "  # noqa: E501
-                        "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
-                        system_id,
+                if (
+                    support_result.get("api_error")
+                    and not support_result.get("static_fallback_served")
+                    and (is_ai_api_exhaustion_payload(support_result) or not support_result.get("response"))
+                ):
+                    await disable_company_ai_after_api_exhaustion(
+                        db,
                         company_id,
-                        convo_id,
-                        "AI service unavailable - Please respond manually",
+                        conversation_id=convo_id,
+                        reason=str(support_result.get("error_reason") or support_result.get("error_type") or "AI service unavailable"),
+                        error_type=str(support_result.get("error_type") or ""),
+                        provider=str(support_result.get("provider") or ""),
+                        model=str(support_result.get("model_name") or ""),
                     )
-                    system_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", system_id))
-                    await emit_new_message(convo_id, system_message)
+                    escalation = await escalate_conversation_to_human(
+                        db,
+                        convo_id,
+                        company_id,
+                        customer.get("name", "Customer"),
+                        "web_chat",
+                        reason=AI_API_EXHAUSTED_MANUAL_MESSAGE,
+                        automatic=True,
+                    )
+                    await emit_new_message(convo_id, escalation["message"])
                     return {
                         "status": "ok",
                         "conversation_id": convo_id,
                         "customer_message": customer_message,
                         "ai_message": None,
-                        "response": "Thanks for your message! A team member will respond shortly.",
+                        "response": AI_API_EXHAUSTED_MANUAL_MESSAGE,
                         "is_ai": False,
                     }
                 if support_result.get("escalate"):
@@ -5480,6 +5520,21 @@ async def web_chat_webhook(request: Request):
                         await emit_new_message(convo_id, ai_message)
                     ai_response_text = support_result["response"]
                     is_ai = True
+                    create_safe_detached_task(
+                        db,
+                        _update_qualification_silently(
+                            db,
+                            company_id,
+                            lead,
+                            content,
+                            intent,
+                        ),
+                        name=f"qualification-update-{convo_id}",
+                        company_id=company_id,
+                        channel="web_chat",
+                        trace_id=trace_id,
+                        event_id=ai_id,
+                    )
                 else:
                     escalation = await escalate_conversation_to_human(
                         db,
