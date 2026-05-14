@@ -949,19 +949,48 @@ async def stream_model_text(
 
 
 def _extract_json_object(raw: str) -> dict[str, Any]:
+    """Extract and parse a JSON object from a raw LLM response.
+
+    The model is instructed to return a JSON object, but some providers may
+    return invalid JSON (e.g. unquoted keys or wrapped in code fences).  This
+    function attempts to sanitize and parse the first JSON-like object found.
+    """
     candidate = (raw or "").strip()
     if not candidate:
         return {}
+    # Strip markdown fences and optional language tag (e.g. ```json)
     if candidate.startswith("```"):
+        # Remove all backticks and any leading language marker
         candidate = candidate.strip("`")
         candidate = re.sub(r"^json\s*", "", candidate, flags=re.IGNORECASE)
-    try:
-        return json.loads(candidate)
-    except Exception:
-        match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+    # Try to parse the entire candidate as JSON
+    def _load_json(text: str) -> dict[str, Any]:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    # First attempt: direct JSON parsing
+    parsed = _load_json(candidate)
+    if parsed is not None:
+        return parsed
+    # Second attempt: locate the first curly-braces object and parse it
+    match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if match:
+        obj_str = match.group(0)
+        parsed = _load_json(obj_str)
+        if parsed is not None:
+            return parsed
+        # Third attempt: quote unquoted keys within the curly-braces object
+        # This handles cases like {subject: "...", body: "..."}
+        def _quote_keys(s: str) -> str:
+            # Add quotes around bare keys following { or ,
+            return re.sub(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', s)
+        fixed_obj = _quote_keys(obj_str)
+        parsed = _load_json(fixed_obj)
+        if parsed is not None:
+            return parsed
+    # If all attempts fail, raise the original JSONDecodeError to trigger fallback
+    raise
 
 
 def _error_status_code(exc: Exception) -> int:

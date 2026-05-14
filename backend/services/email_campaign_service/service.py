@@ -363,15 +363,27 @@ async def generate_campaign_copy(
 
     feature_lines = "\n".join(f"- {feature}" for feature in product.get("features") or []) or "- No structured features stored"
     image_lines = "\n".join(f"- {image}" for image in product.get("images") or []) or "- No product images stored"
+    # Build the prompt for the campaign copy generator.  The model must return valid JSON
+    # containing only the keys "subject", "body" and "html_body".  We specify
+    # explicit formatting rules to avoid malformed JSON (e.g. unquoted keys) that can
+    # break JSON parsing.  The instructions below emphasize valid JSON syntax: use
+    # double quotes around keys and string values, no markdown code fences, no
+    # comments and no trailing commas.  See llm_client._extract_json_object for
+    # additional parsing safeguards.
     prompt = (
-        "You are creating outbound CRM email campaign copy.\n"
-        "Return JSON with keys: subject, body, html_body.\n"
-        "Constraints:\n"
-        "- subject: 4-10 words, specific, non-spammy.\n"
-        "- body: 3 short paragraphs, plain text, warm but concise, with one clear CTA.\n"
-        "- html_body: clean HTML matching the body with simple <p> tags.\n"
-        "- Mention only product details provided below.\n"
-        "- Do not invent discounts, deadlines, or guarantees.\n\n"
+        "You are creating outbound email campaign copy for a business.\n"
+        "Return a single JSON object with exactly three keys: \"subject\", \"body\", and \"html_body\".\n"
+        "Rules for the JSON response:\n"
+        "- Use only double-quoted keys and double-quoted string values.\n"
+        "- Do not output any markdown, code fences or comments.\n"
+        "- Do not include trailing commas after the last key/value pair.\n"
+        "- Do not invent discounts, deadlines, guarantees or other details not provided.\n"
+        "- Do not include any additional keys.\n"
+        "Constraints for content:\n"
+        "- subject: 4–10 words, specific, non-spammy.\n"
+        "- body: 3 short paragraphs, plain text, warm but concise, with one clear call to action.\n"
+        "- html_body: clean HTML matching the body using simple <p> tags.\n"
+        "- Mention only product details provided below.\n\n"
         f"Campaign goal: {campaign_goal.strip()}\n"
         f"Audience: {audience_description.strip()}\n"
         f"Tone: {tone.strip()}\n"

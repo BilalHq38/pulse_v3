@@ -68,6 +68,32 @@ def _db(req):
     return req.app.state.db
 
 
+def _first_valid_nurture_message(result: dict) -> str:
+    def coerce(value) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            for key in ("message", "content", "text", "response"):
+                text = coerce(value.get(key))
+                if text:
+                    return text
+        return ""
+
+    for key in ("message", "nurture_message", "response"):
+        text = coerce((result or {}).get(key))
+        if text:
+            return text
+
+    for key in ("messages", "nurture_messages"):
+        values = (result or {}).get(key)
+        if isinstance(values, list):
+            for value in values:
+                text = coerce(value)
+                if text:
+                    return text
+    return ""
+
+
 def _trace_id_from_context() -> str:
     try:
         context = current_trace_context()
@@ -1207,24 +1233,43 @@ async def nurture_lead(lead_id: str, request: Request):
         current_query=str(lead.get("notes") or lead.get("name") or ""),
         top_k=5,
     )
-    result = await generate_nurture_message(lead, lead.get("status", "new"), company_context, db=db)
+    result = await generate_nurture_message(
+        lead,
+        lead.get("status", "new"),
+        company_context,
+        db=db,
+        company_id=cid,
+    )
+    message = _first_valid_nurture_message(result)
+    stage = str(result.get("stage") or result.get("phase") or lead.get("status") or "new")
+    if not message:
+        return {**result, "message": "", "stage": stage}
+    existing_message_id = await db.fetchval(
+        "SELECT id FROM lead_nurture_messages WHERE lead_id=$1 AND company_id=$2 AND sent=FALSE AND TRIM(message)=$3 LIMIT 1",
+        lead_id,
+        cid,
+        message,
+    )
+    if existing_message_id:
+        return {**result, "message": message, "stage": stage, "message_id": existing_message_id, "duplicate": True}
+    message_id = make_id()
     await db.execute(
         "INSERT INTO lead_activities(id,lead_id,company_id,type,content,stage,created_at) VALUES($1,$2,$3,'nurture',$4,$5,NOW())",  # noqa: E501
         make_id(),
         lead_id,
         cid,
-        result["message"],
-        result["stage"],
+        message,
+        stage,
     )
     await db.execute(
         "INSERT INTO lead_nurture_messages(id,lead_id,company_id,message,phase,sent,created_at) VALUES($1,$2,$3,$4,$5,FALSE,NOW())",  # noqa: E501
-        make_id(),
+        message_id,
         lead_id,
         cid,
-        result["message"],
-        result["stage"],
+        message,
+        stage,
     )
-    return result
+    return {**result, "message": message, "stage": stage, "message_id": message_id}
 
 
 @router.post("/leads/{lead_id}/conversation")
@@ -1458,7 +1503,20 @@ async def auto_nurture_all_leads(request: Request):
     cid = cu.get("company_id", "")
     leads = rs(
         await db.fetch(
-            "SELECT * FROM leads WHERE company_id=$1 AND status=ANY($2) LIMIT 50",
+            """
+            SELECT *
+            FROM leads l
+            WHERE l.company_id=$1
+              AND l.status=ANY($2)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM lead_nurture_messages nm
+                WHERE nm.lead_id=l.id
+                  AND nm.company_id=$1
+                  AND nm.sent=FALSE
+              )
+            LIMIT 50
+            """,
             cid,
             ["new", "contacted", "qualified"],
         )
@@ -1466,50 +1524,39 @@ async def auto_nurture_all_leads(request: Request):
     results = []
     for lead in leads:
         try:
-            workflow = await orchestrate_lead_workflow(
-                LeadWorkflowRequest(
-                    company_id=cid,
-                    lead_id=lead.get("id", ""),
-                    lead=lead,
-                    source=str(lead.get("source") or "lead"),
-                    actor_user_id=cu.get("sub", ""),
-                    actor_user_role=cu.get("role", ""),
-                    auto_support=True,
-                ),
-                authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
+            company_context = await get_company_knowledge(
                 db=db,
+                company_id=cid,
+                current_query=str(lead.get("notes") or lead.get("name") or ""),
+                top_k=5,
             )
-            qualification = workflow.agent_outputs.qualification
-            support = workflow.agent_outputs.support
-            result = {
-                **qualification,
-                "nurture_message": str(support.get("response") or ""),
-            }
-            await db.execute(
-                "UPDATE leads SET score=$1,grade=$2,phase=$3,scoring_reason=$4,next_action=$5,updated_at=NOW() WHERE id=$6",  # noqa: E501
-                result["score"],
-                result["grade"],
-                result.get("phase", "awareness"),
-                result.get("reasoning", ""),
-                result.get("next_action", ""),
-                lead["id"],
+            result = await generate_nurture_message(
+                lead,
+                lead.get("status", "new"),
+                company_context,
+                db=db,
+                company_id=cid,
             )
-            if result.get("nurture_message"):
+            message = _first_valid_nurture_message(result)
+            stage = str(result.get("stage") or result.get("phase") or lead.get("status") or "new")
+            message_id = ""
+            if message:
+                message_id = make_id()
                 await db.execute(
                     "INSERT INTO lead_activities(id,lead_id,company_id,type,content,stage,created_at) VALUES($1,$2,$3,'auto_nurture',$4,$5,NOW())",  # noqa: E501
                     make_id(),
                     lead["id"],
                     cid,
-                    result["nurture_message"],
-                    result.get("phase", "awareness"),
+                    message,
+                    stage,
                 )
                 await db.execute(
                     "INSERT INTO lead_nurture_messages(id,lead_id,company_id,message,phase,sent,created_at) VALUES($1,$2,$3,$4,$5,FALSE,NOW())",  # noqa: E501
-                    make_id(),
+                    message_id,
                     lead["id"],
                     cid,
-                    result["nurture_message"],
-                    result.get("phase", "awareness"),
+                    message,
+                    stage,
                 )
             refreshed = r(
                 await db.fetchrow(
@@ -1528,9 +1575,8 @@ async def auto_nurture_all_leads(request: Request):
                 {
                     "lead_id": lead["id"],
                     "name": lead["name"],
-                    "score": result["score"],
-                    "grade": result["grade"],
-                    "status": "nurtured",
+                    "message_id": message_id,
+                    "status": "nurtured" if message_id else "skipped_empty",
                 }
             )
         except Exception as e:

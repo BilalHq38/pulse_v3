@@ -73,6 +73,18 @@ export default function AnalyticsPage() {
 
   const leadsBySource = leadData ? Object.entries(leadData.by_source).map(([name, value]) => ({ name: name.replace('_', ' '), value })) : [];
   const leadsByGrade = leadData ? Object.entries(leadData.by_grade).map(([name, value]) => ({ name, value })) : [];
+  const summaryEntityType = (item) => {
+    const entityType = String(item?.entity_type || '').trim().toLowerCase();
+    if (entityType) return entityType;
+    const sourceType = String(item?.source_type || '').trim().toLowerCase();
+    if (sourceType.includes('customer')) return 'customer';
+    if (sourceType.includes('lead')) return 'lead';
+    const legacyType = String(item?.type || '').trim().toLowerCase();
+    return legacyType === 'customer' || legacyType === 'lead' ? legacyType : '';
+  };
+  const customerInteractionRows = customerSummaries.filter((item) => summaryEntityType(item) === 'customer');
+  const leadInteractionRows = customerSummaries.filter((item) => summaryEntityType(item) === 'lead');
+  const visibleInteractionCount = customerInteractionRows.length + leadInteractionRows.length;
 
   return (
     <div className="p-6 lg:p-8 space-y-8" data-testid="analytics-page">
@@ -296,12 +308,12 @@ export default function AnalyticsPage() {
         )}
       </div>
 
-      {/* Customer Interaction Log */}
+      {/* Interaction Log */}
       <div className="bg-white border border-slate-100 rounded-xl p-6" data-testid="customer-interaction-log">
         <div className="flex items-center gap-2 mb-5">
           <MessageSquare size={16} className="text-cyan-500" />
-          <h3 className="text-sm font-semibold text-slate-900">Customer Interaction Summaries</h3>
-          <span className="text-xs text-slate-400 ml-1">({customerSummaries.length} recent)</span>
+          <h3 className="text-sm font-semibold text-slate-900">Interaction Summaries</h3>
+          <span className="text-xs text-slate-400 ml-1">({visibleInteractionCount} recent)</span>
         </div>
         {customerSummaries.length === 0 ? (
           <div className="text-center py-10 text-slate-400 text-sm">
@@ -309,56 +321,132 @@ export default function AnalyticsPage() {
             Interaction summaries appear here after AI conversations.
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[700px]">
-              <thead>
-                <tr className="border-b border-slate-100">
-                  <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Customer</th>
-                  <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Date</th>
-                  <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Sentiment</th>
-                  <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Status</th>
-                  <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Topics</th>
-                  <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Summary</th>
-                </tr>
-              </thead>
-              <tbody>
-                {customerSummaries.map((cs) => (
-                  <tr key={cs.id} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
-                    <td className="py-3 px-3">
-                      <div className="flex items-center gap-2">
-                        <div className="w-6 h-6 rounded-full bg-cyan-50 flex items-center justify-center text-xs font-bold text-cyan-600">{(cs.customer_name || '?').charAt(0).toUpperCase()}</div>
-                        <span className="text-sm text-slate-700 font-medium">{cs.customer_name || 'Unknown'}</span>
-                      </div>
-                    </td>
-                    <td className="py-3 px-3 text-xs text-slate-500">{cs.date}</td>
-                    <td className="py-3 px-3">
-                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                        cs.sentiment_label === 'positive' ? 'bg-emerald-50 text-emerald-700' :
-                        cs.sentiment_label === 'negative' ? 'bg-red-50 text-red-600' :
-                        cs.sentiment_label === 'mixed' ? 'bg-amber-50 text-amber-700' :
-                        'bg-slate-100 text-slate-500'
-                      }`}>{cs.sentiment_label || 'neutral'}</span>
-                    </td>
-                    <td className="py-3 px-3">
-                      <div className="flex items-center gap-1">
-                        {cs.resolution_status === 'resolved' ? <CheckCircle size={12} className="text-emerald-500" /> :
-                         cs.resolution_status === 'escalated' ? <AlertCircle size={12} className="text-red-500" /> :
-                         <Clock size={12} className="text-amber-500" />}
-                        <span className="text-xs text-slate-600 capitalize">{cs.resolution_status?.replace('_', ' ')}</span>
-                      </div>
-                    </td>
-                    <td className="py-3 px-3">
-                      <div className="flex flex-wrap gap-1">
-                        {(cs.topics || []).slice(0, 3).map((t, i) => (
-                          <span key={i} className="text-xs bg-violet-50 text-violet-700 px-1.5 py-0.5 rounded">{t}</span>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="py-3 px-3 text-xs text-slate-500 max-w-[260px] truncate">{cs.summary}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="space-y-6">
+            <div>
+              <h4 className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Customer Interaction Summary</h4>
+              {customerInteractionRows.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-slate-200 py-6 text-center text-sm text-slate-400">
+                  No customer interaction summaries yet.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[700px]">
+                    <thead>
+                      <tr className="border-b border-slate-100">
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Type</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Name</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Date</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Sentiment</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Status</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Topics</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {customerInteractionRows.map((cs) => (
+                        <tr key={cs.id} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                          <td className="py-3 px-3">
+                            <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-cyan-50 text-cyan-700">{cs.type || 'Customer'}</span>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-2">
+                              <div className="w-6 h-6 rounded-full bg-cyan-50 flex items-center justify-center text-xs font-bold text-cyan-600">{(cs.name || cs.customer_name || '?').charAt(0).toUpperCase()}</div>
+                              <span className="text-sm text-slate-700 font-medium">{cs.name || cs.customer_name || 'Unknown'}</span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3 text-xs text-slate-500">{cs.date}</td>
+                          <td className="py-3 px-3">
+                            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                              cs.sentiment_label === 'positive' ? 'bg-emerald-50 text-emerald-700' :
+                              cs.sentiment_label === 'negative' ? 'bg-red-50 text-red-600' :
+                              cs.sentiment_label === 'mixed' ? 'bg-amber-50 text-amber-700' :
+                              'bg-slate-100 text-slate-500'
+                            }`}>{cs.sentiment_label || 'neutral'}</span>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-1">
+                              {cs.resolution_status === 'resolved' ? <CheckCircle size={12} className="text-emerald-500" /> :
+                               cs.resolution_status === 'escalated' ? <AlertCircle size={12} className="text-red-500" /> :
+                               <Clock size={12} className="text-amber-500" />}
+                              <span className="text-xs text-slate-600 capitalize">{cs.resolution_status?.replace('_', ' ')}</span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex flex-wrap gap-1">
+                              {(cs.topics || []).slice(0, 3).map((t, i) => (
+                                <span key={i} className="text-xs bg-violet-50 text-violet-700 px-1.5 py-0.5 rounded">{t}</span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <h4 className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Lead Interaction Summary</h4>
+              {leadInteractionRows.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-slate-200 py-6 text-center text-sm text-slate-400">
+                  No lead-only interaction summaries yet.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[700px]">
+                    <thead>
+                      <tr className="border-b border-slate-100">
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Type</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Name</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Date</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Sentiment</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Status</th>
+                        <th className="text-left text-xs text-slate-400 font-medium py-2 px-3">Topics</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {leadInteractionRows.map((cs) => (
+                        <tr key={cs.id} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                          <td className="py-3 px-3">
+                            <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-amber-50 text-amber-700">{cs.type || 'Lead'}</span>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-2">
+                              <div className="w-6 h-6 rounded-full bg-cyan-50 flex items-center justify-center text-xs font-bold text-cyan-600">{(cs.name || cs.lead_name || '?').charAt(0).toUpperCase()}</div>
+                              <span className="text-sm text-slate-700 font-medium">{cs.name || cs.lead_name || 'Unknown'}</span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3 text-xs text-slate-500">{cs.date}</td>
+                          <td className="py-3 px-3">
+                            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                              cs.sentiment_label === 'positive' ? 'bg-emerald-50 text-emerald-700' :
+                              cs.sentiment_label === 'negative' ? 'bg-red-50 text-red-600' :
+                              cs.sentiment_label === 'mixed' ? 'bg-amber-50 text-amber-700' :
+                              'bg-slate-100 text-slate-500'
+                            }`}>{cs.sentiment_label || 'neutral'}</span>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-1">
+                              {cs.resolution_status === 'resolved' ? <CheckCircle size={12} className="text-emerald-500" /> :
+                               cs.resolution_status === 'escalated' ? <AlertCircle size={12} className="text-red-500" /> :
+                               <Clock size={12} className="text-amber-500" />}
+                              <span className="text-xs text-slate-600 capitalize">{cs.resolution_status?.replace('_', ' ')}</span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex flex-wrap gap-1">
+                              {(cs.topics || []).slice(0, 3).map((t, i) => (
+                                <span key={i} className="text-xs bg-violet-50 text-violet-700 px-1.5 py-0.5 rounded">{t}</span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

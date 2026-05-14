@@ -113,6 +113,8 @@ export default function LeadsPage() {
   const [loading, setLoading] = useState(true);
   const [form, setForm] = useState({ name: '', email: '', phone: '', company: '', source: 'web_chat', notes: '' });
   const [nurturingAll, setNurturingAll] = useState(false);
+  const [pendingBatchNurture, setPendingBatchNurture] = useState([]);
+  const [sendingNurtureAll, setSendingNurtureAll] = useState(false);
   const [autoScoring, setAutoScoring] = useState(false);
   const [nurturingLead, setNurturingLead] = useState(false);
   const [sendingNurtureId, setSendingNurtureId] = useState('');
@@ -316,15 +318,36 @@ export default function LeadsPage() {
   };
 
   const nurtureAllLeads = async () => {
+    if (nurturingAll || sendingNurtureAll) return;
+    const existingPending = collectBatchNurtureDrafts(leads);
+    if (existingPending.length > 0) {
+      setPendingBatchNurture(existingPending);
+      showToast({
+        type: 'warning',
+        title: 'Drafts Already Pending',
+        message: `${existingPending.length} nurture drafts are ready to send. Send them before generating more.`,
+      });
+      return;
+    }
     setNurturingAll(true);
     try {
       const res = await api.post('/leads/auto-nurture-all');
+      const refreshed = await api.get('/leads');
+      const refreshedLeads = Array.isArray(refreshed.data) ? refreshed.data : [];
+      const generatedIds = new Set((res.data?.results || [])
+        .filter((item) => item?.status === 'nurtured')
+        .map((item) => item.lead_id));
+      const pendingDrafts = collectBatchNurtureDrafts(
+        refreshedLeads,
+        generatedIds.size ? (lead) => generatedIds.has(lead?.id) : undefined,
+      );
+      setPendingBatchNurture(pendingDrafts);
       showToast({
         type: 'success',
-        title: 'Batch Complete',
-        message: `Processed ${res.data.total_processed || 0} leads for scoring and nurture drafts.`,
+        title: 'Drafts Generated',
+        message: `Generated ${pendingDrafts.length} nurture drafts. Review, then send when ready.`,
       });
-      loadLeads();
+      await loadLeads();
     } catch (err) {
       console.error(err);
       showToast({
@@ -593,6 +616,25 @@ export default function LeadsPage() {
     return Array.from(available.values());
   }, []);
 
+  function collectBatchNurtureDrafts(leadItems, filterLead = null) {
+    const eligibleStatuses = new Set(['new', 'contacted', 'qualified']);
+    return (Array.isArray(leadItems) ? leadItems : [])
+      .filter((lead) => lead?.id && eligibleStatuses.has(String(lead.status || 'new')))
+      .filter((lead) => (filterLead ? filterLead(lead) : true))
+      .map((lead) => {
+        const draft = getLatestDraft(lead);
+        const channels = draft ? getLeadSendChannels(lead) : [];
+        if (!draft?.id || channels.length === 0) return null;
+        return {
+          leadId: lead.id,
+          leadName: lead.name || 'Lead',
+          messageId: draft.id,
+          channel: channels[0].channel,
+        };
+      })
+      .filter(Boolean);
+  }
+
   const closeNurtureComposer = () => {
     setNurtureComposer({ open: false, lead: null, message: null, channel: '' });
   };
@@ -791,6 +833,7 @@ export default function LeadsPage() {
       const updatedLead = res.data?.lead;
       if (updatedLead) upsertLeadState(updatedLead);
       await loadLeads();
+      setPendingBatchNurture((prev) => prev.filter((item) => item.messageId !== nurtureMessage.id));
       closeNurtureComposer();
       showToast({
         type: 'success',
@@ -808,6 +851,38 @@ export default function LeadsPage() {
       });
     } finally {
       setSendingNurtureId('');
+    }
+  };
+
+  const sendAllGeneratedNurture = async () => {
+    if (sendingNurtureAll || nurturingAll || pendingBatchNurture.length === 0) return;
+    setSendingNurtureAll(true);
+    const failed = [];
+    let sentCount = 0;
+    try {
+      for (const item of pendingBatchNurture) {
+        try {
+          const res = await api.post(`/leads/${item.leadId}/nurture-messages/${item.messageId}/send`, {
+            channel: item.channel,
+          });
+          if (res.data?.lead) upsertLeadState(res.data.lead);
+          sentCount += 1;
+        } catch (err) {
+          console.error(err);
+          failed.push(item);
+        }
+      }
+      setPendingBatchNurture(failed);
+      await loadLeads();
+      showToast({
+        type: failed.length ? 'warning' : 'success',
+        title: failed.length ? 'Some Messages Failed' : 'Messages Sent',
+        message: failed.length
+          ? `Sent ${sentCount}; ${failed.length} still need attention.`
+          : `Sent ${sentCount} nurture messages.`,
+      });
+    } finally {
+      setSendingNurtureAll(false);
     }
   };
 
@@ -970,12 +1045,22 @@ export default function LeadsPage() {
           </button>
           <button
             onClick={nurtureAllLeads}
-            disabled={nurturingAll}
+            disabled={nurturingAll || sendingNurtureAll || pendingBatchNurture.length > 0}
             className="flex items-center gap-2 px-3 py-2 bg-purple-50 border border-purple-200 text-purple-600 rounded-lg text-sm font-medium hover:bg-purple-100 transition-all disabled:opacity-50"
             data-testid="auto-nurture-all-btn"
           >
             <Sparkles size={16} className={nurturingAll ? 'animate-spin' : ''} /> {nurturingAll ? 'Nurturing All...' : 'AI Auto-Nurture All'}
           </button>
+          {pendingBatchNurture.length > 0 && (
+            <button
+              onClick={sendAllGeneratedNurture}
+              disabled={sendingNurtureAll || nurturingAll}
+              className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-all disabled:opacity-50"
+              data-testid="send-nurture-all-btn"
+            >
+              <MessageSquare size={16} /> {sendingNurtureAll ? 'Sending All...' : `Send Message to All (${pendingBatchNurture.length})`}
+            </button>
+          )}
           <button
             onClick={() => { setShowForm(true); setCreateLeadError(''); setForm({ name: '', email: '', phone: '', company: '', source: 'web_chat', notes: '' }); }}
             className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-all"
@@ -1121,16 +1206,16 @@ export default function LeadsPage() {
 
       {selectedLead && (
         <div
-          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center overflow-y-auto p-4"
           data-testid="lead-detail-modal"
           onClick={closeLeadDetail}
         >
           <div
-            className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg max-h-[80vh] overflow-y-auto"
+            className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg max-h-[calc(100vh-2rem)] overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="p-6">
-              <div className="flex items-start justify-between mb-6">
+            <div className="flex-none bg-white border-b border-slate-100 p-6">
+              <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3 min-w-0">
                   <LeadAvatar lead={selectedLead} className="w-12 h-12" textClass="text-lg" />
                   <div className="min-w-0">
@@ -1151,45 +1236,49 @@ export default function LeadsPage() {
                   </button>
                 </div>
               </div>
+            </div>
 
-              <div className="grid grid-cols-2 gap-4 mb-6">
-                <div className="bg-slate-50 rounded-lg p-3">
-                  <p className="text-[10px] text-slate-400 mb-1">Score</p>
-                  <p className="text-2xl font-bold text-slate-900">{selectedLead.score}</p>
+            <div className="min-h-0 flex-1 overflow-y-auto p-6" data-testid="lead-detail-scroll-body">
+              <div>
+                <div className="grid grid-cols-2 gap-4 mb-6">
+                  <div className="bg-slate-50 rounded-lg p-3">
+                    <p className="text-[10px] text-slate-400 mb-1">Score</p>
+                    <p className="text-2xl font-bold text-slate-900">{selectedLead.score}</p>
+                  </div>
+                  <div className="bg-slate-50 rounded-lg p-3">
+                    <p className="text-[10px] text-slate-400 mb-1">Grade</p>
+                    <p className={`text-xl font-bold capitalize ${selectedLead.grade === 'hot' ? 'text-red-500' : selectedLead.grade === 'warm' ? 'text-amber-600' : 'text-blue-600'}`}>{selectedLead.grade}</p>
+                  </div>
                 </div>
-                <div className="bg-slate-50 rounded-lg p-3">
-                  <p className="text-[10px] text-slate-400 mb-1">Grade</p>
-                  <p className={`text-xl font-bold capitalize ${selectedLead.grade === 'hot' ? 'text-red-500' : selectedLead.grade === 'warm' ? 'text-amber-600' : 'text-blue-600'}`}>{selectedLead.grade}</p>
+
+                <div className="space-y-3 mb-6">
+                  {selectedLead.email && <p className="text-sm text-slate-600 flex items-center gap-2"><Mail size={14} className="text-slate-400" /> {selectedLead.email}</p>}
+                  {selectedLead.phone && <p className="text-sm text-slate-600 flex items-center gap-2"><Phone size={14} className="text-slate-400" /> {selectedLead.phone}</p>}
+                  <p className="text-sm text-slate-600 flex items-center gap-2"><Building2 size={14} className="text-slate-400" /> {selectedLead.company || 'N/A'}</p>
+                  <p className="text-sm text-slate-600 flex items-center gap-2"><Target size={14} className="text-slate-400" /> Source: {selectedLead.source?.replace('_', ' ')}</p>
                 </div>
+
+                {selectedLead.notes && (
+                  <div className="bg-slate-50 rounded-lg p-3 mb-6">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">Notes</p>
+                    <p className="text-sm text-slate-600">{selectedLead.notes}</p>
+                  </div>
+                )}
+
+                {selectedLead.scoring_reason && (
+                  <div className="bg-purple-50 border border-purple-200 rounded-lg p-3 mb-6">
+                    <p className="text-[10px] text-purple-600 uppercase tracking-wider mb-1 flex items-center gap-1"><Sparkles size={10} /> AI Scoring Insight</p>
+                    <p className="text-sm text-slate-600">{selectedLead.scoring_reason}</p>
+                    {selectedLead.phase && <p className="text-xs text-purple-600 mt-1.5">Phase: <span className="font-medium capitalize">{selectedLead.phase}</span></p>}
+                    {selectedLead.next_action && <p className="text-xs text-purple-600 mt-1">Next: {selectedLead.next_action}</p>}
+                  </div>
+                )}
               </div>
-
-              <div className="space-y-3 mb-6">
-                {selectedLead.email && <p className="text-sm text-slate-600 flex items-center gap-2"><Mail size={14} className="text-slate-400" /> {selectedLead.email}</p>}
-                {selectedLead.phone && <p className="text-sm text-slate-600 flex items-center gap-2"><Phone size={14} className="text-slate-400" /> {selectedLead.phone}</p>}
-                <p className="text-sm text-slate-600 flex items-center gap-2"><Building2 size={14} className="text-slate-400" /> {selectedLead.company || 'N/A'}</p>
-                <p className="text-sm text-slate-600 flex items-center gap-2"><Target size={14} className="text-slate-400" /> Source: {selectedLead.source?.replace('_', ' ')}</p>
-              </div>
-
-              {selectedLead.notes && (
-                <div className="bg-slate-50 rounded-lg p-3 mb-6">
-                  <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">Notes</p>
-                  <p className="text-sm text-slate-600">{selectedLead.notes}</p>
-                </div>
-              )}
-
-              {selectedLead.scoring_reason && (
-                <div className="bg-purple-50 border border-purple-200 rounded-lg p-3 mb-6">
-                  <p className="text-[10px] text-purple-600 uppercase tracking-wider mb-1 flex items-center gap-1"><Sparkles size={10} /> AI Scoring Insight</p>
-                  <p className="text-sm text-slate-600">{selectedLead.scoring_reason}</p>
-                  {selectedLead.phase && <p className="text-xs text-purple-600 mt-1.5">Phase: <span className="font-medium capitalize">{selectedLead.phase}</span></p>}
-                  {selectedLead.next_action && <p className="text-xs text-purple-600 mt-1">Next: {selectedLead.next_action}</p>}
-                </div>
-              )}
 
               {selectedLead.nurture_messages && selectedLead.nurture_messages.length > 0 && (
                 <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-6">
                   <p className="text-[10px] text-blue-600 uppercase tracking-wider mb-2 flex items-center gap-1"><Sparkles size={10} /> AI Nurture Messages</p>
-                  <div className="space-y-2">
+                  <div className="max-h-72 space-y-2 overflow-y-auto pr-1" data-testid="lead-nurture-message-list">
                     {selectedLead.nurture_messages.slice(-3).map((nm) => (
                       <div key={nm.id} className="bg-white rounded-lg p-2.5 border border-blue-100">
                         {editingNurtureId === nm.id ? (
@@ -1271,7 +1360,9 @@ export default function LeadsPage() {
                   </div>
                 </div>
               )}
+            </div>
 
+            <div className="flex-none border-t border-slate-100 bg-white p-6">
               <div className="grid grid-cols-2 gap-2 mb-4">
                 <button
                   onClick={() => scoreLead(selectedLead.id)}

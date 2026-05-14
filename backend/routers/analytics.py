@@ -22,6 +22,15 @@ def _db(req):
     return req.app.state.db
 
 
+def _sentiment_label(score: float | int | None) -> str:
+    value = float(score or 0)
+    if value > 0.2:
+        return "positive"
+    if value < -0.2:
+        return "negative"
+    return "neutral"
+
+
 @router.get("/analytics/overview")
 async def analytics_overview(request: Request):
     db = _db(request)
@@ -240,21 +249,130 @@ async def analytics_customer_summaries(
         parsed_date = parse_dt(f"{date}T00:00:00+00:00")
         if not parsed_date:
             raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
-        return rs(
+        customer_rows = rs(
             await db.fetch(
-                "SELECT * FROM customer_interaction_summaries WHERE company_id=$1 AND summary_date=$2 ORDER BY created_at DESC LIMIT $3",  # noqa: E501
+                """
+                SELECT cis.*
+                FROM customer_interaction_summaries cis
+                JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
+                WHERE cis.company_id=$1
+                  AND cis.summary_date=$2
+                  AND c.lifecycle_stage='customer'
+                ORDER BY cis.created_at DESC
+                LIMIT $3
+                """,
                 cid,
                 parsed_date.date(),
                 limit,
             )
         )
-    return rs(
-        await db.fetch(
-            "SELECT * FROM customer_interaction_summaries WHERE company_id=$1 ORDER BY created_at DESC LIMIT $2",
-            cid,
-            limit,
+        lead_rows = rs(
+            await db.fetch(
+                """
+                SELECT
+                  la.id,
+                  la.company_id,
+                  la.lead_id,
+                  l.name AS lead_name,
+                  la.created_at::date AS summary_date,
+                  la.created_at,
+                  la.content,
+                  la.type,
+                  la.stage,
+                  l.status,
+                  l.grade,
+                  l.score
+                FROM lead_activities la
+                JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
+                WHERE la.company_id=$1 AND la.created_at::date=$2
+                ORDER BY la.created_at DESC
+                LIMIT $3
+                """,
+                cid,
+                parsed_date.date(),
+                limit,
+            )
         )
-    )
+    else:
+        customer_rows = rs(
+            await db.fetch(
+                """
+                SELECT cis.*
+                FROM customer_interaction_summaries cis
+                JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
+                WHERE cis.company_id=$1
+                  AND c.lifecycle_stage='customer'
+                ORDER BY cis.created_at DESC
+                LIMIT $2
+                """,
+                cid,
+                limit,
+            )
+        )
+        lead_rows = rs(
+            await db.fetch(
+                """
+                SELECT
+                  la.id,
+                  la.company_id,
+                  la.lead_id,
+                  l.name AS lead_name,
+                  la.created_at::date AS summary_date,
+                  la.created_at,
+                  la.content,
+                  la.type,
+                  la.stage,
+                  l.status,
+                  l.grade,
+                  l.score
+                FROM lead_activities la
+                JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
+                WHERE la.company_id=$1
+                ORDER BY la.created_at DESC
+                LIMIT $2
+                """,
+                cid,
+                limit,
+            )
+        )
+
+    rows = []
+    for item in customer_rows:
+        avg_sentiment = float(item.get("avg_sentiment") or 0)
+        rows.append(
+            {
+                **item,
+                "id": f"customer-{item.get('id', '')}",
+                "entity_type": "customer",
+                "source_type": "customer_interaction_summary",
+                "type": "Customer",
+                "name": item.get("customer_name") or "Unknown",
+                "date": str(item.get("summary_date") or "")[:10],
+                "sentiment_label": _sentiment_label(avg_sentiment),
+                "resolution_status": "escalated" if item.get("escalated") else "resolved",
+                "topics": ["AI handled" if item.get("ai_handled") else "Human handled"],
+            }
+        )
+    for item in lead_rows:
+        score = int(item.get("score") or 0)
+        activity_type = item.get("type")
+        rows.append(
+            {
+                **item,
+                "id": f"lead-{item.get('id', '')}",
+                "entity_type": "lead",
+                "source_type": "lead_activity",
+                "activity_type": activity_type,
+                "type": "Lead",
+                "name": item.get("lead_name") or "Unknown",
+                "date": str(item.get("summary_date") or "")[:10],
+                "sentiment_label": "positive" if score >= 70 else "negative" if score < 40 else "neutral",
+                "resolution_status": item.get("status") or item.get("stage") or "new",
+                "topics": [value for value in [activity_type, item.get("stage"), item.get("grade")] if value],
+            }
+        )
+    rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return rows[:limit]
 
 
 @router.get("/analytics/daily-summaries")

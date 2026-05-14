@@ -382,3 +382,173 @@ test('lead nurture send uses the saved draft endpoint once', async () => {
 
   await act(async () => root.unmount());
 });
+
+test('opening a lead detail does not auto score or auto nurture', async () => {
+  installApiMocks();
+  const { container, root } = await renderPage();
+
+  await openLeadDetail(container);
+
+  expect(mockApi.post).not.toHaveBeenCalledWith('/leads/lead-1/score');
+  expect(mockApi.post).not.toHaveBeenCalledWith('/leads/lead-1/nurture');
+
+  await act(async () => root.unmount());
+});
+
+test('lead detail modal keeps header and actions stable while body scrolls', async () => {
+  installApiMocks(cloneLead({
+    notes: 'Long lead notes. '.repeat(80),
+    scoring_reason: 'Detailed scoring explanation. '.repeat(60),
+    nurture_messages: [
+      ...BASE_LEAD.nurture_messages,
+      {
+        id: 'nm-3',
+        message: 'Additional long nurture draft. '.repeat(30),
+        phase: 'decision',
+        sent: false,
+        created_at: '2026-05-01T12:00:00Z',
+      },
+    ],
+  }));
+  const { container, root } = await renderPage();
+
+  const modal = await openLeadDetail(container);
+  const panel = modal.firstElementChild;
+  const header = panel.firstElementChild;
+  const scrollBody = await waitForSelector('[data-testid="lead-detail-scroll-body"]', container);
+  const actions = (await waitForSelector('[data-testid="score-lead-btn"]', container)).closest('.flex-none');
+  const messageList = await waitForSelector('[data-testid="lead-nurture-message-list"]', container);
+
+  expect(panel.className).toContain('max-h-[calc(100vh-2rem)]');
+  expect(panel.className).toContain('overflow-hidden');
+  expect(header.className).toContain('flex-none');
+  expect(scrollBody.className).toContain('overflow-y-auto');
+  expect(actions.className).toContain('border-t');
+  expect(messageList.className).toContain('overflow-y-auto');
+
+  await act(async () => root.unmount());
+});
+
+test('manual AI Nurture creates one draft from the lead card action', async () => {
+  const lead = cloneLead({ nurture_messages: [] });
+  const updatedLead = cloneLead({
+    nurture_messages: [
+      {
+        id: 'nm-new',
+        message: 'One generated nurture draft',
+        phase: 'awareness',
+        sent: false,
+        created_at: '2026-05-02T10:00:00Z',
+      },
+    ],
+  });
+  let detailLead = lead;
+  mockApi.get.mockImplementation((url) => {
+    if (url === '/leads') return Promise.resolve({ data: [detailLead] });
+    if (url === '/reference-data') {
+      return Promise.resolve({
+        data: {
+          lead_statuses: [{ status_name: 'new' }, { status_name: 'contacted' }, { status_name: 'won' }],
+          sources: [{ source_name: 'whatsapp' }, { source_name: 'email' }],
+        },
+      });
+    }
+    if (url === `/leads/${lead.id}`) return Promise.resolve({ data: detailLead });
+    return Promise.resolve({ data: [] });
+  });
+  mockApi.post.mockImplementation((url) => {
+    if (url === '/leads/lead-1/nurture') {
+      detailLead = updatedLead;
+      return Promise.resolve({ data: { message: 'One generated nurture draft' } });
+    }
+    return Promise.resolve({ data: { status: 'ok' } });
+  });
+
+  const { container, root } = await renderPage();
+
+  await openLeadDetail(container);
+  const nurtureButton = await waitForSelector('[data-testid="nurture-lead-btn"]', container);
+  await act(async () => {
+    nurtureButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  await waitForSelector('[data-testid="send-nurture-detail-nm-new"]', container);
+  expect(container.textContent).toContain('One generated nurture draft');
+  expect(mockApi.post.mock.calls.filter(([url]) => url === '/leads/lead-1/nurture')).toHaveLength(1);
+  expect(mockApi.post.mock.calls.filter(([url]) => url === '/leads/lead-1/score')).toHaveLength(0);
+
+  await act(async () => root.unmount());
+});
+
+test('AI Auto Nurture All generates drafts before Send Message to All sends them', async () => {
+  const lead = cloneLead({ nurture_messages: [] });
+  const generatedLead = cloneLead({
+    nurture_messages: [
+      {
+        id: 'nm-batch',
+        message: 'Batch generated draft',
+        phase: 'awareness',
+        sent: false,
+        created_at: '2026-05-02T11:00:00Z',
+      },
+    ],
+  });
+  const sentLead = cloneLead({
+    nurture_messages: [
+      {
+        id: 'nm-batch',
+        message: 'Batch generated draft',
+        phase: 'awareness',
+        sent: true,
+        created_at: '2026-05-02T11:00:00Z',
+      },
+    ],
+  });
+  let currentLead = lead;
+  mockApi.get.mockImplementation((url) => {
+    if (url === '/leads') return Promise.resolve({ data: [currentLead] });
+    if (url === '/reference-data') {
+      return Promise.resolve({
+        data: {
+          lead_statuses: [{ status_name: 'new' }, { status_name: 'contacted' }, { status_name: 'won' }],
+          sources: [{ source_name: 'whatsapp' }, { source_name: 'email' }],
+        },
+      });
+    }
+    if (url === `/leads/${lead.id}`) return Promise.resolve({ data: currentLead });
+    return Promise.resolve({ data: [] });
+  });
+  mockApi.post.mockImplementation((url) => {
+    if (url === '/leads/auto-nurture-all') {
+      currentLead = generatedLead;
+      return Promise.resolve({ data: { total_processed: 1, results: [{ lead_id: 'lead-1', status: 'nurtured' }] } });
+    }
+    if (url === '/leads/lead-1/nurture-messages/nm-batch/send') {
+      currentLead = sentLead;
+      return Promise.resolve({ data: { lead: sentLead, conversation_id: '' } });
+    }
+    return Promise.resolve({ data: { status: 'ok' } });
+  });
+
+  const { container, root } = await renderPage();
+
+  const autoButton = await waitForSelector('[data-testid="auto-nurture-all-btn"]', container);
+  await act(async () => {
+    autoButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  const sendAllButton = await waitForSelector('[data-testid="send-nurture-all-btn"]', container);
+  expect(mockApi.post).toHaveBeenCalledWith('/leads/auto-nurture-all');
+  expect(mockApi.post.mock.calls.filter(([url]) => url.includes('/send'))).toHaveLength(0);
+
+  await act(async () => {
+    sendAllButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+
+  expect(mockApi.post).toHaveBeenCalledWith('/leads/lead-1/nurture-messages/nm-batch/send', {
+    channel: 'whatsapp',
+  });
+  await waitForNoSelector('[data-testid="send-nurture-all-btn"]', container);
+
+  await act(async () => root.unmount());
+});

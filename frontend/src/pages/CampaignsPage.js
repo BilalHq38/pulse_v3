@@ -485,13 +485,13 @@ export default function CampaignsPage() {
         )}
 
         <div className="bg-white border border-slate-100 rounded-2xl overflow-hidden">
-          <div className="grid grid-cols-12 gap-2 px-4 py-2 bg-slate-50/80 text-[11px] uppercase tracking-wide text-slate-400 font-medium">
-            <div className="col-span-5">Campaign</div>
+          <div className="hidden grid-cols-12 gap-2 px-4 py-2 bg-slate-50/80 text-[11px] uppercase tracking-wide text-slate-400 font-medium md:grid">
+            <div className="col-span-4">Campaign</div>
             <div className="col-span-2">Status</div>
             <div className="col-span-1 text-right">Recipients</div>
             <div className="col-span-1 text-right">Sent</div>
             <div className="col-span-1 text-right">Failed</div>
-            <div className="col-span-2 text-right">Actions</div>
+            <div className="col-span-3 text-right">Actions</div>
           </div>
 
           {loading ? (
@@ -508,54 +508,66 @@ export default function CampaignsPage() {
               return (
                 <div
                   key={c.id}
-                  className="grid grid-cols-12 gap-2 px-4 py-3 border-t border-slate-100 items-center hover:bg-slate-50/60"
+                  className="grid grid-cols-1 gap-3 px-4 py-3 border-t border-slate-100 hover:bg-slate-50/60 md:grid-cols-12 md:gap-2 md:items-center"
                   data-testid={`campaign-row-${c.id}`}
                 >
-                  <div className="col-span-5 min-w-0">
+                  <div className="min-w-0 md:col-span-4">
                     <div className="text-sm font-medium text-slate-800 truncate">{c.name || c.subject}</div>
                     <div className="text-[11px] text-slate-400 truncate">{c.subject}</div>
                   </div>
-                  <div className="col-span-2">
+                  <div className="flex items-center justify-between gap-3 md:col-span-2 md:block">
+                    <span className="text-[11px] uppercase tracking-wide text-slate-400 md:hidden">Status</span>
                     <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${s.cls}`}>{s.label}</span>
                   </div>
-                  <div className="col-span-1 text-right text-sm text-slate-600">{c.total_recipients || 0}</div>
-                  <div className="col-span-1 text-right text-sm text-emerald-600">{c.sent_count || 0}</div>
-                  <div className="col-span-1 text-right text-sm text-red-500">{c.failed_count || 0}</div>
-                  <div className="col-span-2 flex items-center justify-end gap-1">
-                    {c.status === 'draft' && (
+                  <div className="flex items-center justify-between gap-3 text-sm text-slate-600 md:col-span-1 md:block md:text-right">
+                    <span className="text-[11px] uppercase tracking-wide text-slate-400 md:hidden">Recipients</span>
+                    <span>{c.total_recipients || 0}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 text-sm text-emerald-600 md:col-span-1 md:block md:text-right">
+                    <span className="text-[11px] uppercase tracking-wide text-slate-400 md:hidden">Sent</span>
+                    <span>{c.sent_count || 0}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 text-sm text-red-500 md:col-span-1 md:block md:text-right">
+                    <span className="text-[11px] uppercase tracking-wide text-slate-400 md:hidden">Failed</span>
+                    <span>{c.failed_count || 0}</span>
+                  </div>
+                  <div className="min-w-0 md:col-span-3">
+                    <div className="flex flex-wrap items-center justify-start gap-1.5 md:justify-end">
+                      {c.status === 'draft' && (
+                        <button
+                          onClick={() => openCampaignEditor(c)}
+                          className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-500 transition-colors hover:bg-slate-50 focus:outline-none focus:ring-1 focus:ring-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+                          data-testid={`edit-campaign-${c.id}`}
+                        >
+                          <Pencil size={13} /> Edit
+                        </button>
+                      )}
+                      {c.status === 'draft' ? (
+                        <button
+                          onClick={() => sendCampaign(c.id)}
+                          disabled={(c.total_recipients || 0) <= 0}
+                          className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 focus:outline-none focus:ring-1 focus:ring-blue-300 disabled:cursor-not-allowed disabled:opacity-50"
+                          data-testid={`send-campaign-${c.id}`}
+                        >
+                          <Send size={13} /> Start Campaign
+                        </button>
+                      ) : c.status === 'failed' && (c.total_recipients || 0) > 0 ? (
+                        <button
+                          onClick={() => sendCampaign(c.id)}
+                          className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 focus:outline-none focus:ring-1 focus:ring-blue-300 disabled:cursor-not-allowed disabled:opacity-50"
+                          data-testid={`send-campaign-${c.id}`}
+                        >
+                          <Send size={13} /> Send
+                        </button>
+                      ) : null}
                       <button
-                        onClick={() => openCampaignEditor(c)}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-slate-200 text-slate-500 text-xs hover:bg-slate-50"
-                        data-testid={`edit-campaign-${c.id}`}
+                        onClick={() => deleteCampaign(c.id)}
+                        className="inline-flex h-8 w-8 flex-none items-center justify-center rounded-md border border-slate-200 text-slate-400 transition-colors hover:bg-red-50 hover:text-red-500 focus:outline-none focus:ring-1 focus:ring-red-200"
+                        aria-label="Delete campaign"
                       >
-                        <Pencil size={11} /> Edit
+                        <Trash2 size={13} />
                       </button>
-                    )}
-                    {c.status === 'draft' ? (
-                      <button
-                        onClick={() => sendCampaign(c.id)}
-                        disabled={(c.total_recipients || 0) <= 0}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-blue-600 text-white text-xs hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                        data-testid={`send-campaign-${c.id}`}
-                      >
-                        <Send size={11} /> Start Campaign
-                      </button>
-                    ) : c.status === 'failed' && (c.total_recipients || 0) > 0 ? (
-                      <button
-                        onClick={() => sendCampaign(c.id)}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-blue-600 text-white text-xs hover:bg-blue-700"
-                        data-testid={`send-campaign-${c.id}`}
-                      >
-                        <Send size={11} /> Send
-                      </button>
-                    ) : null}
-                    <button
-                      onClick={() => deleteCampaign(c.id)}
-                      className="p-1.5 rounded-md border border-slate-200 text-slate-400 hover:text-red-500 hover:bg-red-50"
-                      aria-label="Delete campaign"
-                    >
-                      <Trash2 size={12} />
-                    </button>
+                    </div>
                   </div>
                 </div>
               );
