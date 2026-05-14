@@ -2919,6 +2919,36 @@ async def _run_lead_workflow_sync(
     raw_message: str,
     metadata: dict | None = None,
 ) -> dict:
+    metadata_payload = dict(metadata or {})
+    if str(metadata_payload.get("source") or "").startswith("webhook_"):
+        logger.info(
+            "lead_workflow_skipped_for_message_hot_path company_id=%s lead_id=%s source=%s",
+            company_id,
+            str(lead.get("id") or ""),
+            str(metadata_payload.get("source") or source or ""),
+        )
+        score = int(lead.get("score") or 0)
+        if score <= 0:
+            score = 40
+            if lead.get("email") and lead.get("phone"):
+                score += 20
+            elif lead.get("email") or lead.get("phone"):
+                score += 10
+        grade = str(lead.get("grade") or "").strip().lower()
+        if grade not in {"hot", "warm", "cold"}:
+            grade = "hot" if score >= 80 else "warm" if score >= 60 else "cold"
+        phase = str(lead.get("phase") or "awareness")
+        await db.execute(
+            "UPDATE leads SET score=$1,grade=$2,phase=$3,scoring_reason=$4,next_action=$5,updated_at=NOW() WHERE id=$6",
+            max(0, min(100, score)),
+            grade,
+            phase,
+            "Deferred LLM scoring for inbound message hot path.",
+            "Review lead after conversation",
+            str(lead.get("id") or ""),
+        )
+        return r(await db.fetchrow("SELECT * FROM leads WHERE id=$1", str(lead.get("id") or "")))
+
     workflow = await orchestrate_lead_workflow(
         LeadWorkflowRequest(
             company_id=company_id,
@@ -2928,7 +2958,7 @@ async def _run_lead_workflow_sync(
             raw_message=raw_message,
             lead=lead,
             customer=customer,
-            metadata=dict(metadata or {}),
+            metadata=metadata_payload,
         ),
         db=db,
     )

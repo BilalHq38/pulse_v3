@@ -13,7 +13,6 @@ from agent_orchestrator.repository import (
 from agent_orchestrator.schemas import AgentName, AgentRunResult, WorkflowKind
 from services.ai_service.facade import (
     build_sentiment_gate,
-    classify_intent,
     generate_combined_ai_analysis,
 )
 from services.ai_service.sentiment import analyze_local_sentiment
@@ -139,10 +138,12 @@ class CaptureAgent(BaseAgent):
             conversation_id=getattr(request, "conversation_id", ""),
             message_id=getattr(request, "message_id", ""),
             actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
+            lead=lead,
         )
         sentiment = dict(combined.get("sentiment") or {})
         intent = dict(combined.get("intent") or {})
         conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
+        qualification_hint = dict(combined.get("qualification_hint") or {})
         sentiment_gate = build_sentiment_gate(message_text, sentiment)
         context.global_memory.shared_context["latest_intent"] = str(intent.get("intent") or "")
         prefetched_support_response = dict(combined.get("ai_response") or {})
@@ -166,6 +167,7 @@ class CaptureAgent(BaseAgent):
             "customer": customer,
             "lead": lead,
             "qualification_hint": qualification_hint,
+            "interaction_summary": dict(combined.get("interaction_summary") or {}),
             "rag_called": bool(prefetched_support_response.get("rag_called")),
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
@@ -178,17 +180,13 @@ class CaptureAgent(BaseAgent):
     ) -> AgentRunResult:
         request = context.request
         raw_message = str(getattr(request, "raw_message", "") or lead.get("notes") or "").strip()
-        intent = (
-            await classify_intent(raw_message, db=context.db, company_id=context.company_id)
-            if raw_message
-            else {
-                "intent": "lead_capture",
-                "confidence": 0.0,
-                "entities": {},
-                "urgency": "low",
-                "source": "rule",
-            }
-        )
+        intent = {
+            "intent": "lead_capture",
+            "confidence": 0.0,
+            "entities": {},
+            "urgency": "low",
+            "source": "deferred_to_unified_lead_ai" if raw_message else "rule",
+        }
         structured_lead = {
             **lead,
             "company_id": context.company_id,
@@ -198,6 +196,8 @@ class CaptureAgent(BaseAgent):
             "email": str(lead.get("email") or customer.get("email") or ""),
             "phone": str(lead.get("phone") or customer.get("phone") or ""),
         }
+        if raw_message and not str(structured_lead.get("notes") or "").strip():
+            structured_lead["notes"] = raw_message
         context.global_memory.shared_context["latest_intent"] = str(intent.get("intent") or "")
         payload = {
             "structured_event": {

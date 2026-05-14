@@ -113,6 +113,9 @@ class QualificationAgent(BaseAgent):
             db=context.db,
             company_id=context.company_id,
         )
+        unified_intent = dict(score_result.get("intent") or capture.get("intent") or {})
+        if unified_intent.get("intent"):
+            context.global_memory.shared_context["latest_intent"] = str(unified_intent.get("intent") or "")
         classification = self._classify(
             int(score_result.get("score", 0) or 0),
             context.workflow_kind,
@@ -129,8 +132,11 @@ class QualificationAgent(BaseAgent):
             ),
             "reasoning": str(score_result.get("reasoning") or ""),
             "next_action": str(score_result.get("next_action") or ""),
+            "nurture_message": str(score_result.get("nurture_message") or ""),
+            "intent": unified_intent,
             "structured_lead": structured_lead,
             "ready_for_scoring": True,
+            "missing_fields": list(score_result.get("missing_fields") or []),
             "completed_fields": list(qualification_hint.get("completed_fields") or []),
             "adaptive_question": "",
             "qualification_scoring_called": True,

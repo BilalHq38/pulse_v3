@@ -24,7 +24,6 @@ from shared.config import (
     ai_response_temperature_repetition_delta,
 )
 from services.ai_service.common import (
-    LeadScoreResult,
     _json_safe,
     latest_ai_message,
     latest_customer_message,
@@ -34,7 +33,6 @@ from services.ai_service.common import (
 from services.ai_service.intent import classify_intent, is_short_follow_up_message
 from services.ai_service.llm_client import (
     _resolve_engine_for_request,
-    call_model_json_batch,
     call_with_engines,
     call_model_json,
     call_model_text,
@@ -58,6 +56,7 @@ from services.ai_service.sentiment import (
     # generate_combined_ai_analysis. Import removed to prevent accidental use.
     analyze_sentiment,
 )
+from services.ai_service.unified_ai_prompt import call_unified_lead_ai, call_unified_message_ai
 from services.db_helpers import (
     get_ai_static_fallback_message,
     is_ai_api_exhaustion_payload,
@@ -1762,31 +1761,15 @@ async def generate_lead_score(
     count_against_budget: bool = True,
 ) -> dict:
     safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=False)
-    prompt = (
-        "You are a lead-qualification analyst for a CRM.\n"
-        "Task: score the sales readiness of one lead record using only the provided evidence.\n"
-        "Input format:\n"
-        "- lead: JSON with source, notes, attributes, and any engagement signals\n"
-        "Output format: return ONLY valid JSON with exactly this schema:\n"
-        '{"score": int(0-100), "grade": "hot|warm|cold", "reasoning": "...", '
-        '"next_action": "...", "phase": "awareness|interest|consideration|intent|evaluation|purchase"}\n'
-        "Rules:\n"
-        "- reasoning must be concise and evidence-based.\n"
-        "- next_action must be a concrete CRM follow-up, not a generic suggestion.\n"
-        "- Do not invent missing facts or metrics.\n"
-        f"\nlead:\n{json.dumps(_json_safe(safe_lead), ensure_ascii=True)}"
-    )
     engine: dict = {}
     try:
         engine = await _resolve_engine_cached(db=db, company_id=company_id, use_pro=True)
-        result = await call_model_json(
-            prompt,
-            LeadScoreResult,
+        result = await call_unified_lead_ai(
+            lead=safe_lead,
+            customer={},
+            company_id=company_id,
             engine=engine,
-            use_pro=True,
-            call_purpose="lead_scoring",
-            function_name="generate_lead_score",
-            agent_name="qualification",
+            call_model_json_fn=call_model_json,
             count_against_budget=count_against_budget,
         )
         result.setdefault("scoring_status", "completed")
@@ -1880,26 +1863,7 @@ async def generate_nurture_message(
 
 async def auto_score_and_nurture_lead(lead_data: dict, db=None, company_id: str | None = None) -> dict:
     resolved_company_id = company_id or lead_data.get("company_id", "")
-    score_result = await generate_lead_score(lead_data, db=db, company_id=resolved_company_id)
-    company_context = ""
-    if db:
-        try:
-            context = await build_ai_context(
-                db,
-                company_id=resolved_company_id,
-                current_query=f"{lead_data.get('notes', '')} {lead_data.get('source', '')}".strip(),
-            )
-            company_context = context["knowledge_text"]
-        except Exception as exc:
-            logger.warning("Company knowledge fetch for nurture failed: %s", exc)
-    nurture = await generate_nurture_message(
-        lead_data,
-        score_result.get("phase", "awareness"),
-        company_context=company_context,
-        db=db,
-        company_id=resolved_company_id,
-    )
-    return {**score_result, "nurture_message": nurture.get("message")}
+    return await generate_lead_score(lead_data, db=db, company_id=resolved_company_id)
 
 
 def _dedupe_response_text(
@@ -2954,39 +2918,28 @@ async def generate_combined_ai_analysis(
     knowledge_context: str = "",
     **kwargs,
 ) -> dict:
-    """Run sentiment (message), sentiment (conversation), intent, and AI response.
-
-    ALL analysis tasks are batched into a SINGLE LLM request instead of
-    three separate sequential calls, cutting latency and eliminating the
-    repeated 429 retry cascade that was caused by hitting the same quota-
-    exhausted provider three times per message.
-
-    FIX (latency 1): engine resolution is now parallelised with the batch call
-    prep instead of awaited sequentially before the LLM call fires.
-    """
+    """Run intent, sentiment, response, and qualification hints in one LLM call."""
     context_budget = get_llm_context()
     if context_budget is None:
         set_llm_context(
             company_id=company_id or "",
-            max_calls=5,
-            max_embedding_calls=2,
+            max_calls=1,
+            max_embedding_calls=1,
             workflow_id=str(kwargs.get("workflow_id") or "combined_ai_analysis"),
             conversation_id=str(kwargs.get("conversation_id") or ""),
             message_id=str(kwargs.get("message_id") or ""),
             agent_name="capture",
         )
     else:
-        if context_budget.max_calls < 5:
+        if context_budget.max_calls < 1:
             logger.info(
-                "combined_analysis_llm_budget_raised company_id=%s previous_max_calls=%s new_max_calls=5",
+                "combined_analysis_llm_budget_raised company_id=%s previous_max_calls=%s new_max_calls=1",
                 company_id or "",
                 context_budget.max_calls,
             )
-            context_budget.max_calls = 5
-        if context_budget.max_embedding_calls < 2:
-            context_budget.max_embedding_calls = 2
-    from services.ai_service.common import IntentResult, SentimentResult
-    from services.ai_service.intent import _normalize_intent_payload, _render_history_context
+            context_budget.max_calls = 1
+        if context_budget.max_embedding_calls < 1:
+            context_budget.max_embedding_calls = 1
 
     context = list(conversation_context or [])
     if customer_message and (not context or str(context[-1].get("content") or "").strip() != customer_message):
@@ -3000,175 +2953,124 @@ async def generate_combined_ai_analysis(
         if text:
             history_lines.append(f"{role}: {text}")
     history = "\n".join(history_lines[-16:])
-    if source_text and (not history_lines or source_text not in history_lines[-1]):
-        history_with_latest = history + f"\ncustomer: {source_text}"
-    else:
-        history_with_latest = history
 
-    history_context_str = _render_history_context(context[-10:])
-
-    from services.ai_service.sentiment import (
-        _message_prompt,
-        _conversation_prompt,
-        _finalize_sentiment,
-        _should_retry_for_zero_score,
-        analyze_local_sentiment,
-    )
-
-    intent_prompt = (
-        "You are an intent-routing classifier for a CRM assistant.\n"
-        "Task: infer the single best customer intent for the latest message.\n"
-        "Output format: return ONLY valid JSON with exactly these keys:\n"
-        '{"intent":"snake_case_intent","confidence":0.0,"entities":{},"urgency":"low|medium|high|critical"}\n'
-        "Rules:\n"
-        "- Choose one primary intent only.\n"
-        "- Keep confidence between 0 and 1.\n"
-        "- Set urgency to critical only for explicit immediate risk, legal threat, severe churn risk, or urgent handoff.\n"
-        f"\nprevious_intent: unknown"
-        f"\nrecent_conversation:\n{history_context_str or '[none]'}"
-        f"\nlatest_message:\n{source_text}"
-    )
-
-    # FIX (latency 1): resolve engine in parallel with building the batch prompts.
-    # Previously _resolve_engine_for_request was awaited before call_model_json_batch,
-    # adding a sequential DB round-trip (20-50ms) on every message.
-    # Now both happen concurrently; the batch call fires as soon as the engine is ready.
-    engine = await _resolve_engine_cached(db=db, company_id=company_id or "")
-
-    sentiment: dict
-    conversation_sentiment: dict
-    intent: dict
-
-    try:
-        batch = await call_model_json_batch(
-            {
-                "message_sentiment": {
-                    "prompt": _message_prompt(source_text),
-                    "schema": SentimentResult,
-                },
-                "conversation_sentiment": {
-                    "prompt": _conversation_prompt(history_with_latest, source_text),
-                    "schema": SentimentResult,
-                },
-                "intent": {
-                    "prompt": intent_prompt,
-                    "schema": IntentResult,
-                },
-            },
-            engine=engine,
-            call_purpose="combined_analysis",
-            function_name="generate_combined_ai_analysis",
-            agent_name="capture",
-            individual_fallback=False,
-            max_provider_attempts=1,
-            allow_provider_fallback=False,
-        )
-
-        msg_raw = batch.get("message_sentiment")
-        conv_raw = batch.get("conversation_sentiment")
-        intent_raw = batch.get("intent")
-
-        if msg_raw and not _should_retry_for_zero_score(msg_raw):
-            sentiment = _finalize_sentiment(msg_raw, source_text, scope="message")
-            sentiment["provider"] = str((engine or {}).get("provider") or "")
-            sentiment["model_name"] = str((engine or {}).get("model_name") or "")
-            sentiment["source"] = "provider_batch"
-        else:
-            sentiment = analyze_local_sentiment(source_text)
-            sentiment["scope"] = "message"
-            sentiment["source"] = "local_fallback"
-
-        if conv_raw and not _should_retry_for_zero_score(conv_raw):
-            conversation_sentiment = _finalize_sentiment(conv_raw, source_text, scope="conversation")
-            conversation_sentiment["provider"] = str((engine or {}).get("provider") or "")
-            conversation_sentiment["model_name"] = str((engine or {}).get("model_name") or "")
-            conversation_sentiment["source"] = "provider_batch"
-            conversation_sentiment["turns_analyzed"] = len(history_lines)
-        else:
-            conversation_sentiment = analyze_local_sentiment(history or source_text)
-            conversation_sentiment["scope"] = "conversation"
-            conversation_sentiment["source"] = "local_fallback"
-            conversation_sentiment["turns_analyzed"] = len(history_lines)
-
-        if intent_raw:
-            intent = _normalize_intent_payload(intent_raw)
-        else:
-            intent = {
-                "intent": "general_question",
-                "confidence": 0.0,
-                "entities": {},
-                "urgency": "medium",
-            }
-
-    except Exception as exc:
-        logger.warning(
-            "generate_combined_ai_analysis batch failed, falling back to individual calls: %s", exc
-        )
-        # Individual fallback (original behaviour)
-        sentiment = await analyze_sentiment(source_text, db=db, company_id=company_id or "")
-        try:
-            conversation_sentiment = await analyze_conversation_sentiment(
-                context,
-                latest_message=source_text,
-                db=db,
-                company_id=company_id or "",
-            )
-        except Exception as exc2:
-            logger.warning("Conversation sentiment fallback to message sentiment: %s", exc2)
-            conversation_sentiment = dict(sentiment)
-        intent = await classify_intent(
-            source_text,
-            db=db,
-            company_id=company_id or "",
-            conversation_context=context[-12:],
-        )
+    from services.ai_service.sentiment import analyze_local_sentiment
 
     llm_budget_exhausted = not has_llm_budget_remaining()
     if llm_budget_exhausted:
         logger.warning(
-            "combined_analysis_budget_exhausted_before_response company_id=%s conversation_id=%s",
+            "combined_analysis_budget_exhausted_before_unified_call company_id=%s conversation_id=%s",
             company_id or "",
             str(kwargs.get("conversation_id") or ""),
         )
-        ai_response = {}
-        ai_response_error = "AI_BUDGET_EXCEEDED type=llm"
-    else:
+        sentiment = analyze_local_sentiment(source_text)
+        sentiment["scope"] = "message"
+        conversation_sentiment = analyze_local_sentiment(history or source_text)
+        conversation_sentiment["scope"] = "conversation"
+        intent = {"intent": "general_question", "confidence": 0.0, "entities": {}, "urgency": "medium"}
+        return {
+            "sentiment": sentiment,
+            "conversation_sentiment": conversation_sentiment,
+            "intent": intent,
+            "ai_response": {"llm_budget_exhausted": True},
+            "qualification_hint": {
+                "missing_fields": [],
+                "completed_fields": [],
+                "ready_for_scoring": False,
+                "next_question": "",
+            },
+            "interaction_summary": {
+                "summary": "",
+                "total_messages": len(history_lines),
+                "avg_sentiment": 0.0,
+                "resolution_status": "in_progress",
+                "source": "local_fallback",
+            },
+            "ai_response_error": "AI_BUDGET_EXCEEDED type=llm",
+            "ai_response_generated": False,
+            "llm_budget_exhausted": True,
+        }
+
+    ai_context = {
+        "knowledge_text": "",
+        "product_ids": [],
+        "product_attachments": [],
+        "rag_called": False,
+    }
+    if db and company_id and source_text:
         try:
-            ai_response = await generate_ai_response(
-                context,
-                customer_info=customer_info,
-                knowledge_context=knowledge_context,
+            ai_context = await build_ai_context(
+                db,
                 company_id=company_id,
-                db=db,
-                long_term_summary=long_term_summary,
-                historical_sentiment=historical_sentiment,
-                observed_sentiment=sentiment,
-                observed_conversation_sentiment=conversation_sentiment,
-                observed_intent=intent,
-                response_call_purpose="prefetched_support_response",
-                **kwargs,
+                current_query=source_text,
+                max_products=3,
+                history_text=history,
+                customer_id=str((customer_info or {}).get("id") or ""),
+                conversation_id=str(kwargs.get("conversation_id") or ""),
+                has_history=len(history_lines) > 1,
             )
         except Exception as exc:
-            if "AI_BUDGET_EXCEEDED" in str(exc):
-                llm_budget_exhausted = True
-                logger.warning(
-                    "combined_analysis_budget_exhausted_mid_workflow company_id=%s conversation_id=%s",
-                    company_id or "",
-                    str(kwargs.get("conversation_id") or ""),
-                )
             logger.warning(
-                "generate_combined_ai_analysis ai_response failed; support fallback may generate once if budget allows: %s",
+                "combined_analysis_rag_context_failed company_id=%s conversation_id=%s error=%s",
+                company_id or "",
+                str(kwargs.get("conversation_id") or ""),
                 exc,
             )
-            ai_response = {}
-            ai_response_error = str(exc)
-        else:
-            ai_response_error = ""
+
+    merged_knowledge = "\n\n".join(
+        dict.fromkeys(
+            item
+            for item in (
+                str(knowledge_context or "").strip(),
+                str((ai_context or {}).get("knowledge_text") or "").strip(),
+            )
+            if item
+        )
+    )
+    merged_knowledge = truncate_text_for_tokens(merged_knowledge, 1800)
+
+    engine = await _resolve_engine_cached(db=db, company_id=company_id or "")
+    combined = await call_unified_message_ai(
+        message_text=source_text,
+        conversation_history=context,
+        customer=customer_info or {},
+        lead=dict(kwargs.get("lead") or {}),
+        company_id=company_id or "",
+        knowledge_context=merged_knowledge,
+        previous_intent=str(kwargs.get("previous_intent") or ""),
+        engine=engine,
+        call_model_json_fn=call_model_json,
+    )
+
+    sentiment = dict(combined.get("sentiment") or {})
+    conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
+    conversation_sentiment["turns_analyzed"] = len(history_lines)
+    intent = dict(combined.get("intent") or {})
+    ai_response = dict(combined.get("ai_response") or {})
+
+    response_product_ids = [str(item).strip() for item in (ai_context or {}).get("product_ids", []) if str(item).strip()]
+    response_attachments = _align_product_attachments(
+        response_product_ids,
+        list((ai_context or {}).get("product_attachments") or []),
+    )
+    ai_response["attachments"] = response_attachments
+    ai_response["product_images"] = response_attachments
+    ai_response["product_ids"] = response_product_ids[:3]
+    ai_response["provider"] = str((engine or {}).get("provider") or ai_response.get("provider") or "")
+    ai_response["model_name"] = str((engine or {}).get("model_name") or ai_response.get("model_name") or "")
+    ai_response["llm_id"] = str((engine or {}).get("id") or ai_response.get("llm_id") or "")
+    ai_response["rag_called"] = bool((ai_context or {}).get("rag_called"))
+    ai_response.setdefault("conversation_sentiment", conversation_sentiment)
+    ai_response.setdefault("intent_name", str(intent.get("intent") or ""))
+
+    ai_response_error = str(ai_response.get("error_reason") or "") if ai_response.get("api_error") else ""
     return {
         "sentiment": sentiment,
         "conversation_sentiment": conversation_sentiment,
         "intent": intent,
         "ai_response": ai_response,
+        "qualification_hint": dict(combined.get("qualification_hint") or {}),
+        "interaction_summary": dict(combined.get("interaction_summary") or {}),
         "ai_response_error": ai_response_error,
         "ai_response_generated": bool((ai_response or {}).get("response")),
         "llm_budget_exhausted": llm_budget_exhausted,

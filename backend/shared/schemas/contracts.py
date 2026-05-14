@@ -100,7 +100,10 @@ class LeadScoreResponse(BaseModel):
     reasoning: str = ""
     next_action: str = ""
     phase: str = ""
+    intent: dict[str, Any] = Field(default_factory=dict)
     nurture_message: str = ""
+    missing_fields: list[str] = Field(default_factory=list)
+    ready_for_scoring: bool = False
     scoring_status: str = "completed"
     provider: str = ""
     model_name: str = ""
@@ -115,6 +118,7 @@ class CombinedRequest(BaseModel):
     channel: str = "web_chat"
     conversation_context: list[dict[str, Any]] = Field(default_factory=list)
     customer: dict[str, Any] = Field(default_factory=dict)
+    lead: dict[str, Any] = Field(default_factory=dict)
     knowledge_context: str = ""
     long_term_summary: str = ""
     historical_sentiment: str = ""
@@ -127,6 +131,8 @@ class CombinedResponse(BaseModel):
     conversation_sentiment: dict[str, Any] = Field(default_factory=dict)
     intent: dict[str, Any]
     ai_response: dict[str, Any]
+    qualification_hint: dict[str, Any] = Field(default_factory=dict)
+    interaction_summary: dict[str, Any] = Field(default_factory=dict)
     ai_response_error: str = ""
     llm_budget_exhausted: bool = False
     ai_response_generated: bool = True

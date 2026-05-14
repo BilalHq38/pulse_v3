@@ -47,14 +47,12 @@ from services.ai_service.memory_service import (
 from services.ai_service.rag import build_ai_context
 from services.ai_service.response_generator import (
     auto_score_and_nurture_lead,
-    generate_ai_response,
     generate_combined_ai_analysis,
     generate_lead_score,
     generate_nurture_message,
     generate_product_description,
 )
 from services.ai_service.sentiment import (
-    analyze_sentiment,
     build_sentiment_gate,
     should_auto_escalate,
 )
@@ -73,13 +71,15 @@ async def analyze_message(
 ):
     db = request.app.state.db
     company_id = current_user.get("company_id", "") or payload.company_id
-    sentiment = await analyze_sentiment(payload.text, db=db, company_id=company_id)
-    intent = await classify_intent(
-        payload.text,
-        db=db,
-        company_id=company_id,
+    combined = await generate_combined_ai_analysis(
+        customer_message=payload.text,
         conversation_context=payload.conversation_context,
+        customer_info={},
+        company_id=company_id,
+        db=db,
     )
+    sentiment = dict(combined.get("sentiment") or {})
+    intent = dict(combined.get("intent") or {})
     gate = build_sentiment_gate(payload.text, sentiment)
     return AnalyzeResponse(
         sentiment=sentiment,
@@ -136,14 +136,8 @@ async def respond_to_customer(
             customer_info.update(profile)
         except Exception:
             pass
-    sentiment = await analyze_sentiment(payload.message, db=db, company_id=company_id)
-    intent = await classify_intent(
-        payload.message,
-        db=db,
-        company_id=company_id,
-        conversation_context=context[-12:],
-    )
-    result = await generate_ai_response(
+    combined = await generate_combined_ai_analysis(
+        customer_message=payload.message,
         conversation_context=context,
         customer_info=customer_info,
         company_id=company_id,
@@ -154,13 +148,10 @@ async def respond_to_customer(
         actor_user_id=payload.actor_user_id or current_user.get("sub", ""),
         conversation_id=payload.conversation_id,
         channel=payload.channel,
-        observed_sentiment=sentiment,
-        observed_intent=intent,
-        system_prompt=payload.system_prompt,
-        extra_context=payload.extra_context,
-        company_info=payload.company_info,
-        context_package=payload.context_package,
     )
+    result = dict(combined.get("ai_response") or {})
+    sentiment = dict(combined.get("sentiment") or {})
+    intent = dict(combined.get("intent") or {})
     return RespondResponse(
         reply=result.get("response", ""),
         response=result.get("response", ""),
@@ -269,6 +260,7 @@ async def combined_ai_analysis(
         actor_user_id=payload.actor_user_id or current_user.get("sub", ""),
         conversation_id=payload.conversation_id,
         channel=payload.channel,
+        lead=payload.lead,
     )
     return CombinedResponse(**result)
 
@@ -288,7 +280,10 @@ async def score_lead(
         reasoning=str(result.get("reasoning", "")),
         next_action=str(result.get("next_action", "")),
         phase=str(result.get("phase", "")),
+        intent=dict(result.get("intent") or {}),
         nurture_message=str(result.get("nurture_message", "")),
+        missing_fields=list(result.get("missing_fields") or []),
+        ready_for_scoring=bool(result.get("ready_for_scoring")),
         scoring_status=str(result.get("scoring_status") or "completed"),
         provider=str(result.get("provider") or ""),
         model_name=str(result.get("model_name") or ""),

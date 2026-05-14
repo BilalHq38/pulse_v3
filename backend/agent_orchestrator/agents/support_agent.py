@@ -10,32 +10,12 @@ from agent_orchestrator.repository import (
 )
 from agent_orchestrator.schemas import AgentName, AgentRunResult, WorkflowKind
 from services.ai_service.facade import (
-    build_system_prompt,
-    generate_ai_response,
-    generate_nurture_message,
-    get_company_knowledge,
     should_auto_escalate,
 )
 from services.ai_service.llm_tracking import log_llm_reuse
 from services.db_helpers import AI_API_EXHAUSTED_MANUAL_MESSAGE, is_ai_api_exhaustion_payload
 
 logger = logging.getLogger(__name__)
-
-
-async def _fetch_company_info_for_prompt(db, company_id: str) -> dict:
-    if not db or not company_id:
-        return {}
-    try:
-        row = await db.fetchrow(
-            "SELECT c.name AS name, cs.industry, cs.tagline, cs.description, cs.website_address "
-            "FROM companies c LEFT JOIN company_settings cs ON cs.company_id = c.id "
-            "WHERE c.id=$1 LIMIT 1",
-            company_id,
-        )
-    except Exception as exc:
-        logger.debug("Company prompt context load skipped company_id=%s error=%s", company_id, exc)
-        return {}
-    return dict(row or {})
 
 
 async def _is_repetitive_response(
@@ -158,47 +138,26 @@ class SupportAgent(BaseAgent):
         sentiment_gate = dict(capture.get("sentiment_gate") or {})
         threshold = await fetch_company_ai_threshold(context.db, context.company_id)
         knowledge_context = str(getattr(request, "knowledge_context", "") or "").strip()
-        company_info = await _fetch_company_info_for_prompt(context.db, context.company_id)
-        retrieved_knowledge = await get_company_knowledge(
-            context.db,
-            company_id=context.company_id,
-            current_query=latest_text,
-            top_k=5,
-        )
-        knowledge_context = "\n\n".join(
-            dict.fromkeys(
-                item
-                for item in (
-                    knowledge_context,
-                    retrieved_knowledge,
-                )
-                if str(item or "").strip()
-            )
-        )
-        last_20_messages = conversation_history[-20:]
-        # Build the context package for the LLM. Avoid referencing missing DB columns by
-        # using a safe fallback for previous_interests. If the customer does not
-        # include "tags", leave previous_interests unset.
-        customer_profile = {
-            "name": customer.get("name"),
-            "lifecycle_stage": customer.get("lifecycle_stage"),
-            "language": customer.get("preferred_language") or customer.get("language"),
-        }
-        if isinstance(customer, dict) and "tags" in customer:
-            customer_profile["previous_interests"] = customer.get("tags")
-        context_package = {
-            "system_prompt": build_system_prompt(company_info),
-            "conversation_history": last_20_messages,
-            "customer_profile": customer_profile,
-            "retrieved_knowledge": retrieved_knowledge,
-            "qualification_hint": qualification_hint_for_ai,
-            "customer_message": latest_text,
-        }
         prefetched = dict(capture.get("prefetched_support_response") or {})
         prefetched_response = str(prefetched.get("response") or "").strip()
         prefetched_invalid = bool(prefetched.get("invalid") or (prefetched.get("api_error") and not prefetched_response))
         # If there is a valid prefetched response, reuse it but merge in the latest context
         if prefetched_response and not prefetched_invalid:
+            retrieved_knowledge = str(prefetched.get("retrieved_knowledge") or "").strip()
+            if not knowledge_context:
+                knowledge_context = retrieved_knowledge
+            context_package = {
+                "system_prompt": str(prefetched.get("system_prompt") or ""),
+                "conversation_history": conversation_history[-20:],
+                "customer_profile": {
+                    "name": customer.get("name"),
+                    "lifecycle_stage": customer.get("lifecycle_stage"),
+                    "language": customer.get("preferred_language") or customer.get("language"),
+                },
+                "retrieved_knowledge": retrieved_knowledge,
+                "qualification_hint": qualification_hint_for_ai,
+                "customer_message": latest_text,
+            }
             # Preserve the original prefetched result
             ai_result = dict(prefetched)
             reused_prefetched_response = True
@@ -231,7 +190,7 @@ class SupportAgent(BaseAgent):
             reused_prefetched_response = False
             if prefetched:
                 logger.warning(
-                    "support_prefetched_response_invalid workflow_id=%s message_id=%s conversation_id=%s company_id=%s keys=%s api_error=%s",
+                    "support_prefetched_response_not_reused workflow_id=%s message_id=%s conversation_id=%s company_id=%s keys=%s api_error=%s one_llm_call_enforced=true",
                     context.workflow_id,
                     str(getattr(request, "message_id", "") or ""),
                     str(getattr(request, "conversation_id", "") or ""),
@@ -239,59 +198,21 @@ class SupportAgent(BaseAgent):
                     sorted(prefetched.keys()),
                     bool(prefetched.get("api_error")),
                 )
-            logger.warning(
-                "support_fresh_response_generation workflow_id=%s message_id=%s conversation_id=%s company_id=%s reused_prefetched_response=false",
-                context.workflow_id,
-                str(getattr(request, "message_id", "") or ""),
-                str(getattr(request, "conversation_id", "") or ""),
-                context.company_id,
-            )
-            ai_result = await generate_ai_response(
-                conversation_history,
-                customer,
-                company_id=context.company_id,
-                db=context.db,
-                knowledge_context=knowledge_context,
-                actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
-                conversation_id=str(getattr(request, "conversation_id", "") or ""),
-                message_id=str(getattr(request, "message_id", "") or ""),
-                channel=str(getattr(request, "channel", "") or "web_chat"),
-                observed_sentiment=sentiment,
-                observed_intent=intent,
-                extra_context=qualification_hint_for_ai,
-                system_prompt=context_package["system_prompt"],
-                company_info=company_info,
-                context_package=context_package,
-            )
+            ai_result = dict(prefetched)
+            if not ai_result:
+                ai_result = {
+                    "response": "",
+                    "confidence": 0.0,
+                    "attachments": [],
+                    "product_images": [],
+                    "product_ids": [],
+                    "provider": "none",
+                    "model_name": "",
+                    "next_action": "manual_review",
+                    "fallback_used": True,
+                    "fallback_reason": "missing_prefetched_unified_response",
+                }
         ai_response_text = str(ai_result.get("response") or "").strip()
-        initial_provider_failure = bool(
-            ai_result.get("api_error")
-            and is_ai_api_exhaustion_payload(ai_result)
-        )
-        if manual_draft_mode and not ai_response_text and not initial_provider_failure:
-            ai_result = await generate_ai_response(
-                conversation_history,
-                customer,
-                company_id=context.company_id,
-                db=context.db,
-                knowledge_context=knowledge_context,
-                actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
-                conversation_id=str(getattr(request, "conversation_id", "") or ""),
-                message_id=str(getattr(request, "message_id", "") or ""),
-                channel=str(getattr(request, "channel", "") or "web_chat"),
-                observed_sentiment=sentiment,
-                observed_intent=intent,
-                extra_context=qualification_hint_for_ai,
-                system_prompt=context_package["system_prompt"],
-                company_info=company_info,
-                context_package=context_package,
-                extra_instruction=(
-                    "Generate a short helpful editable draft response to the customer's latest message. "
-                    "Do not return an empty response."
-                ),
-            )
-            reused_prefetched_response = False
-            ai_response_text = str(ai_result.get("response") or "").strip()
         if (
             ai_response_text
             and context.db
@@ -299,30 +220,11 @@ class SupportAgent(BaseAgent):
             and not ai_result.get("api_error")
             and await _is_repetitive_response(context.db, conversation_id, ai_response_text)
         ):
-            ai_result = await generate_ai_response(
-                conversation_history,
-                customer,
-                company_id=context.company_id,
-                db=context.db,
-                knowledge_context=knowledge_context,
-                actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
-                conversation_id=conversation_id,
-                message_id=str(getattr(request, "message_id", "") or ""),
-                channel=str(getattr(request, "channel", "") or "web_chat"),
-                observed_sentiment=sentiment,
-                observed_intent=intent,
-                extra_context=qualification_hint_for_ai,
-                system_prompt=context_package["system_prompt"],
-                company_info=company_info,
-                context_package=context_package,
-                extra_instruction=(
-                    "Your previous response was repeated. "
-                    "Give a completely fresh, useful reply to the customer's message. "
-                    "Do not repeat anything you have already said."
-                ),
+            logger.info(
+                "support_repetitive_response_retry_skipped workflow_id=%s conversation_id=%s reason=one_llm_call_enforced",
+                context.workflow_id,
+                conversation_id,
             )
-            reused_prefetched_response = False
-            ai_response_text = str(ai_result.get("response") or "").strip()
         provider_failure_after_generation = bool(
             ai_result.get("api_error")
             and is_ai_api_exhaustion_payload(ai_result)
@@ -464,28 +366,28 @@ class SupportAgent(BaseAgent):
         qualification = dict(getattr(context.agent_outputs, "qualification", {}) or {})
         lead = dict(qualification.get("structured_lead") or capture.get("structured_lead") or {})
         stage = str(qualification.get("phase") or lead.get("phase") or "awareness")
-        company_context = str(getattr(request, "knowledge_context", "") or "").strip()
-        if not company_context:
-            company_context = await get_company_knowledge(
-                context.db,
-                company_id=context.company_id,
-                current_query=str(lead.get("notes") or lead.get("name") or ""),
-                top_k=5,
+        prefetched_nurture = str(qualification.get("nurture_message") or "").strip()
+        if prefetched_nurture:
+            return AgentRunResult(
+                agent_name=self.name,
+                payload={
+                    "response": prefetched_nurture,
+                    "stage": stage,
+                    "deliver_response": True,
+                    "escalate": False,
+                    "next_action": "queue_nurture",
+                    "knowledge_context": str(getattr(request, "knowledge_context", "") or ""),
+                    "reused_prefetched_response": True,
+                },
             )
-        nurture = await generate_nurture_message(
-            lead,
-            stage,
-            company_context=company_context,
-            db=context.db,
-            company_id=context.company_id,
-        )
         payload = {
-            "response": str(nurture.get("message") or ""),
-            "stage": str(nurture.get("stage") or stage),
-            "deliver_response": bool(nurture.get("message")),
+            "response": "",
+            "stage": stage,
+            "deliver_response": False,
             "escalate": False,
-            "next_action": "queue_nurture" if nurture.get("message") else "review",
-            "knowledge_context": company_context,
+            "next_action": "review",
+            "knowledge_context": str(getattr(request, "knowledge_context", "") or ""),
+            "reused_prefetched_response": False,
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
 

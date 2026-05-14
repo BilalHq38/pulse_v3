@@ -304,21 +304,30 @@ async def test_combined_analysis_raises_low_existing_budget_to_allow_response(mo
     async def fake_engine(**_kwargs):
         return {"provider": "openai", "model_name": "gpt-test", "id": "llm-1"}
 
-    async def fake_batch(*_args, **_kwargs):
+    async def fake_json(*_args, **_kwargs):
         return {
-            "message_sentiment": {"score": 0.1, "emotion": "neutral", "confidence": 0.8, "sentiment_label": "neutral"},
-            "conversation_sentiment": {"score": 0.1, "emotion": "neutral", "confidence": 0.8, "sentiment_label": "neutral"},
             "intent": {"intent": "greeting", "confidence": 0.9, "entities": {}, "urgency": "low"},
+            "sentiment": {"label": "neutral", "score": 0.55, "emotion": "neutral"},
+            "conversation_sentiment": {"label": "neutral", "score": 0.55, "trend": "stable"},
+            "sentiment_gate": {"escalate": False, "reason": ""},
+            "ai_response": {
+                "response": "Hi, what can I help with?",
+                "deliver_response": True,
+                "escalate": False,
+                "next_action": "continue_conversation",
+            },
+            "qualification_hint": {
+                "missing_fields": [],
+                "completed_fields": [],
+                "ready_for_scoring": False,
+                "next_question": "",
+            },
         }
 
-    async def fake_response(*_args, **_kwargs):
-        return {"response": "Hi, what can I help with?", "confidence": 0.9}
-
     monkeypatch.setattr(response_generator, "_resolve_engine_cached", fake_engine)
-    monkeypatch.setattr(response_generator, "call_model_json_batch", fake_batch)
-    monkeypatch.setattr(response_generator, "generate_ai_response", fake_response)
+    monkeypatch.setattr(response_generator, "call_model_json", fake_json)
 
-    token = set_llm_context(company_id="co", max_calls=2, max_embedding_calls=1)
+    token = set_llm_context(company_id="co", max_calls=1, max_embedding_calls=1)
     try:
         result = await response_generator.generate_combined_ai_analysis(
             "hi",
@@ -330,4 +339,5 @@ async def test_combined_analysis_raises_low_existing_budget_to_allow_response(mo
         reset_llm_context(token)
 
     assert result["ai_response_generated"] is True
-    assert snapshot["max_llm_calls"] == 5
+    assert result["intent"]["intent"] == "greeting"
+    assert snapshot["max_llm_calls"] == 1

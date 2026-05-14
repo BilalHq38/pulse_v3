@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from services.ai_service.facade import generate_lead_score
-
 from data_pipeline.constants import RAW_LEAD_TABLE
 from data_pipeline.processors.base import ProcessorBase, row_to_dict
 from data_pipeline.storage import upsert_analytics_event, upsert_lead_metrics
@@ -12,6 +10,29 @@ from data_pipeline.utils import (
     parse_timestamp,
     safe_int,
 )
+
+
+def _deterministic_lead_score(lead_data: dict) -> dict:
+    score = safe_int(lead_data.get("score"), 0)
+    if score <= 0:
+        score = 40
+        if lead_data.get("email") and lead_data.get("phone"):
+            score += 20
+        elif lead_data.get("email") or lead_data.get("phone"):
+            score += 10
+        if lead_data.get("name"):
+            score += 5
+    score = max(0, min(100, score))
+    grade = str(lead_data.get("grade") or "").strip().lower()
+    if grade not in {"hot", "warm", "cold"}:
+        grade = "hot" if score >= 80 else "warm" if score >= 60 else "cold"
+    return {
+        "score": score,
+        "grade": grade,
+        "phase": str(lead_data.get("phase") or "awareness").strip().lower(),
+        "reasoning": "Local lead metric snapshot; LLM scoring is not run from inbound message pipeline.",
+        "next_action": str(lead_data.get("next_action") or "Review lead activity"),
+    }
 
 
 class LeadProcessor(ProcessorBase):
@@ -66,11 +87,7 @@ class LeadProcessor(ProcessorBase):
                 or 0
             )
         is_converted = bool(metadata.get("is_converted")) or converted_count > 0
-        ai_score = await generate_lead_score(
-            lead_data,
-            db=self.db,
-            company_id=raw_record.get("company_id", ""),
-        )
+        ai_score = _deterministic_lead_score(lead_data)
         occurred_at = parse_timestamp(raw_record.get("occurred_at"))
         metric = await upsert_lead_metrics(
             self.db,

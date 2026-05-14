@@ -24,10 +24,8 @@ from shared.config import (
 from shared.service_client import ServiceClient, build_internal_headers
 from services.ai_service.facade import (
     build_sentiment_gate,
-    generate_ai_response,
     generate_combined_ai_analysis,
     generate_lead_score,
-    generate_nurture_message,
     get_company_knowledge,
     should_auto_escalate,
 )
@@ -237,6 +235,7 @@ async def _message_workflow_fallback(
         conversation_id=payload.conversation_id,
         actor_user_id=payload.actor_user_id,
         channel=payload.channel,
+        lead=payload.lead,
     )
     sentiment = dict(combined.get("sentiment") or {})
     conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
@@ -244,19 +243,6 @@ async def _message_workflow_fallback(
     sentiment_gate = build_sentiment_gate(payload.message_text, sentiment)
     threshold = await fetch_company_ai_threshold(db, payload.company_id)
     support = dict(combined.get("ai_response") or {})
-    if not support.get("response"):
-        support = await generate_ai_response(
-            payload.conversation_context,
-            payload.customer,
-            company_id=payload.company_id,
-            db=db,
-            knowledge_context=payload.knowledge_context,
-            actor_user_id=payload.actor_user_id,
-            conversation_id=payload.conversation_id,
-            channel=payload.channel,
-            observed_sentiment=sentiment,
-            observed_intent=intent,
-        )
     lead_candidate = {
         "company_id": payload.company_id,
         "name": str((payload.customer or {}).get("name") or payload.sender_name or ""),
@@ -320,6 +306,8 @@ async def _message_workflow_fallback(
                 "conversation_sentiment": conversation_sentiment,
                 "intent": intent,
                 "sentiment_gate": sentiment_gate,
+                "qualification_hint": dict(combined.get("qualification_hint") or {}),
+                "interaction_summary": dict(combined.get("interaction_summary") or {}),
             },
             qualification={
                 "score": int(qualification.get("score", 0) or 0),
@@ -362,13 +350,12 @@ async def _lead_workflow_fallback(
     )
     support = {}
     if payload.auto_support:
-        support = await generate_nurture_message(
-            lead,
-            str(qualification.get("phase") or lead.get("phase") or "awareness"),
-            company_context=payload.knowledge_context,
-            db=db,
-            company_id=payload.company_id,
-        )
+        prefetched_nurture = str(qualification.get("nurture_message") or "").strip()
+        if prefetched_nurture:
+            support = {
+                "message": prefetched_nurture,
+                "stage": str(qualification.get("phase") or lead.get("phase") or "awareness"),
+            }
     return WorkflowResponse(
         workflow_id=make_id(),
         trace_id=payload.trace_id.replace("-", "") or make_id().replace("-", ""),

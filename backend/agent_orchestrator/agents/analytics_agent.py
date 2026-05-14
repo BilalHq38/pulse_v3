@@ -19,8 +19,6 @@ from data_pipeline.storage import (
     upsert_customer_interaction_summary,
     upsert_lead_metrics,
 )
-from services.ai_service.facade import summarize_customer_interaction
-from services.ai_service.llm_tracking import has_llm_budget_remaining
 from shared.config import ai_analytics_llm_enabled, ai_analytics_summary_min_messages
 
 logger = logging.getLogger(__name__)
@@ -111,16 +109,8 @@ class AnalyticsAgent(BaseAgent):
             skip_reason = "disabled"
         elif not should_summarize:
             skip_reason = "threshold_not_met"
-        elif not has_llm_budget_remaining():
-            skip_reason = "budget_exhausted"
-            should_summarize = False
-        if customer and should_summarize:
-            ai_summary = await summarize_customer_interaction(
-                recent_messages,
-                customer,
-                db=context.db,
-                company_id=context.company_id,
-            )
+        unified_summary = dict(capture.get("interaction_summary") or {})
+        if customer and should_summarize and str(unified_summary.get("summary") or "").strip():
             summary = await upsert_customer_interaction_summary(
                 context.db,
                 {
@@ -129,15 +119,17 @@ class AnalyticsAgent(BaseAgent):
                     "customer_name": customer.get("name", ""),
                     "conversation_id": conversation_id,
                     "summary_date": occurred_at.date(),
-                    "summary_text": str(ai_summary.get("summary", "")),
-                    "total_messages": int(ai_summary.get("total_messages", len(recent_messages))),
-                    "avg_sentiment": float(ai_summary.get("avg_sentiment", metrics.get("avg_sentiment", 0.0))),
+                    "summary_text": str(unified_summary.get("summary", "")),
+                    "total_messages": int(unified_summary.get("total_messages") or len(recent_messages)),
+                    "avg_sentiment": float(unified_summary.get("avg_sentiment", metrics.get("avg_sentiment", 0.0))),
                     "escalated": bool(support.get("escalate")),
                     "ai_handled": bool(conversation.get("ai_handled", True)),
                 },
             )
-            analytics_llm_called = True
+            analytics_llm_called = False
         elif customer:
+            if should_summarize and not str(unified_summary.get("summary") or "").strip():
+                skip_reason = "no_unified_summary"
             logger.info(
                 "analytics_summary_skipped workflow_id=%s conversation_id=%s company_id=%s message_count=%s status=%s reason=%s",
                 context.workflow_id,

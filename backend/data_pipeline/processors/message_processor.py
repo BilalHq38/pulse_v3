@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-
-from services.ai_service.facade import generate_combined_ai_analysis
+from services.ai_service.sentiment import analyze_local_sentiment
 
 from data_pipeline.constants import RAW_MESSAGE_TABLE
 from data_pipeline.processors.base import ProcessorBase, row_to_dict
@@ -62,32 +60,17 @@ class MessageProcessor(ProcessorBase):
         sentiment_label = str(message.get("sentiment_emotion") or "").strip().lower()
         intent_type = str(message.get("intent_type") or "").strip().lower()
         conversation_sentiment = {}
+        intent = {}
 
         if (
             str(message.get("sender_type") or "").strip().lower() == "customer"
             and str(message.get("content") or "").strip()
             and (sentiment_score is None or not sentiment_label or not intent_type)
         ):
-            combined = {}
-            try:
-                combined = await asyncio.wait_for(
-                    generate_combined_ai_analysis(
-                        customer_message=message.get("content", ""),
-                        conversation_context=await self.fetch_conversation_messages(
-                            message.get("conversation_id", ""),
-                            limit=20,
-                        ),
-                        customer_info=customer or None,
-                        company_id=raw_record.get("company_id", ""),
-                        db=self.db,
-                    ),
-                    timeout=8.0,
-                )
-            except Exception:
-                combined = {}
-            sentiment = dict(combined.get("sentiment") or {})
-            conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
-            intent = dict(combined.get("intent") or {})
+            # The message workflow already performs the single allowed AI call.
+            # Pipeline enrichment must stay local so raw-message processing does not double-call the LLM.
+            sentiment = analyze_local_sentiment(message.get("content", ""))
+            conversation_sentiment = dict(sentiment)
             sentiment_score = sentiment_score if sentiment_score is not None else safe_float(sentiment.get("score"))
             sentiment_confidence = (
                 sentiment_confidence if sentiment_confidence is not None else safe_float(sentiment.get("confidence"))
@@ -96,7 +79,6 @@ class MessageProcessor(ProcessorBase):
                 sentiment_label
                 or str(sentiment.get("emotion") or sentiment.get("sentiment_label") or "neutral").strip().lower()
             )
-            intent_type = intent_type or str(intent.get("intent") or "").strip().lower()
             await self.db.execute(
                 "UPDATE messages SET "
                 "sentiment_score=COALESCE(sentiment_score,$1),"

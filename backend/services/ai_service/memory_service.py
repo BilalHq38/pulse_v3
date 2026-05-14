@@ -25,6 +25,133 @@ def _render_messages(messages: list) -> str:
     return "\n".join([f"{message.get('sender_type', '?')}: {message.get('content', '')}" for message in messages])
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _compact_message_text(value, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit].rstrip()
+
+
+def _fallback_interaction_summary(messages: list, customer_info: dict | None = None) -> dict:
+    customer_name = (customer_info or {}).get("name") or "Unknown customer"
+    visible_messages = [item for item in (messages or []) if str(item.get("content") or "").strip()]
+    total_messages = len(visible_messages)
+    latest_customer = next(
+        (
+            item
+            for item in reversed(visible_messages)
+            if str(item.get("sender_type") or "").strip().lower() == "customer"
+        ),
+        visible_messages[-1] if visible_messages else {},
+    )
+    latest_text = _compact_message_text(latest_customer.get("content", ""))
+    intent_values = [
+        str(item.get("intent_type") or "").strip()
+        for item in visible_messages
+        if str(item.get("intent_type") or "").strip()
+    ]
+    topics = list(dict.fromkeys(intent_values))[:5]
+    scores = [
+        _safe_float(item.get("sentiment_score"), 0.0)
+        for item in visible_messages
+        if item.get("sentiment_score") is not None
+    ]
+    avg_sentiment = round(sum(scores) / len(scores), 4) if scores else 0.0
+    if avg_sentiment > 0.2:
+        sentiment_label = "positive"
+    elif avg_sentiment < -0.2:
+        sentiment_label = "negative"
+    else:
+        sentiment_label = "neutral"
+    lowered = " ".join(str(item.get("content") or "").lower() for item in visible_messages[-5:])
+    resolution_status = "in_progress"
+    if any(term in lowered for term in ("human", "agent", "escalate")):
+        resolution_status = "escalated"
+    elif any(term in lowered for term in ("thanks", "thank you", "resolved", "done")):
+        resolution_status = "resolved"
+    elif latest_customer:
+        resolution_status = "unresolved"
+    summary_text = (
+        f"Conversation with {customer_name}: {total_messages} messages."
+        if not latest_text
+        else f"Conversation with {customer_name}: latest customer message was '{latest_text}'."
+    )
+    payload = InteractionSummaryResult(
+        summary=summary_text,
+        topics=topics,
+        sentiment_label=sentiment_label,
+        resolution_status=resolution_status,
+    ).model_dump()
+    payload.update(
+        {
+            "total_messages": total_messages,
+            "avg_sentiment": avg_sentiment,
+            "escalated": resolution_status == "escalated",
+            "ai_handled": True,
+            "source": "local_aggregate",
+        }
+    )
+    return payload
+
+
+def _fallback_daily_summary(date_str: str, interactions: list) -> dict:
+    total_interactions = len(interactions or [])
+    total_messages = sum(_safe_int(item.get("total_messages")) for item in interactions or [])
+    weighted_sentiment = 0.0
+    weight_total = 0
+    for item in interactions or []:
+        weight = max(_safe_int(item.get("total_messages"), 1), 1)
+        weighted_sentiment += _safe_float(item.get("avg_sentiment"), 0.0) * weight
+        weight_total += weight
+    avg_sentiment = round(weighted_sentiment / weight_total, 4) if weight_total else 0.0
+    escalations = sum(1 for item in interactions or [] if item.get("escalated"))
+    ai_handled_count = sum(1 for item in interactions or [] if item.get("ai_handled"))
+    if avg_sentiment > 0.2:
+        overall_sentiment = "positive"
+    elif avg_sentiment < -0.2:
+        overall_sentiment = "negative"
+    else:
+        overall_sentiment = "neutral"
+    highlight_issues = [f"{escalations} escalated interactions"] if escalations else []
+    summary_text = (
+        "No interactions recorded."
+        if not total_interactions
+        else (
+            f"{total_interactions} interactions on {date_str}; "
+            f"{total_messages} messages, {escalations} escalations, average sentiment {avg_sentiment:.2f}."
+        )
+    )
+    payload = DailySummaryResult(
+        total_interactions=total_interactions,
+        overall_sentiment=overall_sentiment,
+        highlight_issues=highlight_issues,
+        summary_text=summary_text,
+    ).model_dump()
+    payload.update(
+        {
+            "date": date_str,
+            "total_messages": total_messages,
+            "avg_sentiment": avg_sentiment,
+            "escalations": escalations,
+            "ai_handled_count": ai_handled_count,
+            "source": "local_aggregate",
+        }
+    )
+    return payload
+
+
 def _safe_json_loads(value: str) -> dict:
     try:
         parsed = json.loads(value or "{}")
@@ -484,95 +611,11 @@ async def summarize_conversation(messages: list, db=None, company_id: str = "") 
 async def summarize_customer_interaction(
     messages: list, customer_info: dict | None = None, db=None, company_id: str = ""
 ) -> dict:
-    if not messages:
-        return InteractionSummaryResult().model_dump()
-    customer_name = (customer_info or {}).get("name", "Unknown customer")
-    rendered_messages = _render_messages(messages)
-    prompt = (
-        "You are a CRM interaction summarizer.\n"
-        f"Task: analyze one customer support conversation for {customer_name}.\n"
-        "Input format:\n"
-        "- conversation: chronological labeled turns\n"
-        "- customer_name: display name only for reference\n"
-        "Output format: return ONLY valid JSON with this schema:\n"
-        '{"summary":"2-3 sentence summary","topics":["list","of","topics"],'
-        '"sentiment_label":"positive|negative|neutral|mixed","key_questions":["questions"],'
-        '"products_discussed":["products"],"resolution_status":"resolved|unresolved|escalated|in_progress"}\n'
-        "Rules:\n"
-        "- Keep topics and products grounded in the conversation.\n"
-        "- resolution_status must reflect the current end state, not an optimistic guess.\n"
-        f"\nconversation:\n{truncate_text_for_tokens(rendered_messages, 2500)}"
-    )
-    try:
-        return await call_model_json(
-            prompt,
-            InteractionSummaryResult,
-            engine=await _resolve_engine_for_request(db=db, company_id=company_id),
-            call_purpose="customer_interaction_summary",
-            function_name="summarize_customer_interaction",
-            agent_name="analytics",
-            max_provider_attempts=1,
-            allow_provider_fallback=False,
-        )
-    except Exception:
-        return InteractionSummaryResult(
-            summary=f"Conversation with {customer_name}: {len(messages)} messages.",
-            resolution_status="in_progress",
-        ).model_dump()
+    return _fallback_interaction_summary(messages, customer_info)
 
 
 async def generate_daily_ai_summary(date_str: str, interactions: list, db=None, company_id: str = "") -> dict:
-    if not interactions:
-        return {
-            **DailySummaryResult(total_interactions=0, summary_text="No interactions recorded.").model_dump(),
-            "date": date_str,
-        }
-    total = len(interactions)
-    digest = "\n".join(
-        [
-            f"{index + 1}. {item.get('customer_name', '?')} | {item.get('sentiment_label', '?')} | {item.get('resolution_status', '?')} | {item.get('summary', '')}"  # noqa: E501
-            for index, item in enumerate(interactions[:50])
-        ]
-    )
-    prompt = (
-        "You are an AI operations analyst for a CRM workspace.\n"
-        f"Task: create a daily summary for all customer interactions on {date_str}.\n"
-        "Input format:\n"
-        "- total_interactions: integer count\n"
-        "- digest: compact list of customer interactions with sentiment and status\n"
-        "Output format: return ONLY valid JSON with this schema:\n"
-        '{"total_interactions":'
-        f'{total},"top_topics":["5 topics"],"overall_sentiment":"positive|negative|neutral|mixed",'
-        '"highlight_issues":["issues"],"recommendations":["3-5 actions"],"summary_text":"3-4 sentence executive summary"}\n'
-        "Rules:\n"
-        "- recommendations must be operationally actionable.\n"
-        "- highlight_issues should focus on repeated friction, escalations, or process gaps.\n"
-        f"\ntotal_interactions: {total}\n"
-        f"\ndigest:\n{truncate_text_for_tokens(digest, 3500)}"
-    )
-    try:
-        return {
-            **await call_model_json(
-                prompt,
-                DailySummaryResult,
-                engine=await _resolve_engine_for_request(db=db, company_id=company_id, use_pro=True),
-                use_pro=True,
-                call_purpose="daily_summary",
-                function_name="generate_daily_ai_summary",
-                agent_name="analytics",
-                max_provider_attempts=1,
-                allow_provider_fallback=False,
-            ),
-            "date": date_str,
-        }
-    except Exception:
-        return {
-            **DailySummaryResult(
-                total_interactions=total,
-                summary_text=f"{total} interactions on {date_str}.",
-            ).model_dump(),
-            "date": date_str,
-        }
+    return _fallback_daily_summary(date_str, interactions)
 
 
 __all__ = [

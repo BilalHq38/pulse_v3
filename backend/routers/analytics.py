@@ -292,7 +292,7 @@ async def generate_daily_summary_endpoint(request: Request, date: Optional[str] 
         summary_id,
         cid,
         target_date_dt.date(),
-        str(summary.get("summary", "")),
+        str(summary.get("summary") or summary.get("summary_text") or ""),
         int(summary.get("total_interactions", len(interactions))),
         int(summary.get("total_messages", 0)),
         float(summary.get("avg_sentiment", 0)),

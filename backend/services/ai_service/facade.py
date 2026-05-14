@@ -459,6 +459,7 @@ async def generate_combined_ai_analysis(
                 "company_id": company_id or (customer_info or {}).get("company_id", ""),
                 "conversation_context": conversation_context,
                 "customer": customer_info or {},
+                "lead": kwargs.get("lead") or {},
                 "knowledge_context": knowledge_context,
                 "long_term_summary": long_term_summary,
                 "historical_sentiment": historical_sentiment,
@@ -665,49 +666,11 @@ async def summarize_conversation(messages: list, db=None, company_id: str = "") 
 async def summarize_customer_interaction(
     messages: list, customer_info: dict | None = None, db=None, company_id: str = ""
 ) -> dict:
-    if _prefer_local_impl():
-        return await _local_summarize_customer_interaction(messages, customer_info, db=db, company_id=company_id)
-    try:
-        return await _call_remote_ai(
-            "POST",
-            "/api/ai/summary/interaction",
-            company_id=company_id or (customer_info or {}).get("company_id", ""),
-            json_body={
-                "messages": messages,
-                "customer": customer_info or {},
-                "company_id": company_id or (customer_info or {}).get("company_id", ""),
-            },
-        )
-    except Exception as exc:
-        logger.warning(
-            "ai_service interaction summary remote failed company_id=%s error=%s",
-            company_id or (customer_info or {}).get("company_id", ""),
-            exc.__class__.__name__,
-        )
-        if _allow_local_fallback():
-            return await _local_summarize_customer_interaction(messages, customer_info, db=db, company_id=company_id)
-        return _safe_interaction_summary_default(messages, customer_info)
+    return await _local_summarize_customer_interaction(messages, customer_info, db=db, company_id=company_id)
 
 
 async def generate_daily_ai_summary(date_str: str, interactions: list, db=None, company_id: str = "") -> dict:
-    if _prefer_local_impl():
-        return await _local_generate_daily_ai_summary(date_str, interactions, db=db, company_id=company_id)
-    try:
-        return await _call_remote_ai(
-            "POST",
-            "/api/ai/summary/daily",
-            company_id=company_id,
-            json_body={"date": date_str, "interactions": interactions, "company_id": company_id},
-        )
-    except Exception as exc:
-        logger.warning(
-            "ai_service daily summary remote failed company_id=%s error=%s",
-            company_id or "",
-            exc.__class__.__name__,
-        )
-        if _allow_local_fallback():
-            return await _local_generate_daily_ai_summary(date_str, interactions, db=db, company_id=company_id)
-        return _safe_daily_summary_default(date_str, interactions)
+    return await _local_generate_daily_ai_summary(date_str, interactions, db=db, company_id=company_id)
 
 
 async def generate_product_description(

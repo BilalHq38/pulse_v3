@@ -560,7 +560,7 @@ def ai_max_provider_attempts(default: int = 3) -> int:
         return default
 
 
-def ai_max_llm_calls_per_message(default: int = 2) -> int:
+def ai_max_llm_calls_per_message(default: int = 1) -> int:
     try:
         return max(1, int(os.environ.get("AI_MAX_LLM_CALLS_PER_MESSAGE", str(default)) or default))
     except ValueError:

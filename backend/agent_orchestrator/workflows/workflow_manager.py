@@ -341,6 +341,7 @@ class WorkflowManager:
             max_llm_calls = int(metadata.get("max_llm_calls_per_message") or ai_max_llm_calls_per_message())
         except Exception:
             max_llm_calls = ai_max_llm_calls_per_message()
+        max_llm_calls = min(max_llm_calls, 1)
         llm_context_token = set_llm_context(
             message_id=str(getattr(request, "message_id", "") or ""),
             conversation_id=str(getattr(request, "conversation_id", "") or ""),
