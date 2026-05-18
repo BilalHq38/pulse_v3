@@ -25,7 +25,8 @@ export default function UnificationTab({
   useSocket(handleSocketEvent);
 
   return (
-    <div className="space-y-6">
+    // Reduce vertical whitespace between sections for a more compact layout
+    <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold text-slate-900">Cross-Platform Unification</h2>
@@ -40,15 +41,16 @@ export default function UnificationTab({
 
       {/* Stats Row */}
       <div className="grid grid-cols-3 gap-4">
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
+        {/* Each stat card has reduced padding to condense the layout */}
+        <div className="bg-white border border-slate-200 rounded-xl p-3">
           <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">Unified Profiles</p>
           <p className="text-2xl font-bold text-slate-900 mt-1">{unifiedProfiles.length}</p>
         </div>
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <div className="bg-white border border-slate-200 rounded-xl p-3">
           <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">Pending Suggestions</p>
           <p className="text-2xl font-bold text-amber-600 mt-1">{mergeSuggestions.length}</p>
         </div>
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <div className="bg-white border border-slate-200 rounded-xl p-3">
           <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">Total Linked</p>
           <p className="text-2xl font-bold text-emerald-600 mt-1">{unifiedProfiles.reduce((sum, p) => sum + (p.member_count || 0), 0)}</p>
         </div>
@@ -57,7 +59,8 @@ export default function UnificationTab({
       {/* Merge Suggestions */}
       {mergeSuggestions.length > 0 && (
         <div className="bg-white border border-amber-200 rounded-xl overflow-hidden">
-          <div className="px-4 py-3 bg-amber-50 border-b border-amber-200 flex items-center gap-2">
+          {/* Suggestion header: reduced padding */}
+          <div className="px-3 py-2 bg-amber-50 border-b border-amber-200 flex items-center gap-2">
             <AlertTriangle size={14} className="text-amber-600" />
             <h3 className="text-sm font-semibold text-amber-800">Merge Suggestions ({mergeSuggestions.length})</h3>
             <span className="text-[10px] text-amber-600 ml-auto">Review and confirm cross-platform matches</span>
@@ -67,7 +70,7 @@ export default function UnificationTab({
               const score = parseFloat(s.match_score) || 0;
               const scoreColor = score >= 0.85 ? 'text-emerald-600 bg-emerald-50' : score >= 0.7 ? 'text-amber-600 bg-amber-50' : 'text-slate-500 bg-slate-50';
               return (
-                <div key={s.id} className="px-4 py-3 hover:bg-slate-50 transition-colors">
+                <div key={s.id} className="px-3 py-2 hover:bg-slate-50 transition-colors">
                   <div className="flex items-center gap-4">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
@@ -126,7 +129,7 @@ export default function UnificationTab({
 
       {/* Manual Merge */}
       {isAdmin && (
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <div className="bg-white border border-slate-200 rounded-xl p-3">
           <h3 className="text-sm font-semibold text-slate-900 mb-3">Manual Merge</h3>
           <p className="text-xs text-slate-400 mb-3">Use the dedicated Unification page to select readable profiles before merging.</p>
           <a
@@ -140,7 +143,8 @@ export default function UnificationTab({
 
       {/* Unified Profiles List */}
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+        {/* Header: reduced padding */}
+        <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between">
           <h3 className="text-sm font-semibold text-slate-900">Unified Profiles ({unifiedProfiles.length})</h3>
         </div>
         {unifiedProfiles.length === 0 ? (
@@ -163,7 +167,7 @@ export default function UnificationTab({
                     message: 'That unified profile could not be loaded right now.',
                   });
                 }
-              }} className="w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors">
+              }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition-colors">
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
                     {(p.display_name || '?').charAt(0)}
@@ -186,18 +190,25 @@ export default function UnificationTab({
         )}
       </div>
 
-      {/* Unified Profile Detail Modal */}
+      {/* Unified Profile Detail Panel */}
       {selectedUnifiedProfile && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setSelectedUnifiedProfile(null)}>
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-4 flex items-center justify-between">
+        <div className="fixed inset-0 z-50 flex bg-black/50 backdrop-blur-sm">
+          {/* Backdrop area closes the panel when clicked */}
+          <div className="flex-1" onClick={() => setSelectedUnifiedProfile(null)} />
+          {/* Side panel for profile details */}
+          <div
+            className="ml-auto flex flex-col w-full max-w-md sm:max-w-lg md:max-w-xl bg-white shadow-2xl overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Sticky header to keep controls visible during scroll */}
+            <div className="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-4 flex items-center justify-between sticky top-0 z-10">
               <div>
                 <h3 className="text-white font-bold text-lg">{selectedUnifiedProfile.display_name}</h3>
                 <p className="text-indigo-200 text-xs">{selectedUnifiedProfile.platforms_used} • {selectedUnifiedProfile.total_interactions} interactions</p>
               </div>
               <button onClick={() => setSelectedUnifiedProfile(null)} className="p-1.5 rounded-lg bg-white/20 hover:bg-white/30 text-white"><X size={16} /></button>
             </div>
-            <div className="p-6 overflow-y-auto max-h-[60vh] space-y-6">
+            <div className="p-6 space-y-6">
               <div>
                 <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Linked Profiles ({selectedUnifiedProfile.members?.length || 0})</h4>
                 <div className="space-y-2">

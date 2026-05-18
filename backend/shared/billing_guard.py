@@ -76,6 +76,7 @@ _EXEMPT_PATH_PREFIXES = (
     "/api/billing/customer-portal",
     "/api/billing/plans",
     "/api/billing/subscription",
+    "/api/visitor/track",
     "/api/admin",
     "/api/platform/super-admin",
     "/health",
@@ -108,6 +109,7 @@ _EMAIL_VERIFICATION_EXEMPT_PREFIXES = (
     "/api/billing/customer-portal",
     "/api/billing/plans",
     "/api/billing/subscription",
+    "/api/visitor/track",
     "/api/admin",
     "/api/platform/super-admin",
     "/health",
@@ -125,6 +127,7 @@ _ENTERPRISE_INVITE_EXEMPT_PREFIXES = (
     "/api/billing/customer-portal",
     "/api/billing/plans",
     "/api/billing/subscription",
+    "/api/visitor/track",
     "/api/settings/company",
     "/api/settings/personal",
     "/api/admin",
@@ -159,6 +162,10 @@ def _company_id(auth: dict[str, Any]) -> str:
 
 def _role(auth: dict[str, Any]) -> str:
     return str(auth.get("role") or "").strip().lower()
+
+
+def _user_id(auth: dict[str, Any]) -> str:
+    return str(auth.get("sub") or auth.get("user_id") or "").strip()
 
 
 def _jti(auth: dict[str, Any]) -> str:
@@ -217,6 +224,26 @@ async def check_enterprise_invite_gate(request: Request) -> None:
     raise HTTPException(status_code=403, detail="ENTERPRISE_INVITE_REQUIRED")
 
 
+async def check_user_status_active(request: Request) -> None:
+    """
+    Enforce live Super Admin pause/block/inactive controls. This deliberately
+    reads the DB instead of Redis so status changes take effect immediately.
+    """
+    auth = _get_auth_context(request)
+    user_id = _user_id(auth)
+    if not user_id:
+        return
+    row = await _db(request).fetchrow("SELECT status FROM users WHERE id=$1 LIMIT 1", user_id)
+    if not row:
+        raise HTTPException(status_code=401, detail="Session has been revoked. Please log in again.")
+    status = str(row.get("status") or "active").strip().lower()
+    if status in {"paused", "blocked", "inactive"}:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your account is {status}. Please contact your administrator.",
+        )
+
+
 async def enforce_access_gates(request: Request) -> None:
     """
     Email verification + enterprise invite gate (JWT claims ev / ei).
@@ -228,6 +255,7 @@ async def enforce_access_gates(request: Request) -> None:
     auth = _get_auth_context(request)
     if not _company_id(auth) and _role(auth) != "super_admin":
         return
+    await check_user_status_active(request)
     if not _is_email_verification_exempt(path):
         await check_email_verified(request)
     if not _relaxed_billing_env() and not _is_enterprise_invite_exempt(path):

@@ -6,9 +6,24 @@ from io import BytesIO, StringIO
 import pandas as pd
 from fastapi import HTTPException
 
+from core.phone_normalization import phone_region_from_country_hint
+
 SUPPORTED_TABULAR_UPLOAD_EXTENSIONS = {"xlsx", "xls", "csv"}
 MAX_TABULAR_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_TABULAR_UPLOAD_ROWS = 2000
+PHONE_REGION_UPLOAD_KEYS = (
+    "phone_region",
+    "default_phone_region",
+    "region",
+    "country",
+    "country_code",
+    "phone_country",
+    "phone_country_code",
+    "dial_code",
+    "calling_code",
+    "mobile_country_code",
+    "whatsapp_country_code",
+)
 
 
 def normalize_header(value: str) -> str:
@@ -47,6 +62,10 @@ def split_multi_value(value: str) -> list[str]:
         seen.add(normalized)
         deduped.append(item)
     return deduped
+
+
+def phone_region_from_upload_row(row: dict) -> str:
+    return phone_region_from_country_hint(*(str(row.get(key) or "") for key in PHONE_REGION_UPLOAD_KEYS)) or ""
 
 
 def parse_tabular_upload(filename: str, payload: bytes) -> list[dict]:

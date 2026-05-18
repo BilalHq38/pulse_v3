@@ -65,6 +65,20 @@ const META_CHANNELS = ['whatsapp', 'instagram', 'facebook'];
 /** Order shown in Settings → Channels; fills gaps if API omits a row (e.g. legacy DB). */
 const CHANNEL_LIST_ORDER = ['whatsapp', 'instagram', 'facebook', 'email', 'web_chat'];
 
+function LogoUploadTrigger({ onClick, disabled = false, uploading = false, title = 'Change image' }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="absolute -bottom-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full border-2 border-white bg-blue-600 text-white shadow transition-colors hover:bg-blue-500 disabled:opacity-60"
+      title={title}
+    >
+      {uploading ? <div className="h-2.5 w-2.5 rounded-full border-2 border-white border-t-transparent animate-spin" /> : <Plus size={10} className="text-white" />}
+    </button>
+  );
+}
+
 function normalizeListPayload(payload, keys = []) {
   if (Array.isArray(payload)) return payload;
   if (!payload || typeof payload !== 'object') return [];
@@ -217,7 +231,9 @@ export default function SettingsPage() {
     return avatar;
   };
   const personalAvatarRef = useRef(null);
+  const companyLogoInputRef = useRef(null);
   const settingsSidebarRef = useRef(null);
+  const [companyLogoUploading, setCompanyLogoUploading] = useState(false);
   const [showProductForm, setShowProductForm] = useState(false);
   const [editingProduct, setEditingProduct] = useState(null);
   const [selectedProduct, setSelectedProduct] = useState(null);
@@ -900,6 +916,11 @@ export default function SettingsPage() {
       };
       const res = await api.put('/settings/company', payload);
       if (res?.data) setCompany(res.data);
+      const updatedCompanyName = res?.data?.company_name || company?.company_name || '';
+      if (updatedCompanyName) {
+        localStorage.setItem('pe_company_name', updatedCompanyName);
+        window.dispatchEvent(new CustomEvent('pe-company-changed', { detail: { company_name: updatedCompanyName } }));
+      }
       setCompanyValidationErrors({});
       setSaving('company_done');
       showToast({
@@ -987,6 +1008,42 @@ export default function SettingsPage() {
       }
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleCompanyLogoChange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    if (!String(file.type || '').startsWith('image/')) {
+      showToast({
+        type: 'error',
+        title: 'Unsupported File',
+        message: 'Upload a JPG, PNG, WEBP, or GIF image for the company logo.',
+      });
+      return;
+    }
+    setCompanyLogoUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await api.post('/settings/company/logo/upload', formData);
+      const nextCompany = res?.data?.company || { ...(company || {}), logo_url: res?.data?.url || '' };
+      setCompany(nextCompany);
+      showToast({
+        type: 'success',
+        title: 'Logo Updated',
+        message: 'Company logo was updated.',
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Logo Upload Failed',
+        message: getErrorMessage(err, 'We could not update the company logo.'),
+      });
+    } finally {
+      setCompanyLogoUploading(false);
+    }
   };
 
   const createTemplate = async () => {
@@ -1198,10 +1255,12 @@ export default function SettingsPage() {
       });
       loadSettings();
     } catch (err) {
+      const message = getErrorMessage(err, 'We could not send that invitation.');
+      const lowerMessage = message.toLowerCase();
       showToast({
         type: 'error',
-        title: 'Invite Failed',
-        message: getErrorMessage(err, 'We could not send that invitation.'),
+        title: lowerMessage.includes('team member limit') || lowerMessage.includes('limit has been reached') ? 'Team Limit Reached' : 'Invite Failed',
+        message,
       });
     }
   };
@@ -1721,13 +1780,7 @@ export default function SettingsPage() {
                           : displayNameInitial(personalSettings.name)
                         }
                       </div>
-                      <button
-                        onClick={() => personalAvatarRef.current?.click()}
-                        className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full bg-blue-600 border-2 border-white flex items-center justify-center hover:bg-blue-500 transition-colors shadow"
-                        title="Change profile photo"
-                      >
-                        <Plus size={10} className="text-white" />
-                      </button>
+                      <LogoUploadTrigger onClick={() => personalAvatarRef.current?.click()} title="Change profile photo" />
                       <input ref={personalAvatarRef} type="file" accept="image/*" className="hidden" onChange={handlePersonalAvatarChange} />
                     </div>
                     <div>
@@ -2157,10 +2210,19 @@ export default function SettingsPage() {
 
               {/* Profile preview card */}
               <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 rounded-xl p-5 flex items-center gap-5">
-                {company.logo_url
-                  ? <img src={company.logo_url} alt="logo" className="w-16 h-16 rounded-xl object-cover border border-white shadow" />
-                  : <div className="w-16 h-16 rounded-xl bg-white border border-blue-200 shadow flex items-center justify-center"><Building2 size={28} className="text-blue-400" /></div>
-                }
+                <div className="relative">
+                  {company.logo_url
+                    ? <img src={resolveMediaUrl(company.logo_url)} alt="logo" className="w-16 h-16 rounded-xl object-cover border border-white shadow" onError={() => setCompany((prev) => ({ ...(prev || {}), logo_url: '' }))} />
+                    : <div className="w-16 h-16 rounded-xl bg-white border border-blue-200 shadow flex items-center justify-center"><Building2 size={28} className="text-blue-400" /></div>
+                  }
+                  <LogoUploadTrigger
+                    onClick={() => companyLogoInputRef.current?.click()}
+                    disabled={companyLogoUploading}
+                    uploading={companyLogoUploading}
+                    title="Upload company logo"
+                  />
+                  <input ref={companyLogoInputRef} type="file" accept="image/*" className="hidden" onChange={handleCompanyLogoChange} />
+                </div>
                 <div>
                   <p className="text-base font-bold text-slate-900">{company.company_name || 'Your Company'}</p>
                   {company.tagline && <p className="text-xs text-slate-500 italic mt-0.5">{company.tagline}</p>}
@@ -2209,7 +2271,21 @@ export default function SettingsPage() {
                     {(company.description || '').length} / 5000
                   </div>
                 </div>
-                <div><label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Image size={11} /> Logo URL</label><input value={company.logo_url || ''} onChange={(e) => setCompany({...company, logo_url: e.target.value})} placeholder="https://yourcompany.com/logo.png" className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" /></div>
+                <div>
+                  <label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Image size={11} /> Logo URL</label>
+                  <div className="flex gap-2">
+                    <input value={company.logo_url || ''} onChange={(e) => setCompany({...company, logo_url: e.target.value})} placeholder="https://yourcompany.com/logo.png" className="min-w-0 flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" />
+                    <button
+                      type="button"
+                      onClick={() => companyLogoInputRef.current?.click()}
+                      disabled={companyLogoUploading}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                    >
+                      {companyLogoUploading ? <div className="h-3 w-3 rounded-full border-2 border-slate-400 border-t-transparent animate-spin" /> : <Plus size={13} />}
+                      Upload
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {/* -- Contact Info -- */}

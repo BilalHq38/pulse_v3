@@ -285,10 +285,14 @@ export default function CustomersPage() {
     setShowMethodPicker(true);
   };
 
-  const buildCustomerEmailDraft = (customer) => ({
-    subject: `Pulse Engine follow up for ${customer?.name || 'customer'}`,
-    body: `Hi ${customer?.name || 'there'},\n\nThis is a follow-up from Pulse Engine.\n\nBest regards,\nPulse Engine Team`,
-  });
+  const buildCustomerEmailDraft = (customer) => {
+    const companyName = String(localStorage.getItem('pe_company_name') || '').trim();
+    const senderLabel = companyName || 'our team';
+    return {
+      subject: `Follow up from ${senderLabel}`,
+      body: `Hi ${customer?.name || 'there'},\n\nThis is a follow-up from ${senderLabel}.\n\nBest regards,\n${senderLabel}`,
+    };
+  };
 
   const closeEmailComposer = () => {
     setEmailComposer({

@@ -381,7 +381,6 @@ export default function SuperAdminDashboardPage() {
                       <tr key={t.company_id} className="border-b border-slate-100 hover:bg-slate-50/50">
                         <td className="px-3 py-2.5">
                           <div className="font-medium text-slate-900">{t.company_name || '—'}</div>
-                          <div className="text-[11px] text-slate-400 font-mono">{t.company_id}</div>
                         </td>
                         <td className="px-3 py-2.5 text-slate-700">
                           <span className="inline-flex px-2 py-0.5 rounded-md bg-slate-100 text-xs font-semibold">
@@ -423,7 +422,7 @@ export default function SuperAdminDashboardPage() {
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog">
               <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-5 border border-slate-200">
                 <h3 className="text-base font-bold text-slate-900 mb-1">Edit plan limits</h3>
-                <p className="text-xs text-slate-500 mb-4 font-mono break-all">{planEditTenant.company_id}</p>
+                <p className="text-xs text-slate-500 mb-4">{planEditTenant.company_name || 'Selected workspace'}</p>
                 <label className="block text-xs font-semibold text-slate-600 mb-1">Monthly conversation limit</label>
                 <input
                   type="number"
@@ -712,7 +711,6 @@ export default function SuperAdminDashboardPage() {
                                     <span className="inline-flex items-center gap-1"><Calendar size={12} /> Joined {admin.created_at ? new Date(admin.created_at).toLocaleDateString() : '—'}</span>
                                     {admin.last_login && <span className="inline-flex items-center gap-1"><Clock size={12} /> Last login {new Date(admin.last_login).toLocaleString()}</span>}
                                     <span className="inline-flex items-center gap-1"><Activity size={12} /> Auth: {admin.auth_provider || 'email'}</span>
-                                    {admin.company_id && <span className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-400">Tenant: {admin.company_id.substring(0, 8)}…</span>}
                                   </div>
                                   <div className="mt-3 flex flex-wrap gap-2">
                                     {['active', 'paused', 'blocked', 'inactive'].filter(s => s !== admin.status).map(st => {
@@ -842,7 +840,6 @@ export default function SuperAdminDashboardPage() {
                                           {agent.last_login && <span className="inline-flex items-center gap-1"><Clock size={12} /> Last login {new Date(agent.last_login).toLocaleString()}</span>}
                                           <span className="inline-flex items-center gap-1"><Activity size={12} /> Auth: {agent.auth_provider || 'email'}</span>
                                           <span className="inline-flex items-center gap-1">Role: {agent.role === 'company_agent' ? 'Company Agent' : (agent.role || 'Company Agent')}</span>
-                                          {agent.company_id && <span className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-400">Tenant: {agent.company_id.substring(0, 8)}…</span>}
                                         </div>
                                         <div className="mt-3 flex flex-wrap gap-2">
                                           {['active', 'paused', 'blocked', 'inactive'].filter(s => s !== agent.status).map(st => {
@@ -961,7 +958,6 @@ export default function SuperAdminDashboardPage() {
                                     {agent.last_login && <span className="inline-flex items-center gap-1"><Clock size={12} /> Last login {new Date(agent.last_login).toLocaleString()}</span>}
                                     <span className="inline-flex items-center gap-1"><Activity size={12} /> Auth: {agent.auth_provider || 'email'}</span>
                                     <span className="inline-flex items-center gap-1">Role: {agent.role === 'company_agent' ? 'Company Agent' : (agent.role || 'Company Agent')}</span>
-                                    {agent.company_id && <span className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-400">Tenant: {agent.company_id.substring(0, 8)}…</span>}
                                   </div>
                                   <div className="mt-3 flex flex-wrap gap-2">
                                     {['active', 'paused', 'blocked', 'inactive'].filter(s => s !== agent.status).map(st => {
@@ -1089,9 +1085,9 @@ export default function SuperAdminDashboardPage() {
                       {filteredLogs.map((l, i) => (
                         <tr key={l.id || i} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
                           <td className="px-4 py-2.5 text-xs text-slate-400 whitespace-nowrap">{l.created_at ? new Date(l.created_at).toLocaleString() : '—'}</td>
-                          <td className="px-4 py-2.5 text-xs text-slate-600 max-w-[120px] truncate">{l.company_name || (l.company_id ? l.company_id.substring(0, 8) + '…' : '—')}</td>
+                          <td className="px-4 py-2.5 text-xs text-slate-600 max-w-[120px] truncate">{l.company_name || 'Unknown company'}</td>
                           <td className="px-4 py-2.5 text-xs max-w-[140px]">
-                            <p className="text-slate-700 font-medium truncate">{l.user_name || (l.user_id ? l.user_id.substring(0, 8) + '…' : '—')}</p>
+                            <p className="text-slate-700 font-medium truncate">{l.user_name || 'Unknown user'}</p>
                             {(l.company_name || (userMap[l.user_id] || {}).company_name) && <p className="text-slate-400 text-[11px] truncate">{l.company_name || (userMap[l.user_id] || {}).company_name}</p>}
                           </td>
                           <td className="px-4 py-2.5">
@@ -1226,10 +1222,10 @@ export default function SuperAdminDashboardPage() {
                               }`}>{l.event_type || 'unknown'}</span>
                             </td>
                             <td className="px-4 py-2.5 text-xs max-w-[140px]">
-                              <p className="text-slate-700 font-medium truncate">{l.user_name || (l.user_id ? l.user_id.substring(0, 8) + '…' : '—')}</p>
+                              <p className="text-slate-700 font-medium truncate">{l.user_name || 'Unknown user'}</p>
                               {(userMap[l.user_id] || {}).role && <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${roleBadgeCls((userMap[l.user_id] || {}).role)}`}>{roleLabel((userMap[l.user_id] || {}).role)}</span>}
                             </td>
-                            <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[120px] truncate">{l.company_name || (l.company_id ? l.company_id.substring(0, 8) + '…' : '—')}</td>
+                            <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[120px] truncate">{l.company_name || 'Unknown company'}</td>
                             <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[180px] truncate">{l.ip_address || l.details || '—'}</td>
                           </tr>
                         ))}
@@ -1280,10 +1276,10 @@ export default function SuperAdminDashboardPage() {
                               <td className="px-4 py-2.5"><span className={`w-2 h-2 rounded-full inline-block ${dotColor}`} /></td>
                               <td className="px-4 py-2.5"><span className={`text-[10px] px-2 py-0.5 rounded border font-medium ${badgeCls}`}>{eventLabel}</span></td>
                               <td className="px-4 py-2.5 text-xs max-w-[140px]">
-                                <p className="text-slate-700 font-medium truncate">{h.user_name || (h.user_id ? h.user_id.substring(0, 8) + '…' : '—')}</p>
+                                <p className="text-slate-700 font-medium truncate">{h.user_name || 'Unknown user'}</p>
                                 {(userMap[h.user_id] || {}).role && <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${roleBadgeCls((userMap[h.user_id] || {}).role)}`}>{roleLabel((userMap[h.user_id] || {}).role)}</span>}
                               </td>
-                              <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[120px] truncate">{h.company_name || (h.company_id ? h.company_id.substring(0, 8) + '…' : '—')}</td>
+                              <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[120px] truncate">{h.company_name || 'Unknown company'}</td>
                               <td className="px-4 py-2.5"><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-medium capitalize">{h.auth_provider || 'email'}</span></td>
                               <td className="px-4 py-2.5 text-xs text-slate-400 font-mono">{h.ip_address || '—'}</td>
                               <td className="px-4 py-2.5 text-xs text-slate-400 whitespace-nowrap">{h.event_time ? new Date(h.event_time).toLocaleString() : '—'}</td>
@@ -1321,10 +1317,10 @@ export default function SuperAdminDashboardPage() {
                         {loginSessions.slice(0, 50).map((s, i) => (
                           <tr key={s.id || i} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
                             <td className="px-4 py-2.5 text-xs max-w-[140px]">
-                              <p className="text-slate-700 font-medium truncate">{s.user_name || (s.user_id ? s.user_id.substring(0, 8) + '…' : '—')}</p>
+                              <p className="text-slate-700 font-medium truncate">{s.user_name || 'Unknown user'}</p>
                               {(userMap[s.user_id] || {}).role && <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${roleBadgeCls((userMap[s.user_id] || {}).role)}`}>{roleLabel((userMap[s.user_id] || {}).role)}</span>}
                             </td>
-                            <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[120px] truncate">{s.company_name || (s.company_id ? s.company_id.substring(0, 8) + '…' : '—')}</td>
+                            <td className="px-4 py-2.5 text-xs text-slate-400 max-w-[120px] truncate">{s.company_name || 'Unknown company'}</td>
                             <td className="px-4 py-2.5 text-xs text-slate-400 whitespace-nowrap">{s.login_time ? new Date(s.login_time).toLocaleString() : '—'}</td>
                             <td className="px-4 py-2.5 text-xs">
                               <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] font-medium">{s.auth_provider || 'email'}</span>

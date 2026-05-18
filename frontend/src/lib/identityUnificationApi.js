@@ -136,7 +136,7 @@ export const identityUnificationApi = {
 
   async getProfileDetail(profileId) {
     const safeProfileId = String(profileId || '').trim();
-    if (!safeProfileId) throw new Error('Profile ID is required.');
+    if (!safeProfileId) throw new Error('Select a profile before loading details.');
 
     const [summaryResult, rawResult] = await Promise.allSettled([
       api.get(`/identity/profiles/${encodeURIComponent(safeProfileId)}`),
@@ -185,7 +185,7 @@ export const identityUnificationApi = {
 
   async split({ profileId, customerId = '', mappingIds = [], fingerprintIds = [], splitReason = 'manual_split' }) {
     const safeProfileId = String(profileId || '').trim();
-    if (!safeProfileId) throw new Error('Profile ID is required for split.');
+    if (!safeProfileId) throw new Error('Select a profile before splitting.');
 
     const payload = {
       profile_id: safeProfileId,
@@ -205,7 +205,7 @@ export const identityUnificationApi = {
 
   async getByCustomer(customerId) {
     const safeCustomerId = String(customerId || '').trim();
-    if (!safeCustomerId) throw new Error('Customer ID is required.');
+    if (!safeCustomerId) throw new Error('Select a customer before loading identity details.');
 
     const response = await api.get(`/identity/customer/${encodeURIComponent(safeCustomerId)}`);
     const data = asObject(response.data);

@@ -9,6 +9,7 @@ from models.reference_data import resolve_role_id
 from services.billing_helpers import assert_workspace_seat_available
 from services.db_helpers import (
     bump_user_token_version,
+    close_login_sessions,
     delete_user_account_records,
     ensure_unique_company_role,
     get_current_user_flexible,
@@ -56,6 +57,14 @@ def _strip_pw(d):
     return d
 
 
+async def _revoke_user_access_after_status_change(db, user_id: str, status: str) -> None:
+    if status == "active":
+        return
+    await bump_user_token_version(db, user_id)
+    await revoke_refresh_tokens_for_user(db, user_id, f"status_changed:{status}")
+    await close_login_sessions(db, user_id)
+
+
 @router.get("/users")
 async def list_users(request: Request):
     db = _db(request)
@@ -86,27 +95,28 @@ async def create_user(request: Request):
     if not is_valid:
         raise HTTPException(400, "; ".join(errors))
     cid = cu.get("company_id", "")
-    await assert_workspace_seat_available(db, cid)
-    if await db.fetchval(
-        "SELECT id FROM users WHERE email=$1 AND company_id=$2",
-        email,
-        cid,
-    ):
-        raise HTTPException(400, "User already exists in this company")
     role_id = await resolve_role_id(db, role)
     uid = make_id()
-    await db.execute(
-        "INSERT INTO users(id,email,password_hash,name,role,role_id,sub_role,status,avatar,company_id,onboarding_completed,plan_selected,billing_status,auth_provider,email_verified,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'',$9,TRUE,TRUE,'active','email',FALSE,NOW(),NOW())",  # noqa: E501
-        uid,
-        email,
-        hash_password(temp_pw),
-        (body.get("name", "") or "").strip() or email.split("@")[0],
-        role,
-        role_id,
-        (body.get("sub_role", "") or "").strip(),
-        body.get("status", "active") if body.get("status") in ("active", "inactive") else "active",
-        cid,
-    )
+    async with db.transaction() as conn:
+        await assert_workspace_seat_available(conn, cid)
+        if await conn.fetchval(
+            "SELECT id FROM users WHERE email=$1 AND company_id=$2",
+            email,
+            cid,
+        ):
+            raise HTTPException(400, "User already exists in this company")
+        await conn.execute(
+            "INSERT INTO users(id,email,password_hash,name,role,role_id,sub_role,status,avatar,company_id,onboarding_completed,plan_selected,billing_status,auth_provider,email_verified,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'',$9,TRUE,TRUE,'active','email',FALSE,NOW(),NOW())",  # noqa: E501
+            uid,
+            email,
+            hash_password(temp_pw),
+            (body.get("name", "") or "").strip() or email.split("@")[0],
+            role,
+            role_id,
+            (body.get("sub_role", "") or "").strip(),
+            body.get("status", "active") if body.get("status") in ("active", "inactive") else "active",
+            cid,
+        )
     return _strip_pw(dict(await db.fetchrow("SELECT * FROM users WHERE id=$1", uid)))
 
 
@@ -247,6 +257,7 @@ async def super_admin_update_user_status(user_id: str, request: Request):
     if not await db.fetchval("SELECT id FROM users WHERE id=$1", user_id):
         raise HTTPException(404, "User not found")
     await db.execute("UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2", status, user_id)
+    await _revoke_user_access_after_status_change(db, user_id, status)
     return {"status": "ok", "user_id": user_id, "new_status": status}
 
 

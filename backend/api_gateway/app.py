@@ -119,6 +119,7 @@ ROUTE_TABLE: list[tuple[str, str]] = [
     ("/api/reference-data", "customer"),
     ("/api/search", "customer"),
     ("/api/dashboard", "customer"),
+    ("/api/visitor", "customer"),
     ("/api/journey", "customer"),
     ("/api/webhook/meta", "customer"),
     ("/api/webhooks", "customer"),
@@ -400,6 +401,11 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         if isinstance(exc.detail, str) and exc.detail in (
             "EMAIL_VERIFICATION_REQUIRED",
             "ENTERPRISE_INVITE_REQUIRED",
+        ):
+            err = exc.detail
+        elif isinstance(exc.detail, str) and (
+            exc.detail.startswith("Your account is ")
+            or exc.detail.startswith("Session has been revoked")
         ):
             err = exc.detail
         return _apply_security_headers(JSONResponse(status_code=exc.status_code, content=_error_body(err)))

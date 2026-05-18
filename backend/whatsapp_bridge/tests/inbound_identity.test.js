@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   normalizeInboundPhone,
   resolveInboundSenderIdentity,
+  resolveOutboundRecipientIdentity,
 } = require("../inbound_identity");
 
 test("WhatsApp Web msg.from c.us normalizes to E.164 sender", async () => {
@@ -75,4 +76,39 @@ test("invalid sender remains invalid when no real phone candidate exists", async
   assert.equal(identity.isValid, false);
   assert.equal(identity.senderPhone, "");
   assert.equal(identity.providerSenderId, "222436977021015@lid");
+});
+
+test("outbound resolver falls back to raw data remote for mobile sent messages", async () => {
+  const identity = await resolveOutboundRecipientIdentity({
+    fromMe: true,
+    _data: { id: { remote: "923445563662@c.us" } },
+  });
+
+  assert.equal(identity.isValid, true);
+  assert.equal(identity.recipientPhone, "+923445563662");
+  assert.equal(identity.recipientPhoneDigits, "923445563662");
+  assert.equal(identity.selectedSource, "msg._data.id.remote");
+});
+
+test("outbound resolver does not turn group chats into personal recipients", async () => {
+  const identity = await resolveOutboundRecipientIdentity({
+    fromMe: true,
+    to: "120363111222333444@g.us",
+    id: { remote: "120363111222333444@g.us" },
+  });
+
+  assert.equal(identity.isValid, false);
+  assert.equal(identity.recipientPhoneDigits, "");
+});
+
+test("outbound resolver preserves raw LID target for pending identity storage", async () => {
+  const identity = await resolveOutboundRecipientIdentity({
+    fromMe: true,
+    to: "222436977021015@lid",
+    id: { remote: "222436977021015@lid" },
+  });
+
+  assert.equal(identity.isValid, false);
+  assert.equal(identity.recipientPhoneDigits, "");
+  assert.equal(identity.rawRecipientId, "222436977021015@lid");
 });

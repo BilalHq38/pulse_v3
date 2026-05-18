@@ -1,6 +1,8 @@
 import json
+from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel, Field
 
 from shared.schemas.contracts import CombinedResponse
 from agent_orchestrator.agents import capture_agent, support_agent
@@ -13,6 +15,12 @@ from services.ai_service.llm_tracking import (
     set_llm_context,
 )
 from services.ai_service import llm_client, response_generator
+
+
+class _CampaignDraftForTest(BaseModel):
+    subject: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    html_body: str = ""
 
 
 def _manager():
@@ -267,6 +275,116 @@ def test_combined_response_preserves_degraded_metadata():
 
     assert payload.llm_budget_exhausted is True
     assert payload.ai_response_generated is False
+
+
+def test_json_extraction_reports_invalid_model_output_without_runtime_error():
+    with pytest.raises(ValueError, match="valid JSON object"):
+        llm_client._extract_json_object("not json")
+
+
+def test_json_extraction_handles_common_model_json_wrappers():
+    payload = llm_client._extract_json_object(
+        """```json
+        {subject: "Hello", "body": "World", "html_body": "<p>World</p>",}
+        ```"""
+    )
+
+    assert payload == {"subject": "Hello", "body": "World", "html_body": "<p>World</p>"}
+
+
+def test_email_campaign_json_calls_can_use_campaign_token_limit():
+    selected = llm_client._json_engine_for_call(
+        {"provider": "gemini", "model_name": "gemini-test", "max_tokens": 900},
+        call_purpose="email_campaign_copy",
+    )
+
+    assert selected["max_tokens"] == 900
+
+
+def test_email_campaign_json_calls_raise_too_small_engine_token_limit():
+    selected = llm_client._json_engine_for_call(
+        {"provider": "gemini", "model_name": "gemini-test", "max_tokens": 24},
+        call_purpose="email_campaign_copy",
+    )
+
+    assert selected["max_tokens"] >= 900
+
+
+def test_json_generation_config_omits_gemini_response_mime_for_stable_api_model():
+    config = llm_client._json_generation_config(
+        {"provider": "gemini", "model_name": "gemini-2.5-pro", "max_tokens": 900}
+    )
+
+    assert "response_mime_type" not in config
+
+
+@pytest.mark.asyncio
+async def test_call_model_json_retries_malformed_json_response(monkeypatch):
+    calls = []
+
+    async def fake_call_model_text(prompt, *_args, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        if len(calls) == 1:
+            return '{"subject":"Hi","body":"This response was cut off'
+        return '{"subject":"Hi","body":"Complete body","html_body":"<p>Complete body</p>"}'
+
+    monkeypatch.setattr(llm_client, "call_model_text", fake_call_model_text)
+
+    result = await llm_client.call_model_json(
+        "Write campaign copy.",
+        _CampaignDraftForTest,
+        engine={"provider": "gemini", "model_name": "gemini-test", "max_tokens": 24},
+        call_purpose="email_campaign_copy",
+    )
+
+    assert result == {"subject": "Hi", "body": "Complete body", "html_body": "<p>Complete body</p>"}
+    assert len(calls) == 2
+    assert "previous model response was invalid" in calls[1]["prompt"].lower()
+    assert calls[0]["engine"]["max_tokens"] >= 900
+    assert calls[1]["engine"]["max_tokens"] > calls[0]["engine"]["max_tokens"]
+    assert calls[0]["generation_config"]["response_format"] == "json_object"
+
+
+@pytest.mark.asyncio
+async def test_gemini_stream_retries_without_response_mime_type_when_api_rejects(monkeypatch):
+    if not llm_client.genai_types:
+        pytest.skip("google-genai is not installed")
+
+    class Chunk:
+        text = '{"subject":"Hi","body":"Body","html_body":"<p>Body</p>"}'
+
+    class FakeModels:
+        def __init__(self):
+            self.configs = []
+
+        async def generate_content_stream(self, *, model, contents, config):
+            self.configs.append(config)
+            if len(self.configs) == 1:
+                raise RuntimeError(
+                    '400 INVALID_ARGUMENT. Invalid JSON payload received. Unknown name "responseMimeType" '
+                    "at 'generation_config': Cannot find field."
+                )
+            return [Chunk()]
+
+    models = FakeModels()
+    client = SimpleNamespace(aio=SimpleNamespace(models=models))
+    monkeypatch.setattr(llm_client, "_gemini_client_for_model", lambda _model: client)
+    monkeypatch.setattr(llm_client, "_iter_gemini_model_candidates", lambda _model: ["gemini-2.5-pro-preview"])
+
+    config = llm_client._build_gemini_config(
+        {"temperature": 0.0, "max_output_tokens": 900, "response_mime_type": "application/json"}
+    )
+    chunks = []
+    async for item in llm_client._stream_gemini(
+        "prompt",
+        {"provider": "gemini", "model_name": "gemini-2.5-pro-preview", "max_tokens": 900},
+        generation_config=config,
+    ):
+        chunks.append(item)
+
+    assert chunks == [(Chunk.text, "gemini-2.5-pro-preview")]
+    assert getattr(models.configs[0], "response_mime_type", None) == "application/json"
+    assert getattr(models.configs[1], "response_mime_type", None) is None
 
 
 @pytest.mark.asyncio

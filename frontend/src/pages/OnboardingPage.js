@@ -11,6 +11,7 @@ import {
 } from '@/lib/phoneCountries';
 import PlatformLogo from '@/components/PlatformLogo';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { getErrorMessage } from '@/hooks/use-toast';
 import {
   Building2,
   Globe,
@@ -611,7 +612,7 @@ function EnterpriseInviteStep({ onDone }) {
         onDone(refreshed.user, refreshed.token);
       }
     } catch (error) {
-      setErr(error.response?.data?.detail || error.response?.data?.error || 'Could not send invitation');
+      setErr(getErrorMessage(error, 'Could not send invitation'));
     } finally {
       setBusy(false);
     }

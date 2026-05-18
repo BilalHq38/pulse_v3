@@ -31,13 +31,30 @@ const DEFAULT_FILTERS = {
 };
 const LONG_REQUEST_TIMEOUT_MS = 120000;
 
-function toFiltersPayload(f, selectedLeadIds = [], selectedCustomerIds = [], productId = '') {
+function toFiltersPayload(
+  f,
+  selectedLeadIds = [],
+  selectedCustomerIds = [],
+  productId = '',
+  aiDetails = null,
+  htmlAiPrompt = '',
+) {
   const out = {};
   if (f.audience && f.audience !== 'both') out.audience = f.audience;
   if (f.channel) out.channel = f.channel.split(',').map((s) => s.trim()).filter(Boolean);
   if (selectedLeadIds.length) out.selected_lead_ids = selectedLeadIds;
   if (selectedCustomerIds.length) out.selected_customer_ids = selectedCustomerIds;
   if (productId) out.product_id = productId;
+  if (aiDetails && typeof aiDetails === 'object') {
+    const savedAiDetails = Object.fromEntries(
+      Object.entries(aiDetails)
+        .map(([key, value]) => [key, String(value || '').trim()])
+        .filter(([, value]) => value),
+    );
+    if (Object.keys(savedAiDetails).length) out.ai_details = savedAiDetails;
+  }
+  const savedHtmlPrompt = String(htmlAiPrompt || '').trim();
+  if (savedHtmlPrompt) out.html_ai_prompt = savedHtmlPrompt;
   return out;
 }
 
@@ -58,6 +75,18 @@ const getListPayload = (data) => {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.items)) return data.items;
   return [];
+};
+
+const parseJsonObject = (value) => {
+  if (!value) return {};
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 };
 
 const isAiExhaustionError = (err) => err?.response?.data?.detail?.ai_enabled === false;
@@ -239,7 +268,7 @@ export default function CampaignsPage() {
       const res = await api.post('/campaigns/generate', {
         product_id: form.product_id,
         ...aiDetails,
-      });
+      }, { timeout: LONG_REQUEST_TIMEOUT_MS });
       setForm((prev) => ({
         ...prev,
         subject: res.data?.subject || prev.subject,
@@ -289,7 +318,7 @@ export default function CampaignsPage() {
         product_id: form.product_id,
         description,
         current_body: form.body,
-      });
+      }, { timeout: LONG_REQUEST_TIMEOUT_MS });
       setForm((prev) => ({
         ...prev,
         html_body: res.data?.html_body || prev.html_body,
@@ -318,11 +347,11 @@ export default function CampaignsPage() {
 
   const submit = async (e) => {
     e?.preventDefault?.();
-    if (!form.subject.trim() || !form.body.trim()) {
+    if (!form.subject.trim() || !(form.body.trim() || form.html_body.trim())) {
       showToast({
         type: 'error',
         title: 'Content Missing',
-        message: 'Add both a subject and body before saving the campaign.',
+        message: 'Add a subject and either plain text or HTML before saving the campaign.',
       });
       return;
     }
@@ -333,7 +362,7 @@ export default function CampaignsPage() {
         subject: form.subject,
         body: form.body,
         html_body: form.html_body,
-        filters: toFiltersPayload(filters, selectedLeadIds, selectedCustomerIds, form.product_id),
+        filters: toFiltersPayload(filters, selectedLeadIds, selectedCustomerIds, form.product_id, aiDetails, htmlAiPrompt),
         send_now: sendNow,
       };
       const res = editingCampaignId
@@ -385,7 +414,7 @@ export default function CampaignsPage() {
   };
 
   const openCampaignEditor = (campaign) => {
-    const campaignFilters = campaign?.filters && typeof campaign.filters === 'object' ? campaign.filters : {};
+    const campaignFilters = parseJsonObject(campaign?.filters);
     setEditingCampaignId(campaign?.id || '');
     setForm({
       name: campaign?.name || '',
@@ -402,6 +431,13 @@ export default function CampaignsPage() {
     setSelectedCustomerIds(
       Array.isArray(campaignFilters.selected_customer_ids) ? campaignFilters.selected_customer_ids : [],
     );
+    setAiDetails({
+      ...EMPTY_AI_DETAILS,
+      ...(campaignFilters.ai_details && typeof campaignFilters.ai_details === 'object'
+        ? campaignFilters.ai_details
+        : {}),
+    });
+    setHtmlAiPrompt(String(campaignFilters.html_ai_prompt || ''));
     setPreview(null);
     setSendNow(false);
     setShowForm(true);
@@ -738,14 +774,13 @@ export default function CampaignsPage() {
                 ) : null}
               </div>
 
-              <Field label="Plain-text body *">
+              <Field label="Plain-text body">
                 <textarea
                   value={form.body}
                   onChange={(e) => setForm({ ...form, body: e.target.value })}
                   placeholder="Write your message…"
                   rows={6}
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm resize-y"
-                  required
                   data-testid="campaign-body"
                 />
               </Field>

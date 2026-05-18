@@ -6,11 +6,12 @@ import secrets
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.utils import make_id, now_ts, parse_dt
 from services.db_helpers import get_company_id, get_current_user_flexible, r, rs
+from services.media_storage import serve_stored_media, store_image_bytes
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -612,6 +613,38 @@ async def update_company_settings(body: CompanySettingsUpdate, request: Request)
         await db.execute(f"UPDATE company_settings SET {set_parts} WHERE id=$1", settings_id, *values)
 
     return await get_company_settings(request)
+
+
+@router.post("/settings/company/logo/upload")
+async def upload_company_logo(request: Request, file: UploadFile = File(...)):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu) or ""
+    if not cid:
+        raise HTTPException(400, "Company context is required")
+    raw = await file.read()
+    upload = store_image_bytes(
+        raw,
+        mime_type=file.content_type or "",
+        category="company-logos",
+        company_id=cid,
+        public_url_prefix="/api/settings/company/logo/media",
+        original_filename=file.filename or "",
+    )
+    settings_id = await _ensure_company_settings_exists(db, cid)
+    if not settings_id:
+        raise HTTPException(404, "Company settings not found")
+    await db.execute(
+        "UPDATE company_settings SET logo_url=$1,updated_at=NOW() WHERE id=$2",
+        upload["url"],
+        settings_id,
+    )
+    return {"url": upload["url"], "company": await get_company_settings(request)}
+
+
+@router.get("/settings/company/logo/media/{company_id}/{filename}")
+async def get_company_logo_media(company_id: str, filename: str):
+    return serve_stored_media(category="company-logos", company_id=company_id, filename=filename)
 
 
 @router.get("/settings/channels")

@@ -5,6 +5,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
+from channel_layer.channel_identity import company_default_phone_region
 from core.phone_normalization import strict_normalize_to_e164_digits
 from core.utils import make_id, now_ts
 from services.ai_service.facade import calculate_churn_risk
@@ -17,7 +18,7 @@ from services.db_helpers import (
     rs,
 )
 from services.lead_stage_service import transition_lead_stage
-from shared.tabular_uploads import parse_tabular_upload, split_multi_value
+from shared.tabular_uploads import parse_tabular_upload, phone_region_from_upload_row, split_multi_value
 from shared.webhook_task_runner import create_safe_detached_task
 
 logger = logging.getLogger(__name__)
@@ -391,6 +392,7 @@ async def bulk_upload_customers(request: Request, file: UploadFile = File(...)):
     cu = await get_current_user_flexible(request)
     cid = get_company_id(cu)
     rows = parse_tabular_upload(file.filename or "", await file.read())
+    tenant_phone_region = await company_default_phone_region(db, cid)
     summary = {
         "total_rows": len(rows),
         "created": 0,
@@ -423,11 +425,13 @@ async def bulk_upload_customers(request: Request, file: UploadFile = File(...)):
 
             normalized_phone = ""
             if raw_phone:
-                normalized_phone = strict_normalize_to_e164_digits(raw_phone) or ""
+                phone_region = phone_region_from_upload_row(row) or tenant_phone_region
+                normalized_phone = strict_normalize_to_e164_digits(raw_phone, fallback_region=phone_region or None) or ""
                 if not normalized_phone:
                     raise HTTPException(
                         400,
-                        "Invalid phone number. Use a valid international number such as +1..., +44..., or +92....",
+                        "Invalid phone number. Use a valid international number such as +1..., +44..., or +92..., "
+                        "or include a country/region code for local numbers.",
                     )
 
             existing = await _find_existing_customer_for_upload(

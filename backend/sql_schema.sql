@@ -558,10 +558,15 @@ CREATE INDEX IF NOT EXISTS idx_lead_nurture_messages_company_lead ON lead_nurtur
 CREATE INDEX IF NOT EXISTS idx_lead_nurture_messages_company_created_at ON lead_nurture_messages(company_id, created_at);
 
 CREATE TABLE IF NOT EXISTS lead_channels (
-    lead_id  TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
-    channel  TEXT NOT NULL,
+    lead_id    TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    channel    TEXT NOT NULL,
+    is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+    is_visible BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (lead_id, channel)
 );
+CREATE INDEX IF NOT EXISTS idx_lead_channels_visible_channel ON lead_channels(channel, is_active, is_visible);
 
 -- ============================================================================
 -- Customers
@@ -617,15 +622,29 @@ CREATE TABLE IF NOT EXISTS customer_tags (
 CREATE TABLE IF NOT EXISTS customer_channels (
     customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
     channel     TEXT NOT NULL,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    is_visible  BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (customer_id, channel)
 );
+CREATE INDEX IF NOT EXISTS idx_customer_channels_visible_channel ON customer_channels(channel, is_active, is_visible);
 
 CREATE TABLE IF NOT EXISTS customer_social_profiles (
     customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
     platform    TEXT NOT NULL,
     profile_id  TEXT NOT NULL DEFAULT '',
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    is_visible  BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (customer_id, platform)
 );
+CREATE INDEX IF NOT EXISTS idx_customer_social_profiles_visible_platform
+    ON customer_social_profiles(platform, is_active, is_visible);
+CREATE INDEX IF NOT EXISTS idx_customer_social_profiles_platform_profile
+    ON customer_social_profiles(platform, profile_id)
+    WHERE BTRIM(profile_id) <> '';
 
 CREATE TABLE IF NOT EXISTS customer_profiles (
     id               TEXT PRIMARY KEY,
@@ -696,6 +715,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     customer_avatar   TEXT NOT NULL DEFAULT '',
     channel           TEXT NOT NULL DEFAULT 'web_chat',
     channel_id        TEXT NOT NULL DEFAULT '',
+    is_group          BOOLEAN NOT NULL DEFAULT FALSE,
+    group_id          TEXT NOT NULL DEFAULT '',
+    whatsapp_account_id TEXT NOT NULL DEFAULT '',
+    identity_key      TEXT NOT NULL DEFAULT '',
     subject           TEXT NOT NULL DEFAULT '',
     status            TEXT NOT NULL DEFAULT 'open',
     priority          TEXT NOT NULL DEFAULT 'medium',
@@ -759,6 +782,15 @@ CREATE TABLE IF NOT EXISTS messages (
     ai_confidence        NUMERIC(5,4),
     external_message_id  TEXT NOT NULL DEFAULT '',
     idempotency_key      TEXT NOT NULL DEFAULT '',
+    provider_event_id    TEXT NOT NULL DEFAULT '',
+    message_direction    TEXT NOT NULL DEFAULT '',
+    source               TEXT NOT NULL DEFAULT '',
+    whatsapp_identity_id TEXT NOT NULL DEFAULT '',
+    whatsapp_group_id    TEXT NOT NULL DEFAULT '',
+    whatsapp_group_name  TEXT NOT NULL DEFAULT '',
+    whatsapp_participant_id TEXT NOT NULL DEFAULT '',
+    whatsapp_participant_name TEXT NOT NULL DEFAULT '',
+    raw_metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
     delivery_status      TEXT NOT NULL DEFAULT 'pending',
     sent_at              TIMESTAMPTZ,
     delivered_at         TIMESTAMPTZ,
@@ -770,6 +802,8 @@ CREATE TABLE IF NOT EXISTS messages (
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_messages_company_row UNIQUE (company_id, id),
+    CONSTRAINT chk_messages_delivery_status
+        CHECK (delivery_status IN ('pending','sending','sent','delivered','read','failed')),
     CONSTRAINT fk_messages_conversation_company FOREIGN KEY (company_id, conversation_id) REFERENCES conversations(company_id, id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_messages_company_id ON messages(company_id);
@@ -779,6 +813,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_company_external_message_id ON messages(
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_idempotency_key_nonempty
     ON messages(company_id, idempotency_key)
     WHERE BTRIM(idempotency_key) <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_provider_event_nonempty
+    ON messages(company_id, provider_event_id)
+    WHERE BTRIM(provider_event_id) <> '';
 CREATE INDEX IF NOT EXISTS idx_messages_sentiment ON messages(company_id, sentiment_score);
 
 CREATE TABLE IF NOT EXISTS message_attachments (
@@ -834,6 +871,109 @@ CREATE INDEX IF NOT EXISTS idx_message_reactions_target_provider ON message_reac
 CREATE UNIQUE INDEX IF NOT EXISTS uq_message_reactions_provider_event
     ON message_reactions(company_id,channel,provider_message_id)
     WHERE BTRIM(provider_message_id) <> '';
+
+CREATE TABLE IF NOT EXISTS whatsapp_identity_mappings (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
+    channel TEXT NOT NULL DEFAULT 'whatsapp',
+    account_id TEXT NOT NULL DEFAULT '',
+    bridge_scope TEXT NOT NULL DEFAULT '',
+    identity_type TEXT NOT NULL DEFAULT '',
+    identity_value TEXT NOT NULL DEFAULT '',
+    identity_value_normalized TEXT NOT NULL DEFAULT '',
+    canonical_phone TEXT NOT NULL DEFAULT '',
+    remote_jid TEXT NOT NULL DEFAULT '',
+    lid_jid TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    contact_id TEXT NOT NULL DEFAULT '',
+    customer_id TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL DEFAULT '',
+    group_id TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    profile_picture_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'resolved',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_identity_alias
+    ON whatsapp_identity_mappings(company_id, channel, account_id, identity_type, identity_value_normalized)
+    WHERE BTRIM(identity_value_normalized) <> '';
+CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_customer ON whatsapp_identity_mappings(company_id, customer_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_conversation ON whatsapp_identity_mappings(company_id, conversation_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_lid ON whatsapp_identity_mappings(company_id, lid_jid);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_phone ON whatsapp_identity_mappings(company_id, canonical_phone);
+
+CREATE TABLE IF NOT EXISTS whatsapp_event_dedup (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
+    channel TEXT NOT NULL DEFAULT 'whatsapp',
+    account_id TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL DEFAULT '',
+    provider_event_id TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    payload_hash TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'seen',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_event_provider
+    ON whatsapp_event_dedup(company_id, channel, account_id, event_type, provider_event_id)
+    WHERE BTRIM(provider_event_id) <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_event_idempotency
+    ON whatsapp_event_dedup(company_id, idempotency_key)
+    WHERE BTRIM(idempotency_key) <> '';
+
+CREATE TABLE IF NOT EXISTS whatsapp_pending_messages (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
+    channel TEXT NOT NULL DEFAULT 'whatsapp',
+    account_id TEXT NOT NULL DEFAULT '',
+    direction TEXT NOT NULL DEFAULT '',
+    provider_event_id TEXT NOT NULL DEFAULT '',
+    raw_identity TEXT NOT NULL DEFAULT '',
+    identity_type TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending',
+    customer_id TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_pending_provider
+    ON whatsapp_pending_messages(company_id, channel, account_id, provider_event_id)
+    WHERE BTRIM(provider_event_id) <> '';
+
+CREATE TABLE IF NOT EXISTS whatsapp_group_participants (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
+    account_id TEXT NOT NULL DEFAULT '',
+    group_id TEXT NOT NULL DEFAULT '',
+    participant_jid TEXT NOT NULL DEFAULT '',
+    participant_phone TEXT NOT NULL DEFAULT '',
+    participant_customer_id TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    profile_picture_url TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_group_participant
+    ON whatsapp_group_participants(company_id, account_id, group_id, participant_jid)
+    WHERE BTRIM(group_id) <> '' AND BTRIM(participant_jid) <> '';
 
 CREATE TABLE IF NOT EXISTS conversation_logs (
     id          TEXT PRIMARY KEY,
@@ -1689,6 +1829,42 @@ CREATE INDEX IF NOT EXISTS idx_journey_tracking_company_created_at ON journey_tr
 CREATE INDEX IF NOT EXISTS idx_journey_tracking_customer_id ON journey_tracking(customer_id);
 CREATE INDEX IF NOT EXISTS idx_journey_tracking_lead_id ON journey_tracking(lead_id);
 
+CREATE TABLE IF NOT EXISTS visitor_sessions (
+    id               TEXT PRIMARY KEY,
+    company_id       TEXT NOT NULL DEFAULT '',
+    user_id          TEXT NOT NULL DEFAULT '',
+    first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    page_url         TEXT NOT NULL DEFAULT '',
+    referrer         TEXT NOT NULL DEFAULT '',
+    landing_path     TEXT NOT NULL DEFAULT '',
+    user_agent       TEXT NOT NULL DEFAULT '',
+    ip_hash          TEXT NOT NULL DEFAULT '',
+    metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_visitor_sessions_company_seen ON visitor_sessions(company_id, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visitor_sessions_user_id ON visitor_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS visitor_events (
+    id               TEXT PRIMARY KEY,
+    session_id       TEXT NOT NULL REFERENCES visitor_sessions(id) ON DELETE CASCADE,
+    company_id       TEXT NOT NULL DEFAULT '',
+    user_id          TEXT NOT NULL DEFAULT '',
+    event_type       TEXT NOT NULL DEFAULT 'page_view',
+    page_url         TEXT NOT NULL DEFAULT '',
+    path             TEXT NOT NULL DEFAULT '',
+    referrer         TEXT NOT NULL DEFAULT '',
+    element          TEXT NOT NULL DEFAULT '',
+    metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_visitor_events_session_time ON visitor_events(session_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visitor_events_company_time ON visitor_events(company_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visitor_events_type_time ON visitor_events(event_type, occurred_at DESC);
+
 CREATE TABLE IF NOT EXISTS journey_metadata (
     journey_id  TEXT NOT NULL REFERENCES journey_tracking(id) ON DELETE CASCADE,
     company_id  TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE CHECK (BTRIM(company_id) <> ''),
@@ -1903,6 +2079,27 @@ COMMENT ON COLUMN profile_merge_history.source_customer_id IS
     'Identity profile UUID from unified_customers.customer_id, not Pulse CRM customers.id.';
 COMMENT ON COLUMN profile_merge_history.target_customer_id IS
     'Identity profile UUID from unified_customers.customer_id, not Pulse CRM customers.id.';
+
+CREATE TABLE IF NOT EXISTS merged_profile_records (
+    record_id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id                 TEXT NOT NULL CHECK (BTRIM(tenant_id) <> ''),
+    unified_customer_id       UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
+    source_customer_id        UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
+    target_customer_id        UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL,
+    source_platforms          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    target_platforms          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    original_identities       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    unified_identity_mapping  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    merge_history             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    merge_reason              TEXT NOT NULL DEFAULT '',
+    merged_by                 TEXT NOT NULL DEFAULT 'auto',
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_merged_profile_records_tenant ON merged_profile_records(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_merged_profile_records_unified ON merged_profile_records(unified_customer_id);
+CREATE INDEX IF NOT EXISTS idx_merged_profile_records_source ON merged_profile_records(source_customer_id);
+CREATE INDEX IF NOT EXISTS idx_merged_profile_records_target ON merged_profile_records(target_customer_id);
 
 CREATE TABLE IF NOT EXISTS review_queue (
     review_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2143,6 +2340,10 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_model TEXT NOT NULL
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_scope TEXT NOT NULL DEFAULT '';
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_disabled_until TIMESTAMPTZ;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_failure_count INT DEFAULT 0;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_group BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS group_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS whatsapp_account_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS identity_key TEXT NOT NULL DEFAULT '';
 
 -- Adaptive qualification + onboarding flow state (JSONB, no schema drift required for callers).
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -2156,16 +2357,53 @@ ALTER TABLE leads DROP COLUMN IF EXISTS country;
 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS external_message_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_event_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_direction TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_identity_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_group_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_group_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_participant_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_participant_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS chk_messages_delivery_status;
+ALTER TABLE messages ADD CONSTRAINT chk_messages_delivery_status
+    CHECK (delivery_status IN ('pending','sending','sent','delivered','read','failed')) NOT VALID;
 CREATE INDEX IF NOT EXISTS idx_messages_company_external_message_id ON messages(company_id, external_message_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_idempotency_key_nonempty
     ON messages(company_id, idempotency_key)
     WHERE BTRIM(idempotency_key) <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_provider_event_nonempty
+    ON messages(company_id, provider_event_id)
+    WHERE BTRIM(provider_event_id) <> '';
+
+ALTER TABLE lead_channels ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE lead_channels ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE lead_channels ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE lead_channels ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS idx_lead_channels_visible_channel ON lead_channels(channel, is_active, is_visible);
+
+ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS idx_customer_channels_visible_channel ON customer_channels(channel, is_active, is_visible);
+
+ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS idx_customer_social_profiles_visible_platform
+    ON customer_social_profiles(platform, is_active, is_visible);
+CREATE INDEX IF NOT EXISTS idx_customer_social_profiles_platform_profile
+    ON customer_social_profiles(platform, profile_id)
+    WHERE BTRIM(profile_id) <> '';
 
 ALTER TABLE user_oauth_providers ADD COLUMN IF NOT EXISTS company_id TEXT;
 UPDATE user_oauth_providers uop
@@ -2267,21 +2505,6 @@ ALTER TABLE deleted_companies ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DE
 -- ============================================================================
 -- Seed data
 -- ============================================================================
-
--- Services enforce UUID tenant IDs; keep a stable UUID for local bootstrapping.
--- This matches `.env` DEFAULT_TENANT_ID and WHATSAPP_BRIDGE default.
-INSERT INTO companies(id, name, is_active, created_at, updated_at)
-VALUES ('d7c253c7-3c35-47c6-8f93-b10cf50a0370', 'Local Tenant', TRUE, NOW(), NOW())
-ON CONFLICT (id) DO NOTHING;
-
-INSERT INTO company_settings(id, company_id, created_at, updated_at)
-VALUES (
-  'company_settings_d7c253c7-3c35-47c6-8f93-b10cf50a0370',
-  'd7c253c7-3c35-47c6-8f93-b10cf50a0370',
-  NOW(),
-  NOW()
-)
-ON CONFLICT (company_id) DO NOTHING;
 
 INSERT INTO roles (id, role_name, description, perm_scope, perm_all)
 VALUES
@@ -2534,6 +2757,34 @@ ALTER TABLE message_attachments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE message_attachments FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS p_message_attachments_tenant ON message_attachments;
 CREATE POLICY p_message_attachments_tenant ON message_attachments
+USING (company_id = current_setting('app.current_company', true))
+WITH CHECK (company_id = current_setting('app.current_company', true));
+
+ALTER TABLE whatsapp_identity_mappings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE whatsapp_identity_mappings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_whatsapp_identity_mappings_tenant ON whatsapp_identity_mappings;
+CREATE POLICY p_whatsapp_identity_mappings_tenant ON whatsapp_identity_mappings
+USING (company_id = current_setting('app.current_company', true))
+WITH CHECK (company_id = current_setting('app.current_company', true));
+
+ALTER TABLE whatsapp_event_dedup ENABLE ROW LEVEL SECURITY;
+ALTER TABLE whatsapp_event_dedup FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_whatsapp_event_dedup_tenant ON whatsapp_event_dedup;
+CREATE POLICY p_whatsapp_event_dedup_tenant ON whatsapp_event_dedup
+USING (company_id = current_setting('app.current_company', true))
+WITH CHECK (company_id = current_setting('app.current_company', true));
+
+ALTER TABLE whatsapp_pending_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE whatsapp_pending_messages FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_whatsapp_pending_messages_tenant ON whatsapp_pending_messages;
+CREATE POLICY p_whatsapp_pending_messages_tenant ON whatsapp_pending_messages
+USING (company_id = current_setting('app.current_company', true))
+WITH CHECK (company_id = current_setting('app.current_company', true));
+
+ALTER TABLE whatsapp_group_participants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE whatsapp_group_participants FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_whatsapp_group_participants_tenant ON whatsapp_group_participants;
+CREATE POLICY p_whatsapp_group_participants_tenant ON whatsapp_group_participants
 USING (company_id = current_setting('app.current_company', true))
 WITH CHECK (company_id = current_setting('app.current_company', true));
 
@@ -2870,6 +3121,13 @@ ALTER TABLE profile_merge_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE profile_merge_history FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS p_profile_merge_history_tenant ON profile_merge_history;
 CREATE POLICY p_profile_merge_history_tenant ON profile_merge_history
+USING (tenant_id = COALESCE(NULLIF(current_setting('app.current_tenant', true), ''), current_setting('app.current_company', true)))
+WITH CHECK (tenant_id = COALESCE(NULLIF(current_setting('app.current_tenant', true), ''), current_setting('app.current_company', true)));
+
+ALTER TABLE merged_profile_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE merged_profile_records FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_merged_profile_records_tenant ON merged_profile_records;
+CREATE POLICY p_merged_profile_records_tenant ON merged_profile_records
 USING (tenant_id = COALESCE(NULLIF(current_setting('app.current_tenant', true), ''), current_setting('app.current_company', true)))
 WITH CHECK (tenant_id = COALESCE(NULLIF(current_setting('app.current_tenant', true), ''), current_setting('app.current_company', true)));
 
@@ -3393,6 +3651,8 @@ CREATE TABLE IF NOT EXISTS email_campaigns (
     body           TEXT NOT NULL DEFAULT '',
     html_body      TEXT NOT NULL DEFAULT '',
     filters        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    attachments    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata       JSONB NOT NULL DEFAULT '{}'::jsonb,
     status         TEXT NOT NULL DEFAULT 'draft'
                    CHECK (status IN ('draft','queued','sending','completed','failed','cancelled')),
     total_recipients INTEGER NOT NULL DEFAULT 0,
@@ -3400,10 +3660,17 @@ CREATE TABLE IF NOT EXISTS email_campaigns (
     failed_count   INTEGER NOT NULL DEFAULT 0,
     created_by     TEXT NOT NULL DEFAULT '',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     started_at     TIMESTAMPTZ,
     completed_at   TIMESTAMPTZ,
     last_error     TEXT NOT NULL DEFAULT ''
 );
+ALTER TABLE email_campaigns
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE email_campaigns
+    ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE email_campaigns
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_email_campaigns_company_id
     ON email_campaigns(company_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_email_campaigns_status

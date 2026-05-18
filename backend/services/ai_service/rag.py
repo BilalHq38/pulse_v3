@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _CATALOG_CACHE = get_cache_client(namespace="ai-rag-catalog")
 _RANKING_CACHE = get_cache_client(namespace="ai-rag-ranking")
+_COMPANY_PRODUCTS_COLUMNS: set[str] | None = None
 
 GENERAL_PRODUCT_PATTERNS = (
     "what do you sell",
@@ -222,9 +223,13 @@ async def _load_product_catalog(db, company_id: str, limit: int = 120) -> list[d
 
     increment_counter("ai.cache.catalog.miss")
     started = time.perf_counter()
+    product_columns = await _company_products_columns(db)
+    tags_select = "tags" if "tags" in product_columns else "NULL::jsonb AS tags"
+    sku_select = "sku" if "sku" in product_columns else "''::text AS sku"
+    stock_select = "stock_quantity" if "stock_quantity" in product_columns else "0::integer AS stock_quantity"
     rows = await db.fetch(
         "SELECT id, company_id, name, product_title, description, category, product_type, "
-        "       price, price_currency, status, tags, sku, stock_quantity, created_at, updated_at "
+        f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, created_at, updated_at "
         "FROM company_products "
         "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
         "ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT $2",
@@ -279,6 +284,23 @@ async def _load_product_catalog(db, company_id: str, limit: int = 120) -> list[d
     observe_histogram("ai.catalog.load_ms", (time.perf_counter() - started) * 1000.0)
     await _CATALOG_CACHE.set_json(cache_key, products, ttl_seconds=_CATALOG_CACHE_TTL_SECONDS)
     return products
+
+
+async def _company_products_columns(db) -> set[str]:
+    global _COMPANY_PRODUCTS_COLUMNS
+    if _COMPANY_PRODUCTS_COLUMNS is not None:
+        return _COMPANY_PRODUCTS_COLUMNS
+    try:
+        rows = await db.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ANY(current_schemas(FALSE)) "
+            "  AND table_name='company_products'"
+        )
+        _COMPANY_PRODUCTS_COLUMNS = {str(row["column_name"]) for row in rows if row["column_name"]}
+    except Exception as exc:
+        logger.warning("company_products column validation failed: %s", exc)
+        _COMPANY_PRODUCTS_COLUMNS = set()
+    return _COMPANY_PRODUCTS_COLUMNS
 
 
 def _product_search_text(product: dict) -> str:

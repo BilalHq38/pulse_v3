@@ -12,11 +12,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from services.db_helpers import (
     build_auth_payload,
+    bump_user_token_version,
+    close_login_sessions,
     create_user_session,
     delete_user_account_records,
     ensure_user_company_assignment,
     record_auth_event,
     record_system_log,
+    revoke_refresh_tokens_for_user,
     r,
     set_public_auth_context,
 )
@@ -112,6 +115,22 @@ def _strip_password_hash(record: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def _blocked_account_response(status: str) -> JSONResponse:
+    normalized = str(status or "inactive").strip().lower() or "inactive"
+    return JSONResponse(
+        status_code=403,
+        content={"detail": f"Your account is {normalized}. Please contact your administrator."},
+    )
+
+
+async def _revoke_user_access_after_status_change(db, user_id: str, status: str) -> None:
+    if status == "active":
+        return
+    await bump_user_token_version(db, user_id)
+    await revoke_refresh_tokens_for_user(db, user_id, f"status_changed:{status}")
+    await close_login_sessions(db, user_id)
+
+
 def _normalize_record(record: Any) -> dict[str, Any]:
     return {key: _coerce_value(value) for key, value in dict(record or {}).items()}
 
@@ -141,6 +160,10 @@ async def admin_login(request: Request) -> JSONResponse:
         return _invalid_admin_login()
 
     user = await ensure_user_company_assignment(db, user)
+    account_status = str(user.get("status") or "active").strip().lower()
+    if account_status in {"paused", "blocked", "inactive"}:
+        await record_auth_event(db, user["id"], "login", request, False, email)
+        return _blocked_account_response(account_status)
     await db.execute(
         "UPDATE users SET last_login=NOW(),updated_at=NOW() WHERE id=$1",
         user["id"],
@@ -332,6 +355,7 @@ async def admin_update_user_status(user_id: str, request: Request) -> dict[str, 
         status,
         user_id,
     )
+    await _revoke_user_access_after_status_change(db, user_id, status)
     await record_system_log(
         db,
         current_user,

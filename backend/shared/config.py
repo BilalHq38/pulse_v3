@@ -55,6 +55,7 @@ PUBLIC_GATEWAY_PREFIXES = (
     "/api/auth/invitations/accept",
     "/api/auth/register/status",
     "/api/auth/signup-billing-info",
+    "/api/visitor/track",
     "/api/unification/public",
     "/api/billing/webhooks/stripe",
     "/api/webhook/meta/",
@@ -62,6 +63,7 @@ PUBLIC_GATEWAY_PREFIXES = (
     "/api/webhooks/external/purchases",
     "/api/products/media/",
     "/api/company-data/products/media/",
+    "/api/settings/company/logo/media/",
     "/api/conversations/attachments/media/",
 )
 

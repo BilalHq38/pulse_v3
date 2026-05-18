@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 # with the rest of the API. Override via CAMPAIGN_SEND_CONCURRENCY env if needed.
 DEFAULT_BATCH_CONCURRENCY = 10
 RECIPIENT_HARD_CAP = 50_000
+CAMPAIGN_COPY_MIN_OUTPUT_TOKENS = 1200
+HTML_BODY_MIN_OUTPUT_TOKENS = 1000
+CAMPAIGN_AI_OUTPUT_TOKEN_CEILING = 2048
 
 
 class CampaignCopyDraft(BaseModel):
@@ -117,6 +120,45 @@ def _body_to_html(body: str) -> str:
     if not paragraphs:
         return ""
     return "".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
+
+
+def _html_to_text(html_body: str) -> str:
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", str(html_body or ""))
+    text = re.sub(r"(?i)</\s*p\s*>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(re.sub(r"\n{3,}", "\n\n", text)).strip()
+
+
+def _finalize_email_html(html_body: str, plain_body: str = "") -> str:
+    inner = _sanitize_email_html(html_body or _body_to_html(plain_body))
+    if not inner:
+        return ""
+    if re.search(r"<\s*html[\s>]", inner, re.I):
+        return inner[:12000]
+    return _sanitize_email_html(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f6f7f9;\">"
+        "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" "
+        "style=\"border-collapse:collapse;background:#f6f7f9;\"><tr><td align=\"center\" "
+        "style=\"padding:24px 12px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" "
+        "cellpadding=\"0\" style=\"max-width:640px;border-collapse:collapse;background:#ffffff;\">"
+        "<tr><td style=\"font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.55;"
+        "color:#111827;padding:28px;\">"
+        f"{inner}"
+        "</td></tr></table></td></tr></table></body></html>"
+    )
+
+
+def _campaign_ai_engine(engine: dict | None, *, min_output_tokens: int) -> dict:
+    tuned = dict(engine or {})
+    try:
+        configured_max = int(tuned.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        configured_max = 0
+    tuned["max_tokens"] = min(
+        max(configured_max, int(min_output_tokens)),
+        CAMPAIGN_AI_OUTPUT_TOKEN_CEILING,
+    )
+    return tuned
 
 
 async def resolve_recipients(
@@ -361,7 +403,10 @@ async def generate_campaign_copy(
     if missing:
         raise ValueError(f"Missing campaign details: {', '.join(missing)}")
 
-    feature_lines = "\n".join(f"- {feature}" for feature in product.get("features") or []) or "- No structured features stored"
+    feature_lines = (
+        "\n".join(f"- {feature}" for feature in product.get("features") or [])
+        or "- No structured features stored"
+    )
     image_lines = "\n".join(f"- {image}" for image in product.get("images") or []) or "- No product images stored"
     # Build the prompt for the campaign copy generator.  The model must return valid JSON
     # containing only the keys "subject", "body" and "html_body".  We specify
@@ -377,6 +422,7 @@ async def generate_campaign_copy(
         "- Use only double-quoted keys and double-quoted string values.\n"
         "- Do not output any markdown, code fences or comments.\n"
         "- Do not include trailing commas after the last key/value pair.\n"
+        "- Return a complete object in one response; the last character must be }.\n"
         "- Do not invent discounts, deadlines, guarantees or other details not provided.\n"
         "- Do not include any additional keys.\n"
         "Constraints for content:\n"
@@ -401,14 +447,13 @@ async def generate_campaign_copy(
     )
 
     try:
-        tuned_engine = dict(engine or {})
-        tuned_engine["max_tokens"] = min(int(tuned_engine.get("max_tokens") or 900), 900)
+        tuned_engine = _campaign_ai_engine(engine, min_output_tokens=CAMPAIGN_COPY_MIN_OUTPUT_TOKENS)
         generated = CampaignCopyDraft.model_validate(
             await call_model_json(prompt, CampaignCopyDraft, engine=tuned_engine, call_purpose="email_campaign_copy")
         ).model_dump()
         if not generated.get("html_body"):
             generated["html_body"] = _body_to_html(generated.get("body", ""))
-        generated["html_body"] = _sanitize_email_html(generated.get("html_body", ""))
+        generated["html_body"] = _finalize_email_html(generated.get("html_body", ""), generated.get("body", ""))
         return generated
     except Exception as exc:
         logger.exception(
@@ -421,7 +466,7 @@ async def generate_campaign_copy(
         return {
             "subject": "A quick update",
             "body": fallback,
-            "html_body": _body_to_html(fallback),
+            "html_body": _finalize_email_html("", fallback),
             "fallback_used": True,
             "error_type": "quota_exhausted" if _is_quota_exhausted_error(exc) else "provider_error",
         }
@@ -447,7 +492,10 @@ async def generate_html_email_body(
         engine = await get_active_llm_engine(db, company_id)
     product_context = "No product selected."
     if product:
-        feature_lines = "\n".join(f"- {feature}" for feature in product.get("features") or []) or "- No structured features stored"
+        feature_lines = (
+            "\n".join(f"- {feature}" for feature in product.get("features") or [])
+            or "- No structured features stored"
+        )
         product_context = (
             f"Product name: {product.get('name') or product.get('product_title') or 'Product'}\n"
             f"Product description: {product.get('description') or 'No description provided'}\n"
@@ -458,6 +506,7 @@ async def generate_html_email_body(
     prompt = (
         "Generate a production-ready HTML email body for a CRM campaign.\n"
         "Return JSON with key html_body only.\n"
+        "Return a complete object in one response; the last character must be }.\n"
         "Constraints:\n"
         "- Use safe email HTML with simple headings, paragraphs, bullet lists, and links only if requested.\n"
         "- Do not include script, style, forms, tracking pixels, or external assets.\n"
@@ -469,12 +518,11 @@ async def generate_html_email_body(
     )
 
     try:
-        tuned_engine = dict(engine or {})
-        tuned_engine["max_tokens"] = min(int(tuned_engine.get("max_tokens") or 700), 700)
+        tuned_engine = _campaign_ai_engine(engine, min_output_tokens=HTML_BODY_MIN_OUTPUT_TOKENS)
         generated = HtmlEmailBodyDraft.model_validate(
             await call_model_json(prompt, HtmlEmailBodyDraft, engine=tuned_engine, call_purpose="email_html_body")
         ).model_dump()
-        html_body = _sanitize_email_html(generated.get("html_body", ""))
+        html_body = _finalize_email_html(generated.get("html_body", ""), current_body)
         if not html_body:
             raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("html"))
         return {"html_body": html_body}
@@ -482,14 +530,15 @@ async def generate_html_email_body(
         raise
     except Exception as exc:
         logger.exception(
-            "HTML email body AI generation failed function=generate_html_email_body company_id=%s product_id=%s error=%s",
+            "HTML email body AI generation failed function=generate_html_email_body "
+            "company_id=%s product_id=%s error=%s",
             company_id,
             product_id,
             exc,
         )
         fallback = await _campaign_static_fallback(db, company_id)
         return {
-            "html_body": _body_to_html(fallback),
+            "html_body": _finalize_email_html("", fallback),
             "fallback_used": True,
             "error_type": "quota_exhausted" if _is_quota_exhausted_error(exc) else "provider_error",
         }
@@ -517,6 +566,21 @@ def _campaign_product_snapshot(product: dict | None) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 
+async def bootstrap_email_campaign_schema(db) -> None:
+    await db.execute(
+        "ALTER TABLE IF EXISTS email_campaigns "
+        "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+    )
+    await db.execute(
+        "ALTER TABLE IF EXISTS email_campaigns "
+        "ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb"
+    )
+    await db.execute(
+        "ALTER TABLE IF EXISTS email_campaigns "
+        "ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
+    )
+
+
 async def create_campaign(
     db,
     *,
@@ -526,6 +590,8 @@ async def create_campaign(
     body: str,
     html_body: str = "",
     filters: dict | None = None,
+    attachments: list | None = None,
+    metadata: dict | None = None,
     created_by: str = "",
 ) -> dict:
     """Insert a draft campaign + its resolved recipients. Returns the campaign row."""
@@ -533,6 +599,9 @@ async def create_campaign(
         raise ValueError("company_id, subject, and body (or html_body) are required")
 
     filters = dict(filters or {})
+    final_html = _finalize_email_html(html_body, body)
+    final_body = str(body or "").strip() or _html_to_text(final_html)
+    metadata_payload = dict(metadata or {})
     product_id = str(filters.get("product_id") or "").strip()
     if product_id:
         product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
@@ -545,16 +614,18 @@ async def create_campaign(
     import json as _json
 
     await db.execute(
-        "INSERT INTO email_campaigns(id,company_id,name,subject,body,html_body,filters,status,"
+        "INSERT INTO email_campaigns(id,company_id,name,subject,body,html_body,filters,attachments,metadata,status,"
         "total_recipients,sent_count,failed_count,created_by,created_at) "
-        "VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,'draft',$8,0,0,$9,NOW())",
+        "VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,'draft',$10,0,0,$11,NOW())",
         campaign_id,
         company_id,
         (name or subject)[:240],
         subject[:500],
-        body or "",
-        html_body or "",
+        final_body,
+        final_html,
         _json.dumps(filters),
+        _json.dumps(list(attachments or [])),
+        _json.dumps(metadata_payload),
         len(recipients),
         (created_by or "")[:120],
     )
@@ -579,7 +650,9 @@ async def create_campaign(
                 ]
             )
         await db.execute(
-            "INSERT INTO email_campaign_recipients(id,campaign_id,company_id,customer_id,lead_id,email,status,created_at) "  # noqa: E501
+            "INSERT INTO email_campaign_recipients("
+            "id,campaign_id,company_id,customer_id,lead_id,email,status,created_at"
+            ") "
             f"VALUES {','.join(values_sql)}",
             *flat,
         )
@@ -608,6 +681,8 @@ async def update_campaign(
     body: str,
     html_body: str = "",
     filters: dict | None = None,
+    attachments: list | None = None,
+    metadata: dict | None = None,
 ) -> dict:
     if not (campaign_id and company_id and subject and (body or html_body)):
         raise ValueError("campaign_id, company_id, subject, and body (or html_body) are required")
@@ -624,6 +699,9 @@ async def update_campaign(
         raise ValueError("Only draft campaigns can be edited")
 
     filters = dict(filters or {})
+    final_html = _finalize_email_html(html_body, body)
+    final_body = str(body or "").strip() or _html_to_text(final_html)
+    metadata_payload = dict(metadata or {})
     product_id = str(filters.get("product_id") or "").strip()
     if product_id:
         product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
@@ -636,13 +714,15 @@ async def update_campaign(
 
     await db.execute(
         "UPDATE email_campaigns SET name=$1,subject=$2,body=$3,html_body=$4,filters=$5::jsonb,"
-        "total_recipients=$6,sent_count=0,failed_count=0,last_error='',updated_at=NOW() "
-        "WHERE id=$7 AND company_id=$8",
+        "attachments=$6::jsonb,metadata=$7::jsonb,total_recipients=$8,sent_count=0,failed_count=0,"
+        "last_error='',updated_at=NOW() WHERE id=$9 AND company_id=$10",
         (name or subject)[:240],
         subject[:500],
-        body or "",
-        html_body or "",
+        final_body,
+        final_html,
         _json.dumps(filters),
+        _json.dumps(list(attachments or [])),
+        _json.dumps(metadata_payload),
         len(recipients),
         campaign_id,
         company_id,
@@ -672,7 +752,9 @@ async def update_campaign(
                 ]
             )
         await db.execute(
-            "INSERT INTO email_campaign_recipients(id,campaign_id,company_id,customer_id,lead_id,email,status,created_at) "
+            "INSERT INTO email_campaign_recipients("
+            "id,campaign_id,company_id,customer_id,lead_id,email,status,created_at"
+            ") "
             f"VALUES {','.join(values_sql)}",
             *flat,
         )
@@ -753,8 +835,8 @@ async def _dispatch_campaign(
         )
 
     subject = str(campaign.get("subject") or "")
-    body = str(campaign.get("body") or "")
-    html_body = str(campaign.get("html_body") or "")
+    html_body = _finalize_email_html(str(campaign.get("html_body") or ""), str(campaign.get("body") or ""))
+    body = str(campaign.get("body") or "").strip() or _html_to_text(html_body)
 
     async with company_context(db, company_id):
         pending = await db.fetch(

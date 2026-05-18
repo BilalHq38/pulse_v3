@@ -252,13 +252,17 @@ async def analytics_customer_summaries(
         customer_rows = rs(
             await db.fetch(
                 """
-                SELECT cis.*
-                FROM customer_interaction_summaries cis
-                JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
-                WHERE cis.company_id=$1
-                  AND cis.summary_date=$2
-                  AND c.lifecycle_stage='customer'
-                ORDER BY cis.created_at DESC
+                SELECT *
+                FROM (
+                  SELECT DISTINCT ON (cis.customer_id, cis.conversation_id, cis.summary_date) cis.*
+                  FROM customer_interaction_summaries cis
+                  JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
+                  WHERE cis.company_id=$1
+                    AND cis.summary_date=$2
+                    AND c.lifecycle_stage='customer'
+                  ORDER BY cis.customer_id, cis.conversation_id, cis.summary_date, cis.created_at DESC
+                ) deduped
+                ORDER BY created_at DESC
                 LIMIT $3
                 """,
                 cid,
@@ -269,23 +273,27 @@ async def analytics_customer_summaries(
         lead_rows = rs(
             await db.fetch(
                 """
-                SELECT
-                  la.id,
-                  la.company_id,
-                  la.lead_id,
-                  l.name AS lead_name,
-                  la.created_at::date AS summary_date,
-                  la.created_at,
-                  la.content,
-                  la.type,
-                  la.stage,
-                  l.status,
-                  l.grade,
-                  l.score
-                FROM lead_activities la
-                JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
-                WHERE la.company_id=$1 AND la.created_at::date=$2
-                ORDER BY la.created_at DESC
+                SELECT *
+                FROM (
+                  SELECT DISTINCT ON (la.lead_id, la.type, la.stage, la.content, la.created_at::date)
+                    la.id,
+                    la.company_id,
+                    la.lead_id,
+                    l.name AS lead_name,
+                    la.created_at::date AS summary_date,
+                    la.created_at,
+                    la.content,
+                    la.type,
+                    la.stage,
+                    l.status,
+                    l.grade,
+                    l.score
+                  FROM lead_activities la
+                  JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
+                  WHERE la.company_id=$1 AND la.created_at::date=$2
+                  ORDER BY la.lead_id, la.type, la.stage, la.content, la.created_at::date, la.created_at DESC
+                ) deduped
+                ORDER BY created_at DESC
                 LIMIT $3
                 """,
                 cid,
@@ -297,12 +305,16 @@ async def analytics_customer_summaries(
         customer_rows = rs(
             await db.fetch(
                 """
-                SELECT cis.*
-                FROM customer_interaction_summaries cis
-                JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
-                WHERE cis.company_id=$1
-                  AND c.lifecycle_stage='customer'
-                ORDER BY cis.created_at DESC
+                SELECT *
+                FROM (
+                  SELECT DISTINCT ON (cis.customer_id, cis.conversation_id, cis.summary_date) cis.*
+                  FROM customer_interaction_summaries cis
+                  JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
+                  WHERE cis.company_id=$1
+                    AND c.lifecycle_stage='customer'
+                  ORDER BY cis.customer_id, cis.conversation_id, cis.summary_date, cis.created_at DESC
+                ) deduped
+                ORDER BY created_at DESC
                 LIMIT $2
                 """,
                 cid,
@@ -312,23 +324,27 @@ async def analytics_customer_summaries(
         lead_rows = rs(
             await db.fetch(
                 """
-                SELECT
-                  la.id,
-                  la.company_id,
-                  la.lead_id,
-                  l.name AS lead_name,
-                  la.created_at::date AS summary_date,
-                  la.created_at,
-                  la.content,
-                  la.type,
-                  la.stage,
-                  l.status,
-                  l.grade,
-                  l.score
-                FROM lead_activities la
-                JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
-                WHERE la.company_id=$1
-                ORDER BY la.created_at DESC
+                SELECT *
+                FROM (
+                  SELECT DISTINCT ON (la.lead_id, la.type, la.stage, la.content, la.created_at::date)
+                    la.id,
+                    la.company_id,
+                    la.lead_id,
+                    l.name AS lead_name,
+                    la.created_at::date AS summary_date,
+                    la.created_at,
+                    la.content,
+                    la.type,
+                    la.stage,
+                    l.status,
+                    l.grade,
+                    l.score
+                  FROM lead_activities la
+                  JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
+                  WHERE la.company_id=$1
+                  ORDER BY la.lead_id, la.type, la.stage, la.content, la.created_at::date, la.created_at DESC
+                ) deduped
+                ORDER BY created_at DESC
                 LIMIT $2
                 """,
                 cid,

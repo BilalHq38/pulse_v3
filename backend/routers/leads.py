@@ -5,6 +5,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from agent_orchestrator.schemas import LeadWorkflowRequest
+from channel_layer.channel_identity import company_default_phone_region
 from channel_layer.router import get_outbound_router
 from channel_layer.schemas import ChannelType
 from services.ai_service.facade import (
@@ -17,7 +18,8 @@ from core.phone_normalization import strict_normalize_to_e164_digits
 from core.utils import make_id, now_ts, normalize_reference_key
 from models.reference_data import resolve_company_reference_id
 from shared.tracing import current_trace_context
-from shared.tabular_uploads import parse_tabular_upload, split_multi_value
+from shared.tabular_uploads import parse_tabular_upload, phone_region_from_upload_row, split_multi_value
+from shared.usage_guard import conversation_limit_status, raise_conversation_limit_completed, reserve_conversation_usage
 from shared.webhook_task_runner import create_safe_detached_task
 from services.db_helpers import (
     r,
@@ -521,35 +523,44 @@ async def _send_lead_nurture_message(
 
     channel = str(conversation.get("channel") or channel).strip().lower()
     recipient_id = _resolve_lead_recipient(channel, customer, lead)
+    if channel in {"whatsapp", "facebook", "instagram", "email"} and not recipient_id:
+        if channel == "whatsapp":
+            raise HTTPException(400, "Phone number is required to send a WhatsApp message.")
+        if channel == "email":
+            raise HTTPException(400, "Email address is required to send an email message.")
+        raise HTTPException(
+            400,
+            f"{channel.capitalize()} recipient ID is required to send this message.",
+        )
     msg_id = make_id()
+    company_id = conversation.get("company_id", get_company_id(current_user))
+    reservation = await reserve_conversation_usage(
+        db,
+        company_id,
+        channel=channel,
+        idempotency_key=f"out:{company_id}:{channel}:lead_nurture:{msg_id}",
+        metadata={
+            "source": "lead_nurture",
+            "lead_id": lead.get("id", ""),
+            "nurture_message_id": nurture_message.get("id", ""),
+        },
+    )
+    if reservation == "denied":
+        raise_conversation_limit_completed(await conversation_limit_status(db, company_id))
     await db.execute(
         "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,read,created_at) "
         "VALUES($1,$2,$3,$4,'agent',$5,$6,FALSE,NOW())",
         msg_id,
-        conversation.get("company_id", get_company_id(current_user)),
+        company_id,
         conversation["id"],
         content,
         current_user.get("sub", ""),
         current_user.get("name", ""),
     )
     if channel in {"whatsapp", "facebook", "instagram", "email"}:
-        if not recipient_id:
-            await db.execute(
-                "DELETE FROM messages WHERE id=$1 AND company_id=$2",
-                msg_id,
-                conversation.get("company_id", get_company_id(current_user)),
-            )
-            if channel == "whatsapp":
-                raise HTTPException(400, "Phone number is required to send a WhatsApp message.")
-            if channel == "email":
-                raise HTTPException(400, "Email address is required to send an email message.")
-            raise HTTPException(
-                400,
-                f"{channel.capitalize()} recipient ID is required to send this message.",
-            )
         sent, error = await _send_outbound_via_channel_layer(
             db=db,
-            company_id=conversation.get("company_id", get_company_id(current_user)),
+            company_id=company_id,
             channel=channel,
             recipient_id=recipient_id,
             content=content,
@@ -562,17 +573,13 @@ async def _send_lead_nurture_message(
                 "actor_user_role": current_user.get("role", ""),
                 "trace_id": _trace_id_from_context(),
             },
-            subject=(
-                f"Pulse Engine follow up for {lead.get('name') or customer.get('name') or 'lead'}"
-                if channel == "email"
-                else ""
-            ),
+            subject="",
         )
         if not sent:
             await db.execute(
                 "DELETE FROM messages WHERE id=$1 AND company_id=$2",
                 msg_id,
-                conversation.get("company_id", get_company_id(current_user)),
+                company_id,
             )
             raise HTTPException(502, error or f"Failed to send {channel} message")
     await persist_chat_history(
@@ -932,6 +939,7 @@ async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
     cu = await get_current_user_flexible(request)
     cid = get_company_id(cu)
     rows = parse_tabular_upload(file.filename or "", await file.read())
+    tenant_phone_region = await company_default_phone_region(db, cid)
     summary = {
         "total_rows": len(rows),
         "created": 0,
@@ -966,11 +974,13 @@ async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
 
             normalized_phone = ""
             if raw_phone:
-                normalized_phone = strict_normalize_to_e164_digits(raw_phone) or ""
+                phone_region = phone_region_from_upload_row(row) or tenant_phone_region
+                normalized_phone = strict_normalize_to_e164_digits(raw_phone, fallback_region=phone_region or None) or ""
                 if not normalized_phone:
                     raise HTTPException(
                         400,
-                        "Invalid phone number. Use a valid international number such as +1..., +44..., or +92....",
+                        "Invalid phone number. Use a valid international number such as +1..., +44..., or +92..., "
+                        "or include a country/region code for local numbers.",
                     )
 
             existing = await _find_existing_lead_for_upload(

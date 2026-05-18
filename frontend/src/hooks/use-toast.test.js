@@ -26,3 +26,21 @@ test('getErrorMessage maps unconfigured email delivery to a clean message', () =
     ),
   ).toBe('Email channel is not configured.');
 });
+
+test('getErrorMessage maps workspace seat limits to a team limit message', () => {
+  expect(
+    getErrorMessage(
+      { response: { data: { detail: 'Workspace user limit reached (3 seat(s) on your plan). Upgrade or remove users to add more.' } } },
+      'fallback',
+    ),
+  ).toBe('Team member limit reached (3 seat(s) on your plan). Upgrade your plan or remove pending invitations/users before adding another teammate.');
+});
+
+test('getErrorMessage maps protected prebuilt article deletion accurately', () => {
+  expect(
+    getErrorMessage(
+      { response: { data: { detail: 'Prebuilt knowledge base articles cannot be deleted. Edit the article or disable AI context instead.' } } },
+      'fallback',
+    ),
+  ).toBe('Prebuilt knowledge base articles cannot be deleted. Edit the article or disable AI context instead.');
+});

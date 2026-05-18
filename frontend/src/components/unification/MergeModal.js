@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Link2, Plus, X } from 'lucide-react';
 
@@ -26,21 +26,11 @@ export default function MergeModal({
   onConfirm,
   actionInFlight = false,
 }) {
-  const [manualIdInput, setManualIdInput] = useState('');
-
-  const manualIds = useMemo(() => {
-    return dedupe(
-      String(manualIdInput || '')
-        .split(/[,\s\n\t]+/)
-        .map((item) => item.trim())
-        .filter(Boolean),
-    );
-  }, [manualIdInput]);
-
-  const candidateIds = useMemo(
-    () => dedupe([...(selectedIds || []), ...manualIds]),
-    [selectedIds, manualIds],
-  );
+  const candidateIds = useMemo(() => dedupe(selectedIds || []), [selectedIds]);
+  const selectedProfiles = useMemo(() => {
+    const lookup = new Map((profiles || []).map((profile) => [normalizeId(profile?.id), profile]));
+    return candidateIds.map((id) => lookup.get(id) || { id, display_name: 'Selected profile' });
+  }, [candidateIds, profiles]);
   const canSubmit = candidateIds.length >= 2 && !actionInFlight;
 
   if (!isOpen) return null;
@@ -59,7 +49,7 @@ export default function MergeModal({
           <div>
             <h2 className="text-base font-semibold text-slate-900">Manual Identity Merge</h2>
             <p className="mt-1 text-xs text-slate-500">
-              Merge at least two unified profile IDs. This operation requires admin permissions and is audited.
+              Merge at least two selected profiles. This operation requires admin permissions and is audited.
             </p>
           </div>
           <button
@@ -92,6 +82,12 @@ export default function MergeModal({
                 profiles.map((profile) => {
                   const profileId = normalizeId(profile?.id);
                   const selected = (selectedIds || []).includes(profileId);
+                  const channels = Array.isArray(profile?.source_channels) && profile.source_channels.length
+                    ? profile.source_channels
+                    : String(profile?.platforms_used || '')
+                        .split(/[,\u2022/|]+/)
+                        .map((item) => item.trim())
+                        .filter(Boolean);
                   return (
                     <label
                       key={profileId}
@@ -108,9 +104,11 @@ export default function MergeModal({
                         className="h-3.5 w-3.5 rounded border-slate-300 text-blue-600"
                       />
                       <span className="min-w-0 flex-1 truncate font-medium">
-                        {profile?.display_name || profileId}
+                        {profile?.display_name || 'Unknown profile'}
                       </span>
-                      <span className="font-mono text-[10px] text-slate-400">{profileId}</span>
+                      <span className="max-w-[12rem] truncate text-[10px] text-slate-400">
+                        {channels.length ? channels.join(', ') : `${Number(profile?.member_count || 0) || 0} linked`}
+                      </span>
                     </label>
                   );
                 })
@@ -120,35 +118,21 @@ export default function MergeModal({
             </div>
           </section>
 
-          <section>
-            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Additional IDs</p>
-            <textarea
-              rows={3}
-              value={manualIdInput}
-              onChange={(event) => setManualIdInput(event.target.value)}
-              placeholder="Paste profile IDs separated by commas or new lines"
-              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-700 outline-none ring-blue-300 transition focus:border-blue-300 focus:ring"
-            />
-            <p className="mt-1 text-[11px] text-slate-500">
-              Parsed IDs: {manualIds.length > 0 ? manualIds.join(', ') : 'none'}
-            </p>
-          </section>
-
           <section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
             <p className="text-xs text-slate-600">Profiles queued for merge</p>
             <div className="mt-2 flex flex-wrap gap-1.5">
-              {candidateIds.length > 0 ? (
-                candidateIds.map((id) => (
+              {selectedProfiles.length > 0 ? (
+                selectedProfiles.map((profile) => (
                   <span
-                    key={id}
+                    key={profile.id}
                     className="rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600"
                   >
-                    {id}
+                    {profile.display_name || 'Unknown profile'}
                   </span>
                 ))
               ) : (
                 <span className="text-[11px] text-slate-500">
-                  Select or add at least two profile IDs.
+                  Select at least two profiles.
                 </span>
               )}
             </div>

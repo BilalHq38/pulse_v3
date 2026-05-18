@@ -11,6 +11,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from channel_layer.channel_identity import normalize_whatsapp_phone
 from channel_layer.schemas import ChannelType, UnifiedMessage
 
 logger = logging.getLogger(__name__)
@@ -167,8 +168,25 @@ class MessageNormalizer:
         try:
             # Try phone match (WhatsApp, SMS) — try multiple normalized forms
             if message.channel_type == ChannelType.WHATSAPP:
+                whatsapp_identity = normalize_whatsapp_phone(external_id)
+                external_digits = re.sub(r"\D", "", external_id)
+                canonical_digits = re.sub(r"\D", "", whatsapp_identity.canonical_value)
                 normalized_phone = _normalize_phone_simple(external_id)
-                phone_candidates = list(dict.fromkeys([p for p in [external_id, normalized_phone] if p]))
+                phone_candidates = list(
+                    dict.fromkeys(
+                        [
+                            p
+                            for p in [
+                                external_id,
+                                whatsapp_identity.canonical_value,
+                                canonical_digits,
+                                external_digits,
+                                normalized_phone,
+                            ]
+                            if p
+                        ]
+                    )
+                )
                 for phone_value in phone_candidates:
                     customer_id = await db.fetchval(
                         "SELECT id FROM customers WHERE company_id=$1 AND phone=$2 LIMIT 1",
@@ -181,7 +199,7 @@ class MessageNormalizer:
                 # Last-10-digits fallback — handles stored numbers that include
                 # country code / spaces / dashes while the webhook delivers the
                 # raw E.164 form (or vice versa).
-                digits = re.sub(r"\D", "", external_id)
+                digits = canonical_digits or external_digits
                 if digits:
                     customer_id = await db.fetchval(
                         "SELECT id FROM customers "

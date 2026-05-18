@@ -408,6 +408,14 @@ async def login(request: Request):
         )
     user = password_matches[0]
     user = await ensure_user_company_assignment(db, user)
+    account_status = str(user.get("status") or "active").strip().lower()
+    if account_status in {"paused", "blocked", "inactive"}:
+        await _record_auth_event_safe(db, user["id"], "login", request, False, email)
+        logger.warning("auth login_failed method=email reason=account_%s", account_status)
+        return JSONResponse(
+            status_code=403,
+            content={"detail": f"Your account is {account_status}. Please contact your administrator."},
+        )
     if user.get("role") == "super_admin" and not relaxed_billing_env():
         logger.warning("auth login_failed method=email reason=super_admin_requires_admin_login")
         return JSONResponse(
@@ -1288,7 +1296,7 @@ async def accept_invitation(request: Request, background_tasks: BackgroundTasks)
         if used + pending_ct > cap:
             raise HTTPException(
                 403,
-                "This workspace no longer has room for new users under its current plan. Ask an admin to upgrade or increase seats.",
+                "You cannot add a new team member because your limit has been reached.",
             )
         user_id = make_id()
         await db.execute(
@@ -1604,35 +1612,36 @@ async def invite_team_member(request: Request, background_tasks: BackgroundTasks
     company_id = (current_user.get("company_id") or "").strip()
     if not company_id:
         raise HTTPException(400, "Company context is required")
-    await assert_workspace_seat_available(db, company_id)
-    existing_user = await db.fetchval(
-        "SELECT id FROM users WHERE email=$1 AND company_id=$2",
-        email,
-        company_id,
-    )
-    if existing_user:
-        raise HTTPException(400, "User already exists in this company")
-    await db.execute(
-        "UPDATE invitations SET status='expired' WHERE company_id=$1 AND email=$2 AND status='pending'",
-        company_id,
-        email,
-    )
     raw_token = secrets.token_urlsafe(32)
     token_hash = hash_token(raw_token)
     invitation_id = make_id()
     expires_at = datetime.now(timezone.utc) + timedelta(hours=INVITATION_TTL_HOURS)
-    await db.execute(
-        "INSERT INTO invitations(id,company_id,email,token,status,role,sub_role,invitee_status,expires_at,created_at) "
-        "VALUES($1,$2,$3,$4,'pending',$5,$6,$7,$8,NOW())",
-        invitation_id,
-        company_id,
-        email,
-        token_hash,
-        role,
-        sub_role,
-        invitee_status,
-        expires_at,
-    )
+    async with db.transaction() as conn:
+        await assert_workspace_seat_available(conn, company_id)
+        existing_user = await conn.fetchval(
+            "SELECT id FROM users WHERE email=$1 AND company_id=$2",
+            email,
+            company_id,
+        )
+        if existing_user:
+            raise HTTPException(400, "User already exists in this company")
+        await conn.execute(
+            "UPDATE invitations SET status='expired' WHERE company_id=$1 AND email=$2 AND status='pending'",
+            company_id,
+            email,
+        )
+        await conn.execute(
+            "INSERT INTO invitations(id,company_id,email,token,status,role,sub_role,invitee_status,expires_at,created_at) "
+            "VALUES($1,$2,$3,$4,'pending',$5,$6,$7,$8,NOW())",
+            invitation_id,
+            company_id,
+            email,
+            token_hash,
+            role,
+            sub_role,
+            invitee_status,
+            expires_at,
+        )
     company = r(await db.fetchrow("SELECT name FROM companies WHERE id=$1 LIMIT 1", company_id))
     invite_url = f"{resolve_frontend_base_url(request)}/accept-invite?{urlencode({'token': raw_token, 'email': email})}"
     html = render_platform_email_html(

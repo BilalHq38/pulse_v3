@@ -67,9 +67,12 @@ from shared.tracing import current_trace_context
 from shared.webhook_task_runner import create_safe_detached_task
 from services.billing_helpers import relaxed_billing_env
 from shared.usage_guard import (
+    conversation_limit_completed_message,
+    conversation_limit_status,
     inbound_conversation_billing_precheck,
     insert_conversation_usage_relaxed,
     insert_conversation_usage_row,
+    reserve_conversation_usage,
 )
 from services.db_helpers import (
     AI_API_EXHAUSTED_MANUAL_MESSAGE,
@@ -117,6 +120,8 @@ _UNPROCESSED_SCHEMA_READY = False
 _UNPROCESSED_SCHEMA_LOCK = asyncio.Lock()
 _MESSAGES_IDEMPOTENCY_SCHEMA_READY = False
 _MESSAGES_IDEMPOTENCY_SCHEMA_LOCK = asyncio.Lock()
+_WHATSAPP_IDENTITY_SCHEMA_READY = False
+_WHATSAPP_IDENTITY_SCHEMA_LOCK = asyncio.Lock()
 _CHANNEL_NORMALIZER = MessageNormalizer()
 
 
@@ -267,7 +272,12 @@ def _extract_sender_contact_fields(channel: str, sender_contact: str, metadata_p
     profile_id = ""
     if normalized_channel == "whatsapp":
         candidate = (
-            str(payload.get("normalized_sender_id") or "").strip()
+            (
+                str(payload.get("group_sender_phone") or payload.get("group_sender_phone_digits") or "").strip()
+                if _is_whatsapp_group_metadata(payload)
+                else ""
+            )
+            or str(payload.get("normalized_sender_id") or "").strip()
             or raw_contact
             or str(payload.get("raw_wa_id") or "").strip()
             or metadata_contact
@@ -285,7 +295,14 @@ def _extract_sender_contact_fields(channel: str, sender_contact: str, metadata_p
                 identity.reason,
                 payload.get("trace_id", ""),
             )
-            channel_id = ""
+            channel_id = str(
+                raw_contact
+                or metadata_contact
+                or payload.get("provider_sender_id")
+                or payload.get("raw_sender_id")
+                or payload.get("raw_wa_id")
+                or ""
+            ).strip()
     elif normalized_channel == "email":
         email_identity = normalize_channel_email(raw_contact or metadata_contact)
         email = email_identity.canonical_value
@@ -315,6 +332,339 @@ def _extract_sender_contact_fields(channel: str, sender_contact: str, metadata_p
     }
 
 
+def _identity_digits(value: Any) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _customer_matches_contact_identity(customer: dict | None, contact_fields: dict[str, str]) -> bool:
+    if not customer:
+        return False
+    email = str(contact_fields.get("email") or "").strip().lower()
+    if email and str((customer or {}).get("email") or "").strip().lower() == email:
+        return True
+
+    incoming_digits = _identity_digits(contact_fields.get("phone"))
+    customer_digits = _identity_digits((customer or {}).get("phone"))
+    return bool(incoming_digits and customer_digits and incoming_digits == customer_digits)
+
+
+def _contact_lookup_values(email: str = "", phone: str = "") -> list[tuple[str, str]]:
+    values: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(value: str, digits: str = "") -> None:
+        cleaned = str(value or "").strip()
+        normalized_digits = _identity_digits(digits) if digits else ""
+        key = (cleaned.lower(), normalized_digits)
+        if cleaned and key not in seen:
+            seen.add(key)
+            values.append((cleaned, normalized_digits))
+
+    if email:
+        add(email, "")
+    if phone:
+        digits = _identity_digits(phone)
+        add(phone, digits)
+        if digits:
+            add(digits, digits)
+            add(f"+{digits}", digits)
+    return values
+
+
+def _metadata_truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_whatsapp_group_metadata(metadata_payload: dict | None) -> bool:
+    payload = dict(metadata_payload or {})
+    group_id = str(payload.get("group_id") or payload.get("group_chat_id") or "").strip()
+    raw_from = str(payload.get("raw_from") or payload.get("msg_from") or payload.get("channel_id") or "").strip()
+    return bool(group_id or _metadata_truthy(payload.get("is_group_message")) or raw_from.lower().endswith("@g.us"))
+
+
+def _whatsapp_group_id(metadata_payload: dict | None) -> str:
+    payload = dict(metadata_payload or {})
+    for key in ("group_id", "group_chat_id", "channel_id", "msg_id_remote", "raw_from", "msg_from"):
+        value = str(payload.get(key) or "").strip()
+        if value.lower().endswith("@g.us") or key in {"group_id", "group_chat_id"}:
+            if value:
+                return value
+    return ""
+
+
+def _preferred_sender_name(channel: str, sender_name: str, metadata_payload: dict | None, existing_name: str = "") -> str:
+    payload = dict(metadata_payload or {})
+    normalized_channel = str(channel or "").strip().lower()
+    incoming = str(sender_name or "").strip()
+    existing = str(existing_name or "").strip()
+    if normalized_channel != "whatsapp":
+        return incoming or existing
+    saved = str(
+        payload.get("sender_name_saved")
+        or payload.get("contact_name_saved")
+        or payload.get("name_saved")
+        or ""
+    ).strip()
+    push = str(payload.get("sender_pushname") or payload.get("contact_pushname") or "").strip()
+    if saved:
+        return saved
+    generic_existing = not existing or existing.lower() in {"unknown", "unknown contact"} or existing.startswith("WhatsApp ")
+    if existing and not generic_existing and incoming in {push, f"WhatsApp {payload.get('normalized_sender_id', '')}".strip()}:
+        return existing
+    return incoming or push or existing
+
+
+def _should_update_sender_name(channel: str, incoming_name: str, metadata_payload: dict | None, existing_name: str) -> bool:
+    incoming = str(incoming_name or "").strip()
+    existing = str(existing_name or "").strip()
+    if not incoming or incoming == existing:
+        return False
+    if str(channel or "").strip().lower() != "whatsapp":
+        return True
+    payload = dict(metadata_payload or {})
+    saved = str(payload.get("sender_name_saved") or payload.get("contact_name_saved") or "").strip()
+    if saved:
+        return True
+    generic_existing = not existing or existing.lower() in {"unknown", "unknown contact"} or existing.startswith("WhatsApp ")
+    return generic_existing
+
+
+async def _get_or_create_whatsapp_group_customer(db, company_id: str, group_id: str, group_name: str = "") -> dict:
+    scoped_company_id = str(company_id or "").strip()
+    scoped_group_id = str(group_id or "").strip()
+    if not scoped_company_id or not scoped_group_id:
+        return {}
+    existing = r(
+        await db.fetchrow(
+            "SELECT c.* FROM customers c "
+            "JOIN customer_social_profiles csp ON csp.customer_id=c.id "
+            "WHERE c.company_id=$1 AND csp.platform='whatsapp_group' AND csp.profile_id=$2 "
+            "ORDER BY c.updated_at DESC LIMIT 1",
+            scoped_company_id,
+            scoped_group_id,
+        )
+    )
+    display_name = str(group_name or "").strip() or "WhatsApp Group"
+    if existing:
+        if display_name and display_name != existing.get("name"):
+            await db.execute(
+                "UPDATE customers SET name=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                display_name,
+                existing.get("id", ""),
+                scoped_company_id,
+            )
+            existing["name"] = display_name
+        return existing
+
+    customer_id = make_id()
+    await db.execute(
+        "INSERT INTO customers(id,company_id,name,email,phone,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,"
+        "recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "
+        "VALUES($1,$2,$3,'','','group','', 'customer',0,0,0,0,0,0,NOW(),NOW())",
+        customer_id,
+        scoped_company_id,
+        display_name,
+    )
+    await db.execute(
+        "INSERT INTO customer_social_profiles(customer_id,platform,profile_id) VALUES($1,'whatsapp_group',$2) "
+        "ON CONFLICT (customer_id,platform) DO UPDATE SET profile_id=EXCLUDED.profile_id,updated_at=NOW()",
+        customer_id,
+        scoped_group_id,
+    )
+    await db.execute(
+        "INSERT INTO customer_channels(customer_id,channel) VALUES($1,'whatsapp') ON CONFLICT DO NOTHING",
+        customer_id,
+    )
+    await db.execute(
+        "INSERT INTO customer_tags(customer_id,tag) VALUES($1,'whatsapp-group') ON CONFLICT DO NOTHING",
+        customer_id,
+    )
+    return r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 AND company_id=$2", customer_id, scoped_company_id))
+
+
+async def _get_or_create_whatsapp_pending_customer(
+    db,
+    company_id: str,
+    raw_identity: str,
+    display_name: str = "",
+    avatar_url: str = "",
+) -> dict:
+    scoped_company_id = str(company_id or "").strip()
+    scoped_identity = str(raw_identity or "").strip()
+    if not scoped_company_id or not scoped_identity:
+        return {}
+    existing = r(
+        await db.fetchrow(
+            "SELECT c.* FROM customers c "
+            "JOIN customer_social_profiles csp ON csp.customer_id=c.id "
+            "WHERE c.company_id=$1 AND csp.platform='whatsapp_pending' AND csp.profile_id=$2 "
+            "ORDER BY c.updated_at DESC LIMIT 1",
+            scoped_company_id,
+            scoped_identity,
+        )
+    )
+    safe_avatar = _safe_provider_avatar_url(avatar_url)
+    safe_name = str(display_name or "").strip() or f"WhatsApp pending {scoped_identity[:16]}"
+    if existing:
+        updates: list[str] = []
+        args: list[Any] = []
+        if safe_name and _should_update_sender_name("whatsapp", safe_name, {}, existing.get("name", "")):
+            updates.append(f"name=${len(args) + 1}")
+            args.append(safe_name)
+            existing["name"] = safe_name
+        if safe_avatar and not existing.get("avatar"):
+            updates.append(f"avatar=${len(args) + 1}")
+            args.append(safe_avatar)
+            existing["avatar"] = safe_avatar
+        if updates:
+            args.extend([existing.get("id", ""), scoped_company_id])
+            await db.execute(
+                f"UPDATE customers SET {', '.join(updates)},updated_at=NOW() "
+                f"WHERE id=${len(args) - 1} AND company_id=${len(args)}",
+                *args,
+            )
+        return existing
+
+    customer_id = make_id()
+    await db.execute(
+        "INSERT INTO customers(id,company_id,name,email,phone,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,"
+        "recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "
+        "VALUES($1,$2,$3,'','','unknown',$4,'lead',0,0,0,0,0,0,NOW(),NOW())",
+        customer_id,
+        scoped_company_id,
+        safe_name,
+        safe_avatar,
+    )
+    await db.execute(
+        "INSERT INTO customer_social_profiles(customer_id,platform,profile_id) VALUES($1,'whatsapp_pending',$2) "
+        "ON CONFLICT (customer_id,platform) DO UPDATE SET profile_id=EXCLUDED.profile_id,updated_at=NOW()",
+        customer_id,
+        scoped_identity,
+    )
+    await db.execute(
+        "INSERT INTO customer_channels(customer_id,channel) VALUES($1,'whatsapp') ON CONFLICT DO NOTHING",
+        customer_id,
+    )
+    await db.execute(
+        "INSERT INTO customer_tags(customer_id,tag) VALUES($1,'whatsapp-pending') ON CONFLICT DO NOTHING",
+        customer_id,
+    )
+    return r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 AND company_id=$2", customer_id, scoped_company_id))
+
+
+def _whatsapp_account_id(metadata_payload: dict | None) -> str:
+    payload = dict(metadata_payload or {})
+    return str(
+        payload.get("business_account_id")
+        or payload.get("phone_number_id")
+        or payload.get("bridge_scope")
+        or ""
+    ).strip()
+
+
+def _normalize_whatsapp_identity_value(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    if "@" not in lower:
+        digits = _identity_digits(raw)
+        return digits or lower
+    if lower.endswith("@c.us") or lower.endswith("@s.whatsapp.net"):
+        user = lower.split("@", 1)[0]
+        digits = _identity_digits(user)
+        return f"{digits}@s.whatsapp.net" if digits else lower
+    return lower
+
+
+def _whatsapp_identity_type(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw.endswith("@lid") or "@lid:" in raw:
+        return "lid_jid"
+    if raw.endswith("@g.us"):
+        return "group_jid"
+    if raw.endswith("@c.us") or raw.endswith("@s.whatsapp.net"):
+        return "jid"
+    if _identity_digits(raw) == raw.replace("+", "") and len(_identity_digits(raw)) >= 7:
+        return "phone"
+    if "@" in raw:
+        return "provider_jid"
+    return "raw"
+
+
+def _append_whatsapp_alias_candidate(candidates: list[dict], seen: set[tuple[str, str]], value: Any, source: str) -> None:
+    raw = str(value or "").strip()
+    if not raw:
+        return
+    normalized = _normalize_whatsapp_identity_value(raw)
+    identity_type = _whatsapp_identity_type(raw)
+    if not normalized or not identity_type:
+        return
+    key = (identity_type, normalized)
+    if key in seen:
+        return
+    seen.add(key)
+    candidates.append(
+        {
+            "identity_type": identity_type,
+            "identity_value": raw,
+            "identity_value_normalized": normalized,
+            "source": source,
+        }
+    )
+    digits = _identity_digits(raw)
+    if digits and identity_type in {"jid", "phone"}:
+        phone_key = ("phone", digits)
+        if phone_key not in seen:
+            seen.add(phone_key)
+            candidates.append(
+                {
+                    "identity_type": "phone",
+                    "identity_value": digits,
+                    "identity_value_normalized": digits,
+                    "source": f"{source}:digits",
+                }
+            )
+
+
+def _whatsapp_alias_candidates(
+    metadata_payload: dict | None,
+    *,
+    sender_contact: str = "",
+    channel_binding: str = "",
+) -> list[dict]:
+    payload = dict(metadata_payload or {})
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for key in (
+        "normalized_sender_id",
+        "sender_contact",
+        "sender_phone",
+        "sender_phone_digits",
+        "target_phone",
+        "target_phone_digits",
+        "target_raw_id",
+        "target_lid_jid",
+        "raw_from",
+        "msg_from",
+        "msg_to",
+        "msg_author",
+        "msg_id_remote",
+        "raw_sender_id",
+        "provider_sender_id",
+        "raw_wa_id",
+        "contact_id",
+        "chat_id",
+        "group_id",
+    ):
+        _append_whatsapp_alias_candidate(candidates, seen, payload.get(key), key)
+    _append_whatsapp_alias_candidate(candidates, seen, sender_contact, "sender_contact_arg")
+    _append_whatsapp_alias_candidate(candidates, seen, channel_binding, "channel_binding")
+    return candidates
+
+
 def _is_whatsapp_web_bridge_payload(payload: dict) -> bool:
     for entry in payload.get("entry", []) or []:
         for change in (entry or {}).get("changes", []) or []:
@@ -326,6 +676,12 @@ def _is_whatsapp_web_bridge_payload(payload: dict) -> bool:
                 if isinstance((msg or {}).get("web_bridge"), dict):
                     return True
     return False
+
+
+def _is_whatsapp_bridge_outbound_message(msg: dict, metadata: dict | None = None) -> bool:
+    web_bridge = (msg or {}).get("web_bridge") if isinstance((msg or {}).get("web_bridge"), dict) else {}
+    direction = str(web_bridge.get("direction") or (metadata or {}).get("direction") or "").strip().lower()
+    return direction == "outbound" or bool(web_bridge.get("from_me") is True)
 
 
 def _is_truthy(value: str | None) -> bool:
@@ -669,7 +1025,10 @@ async def _verify_meta_webhook_request(
     raw_body: bytes,
 ) -> str:
     bridge_trusted = channel == "whatsapp" and _is_trusted_whatsapp_web_bridge_request(request)
-    await _enforce_meta_webhook_rate_limit(request, channel)
+    if not bridge_trusted:
+        await _enforce_meta_webhook_rate_limit(request, channel)
+    else:
+        logger.debug("Skipping external Meta webhook rate limit for trusted WhatsApp bridge request")
     if not bridge_trusted:
         _enforce_meta_webhook_ip_allowlist(request, channel)
 
@@ -1486,6 +1845,7 @@ async def _handle_whatsapp_webhook_payload(
                         _schedule_unprocessed_retry(db, "whatsapp")
                     continue
                 tenant_resolved_any = True
+                await _ensure_whatsapp_identity_schema(db)
 
                 await _record_webhook_event_safe(
                     db,
@@ -1513,13 +1873,28 @@ async def _handle_whatsapp_webhook_payload(
                 for i, msg in enumerate(messages):
                     contact = contacts[i] if i < len(contacts) else {}
                     web_bridge = (msg or {}).get("web_bridge") if isinstance((msg or {}).get("web_bridge"), dict) else {}
+                    is_bridge_outbound = is_web_bridge and _is_whatsapp_bridge_outbound_message(msg or {}, value_metadata)
+                    is_group_message = bool(
+                        web_bridge.get("is_group_message")
+                        or value_metadata.get("is_group_message")
+                        or str((msg or {}).get("from") or "").strip().lower().endswith("@g.us")
+                    )
                     raw_sender_phone = str((msg or {}).get("from") or "").strip()
                     raw_wa_id = str((contact or {}).get("wa_id") or "").strip()
                     bridge_sender_phone = str(
-                        web_bridge.get("sender_phone") or web_bridge.get("sender_phone_digits") or ""
+                        web_bridge.get("target_phone")
+                        or web_bridge.get("target_phone_digits")
+                        or web_bridge.get("target_raw_id")
+                        or web_bridge.get("target_lid_jid")
+                        or web_bridge.get("sender_phone")
+                        or web_bridge.get("sender_phone_digits")
+                        or ""
                     ).strip()
-                    sender_phone = raw_sender_phone or raw_wa_id or bridge_sender_phone
-                    if not sender_phone:
+                    if is_bridge_outbound:
+                        sender_phone = bridge_sender_phone or raw_sender_phone or raw_wa_id or str(web_bridge.get("group_id") or "").strip()
+                    else:
+                        sender_phone = raw_sender_phone or raw_wa_id or bridge_sender_phone
+                    if not sender_phone and not is_group_message:
                         logger.warning(
                             "Skipping WhatsApp inbound without sender identity company_id=%s event_id=%s trace_id=%s",
                             resolved_company_id,
@@ -1529,6 +1904,41 @@ async def _handle_whatsapp_webhook_payload(
                         skipped_reasons.append("invalid_sender_identity")
                         continue
                     reaction_payload = _extract_whatsapp_reaction(msg or {})
+                    provider_event_id = str(
+                        (msg or {}).get("provider_event_id")
+                        or (msg or {}).get("id")
+                        or reaction_payload.get("provider_message_id")
+                        or ""
+                    ).strip()
+                    idempotency_key = str(
+                        (msg or {}).get("idempotency_key")
+                        or web_bridge.get("idempotency_key")
+                        or (
+                            f"whatsapp:{resolved_company_id}:{'reaction' if reaction_payload else 'message'}:{provider_event_id}"
+                            if provider_event_id
+                            else ""
+                        )
+                    ).strip()
+                    dedup_result = await _record_whatsapp_event_dedup(
+                        db,
+                        resolved_company_id,
+                        {**inbound_metadata, **value_metadata, **web_bridge},
+                        event_type="reaction" if reaction_payload else str(value_metadata.get("bridge_event_type") or "message"),
+                        provider_event_id=provider_event_id,
+                        idempotency_key=idempotency_key,
+                        payload=msg or {},
+                    )
+                    if dedup_result.get("duplicate"):
+                        processed_results.append(
+                            {
+                                "message_id": provider_event_id,
+                                "conversation_id": "",
+                                "duplicate": True,
+                                "dedup_stage": "database",
+                            }
+                        )
+                        processed_any = True
+                        continue
                     if reaction_payload:
                         saved_reaction = await _store_and_emit_message_reaction(
                             db,
@@ -1579,6 +1989,7 @@ async def _handle_whatsapp_webhook_payload(
                             "company_id": resolved_company_id,
                             "source": source or "whatsapp_webhook",
                             "bridge_source": source,
+                            "direction": "outbound" if is_bridge_outbound else "inbound",
                             "provider_sender_id": str(web_bridge.get("provider_sender_id") or ""),
                             "profile_picture_url": str(
                                 (unified_message.metadata or {}).get("profile_picture_url")
@@ -1586,15 +1997,64 @@ async def _handle_whatsapp_webhook_payload(
                                 or value_metadata.get("profile_picture_url")
                                 or ""
                             ),
+                            "group_profile_picture_url": str(
+                                web_bridge.get("group_profile_picture_url")
+                                or value_metadata.get("group_profile_picture_url")
+                                or ""
+                            ),
                             "raw_from": str(web_bridge.get("raw_from") or raw_sender_phone or ""),
                             "msg_from": str(web_bridge.get("msg_from") or raw_sender_phone or ""),
+                            "msg_to": str(web_bridge.get("msg_to") or ""),
                             "msg_author": str(web_bridge.get("msg_author") or ""),
                             "msg_id_remote": str(web_bridge.get("msg_id_remote") or ""),
+                            "target_raw_id": str(web_bridge.get("target_raw_id") or ""),
+                            "target_lid_jid": str(web_bridge.get("target_lid_jid") or ""),
+                            "target_phone": str(web_bridge.get("target_phone") or ""),
+                            "target_phone_digits": str(web_bridge.get("target_phone_digits") or ""),
+                            "identity_unresolved": bool(web_bridge.get("identity_unresolved")),
+                            "pending_identity": bool(web_bridge.get("pending_identity")),
+                            "is_group_message": is_group_message,
+                            "suppress_ai": _metadata_truthy(web_bridge.get("suppress_ai"))
+                            or _metadata_truthy(value_metadata.get("suppress_ai")),
+                            "group_id": str(web_bridge.get("group_id") or value_metadata.get("group_id") or ""),
+                            "group_name": str(web_bridge.get("group_name") or value_metadata.get("group_name") or ""),
+                            "group_sender_phone": str(
+                                web_bridge.get("group_sender_phone")
+                                or web_bridge.get("group_sender_phone_digits")
+                                or ""
+                            ),
+                            "group_sender_name": str(web_bridge.get("group_sender_name") or ""),
+                            "sender_name_saved": str(web_bridge.get("sender_name_saved") or ""),
+                            "sender_pushname": str(web_bridge.get("sender_pushname") or ""),
                             "message_type": str((msg or {}).get("type") or "text"),
                             "event_id": event_id,
+                            "provider_event_id": provider_event_id,
+                            "idempotency_key": idempotency_key,
                             "trace_id": unified_message.trace_id,
+                            "external_message_id": str((msg or {}).get("id") or unified_message.message_id or ""),
+                            "outbound_external_message_id": (
+                                str((msg or {}).get("id") or unified_message.message_id or "")
+                                if is_bridge_outbound
+                                else ""
+                            ),
                         }
                     )
+                    if is_bridge_outbound:
+                        unified_message.direction = MessageDirection.OUTBOUND
+                    if is_bridge_outbound and not unified_message.external_user_id:
+                        unified_message.external_user_id = (
+                            str(unified_message.metadata.get("target_phone") or "").strip()
+                            or str(unified_message.metadata.get("target_phone_digits") or "").strip()
+                            or str(unified_message.metadata.get("target_raw_id") or "").strip()
+                            or str(unified_message.metadata.get("target_lid_jid") or "").strip()
+                            or sender_phone
+                        )
+                    if not unified_message.external_user_id and is_group_message:
+                        unified_message.external_user_id = (
+                            str(unified_message.metadata.get("group_sender_phone") or "").strip()
+                            or str(unified_message.metadata.get("group_id") or "").strip()
+                            or sender_phone
+                        )
                     if not unified_message.external_user_id:
                         logger.warning(
                             "Skipping WhatsApp inbound with invalid sender identity company_id=%s user_id=%s source=%s event_id=%s raw_from=%s msg_from=%s msg_author=%s msg_id_remote=%s raw_sender_id=%s raw_wa_id=%s provider_sender_id=%s reason=%s trace_id=%s",
@@ -1648,6 +2108,15 @@ async def _handle_whatsapp_webhook_payload(
                                     dedup_message_id,
                                     unified_message.trace_id,
                                 )
+                                processed_results.append(
+                                    {
+                                        "message_id": dedup_message_id,
+                                        "conversation_id": "",
+                                        "duplicate": True,
+                                        "dedup_stage": "cache",
+                                    }
+                                )
+                                processed_any = True
                                 continue
                             await dedup_cache.set_json(
                                 dedup_key,
@@ -1668,19 +2137,29 @@ async def _handle_whatsapp_webhook_payload(
                             )
 
                     sender_name = (
-                        str(((contact or {}).get("profile") or {}).get("name") or "").strip()
+                        str(web_bridge.get("sender_name_saved") or "").strip()
+                        or str(((contact or {}).get("profile") or {}).get("name") or "").strip()
+                        or str(web_bridge.get("group_sender_name") or "").strip()
                         or str((unified_message.metadata or {}).get("profile_name") or "").strip()
                         or f"WhatsApp {unified_message.external_user_id}"
                     )
                     if not (str(unified_message.content or "").strip() or unified_message.attachments):
                         continue
 
-                    processed = await _process_unified_incoming_message(
-                        db,
-                        unified_message,
-                        sender_name=sender_name,
-                        sender_contact=unified_message.external_user_id,
-                    )
+                    if is_bridge_outbound:
+                        processed = await _process_unified_outbound_bridge_message(
+                            db,
+                            unified_message,
+                            sender_name=sender_name,
+                            sender_contact=unified_message.external_user_id,
+                        )
+                    else:
+                        processed = await _process_unified_incoming_message(
+                            db,
+                            unified_message,
+                            sender_name=sender_name,
+                            sender_contact=unified_message.external_user_id,
+                        )
                     if processed:
                         processed_results.append(processed)
                         processed_any = True
@@ -2499,7 +2978,31 @@ def _message_preview(content: str, attachments: Optional[list], sender_type: str
     has_image = any(str(item.get("type") or item.get("file_type") or "").lower() == "image" for item in files)
     if has_image:
         return "Received image" if sender_type == "customer" else "Sent image"
+    has_video = any(str(item.get("type") or item.get("file_type") or "").lower() == "video" for item in files)
+    if has_video:
+        return "Received video" if sender_type == "customer" else "Sent video"
     return "Received attachment" if sender_type == "customer" else "Sent attachment"
+
+
+def _coerce_provider_message_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        ts = int(value)
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+        if ts > 0:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+    text = str(value or "").strip()
+    if text:
+        if text.isdigit():
+            return _coerce_provider_message_timestamp(int(text))
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
 
 
 async def _capture_lead_snapshot(
@@ -2806,6 +3309,559 @@ async def _ensure_messages_idempotency_schema(db) -> None:
             logger.warning("Messages idempotency schema check failed: %s", exc)
 
 
+async def _ensure_whatsapp_identity_schema(db) -> None:
+    global _WHATSAPP_IDENTITY_SCHEMA_READY
+    if _WHATSAPP_IDENTITY_SCHEMA_READY or not db:
+        return
+    async with _WHATSAPP_IDENTITY_SCHEMA_LOCK:
+        if _WHATSAPP_IDENTITY_SCHEMA_READY:
+            return
+        try:
+            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_group BOOLEAN NOT NULL DEFAULT FALSE")
+            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS group_id TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS whatsapp_account_id TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS identity_key TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_event_id TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_direction TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_identity_id TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_group_id TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_group_name TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_participant_id TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_participant_name TEXT NOT NULL DEFAULT ''")
+            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_provider_event_nonempty "
+                "ON messages(company_id, provider_event_id) WHERE BTRIM(provider_event_id) <> ''"
+            )
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS whatsapp_identity_mappings ("
+                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'whatsapp', "
+                "account_id TEXT NOT NULL DEFAULT '', bridge_scope TEXT NOT NULL DEFAULT '', "
+                "identity_type TEXT NOT NULL DEFAULT '', identity_value TEXT NOT NULL DEFAULT '', "
+                "identity_value_normalized TEXT NOT NULL DEFAULT '', canonical_phone TEXT NOT NULL DEFAULT '', "
+                "remote_jid TEXT NOT NULL DEFAULT '', lid_jid TEXT NOT NULL DEFAULT '', chat_id TEXT NOT NULL DEFAULT '', "
+                "contact_id TEXT NOT NULL DEFAULT '', customer_id TEXT NOT NULL DEFAULT '', conversation_id TEXT NOT NULL DEFAULT '', "
+                "group_id TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL DEFAULT '', profile_picture_url TEXT NOT NULL DEFAULT '', "
+                "status TEXT NOT NULL DEFAULT 'resolved', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_identity_alias "
+                "ON whatsapp_identity_mappings(company_id,channel,account_id,identity_type,identity_value_normalized) "
+                "WHERE BTRIM(identity_value_normalized) <> ''"
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_customer ON whatsapp_identity_mappings(company_id,customer_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_conversation ON whatsapp_identity_mappings(company_id,conversation_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_lid ON whatsapp_identity_mappings(company_id,lid_jid)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_phone ON whatsapp_identity_mappings(company_id,canonical_phone)")
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS whatsapp_event_dedup ("
+                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'whatsapp', "
+                "account_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL DEFAULT '', provider_event_id TEXT NOT NULL DEFAULT '', "
+                "idempotency_key TEXT NOT NULL DEFAULT '', payload_hash TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'seen', "
+                "attempts INTEGER NOT NULL DEFAULT 1, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_event_provider "
+                "ON whatsapp_event_dedup(company_id,channel,account_id,event_type,provider_event_id) "
+                "WHERE BTRIM(provider_event_id) <> ''"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_event_idempotency "
+                "ON whatsapp_event_dedup(company_id,idempotency_key) WHERE BTRIM(idempotency_key) <> ''"
+            )
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS whatsapp_pending_messages ("
+                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'whatsapp', account_id TEXT NOT NULL DEFAULT '', "
+                "direction TEXT NOT NULL DEFAULT '', provider_event_id TEXT NOT NULL DEFAULT '', raw_identity TEXT NOT NULL DEFAULT '', "
+                "identity_type TEXT NOT NULL DEFAULT '', payload JSONB NOT NULL DEFAULT '{}'::jsonb, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "status TEXT NOT NULL DEFAULT 'pending', customer_id TEXT NOT NULL DEFAULT '', conversation_id TEXT NOT NULL DEFAULT '', "
+                "message_id TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                "last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_pending_provider "
+                "ON whatsapp_pending_messages(company_id,channel,account_id,provider_event_id) WHERE BTRIM(provider_event_id) <> ''"
+            )
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS whatsapp_group_participants ("
+                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', group_id TEXT NOT NULL DEFAULT '', "
+                "participant_jid TEXT NOT NULL DEFAULT '', participant_phone TEXT NOT NULL DEFAULT '', participant_customer_id TEXT NOT NULL DEFAULT '', "
+                "display_name TEXT NOT NULL DEFAULT '', profile_picture_url TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_group_participant "
+                "ON whatsapp_group_participants(company_id,account_id,group_id,participant_jid) "
+                "WHERE BTRIM(group_id) <> '' AND BTRIM(participant_jid) <> ''"
+            )
+            _WHATSAPP_IDENTITY_SCHEMA_READY = True
+        except Exception as exc:
+            logger.warning("WhatsApp identity schema check failed: %s", exc)
+
+
+async def _record_whatsapp_event_dedup(
+    db,
+    company_id: str,
+    metadata_payload: dict | None,
+    *,
+    event_type: str,
+    provider_event_id: str = "",
+    idempotency_key: str = "",
+    payload: dict | None = None,
+) -> dict:
+    scoped_company_id = str(company_id or "").strip()
+    provider_id = str(provider_event_id or "").strip()
+    idempotency = str(idempotency_key or "").strip()
+    if not db or not scoped_company_id or (not provider_id and not idempotency):
+        return {"duplicate": False}
+    await _ensure_whatsapp_identity_schema(db)
+    account_id = _whatsapp_account_id(metadata_payload)
+    payload_hash = hashlib.sha256(
+        json.dumps(payload or {}, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    try:
+        existing = None
+        if provider_id:
+            existing = r(
+                await db.fetchrow(
+                    "SELECT id,attempts FROM whatsapp_event_dedup WHERE company_id=$1 AND channel='whatsapp' "
+                    "AND account_id=$2 AND event_type=$3 AND provider_event_id=$4 LIMIT 1",
+                    scoped_company_id,
+                    account_id,
+                    event_type,
+                    provider_id,
+                )
+            )
+        if not existing and idempotency:
+            existing = r(
+                await db.fetchrow(
+                    "SELECT id,attempts FROM whatsapp_event_dedup WHERE company_id=$1 AND idempotency_key=$2 LIMIT 1",
+                    scoped_company_id,
+                    idempotency,
+                )
+            )
+        if existing:
+            await db.execute(
+                "UPDATE whatsapp_event_dedup SET attempts=attempts+1,last_seen_at=NOW(),updated_at=NOW() WHERE id=$1",
+                existing.get("id", ""),
+            )
+            logger.info(
+                "duplicate event skipped channel=whatsapp company_id=%s event_type=%s provider_event_id=%s idempotency_key=%s",
+                scoped_company_id,
+                event_type,
+                provider_id,
+                idempotency,
+            )
+            return {"duplicate": True, "id": existing.get("id", "")}
+        row_id = make_id()
+        await db.execute(
+            "INSERT INTO whatsapp_event_dedup(id,company_id,channel,account_id,event_type,provider_event_id,idempotency_key,payload_hash,metadata,created_at,updated_at) "
+            "VALUES($1,$2,'whatsapp',$3,$4,$5,$6,$7,$8::jsonb,NOW(),NOW())",
+            row_id,
+            scoped_company_id,
+            account_id,
+            event_type,
+            provider_id,
+            idempotency,
+            payload_hash,
+            json.dumps(dict(metadata_payload or {}), ensure_ascii=True, default=str),
+        )
+        return {"duplicate": False, "id": row_id}
+    except Exception as exc:
+        logger.warning("WhatsApp event dedup failed company_id=%s event_type=%s provider_event_id=%s: %s", scoped_company_id, event_type, provider_id, exc)
+        return {"duplicate": False}
+
+
+async def _upsert_whatsapp_identity_aliases(
+    db,
+    company_id: str,
+    metadata_payload: dict | None,
+    *,
+    customer_id: str = "",
+    conversation_id: str = "",
+    channel_binding: str = "",
+    sender_contact: str = "",
+    status: str = "resolved",
+    display_name: str = "",
+    profile_picture_url: str = "",
+) -> str:
+    scoped_company_id = str(company_id or "").strip()
+    if not db or not scoped_company_id:
+        return ""
+    await _ensure_whatsapp_identity_schema(db)
+    payload = dict(metadata_payload or {})
+    account_id = _whatsapp_account_id(payload)
+    bridge_scope = str(payload.get("bridge_scope") or "").strip()
+    safe_avatar = _safe_provider_avatar_url(
+        profile_picture_url
+        or payload.get("profile_picture_url")
+        or payload.get("group_profile_picture_url")
+        or ""
+    )
+    aliases = _whatsapp_alias_candidates(payload, sender_contact=sender_contact, channel_binding=channel_binding)
+    first_identity_id = ""
+    for alias in aliases:
+        identity_type = alias["identity_type"]
+        identity_value = alias["identity_value"]
+        normalized = alias["identity_value_normalized"]
+        if not normalized:
+            continue
+        digits = _identity_digits(identity_value)
+        canonical_phone = f"+{digits}" if digits and identity_type in {"phone", "jid"} else ""
+        remote_jid = identity_value if identity_type in {"jid", "provider_jid"} else ""
+        lid_jid = identity_value if identity_type == "lid_jid" else ""
+        chat_id = identity_value if identity_type in {"group_jid", "raw"} and str(alias.get("source") or "") == "chat_id" else str(payload.get("chat_id") or "")
+        group_id = str(payload.get("group_id") or "") if _is_whatsapp_group_metadata(payload) else ""
+        try:
+            row = r(
+                await db.fetchrow(
+                    "INSERT INTO whatsapp_identity_mappings("
+                    "id,company_id,channel,account_id,bridge_scope,identity_type,identity_value,identity_value_normalized,"
+                    "canonical_phone,remote_jid,lid_jid,chat_id,contact_id,customer_id,conversation_id,group_id,display_name,profile_picture_url,status,metadata,created_at,updated_at"
+                    ") VALUES($1,$2,'whatsapp',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,NOW(),NOW()) "
+                    "ON CONFLICT (company_id,channel,account_id,identity_type,identity_value_normalized) "
+                    "WHERE BTRIM(identity_value_normalized) <> '' DO UPDATE SET "
+                    "customer_id=COALESCE(NULLIF(EXCLUDED.customer_id,''), whatsapp_identity_mappings.customer_id), "
+                    "conversation_id=COALESCE(NULLIF(EXCLUDED.conversation_id,''), whatsapp_identity_mappings.conversation_id), "
+                    "canonical_phone=COALESCE(NULLIF(EXCLUDED.canonical_phone,''), whatsapp_identity_mappings.canonical_phone), "
+                    "remote_jid=COALESCE(NULLIF(EXCLUDED.remote_jid,''), whatsapp_identity_mappings.remote_jid), "
+                    "lid_jid=COALESCE(NULLIF(EXCLUDED.lid_jid,''), whatsapp_identity_mappings.lid_jid), "
+                    "chat_id=COALESCE(NULLIF(EXCLUDED.chat_id,''), whatsapp_identity_mappings.chat_id), "
+                    "contact_id=COALESCE(NULLIF(EXCLUDED.contact_id,''), whatsapp_identity_mappings.contact_id), "
+                    "group_id=COALESCE(NULLIF(EXCLUDED.group_id,''), whatsapp_identity_mappings.group_id), "
+                    "display_name=COALESCE(NULLIF(EXCLUDED.display_name,''), whatsapp_identity_mappings.display_name), "
+                    "profile_picture_url=COALESCE(NULLIF(EXCLUDED.profile_picture_url,''), whatsapp_identity_mappings.profile_picture_url), "
+                    "status=CASE WHEN whatsapp_identity_mappings.status='pending' AND EXCLUDED.status='resolved' THEN 'resolved' ELSE whatsapp_identity_mappings.status END, "
+                    "metadata=whatsapp_identity_mappings.metadata || EXCLUDED.metadata, last_seen_at=NOW(), updated_at=NOW() "
+                    "RETURNING id",
+                    make_id(),
+                    scoped_company_id,
+                    account_id,
+                    bridge_scope,
+                    identity_type,
+                    identity_value,
+                    normalized,
+                    canonical_phone,
+                    remote_jid,
+                    lid_jid,
+                    chat_id,
+                    str(payload.get("contact_id") or ""),
+                    str(customer_id or ""),
+                    str(conversation_id or ""),
+                    group_id,
+                    str(display_name or payload.get("profile_name") or payload.get("group_name") or ""),
+                    safe_avatar,
+                    str(status or "resolved"),
+                    json.dumps({"source": alias.get("source", ""), **payload}, ensure_ascii=True, default=str),
+                )
+            )
+            if row and row.get("id") and not first_identity_id:
+                first_identity_id = str(row.get("id") or "")
+            if identity_type == "lid_jid":
+                logger.info(
+                    "LID alias mapped company_id=%s account_id=%s lid_jid=%s customer_id=%s conversation_id=%s status=%s",
+                    scoped_company_id,
+                    account_id,
+                    identity_value,
+                    customer_id,
+                    conversation_id,
+                    status,
+                )
+        except Exception as exc:
+            logger.warning(
+                "WhatsApp identity alias upsert failed company_id=%s identity_type=%s identity_value=%s: %s",
+                scoped_company_id,
+                identity_type,
+                identity_value,
+                exc,
+            )
+    if safe_avatar and customer_id:
+        try:
+            await db.execute(
+                "UPDATE customers SET avatar=COALESCE(NULLIF(avatar,''), $1),updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                safe_avatar,
+                customer_id,
+                scoped_company_id,
+            )
+        except Exception as exc:
+            logger.debug("WhatsApp profile picture customer cache skipped customer_id=%s: %s", customer_id, exc)
+    if safe_avatar:
+        logger.info(
+            "profile picture fetched channel=whatsapp company_id=%s customer_id=%s conversation_id=%s",
+            scoped_company_id,
+            customer_id,
+            conversation_id,
+        )
+    if str(status or "").strip().lower() == "resolved" and customer_id:
+        for alias in aliases:
+            await _reconcile_pending_whatsapp_identity(
+                db,
+                company_id=scoped_company_id,
+                account_id=account_id,
+                raw_identity=str(alias.get("identity_value") or ""),
+                normalized_identity=str(alias.get("identity_value_normalized") or ""),
+                customer_id=customer_id,
+                conversation_id=conversation_id,
+            )
+    return first_identity_id
+
+
+async def _reconcile_pending_whatsapp_identity(
+    db,
+    *,
+    company_id: str,
+    account_id: str,
+    raw_identity: str,
+    normalized_identity: str = "",
+    customer_id: str = "",
+    conversation_id: str = "",
+) -> None:
+    scoped_company_id = str(company_id or "").strip()
+    raw = str(raw_identity or "").strip()
+    normalized = str(normalized_identity or "").strip()
+    if not db or not scoped_company_id or not customer_id or not (raw or normalized):
+        return
+    try:
+        rows = await db.fetch(
+            "SELECT id,message_id,conversation_id FROM whatsapp_pending_messages "
+            "WHERE company_id=$1 AND channel='whatsapp' AND account_id=$2 AND status='pending' "
+            "AND (raw_identity=$3 OR raw_identity=$4)",
+            scoped_company_id,
+            str(account_id or ""),
+            raw,
+            normalized,
+        )
+    except Exception as exc:
+        logger.debug("WhatsApp pending reconciliation lookup failed company_id=%s raw_identity=%s: %s", scoped_company_id, raw, exc)
+        return
+    for row in rows or []:
+        pending = r(row)
+        pending_id = str(pending.get("id") or "")
+        pending_message_id = str(pending.get("message_id") or "")
+        try:
+            if pending_message_id and conversation_id:
+                await db.execute(
+                    "UPDATE messages SET conversation_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                    conversation_id,
+                    pending_message_id,
+                    scoped_company_id,
+                )
+            await db.execute(
+                "UPDATE whatsapp_pending_messages SET status='resolved',customer_id=$1,conversation_id=COALESCE(NULLIF($2,''),conversation_id),"
+                "last_seen_at=NOW(),updated_at=NOW() WHERE id=$3 AND company_id=$4",
+                customer_id,
+                conversation_id,
+                pending_id,
+                scoped_company_id,
+            )
+            logger.info(
+                "identity resolved channel=whatsapp company_id=%s raw_identity=%s customer_id=%s conversation_id=%s message_id=%s",
+                scoped_company_id,
+                raw or normalized,
+                customer_id,
+                conversation_id,
+                pending_message_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "WhatsApp pending reconciliation failed company_id=%s pending_id=%s raw_identity=%s: %s",
+                scoped_company_id,
+                pending_id,
+                raw or normalized,
+                exc,
+            )
+
+
+async def _persist_whatsapp_message_context(
+    db,
+    *,
+    company_id: str,
+    message_id: str,
+    conversation_id: str,
+    metadata_payload: dict | None,
+    direction: str,
+    source: str,
+    identity_id: str = "",
+) -> None:
+    payload = dict(metadata_payload or {})
+    if not db or not company_id or not message_id:
+        return
+    await _ensure_whatsapp_identity_schema(db)
+    provider_event_id = str(
+        payload.get("external_message_id")
+        or payload.get("outbound_external_message_id")
+        or payload.get("inbound_external_message_id")
+        or payload.get("provider_event_id")
+        or ""
+    ).strip()
+    group_id = _whatsapp_group_id(payload)
+    group_name = str(payload.get("group_name") or "").strip()
+    participant_id = str(payload.get("group_sender_phone") or payload.get("msg_author") or payload.get("raw_from") or "").strip()
+    participant_name = str(payload.get("group_sender_name") or payload.get("group_participant_name") or "").strip()
+    try:
+        await db.execute(
+            "UPDATE messages SET provider_event_id=$1,message_direction=$2,source=$3,whatsapp_identity_id=$4,"
+            "whatsapp_group_id=$5,whatsapp_group_name=$6,whatsapp_participant_id=$7,whatsapp_participant_name=$8,"
+            "raw_metadata=$9::jsonb,updated_at=NOW() WHERE id=$10 AND company_id=$11",
+            provider_event_id,
+            direction,
+            source,
+            identity_id,
+            group_id,
+            group_name,
+            participant_id,
+            participant_name,
+            json.dumps(payload, ensure_ascii=True, default=str),
+            message_id,
+            company_id,
+        )
+        if conversation_id:
+            direct_group_capture = _metadata_truthy(payload.get("group_direct_lead_capture"))
+            conversation_group_id = "" if direct_group_capture else group_id
+            identity_key = str(
+                payload.get("normalized_sender_id")
+                or payload.get("group_sender_phone")
+                or payload.get("sender_contact")
+                or ""
+            ).strip()
+            await db.execute(
+                "UPDATE conversations SET is_group=$1,group_id=$2,whatsapp_account_id=$3,identity_key=$4,updated_at=NOW() "
+                "WHERE id=$5 AND company_id=$6",
+                bool(conversation_group_id),
+                conversation_group_id,
+                _whatsapp_account_id(payload),
+                identity_key or conversation_group_id,
+                conversation_id,
+                company_id,
+            )
+    except Exception as exc:
+        logger.warning("WhatsApp message context persist failed company_id=%s message_id=%s: %s", company_id, message_id, exc)
+
+
+async def _upsert_whatsapp_group_participant(
+    db,
+    *,
+    company_id: str,
+    metadata_payload: dict | None,
+    participant_customer_id: str = "",
+) -> None:
+    payload = dict(metadata_payload or {})
+    group_id = _whatsapp_group_id(payload)
+    if not db or not company_id or not group_id:
+        return
+    await _ensure_whatsapp_identity_schema(db)
+    participant_jid = str(payload.get("msg_author") or payload.get("raw_from") or payload.get("group_sender_phone") or "").strip()
+    participant_phone = str(payload.get("group_sender_phone") or "").strip()
+    if not participant_jid and not participant_phone:
+        return
+    try:
+        await db.execute(
+            "INSERT INTO whatsapp_group_participants(id,company_id,account_id,group_id,participant_jid,participant_phone,participant_customer_id,display_name,profile_picture_url,metadata,created_at,updated_at) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,NOW(),NOW()) "
+            "ON CONFLICT (company_id,account_id,group_id,participant_jid) "
+            "WHERE BTRIM(group_id) <> '' AND BTRIM(participant_jid) <> '' DO UPDATE SET "
+            "participant_phone=COALESCE(NULLIF(EXCLUDED.participant_phone,''), whatsapp_group_participants.participant_phone), "
+            "participant_customer_id=COALESCE(NULLIF(EXCLUDED.participant_customer_id,''), whatsapp_group_participants.participant_customer_id), "
+            "display_name=COALESCE(NULLIF(EXCLUDED.display_name,''), whatsapp_group_participants.display_name), "
+            "profile_picture_url=COALESCE(NULLIF(EXCLUDED.profile_picture_url,''), whatsapp_group_participants.profile_picture_url), "
+            "metadata=whatsapp_group_participants.metadata || EXCLUDED.metadata,last_seen_at=NOW(),updated_at=NOW()",
+            make_id(),
+            company_id,
+            _whatsapp_account_id(payload),
+            group_id,
+            participant_jid or participant_phone,
+            participant_phone,
+            participant_customer_id,
+            str(payload.get("group_sender_name") or payload.get("group_participant_name") or ""),
+            _safe_provider_avatar_url(str(payload.get("profile_picture_url") or "")),
+            json.dumps(payload, ensure_ascii=True, default=str),
+        )
+        logger.info(
+            "group message received channel=whatsapp company_id=%s group_id=%s group_name=%s participant=%s",
+            company_id,
+            group_id,
+            str(payload.get("group_name") or ""),
+            participant_jid or participant_phone,
+        )
+    except Exception as exc:
+        logger.warning("WhatsApp group participant upsert failed company_id=%s group_id=%s: %s", company_id, group_id, exc)
+
+
+async def _store_pending_whatsapp_message(
+    db,
+    *,
+    company_id: str,
+    metadata_payload: dict | None,
+    direction: str,
+    provider_event_id: str = "",
+    raw_identity: str = "",
+    payload: dict | None = None,
+    customer_id: str = "",
+    conversation_id: str = "",
+    message_id: str = "",
+) -> dict:
+    scoped_company_id = str(company_id or "").strip()
+    raw = str(raw_identity or "").strip()
+    if not db or not scoped_company_id or not raw:
+        return {}
+    await _ensure_whatsapp_identity_schema(db)
+    meta = dict(metadata_payload or {})
+    account_id = _whatsapp_account_id(meta)
+    provider_id = str(provider_event_id or meta.get("external_message_id") or "").strip()
+    row_id = make_id()
+    try:
+        await db.execute(
+            "INSERT INTO whatsapp_pending_messages(id,company_id,channel,account_id,direction,provider_event_id,raw_identity,identity_type,payload,metadata,status,customer_id,conversation_id,message_id,created_at,updated_at) "
+            "VALUES($1,$2,'whatsapp',$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,'pending',$10,$11,$12,NOW(),NOW()) "
+            "ON CONFLICT (company_id,channel,account_id,provider_event_id) WHERE BTRIM(provider_event_id) <> '' DO UPDATE SET "
+            "raw_identity=EXCLUDED.raw_identity,identity_type=EXCLUDED.identity_type,payload=EXCLUDED.payload,metadata=whatsapp_pending_messages.metadata || EXCLUDED.metadata,"
+            "customer_id=COALESCE(NULLIF(EXCLUDED.customer_id,''), whatsapp_pending_messages.customer_id), "
+            "conversation_id=COALESCE(NULLIF(EXCLUDED.conversation_id,''), whatsapp_pending_messages.conversation_id), "
+            "message_id=COALESCE(NULLIF(EXCLUDED.message_id,''), whatsapp_pending_messages.message_id), "
+            "attempts=whatsapp_pending_messages.attempts+1,last_seen_at=NOW(),updated_at=NOW()",
+            row_id,
+            scoped_company_id,
+            account_id,
+            direction,
+            provider_id,
+            raw,
+            _whatsapp_identity_type(raw) or "raw",
+            json.dumps(payload or {}, ensure_ascii=True, default=str),
+            json.dumps(meta, ensure_ascii=True, default=str),
+            customer_id,
+            conversation_id,
+            message_id,
+        )
+        await _upsert_whatsapp_identity_aliases(
+            db,
+            scoped_company_id,
+            meta,
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+            channel_binding=raw,
+            sender_contact=raw,
+            status="pending",
+            display_name=str(meta.get("profile_name") or meta.get("sender_name") or ""),
+        )
+        logger.warning(
+            "identity unresolved channel=whatsapp company_id=%s direction=%s provider_event_id=%s raw_identity=%s",
+            scoped_company_id,
+            direction,
+            provider_id,
+            raw,
+        )
+        return {"pending_identity": True, "provider_event_id": provider_id, "raw_identity": raw}
+    except Exception as exc:
+        logger.warning("Pending WhatsApp message persist failed company_id=%s provider_event_id=%s raw_identity=%s: %s", scoped_company_id, provider_id, raw, exc)
+        return {}
+
+
 async def _load_ai_message_by_idempotency(db, *, company_id: str, idempotency_key: str) -> dict:
     key = str(idempotency_key or "").strip()
     if not db or not company_id or not key:
@@ -2903,6 +3959,53 @@ async def _emit_outbound_failure_notice(
     )
     notice_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", notice_id))
     await emit_new_message(conversation_id, notice_message)
+
+
+async def _emit_conversation_limit_notice(
+    db,
+    *,
+    company_id: str,
+    conversation_id: str,
+    limit_state: dict[str, Any],
+) -> dict:
+    if not db or not company_id or not conversation_id:
+        return {}
+    notice_text = conversation_limit_completed_message(
+        int(limit_state.get("limit") or 0),
+        limit_state.get("used"),
+    )
+    try:
+        existing_notice = r(
+            await db.fetchrow(
+                "SELECT * FROM messages WHERE company_id=$1 AND conversation_id=$2 AND sender_type='system' "
+                "AND is_alert=TRUE AND content=$3 AND created_at >= NOW() - INTERVAL '15 minutes' "
+                "ORDER BY created_at DESC LIMIT 1",
+                company_id,
+                conversation_id,
+                notice_text,
+            )
+        )
+        if existing_notice:
+            return existing_notice
+    except Exception as exc:
+        logger.warning(
+            "Conversation limit notice dedupe failed company_id=%s conversation_id=%s: %s",
+            company_id,
+            conversation_id,
+            exc,
+        )
+    notice_id = make_id()
+    await db.execute(
+        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "
+        "VALUES($1,$2,$3,$4,'system','system','System',TRUE,FALSE,NOW())",
+        notice_id,
+        company_id,
+        conversation_id,
+        notice_text,
+    )
+    notice_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", notice_id))
+    await emit_new_message(conversation_id, notice_message)
+    return notice_message
 
 
 def _dedup_cache_key(channel: str, company_id: str, external_message_id: str) -> str:
@@ -3185,16 +4288,41 @@ async def _auto_capture_lead(
                 sender_contact,
             )
             return None
+        normalized_channel = str(channel or "").strip().lower()
         existing = None
+        contact_fields = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)
+        avatar_url = _safe_provider_avatar_url(
+            metadata_payload.get("profile_picture_url")
+            or metadata_payload.get("profile_picture")
+            or metadata_payload.get("avatar")
+            or ""
+        )
         explicit_customer_id = str(metadata_payload.get("customer_id") or "").strip()
+        trusted_explicit_customer_id = explicit_customer_id
         if explicit_customer_id:
-            existing = r(
+            explicit_customer = r(
                 await db.fetchrow(
                     "SELECT * FROM customers WHERE id=$1 AND company_id=$2 LIMIT 1",
                     explicit_customer_id,
                     company_id,
                 )
             )
+            if explicit_customer:
+                if normalized_channel == "whatsapp":
+                    if _customer_matches_contact_identity(explicit_customer, contact_fields):
+                        existing = explicit_customer
+                    else:
+                        trusted_explicit_customer_id = ""
+                        logger.warning(
+                            "Ignoring WhatsApp customer_id override because remote identity does not match company_id=%s customer_id=%s sender_contact=%s normalized_phone=%s trace_id=%s",
+                            company_id,
+                            explicit_customer_id,
+                            sender_contact,
+                            contact_fields.get("phone", ""),
+                            metadata_payload.get("trace_id", ""),
+                        )
+                else:
+                    existing = explicit_customer
         social_profile_id = str(metadata_payload.get("social_profile_id") or "").strip()
         if social_profile_id and not existing and channel in {"facebook", "instagram"}:
             existing = r(
@@ -3208,24 +4336,27 @@ async def _auto_capture_lead(
                     social_profile_id,
                 )
             )
-        contact_fields = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)
-        avatar_url = _safe_provider_avatar_url(
-            metadata_payload.get("profile_picture_url")
-            or metadata_payload.get("profile_picture")
-            or metadata_payload.get("avatar")
-            or ""
-        )
         if (contact_fields["phone"] or contact_fields["email"]) and not existing:
-            # Exact match first (cheap, indexed).
+            # Exact match first (cheap, indexed), accepting both +E.164 and
+            # legacy digits-only phone rows before falling back to suffix match.
             exact_contact = contact_fields["email"] or contact_fields["phone"]
-            existing = r(
-                await db.fetchrow(
-                    "SELECT * FROM customers WHERE (phone=$1 OR email=$1) AND company_id=$2 "
-                    "ORDER BY updated_at DESC LIMIT 1",
-                    exact_contact,
-                    company_id,
+            for lookup_value, lookup_digits in _contact_lookup_values(
+                contact_fields["email"],
+                contact_fields["phone"],
+            ):
+                existing = r(
+                    await db.fetchrow(
+                        "SELECT * FROM customers WHERE company_id=$1 AND "
+                        "(phone=$2 OR LOWER(email)=LOWER($2) OR "
+                        "($3<>'' AND regexp_replace(phone, '\\D', '', 'g')=$3)) "
+                        "ORDER BY updated_at DESC LIMIT 1",
+                        company_id,
+                        lookup_value,
+                        lookup_digits,
+                    )
                 )
-            )
+                if existing:
+                    break
             # Identity fallback — case-insensitive email + last-10-digits phone.
             if not existing:
                 contact_str = str(exact_contact).strip()
@@ -3244,15 +4375,15 @@ async def _auto_capture_lead(
                     digits = _re_cap.sub(r"\D", "", contact_str)
                     last10 = digits[-10:] if len(digits) >= 10 else digits
                     if last10:
-                        existing = r(
-                            await db.fetchrow(
-                                "SELECT * FROM customers WHERE company_id=$1 "
-                                "AND regexp_replace(phone, '\\D', '', 'g') LIKE $2 "
-                                "ORDER BY updated_at DESC LIMIT 1",
-                                company_id,
-                                f"%{last10}",
-                            )
+                        rows = await db.fetch(
+                            "SELECT * FROM customers WHERE company_id=$1 "
+                            "AND regexp_replace(phone, '\\D', '', 'g') LIKE $2 "
+                            "ORDER BY updated_at DESC LIMIT 2",
+                            company_id,
+                            f"%{last10}",
                         )
+                        if len(rows or []) == 1:
+                            existing = r(rows[0])
         social_profile_id = contact_fields["social_profile_id"] or social_profile_id
         if not existing:
             existing = await resolve_customer_by_contact(
@@ -3262,22 +4393,52 @@ async def _auto_capture_lead(
                 email=contact_fields["email"],
                 channel=channel,
                 channel_profile_id=social_profile_id,
-                explicit_customer_id=explicit_customer_id,
+                explicit_customer_id=trusted_explicit_customer_id,
             )
+        hint_customer_id = str(metadata_payload.get("resolved_customer_id_hint") or "").strip()
+        if not existing and hint_customer_id and normalized_channel == "whatsapp":
+            hint_customer = r(
+                await db.fetchrow(
+                    "SELECT * FROM customers WHERE id=$1 AND company_id=$2 LIMIT 1",
+                    hint_customer_id,
+                    company_id,
+                )
+            )
+            if _customer_matches_contact_identity(hint_customer, contact_fields):
+                existing = hint_customer
+            elif hint_customer:
+                logger.warning(
+                    "Ignoring WhatsApp resolved_customer_id hint because remote identity does not match company_id=%s customer_id=%s sender_contact=%s normalized_phone=%s trace_id=%s",
+                    company_id,
+                    hint_customer_id,
+                    sender_contact,
+                    contact_fields.get("phone", ""),
+                    metadata_payload.get("trace_id", ""),
+                )
         if not existing:
+            if normalized_channel == "whatsapp" and not contact_fields["phone"] and not social_profile_id:
+                logger.warning(
+                    "Refusing to create WhatsApp customer without stable remote identity sender_contact=%s channel_id=%s company_id=%s trace_id=%s",
+                    sender_contact,
+                    contact_fields.get("channel_id", ""),
+                    company_id,
+                    metadata_payload.get("trace_id", ""),
+                )
+                return None
             nid = make_id()
             normalized_phone = (
                 await normalize_customer_contact_phone(db, company_id, contact_fields["phone"])
                 if contact_fields["phone"]
                 else ""
             )
+            display_sender_name = _preferred_sender_name(channel, sender_name, metadata_payload)
             await db.execute(
                 "INSERT INTO customers(id,company_id,name,email,phone,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,"  # noqa: E501
                 "recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "
                 "VALUES($1,$2,$3,$4,$5,'general',$6,'lead',0,0,0,0,0,0,NOW(),NOW())",
                 nid,
                 company_id,
-                sender_name or "Unknown Contact",
+                display_sender_name or "Unknown Contact",
                 contact_fields["email"],
                 normalized_phone,
                 avatar_url,
@@ -3290,10 +4451,11 @@ async def _auto_capture_lead(
                 customer_updates.append(f"company_id=${len(args) + 1}")
                 args.append(company_id)
                 existing["company_id"] = company_id
-            if sender_name and sender_name != existing.get("name"):
+            display_sender_name = _preferred_sender_name(channel, sender_name, metadata_payload, existing.get("name", ""))
+            if _should_update_sender_name(channel, display_sender_name, metadata_payload, existing.get("name", "")):
                 customer_updates.append(f"name=${len(args) + 1}")
-                args.append(sender_name)
-                existing["name"] = sender_name
+                args.append(display_sender_name)
+                existing["name"] = display_sender_name
             normalized_email = contact_fields["email"]
             normalized_phone = (
                 await normalize_customer_contact_phone(db, company_id, contact_fields["phone"])
@@ -3376,12 +4538,13 @@ async def _auto_capture_lead(
             )
         if not existing_lead:
             lid = make_id()
+            display_lead_name = _preferred_sender_name(channel, sender_name, metadata_payload, existing.get("name", ""))
             await db.execute(
                 "INSERT INTO leads(id,company_id,name,email,phone,source,status,score,grade,phase,notes,assigned_to,assigned_name,created_at,updated_at) "  # noqa: E501
                 "VALUES($1,$2,$3,$4,$5,$6,'new',0,'cold','awareness',$7,'','',NOW(),NOW())",
                 lid,
                 company_id,
-                sender_name or "Unknown",
+                display_lead_name or "Unknown",
                 existing.get("email", ""),
                 existing.get("phone", ""),
                 channel,
@@ -3444,9 +4607,11 @@ async def _auto_capture_lead(
         if company_id and not existing_lead.get("company_id"):
             lead_updates.append(f"company_id=${len(args) + 1}")
             args.append(company_id)
-        if sender_name and sender_name != existing_lead.get("name"):
+        display_lead_name = _preferred_sender_name(channel, sender_name, metadata_payload, existing_lead.get("name", ""))
+        if _should_update_sender_name(channel, display_lead_name, metadata_payload, existing_lead.get("name", "")):
             lead_updates.append(f"name=${len(args) + 1}")
-            args.append(sender_name)
+            args.append(display_lead_name)
+            existing_lead["name"] = display_lead_name
         if lead_updates:
             args.append(existing_lead["id"])
             await db.execute(
@@ -3900,6 +5065,361 @@ async def _send_outbound_response_via_channel_layer(
     return False, last_error or "Outbound send failed"
 
 
+async def _process_unified_outbound_bridge_message(
+    db,
+    message: UnifiedMessage,
+    *,
+    sender_name: str = "",
+    sender_contact: str = "",
+    metadata: dict | None = None,
+):
+    channel = message.channel_type.value
+    metadata_payload = dict(message.metadata or {})
+    metadata_payload.update(dict(metadata or {}))
+    company_id = str(metadata_payload.get("company_id") or message.tenant_id or "").strip()
+    company_id = await _validate_resolved_company_id(
+        db,
+        company_id,
+        channel=channel,
+        descriptor="process_outbound_bridge_message",
+    )
+    if not company_id:
+        return None
+
+    external_message_id = str(
+        metadata_payload.get("outbound_external_message_id")
+        or metadata_payload.get("inbound_external_message_id")
+        or metadata_payload.get("external_message_id")
+        or message.message_id
+        or ""
+    ).strip()
+    if external_message_id:
+        existing = r(
+            await db.fetchrow(
+                "SELECT id,conversation_id FROM messages "
+                "WHERE company_id=$1 AND external_message_id=$2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                company_id,
+                external_message_id,
+            )
+        )
+        if existing:
+            logger.info(
+                "Duplicate outbound bridge event ignored company_id=%s channel=%s external_message_id=%s message_id=%s",
+                company_id,
+                channel,
+                external_message_id,
+                existing.get("id", ""),
+            )
+            return {
+                "conversation_id": existing.get("conversation_id", ""),
+                "message_id": existing.get("id", ""),
+                "customer_id": "",
+                "customer_message": await _load_message_with_attachments(db, existing.get("id", "")),
+                "duplicate": True,
+            }
+
+    target_contact = str(sender_contact or message.external_user_id or "").strip()
+    metadata_payload.setdefault("company_id", company_id)
+    metadata_payload.setdefault("external_message_id", external_message_id)
+    metadata_payload.setdefault("outbound_external_message_id", external_message_id)
+    metadata_payload.setdefault("normalized_sender_id", target_contact)
+    metadata_payload.setdefault("sender_contact", target_contact)
+    metadata_payload["direction"] = "outbound"
+
+    is_group_message = channel == "whatsapp" and _is_whatsapp_group_metadata(metadata_payload)
+    if is_group_message:
+        group_id = _whatsapp_group_id(metadata_payload)
+        customer = await _get_or_create_whatsapp_group_customer(
+            db,
+            company_id,
+            group_id,
+            str(metadata_payload.get("group_name") or sender_name or "WhatsApp Group"),
+        )
+        if not customer:
+            return None
+        result = {"lead_id": None, "lead": None, "customer": customer, "company_id": company_id}
+        cid = str(customer.get("id") or "")
+        channel_binding = group_id
+    else:
+        contact_fields = _extract_sender_contact_fields(channel, target_contact, metadata_payload)
+        result = await _auto_capture_lead(
+            db,
+            channel,
+            sender_name or f"WhatsApp {target_contact}",
+            target_contact,
+            str(message.content or "").strip(),
+            metadata_payload,
+        )
+        if not result:
+            pending_identity = str(
+                metadata_payload.get("target_raw_id")
+                or metadata_payload.get("target_lid_jid")
+                or metadata_payload.get("provider_sender_id")
+                or target_contact
+                or ""
+            ).strip()
+            if channel == "whatsapp" and pending_identity:
+                customer = await _get_or_create_whatsapp_pending_customer(
+                    db,
+                    company_id,
+                    pending_identity,
+                    sender_name or str(metadata_payload.get("profile_name") or ""),
+                    str(metadata_payload.get("profile_picture_url") or ""),
+                )
+                if not customer:
+                    await _store_pending_whatsapp_message(
+                        db,
+                        company_id=company_id,
+                        metadata_payload=metadata_payload,
+                        direction="outbound",
+                        provider_event_id=external_message_id,
+                        raw_identity=pending_identity,
+                        payload={"content": str(message.content or ""), "attachments": [a.__dict__ for a in (message.attachments or [])]},
+                    )
+                    return {"pending_identity": True, "provider_event_id": external_message_id, "raw_identity": pending_identity}
+                result = {"lead_id": None, "lead": None, "customer": customer, "company_id": company_id, "pending_identity": True}
+                logger.warning(
+                    "identity unresolved channel=whatsapp company_id=%s direction=outbound provider_event_id=%s raw_identity=%s stored_under_pending_customer=%s",
+                    company_id,
+                    external_message_id,
+                    pending_identity,
+                    customer.get("id", ""),
+                )
+            else:
+                return None
+
+        customer = dict(result.get("customer") or {})
+        cid = str(customer.get("id") or "")
+        channel_binding = contact_fields["channel_id"] or str(metadata_payload.get("target_raw_id") or metadata_payload.get("target_lid_jid") or "").strip()
+    attachments = _legacy_attachments_from_unified(list(message.attachments or []))
+    content = str(message.content or "").strip()
+    created_at = message.timestamp or datetime.now(timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    msg_id = make_id()
+    idempotency_key = (
+        f"out:{company_id}:{channel}:{external_message_id}"
+        if external_message_id
+        else f"out:{company_id}:{channel}:msg:{msg_id}"
+    )
+
+    await _ensure_messages_idempotency_schema(db)
+    saved_attachments: list[dict] = []
+    convo: dict = {}
+    convo_id = ""
+    try:
+        async with db.transaction() as conn:
+            if external_message_id:
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", idempotency_key)
+                existing_after_lock = r(
+                    await conn.fetchrow(
+                        "SELECT id,conversation_id FROM messages "
+                        "WHERE company_id=$1 AND external_message_id=$2 "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        company_id,
+                        external_message_id,
+                    )
+                )
+                if existing_after_lock:
+                    return {
+                        "conversation_id": existing_after_lock.get("conversation_id", ""),
+                        "message_id": existing_after_lock.get("id", ""),
+                        "customer_id": cid,
+                        "customer_message": await _load_message_with_attachments(db, existing_after_lock.get("id", "")),
+                        "duplicate": True,
+                    }
+
+            convo = r(
+                await conn.fetchrow(
+                    "SELECT * FROM conversations WHERE customer_id=$1 AND channel=$2 AND status=ANY($3) AND company_id=$4 "
+                    "AND ($5='' OR channel_id=$5) "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    cid,
+                    channel,
+                    ["open", "pending", "escalated"],
+                    company_id,
+                    channel_binding if is_group_message else "",
+                )
+            )
+            if not convo:
+                convo_id = make_id()
+                await conn.execute(
+                    "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,agent_type,"
+                    "channel_id,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,session_id,page_url,created_at,updated_at) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,FALSE,'generic',$10,$11::numeric,$12,0,'',$13,0,'','',NOW(),NOW())",
+                    convo_id,
+                    company_id,
+                    cid,
+                    customer.get("name", sender_name or "WhatsApp Contact"),
+                    customer.get("avatar", ""),
+                    channel,
+                    str(metadata_payload.get("group_name") or "") if is_group_message else f"New {channel} conversation",
+                    "",
+                    "",
+                    channel_binding,
+                    0,
+                    "neutral",
+                    created_at,
+                )
+                convo = r(await conn.fetchrow("SELECT * FROM conversations WHERE id=$1", convo_id))
+            else:
+                convo_id = str(convo.get("id") or "")
+                if channel_binding and convo.get("channel_id") != channel_binding:
+                    await conn.execute(
+                        "UPDATE conversations SET channel_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                        channel_binding,
+                        convo_id,
+                        company_id,
+                    )
+                    convo["channel_id"] = channel_binding
+
+            await conn.execute(
+                "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
+                "external_message_id,idempotency_key,delivery_status,sent_at,read,created_at) "
+                "VALUES($1,$2,$3,$4,'agent',$5,$6,$7,$8,'sent',$9,TRUE,$9)",
+                msg_id,
+                company_id,
+                convo_id,
+                content,
+                str(metadata_payload.get("bridge_user_id") or metadata_payload.get("actor_user_id") or "whatsapp-linked-device"),
+                str(metadata_payload.get("agent_name") or "WhatsApp Linked Device"),
+                external_message_id,
+                idempotency_key,
+                created_at,
+            )
+            saved_attachments = await save_message_attachments(conn, msg_id, attachments)
+            preview = _message_preview(content, saved_attachments, "agent")
+            await insert_chat_history_record(
+                conn,
+                convo,
+                {
+                    "id": msg_id,
+                    "conversation_id": convo_id,
+                    "content": content,
+                    "sender_type": "agent",
+                    "sender_name": "WhatsApp Linked Device",
+                    "sender_id": str(metadata_payload.get("bridge_user_id") or ""),
+                    "external_message_id": external_message_id,
+                    "attachments": saved_attachments,
+                    "created_at": created_at,
+                    "company_id": company_id,
+                },
+            )
+            await conn.execute(
+                "UPDATE conversations SET last_message=$1,last_message_at=$2,updated_at=NOW(),message_count=message_count+1,"
+                "ai_handled=FALSE WHERE id=$3 AND company_id=$4",
+                preview,
+                created_at,
+                convo_id,
+                company_id,
+            )
+    except Exception:
+        logger.exception(
+            "Outbound bridge message transaction failed company_id=%s channel=%s external_message_id=%s",
+            company_id,
+            channel,
+            external_message_id,
+        )
+        return None
+
+    identity_id = ""
+    if channel == "whatsapp":
+        identity_id = await _upsert_whatsapp_identity_aliases(
+            db,
+            company_id,
+            metadata_payload,
+            customer_id=cid,
+            conversation_id=convo_id,
+            channel_binding=channel_binding,
+            sender_contact=target_contact,
+            status="pending" if result.get("pending_identity") else "resolved",
+            display_name=customer.get("name", sender_name or ""),
+            profile_picture_url=str(metadata_payload.get("profile_picture_url") or customer.get("avatar") or ""),
+        )
+        await _persist_whatsapp_message_context(
+            db,
+            company_id=company_id,
+            message_id=msg_id,
+            conversation_id=convo_id,
+            metadata_payload=metadata_payload,
+            direction="outbound",
+            source=str(metadata_payload.get("source") or "whatsapp_web_bridge"),
+            identity_id=identity_id,
+        )
+        if result.get("pending_identity"):
+            await _store_pending_whatsapp_message(
+                db,
+                company_id=company_id,
+                metadata_payload=metadata_payload,
+                direction="outbound",
+                provider_event_id=external_message_id,
+                raw_identity=channel_binding or target_contact,
+                payload={"content": content, "attachments": saved_attachments},
+                customer_id=cid,
+                conversation_id=convo_id,
+                message_id=msg_id,
+            )
+
+    if not is_group_message:
+        try:
+            await apply_message_stage_transition(
+                db,
+                company_id=company_id,
+                customer_id=cid,
+                message_text=content,
+                direction="outbound",
+                source="message_sent",
+                event_id=external_message_id or msg_id,
+                changed_by_user_id=str(metadata_payload.get("bridge_user_id") or ""),
+            )
+        except Exception as exc:
+            logger.warning(
+                "outbound bridge lead stage transition failed company_id=%s customer_id=%s message_id=%s: %s",
+                company_id,
+                cid,
+                msg_id,
+                exc,
+            )
+
+    try:
+        from data_pipeline.ingestion.raw_store import capture_raw_message
+
+        await capture_raw_message(
+            db,
+            conversation=dict(convo),
+            message={
+                "id": msg_id,
+                "content": content,
+                "sender_type": "agent",
+                "company_id": company_id,
+                "conversation_id": convo_id,
+                "external_message_id": external_message_id,
+                "attachments": saved_attachments,
+            },
+            source=channel,
+            metadata={**metadata_payload, "source": metadata_payload.get("source") or "whatsapp_web_bridge"},
+        )
+    except Exception as exc:
+        logger.warning(
+            "outbound bridge raw message capture failed company_id=%s conversation_id=%s message_id=%s error=%s",
+            company_id,
+            convo_id,
+            msg_id,
+            exc,
+        )
+
+    outbound_message = await _load_message_with_attachments(db, msg_id)
+    await emit_new_message(convo_id, outbound_message)
+    return {
+        "conversation_id": convo_id,
+        "message_id": msg_id,
+        "customer_id": cid,
+        "customer_message": outbound_message,
+        "duplicate": False,
+    }
+
+
 async def _process_unified_incoming_message(
     db,
     message: UnifiedMessage,
@@ -3919,8 +5439,8 @@ async def _process_unified_incoming_message(
     payload_metadata.update(dict(metadata or {}))
     if not payload_metadata.get("company_id"):
         payload_metadata["company_id"] = str(message.tenant_id or "").strip()
-    if message.resolved_customer_id and not payload_metadata.get("customer_id"):
-        payload_metadata["customer_id"] = str(message.resolved_customer_id or "").strip()
+    if message.resolved_customer_id and not payload_metadata.get("resolved_customer_id_hint"):
+        payload_metadata["resolved_customer_id_hint"] = str(message.resolved_customer_id or "").strip()
     if (
         message.channel_type in (ChannelType.INSTAGRAM, ChannelType.FACEBOOK)
         and message.external_user_id
@@ -3933,6 +5453,8 @@ async def _process_unified_incoming_message(
         payload_metadata["adapter"] = message.channel_type.value
     if not payload_metadata.get("trace_id"):
         payload_metadata["trace_id"] = _trace_id_from_context(str(message.trace_id or "").strip())
+    if not payload_metadata.get("message_timestamp"):
+        payload_metadata["message_timestamp"] = message.timestamp.isoformat()
 
     logger.info(
         "Inbound unified message received channel=%s tenant=%s user_id=%s external_user=%s message_id=%s trace_id=%s",
@@ -4017,6 +5539,16 @@ async def _process_incoming_message(
         metadata_payload.get("inbound_external_message_id") or metadata_payload.get("external_message_id") or ""
     ).strip()
     channel_binding = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)["channel_id"]
+    is_group_message = channel == "whatsapp" and _is_whatsapp_group_metadata(metadata_payload)
+    conversation_customer = dict(customer)
+    conversation_customer_id = cid
+    conversation_channel_binding = channel_binding
+    message_sender_id = cid
+    message_sender_name = customer.get("name", "Unknown")
+    if is_group_message:
+        metadata_payload["group_participant_customer_id"] = cid
+        metadata_payload["group_participant_name"] = message_sender_name
+        metadata_payload["group_direct_lead_capture"] = True
 
     if inbound_external_message_id and company_id:
         existing = r(
@@ -4063,19 +5595,25 @@ async def _process_incoming_message(
     conversation_sentiment = {}
     intent = {}
     sentiment_gate = build_sentiment_gate(message_text, {})
+    message_created_at = _coerce_provider_message_timestamp(
+        metadata_payload.get("message_timestamp") or metadata_payload.get("timestamp")
+    )
     support_plan: dict = {}
     history_message = {
         "id": msg_id,
         "conversation_id": "",
         "content": message_text,
         "sender_type": "customer",
-        "sender_name": customer.get("name", "Unknown"),
-        "sender_id": cid,
+        "sender_name": message_sender_name,
+        "sender_id": message_sender_id,
         "external_message_id": inbound_external_message_id,
         "attachments": [],
-        "created_at": now_ts(),
+        "created_at": message_created_at,
         "company_id": company_id,
     }
+    await _ensure_messages_idempotency_schema(db)
+    if channel == "whatsapp":
+        await _ensure_whatsapp_identity_schema(db)
     try:
         async with db.transaction() as conn:
             if relaxed_billing_env():
@@ -4093,12 +5631,12 @@ async def _process_incoming_message(
                 )
                 return None
             if billing_gate == "denied":
-                logger.warning(
-                    "Inbound message skipped: monthly conversation quota exceeded company_id=%s channel=%s",
+                logger.info(
+                    "Inbound message accepted without usage increment because monthly conversation quota is exhausted company_id=%s channel=%s",
                     company_id,
                     channel,
                 )
-                return None
+                metadata_payload["conversation_limit_exhausted"] = True
             if inbound_external_message_id and company_id:
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtext($1))",
@@ -4135,11 +5673,13 @@ async def _process_incoming_message(
             convo = r(
                 await conn.fetchrow(
                     "SELECT * FROM conversations WHERE customer_id=$1 AND channel=$2 AND status=ANY($3) AND company_id=$4 "
+                    "AND ($5='' OR channel_id=$5) "
                     "ORDER BY updated_at DESC LIMIT 1",
-                    cid,
+                    conversation_customer_id,
                     channel,
                     ["open", "pending", "escalated"],
                     company_id,
+                    conversation_channel_binding if is_group_message else "",
                 )
             )
             if not convo:
@@ -4151,14 +5691,14 @@ async def _process_incoming_message(
                     "VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,TRUE,'generic',$10,$11::numeric,$12,0,'',NOW(),0,'','',NOW(),NOW())",
                     convo_id,
                     company_id,
-                    cid,
-                    customer.get("name", "Unknown"),
-                    customer.get("avatar", ""),
+                    conversation_customer_id,
+                    conversation_customer.get("name", "Unknown"),
+                    conversation_customer.get("avatar", ""),
                     channel,
-                    f"New {channel} conversation",
+                    str(metadata_payload.get("group_name") or "") if is_group_message else f"New {channel} conversation",
                     "",
                     "",
-                    channel_binding,
+                    conversation_channel_binding,
                     0,
                     "neutral",
                 )
@@ -4174,62 +5714,66 @@ async def _process_incoming_message(
                     convo["id"],
                 )
                 convo["company_id"] = company_id
-            if channel_binding and convo.get("channel_id") != channel_binding:
+            if conversation_channel_binding and convo.get("channel_id") != conversation_channel_binding:
                 await conn.execute(
                     "UPDATE conversations SET channel_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
-                    channel_binding,
+                    conversation_channel_binding,
                     convo["id"],
                     company_id,
                 )
-                convo["channel_id"] = channel_binding
-            if customer.get("avatar") and convo.get("customer_avatar") != customer.get("avatar"):
+                convo["channel_id"] = conversation_channel_binding
+            if conversation_customer.get("avatar") and convo.get("customer_avatar") != conversation_customer.get("avatar"):
                 await conn.execute(
                     "UPDATE conversations SET customer_avatar=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
-                    customer.get("avatar", ""),
+                    conversation_customer.get("avatar", ""),
                     convo["id"],
                     company_id,
                 )
-                convo["customer_avatar"] = customer.get("avatar", "")
+                convo["customer_avatar"] = conversation_customer.get("avatar", "")
 
             convo_id = str(convo["id"])
             history_message["conversation_id"] = convo_id
             await conn.execute(
                 "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,sentiment_score,"
-                "sentiment_emotion,sentiment_confidence,intent_type,external_message_id,read,created_at) "
-                "VALUES($1,$2,$3,$4,'customer',$5,$6,$7,$8,$9,$10,$11,FALSE,NOW())",
+                "sentiment_emotion,sentiment_confidence,intent_type,external_message_id,idempotency_key,read,created_at) "
+                "VALUES($1,$2,$3,$4,'customer',$5,$6,$7,$8,$9,$10,$11,$12,FALSE,$13)",
                 msg_id,
                 company_id,
                 convo_id,
                 message_text,
-                cid,
-                customer.get("name", "Unknown"),
+                message_sender_id,
+                message_sender_name,
                 sent_score,
                 sent_emotion,
                 sent_conf,
                 intent_type,
                 inbound_external_message_id,
+                usage_idempotency_key,
+                message_created_at,
             )
-            if relaxed_billing_env():
-                await insert_conversation_usage_relaxed(
-                    conn,
-                    company_id,
-                    channel=channel,
-                    idempotency_key=usage_idempotency_key,
-                )
-            else:
-                await insert_conversation_usage_row(
-                    conn,
-                    company_id,
-                    channel=channel,
-                    idempotency_key=usage_idempotency_key,
-                )
+            if billing_gate != "denied":
+                if relaxed_billing_env():
+                    await insert_conversation_usage_relaxed(
+                        conn,
+                        company_id,
+                        channel=channel,
+                        idempotency_key=usage_idempotency_key,
+                    )
+                else:
+                    await insert_conversation_usage_row(
+                        conn,
+                        company_id,
+                        channel=channel,
+                        idempotency_key=usage_idempotency_key,
+                    )
             saved_attachments = await save_message_attachments(conn, msg_id, attachments or [])
             history_message["attachments"] = saved_attachments
             await insert_chat_history_record(conn, convo, history_message)
             await conn.execute(
-                "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,unread_count=unread_count+1 "  # noqa: E501
-                "WHERE id=$2",
+                "UPDATE conversations SET last_message=$1,last_message_at=$2,updated_at=NOW(),message_count=message_count+1,unread_count=unread_count+1 "  # noqa: E501
+                "WHERE id=$3",
                 _message_preview(message_text, saved_attachments, "customer"),
+                message_created_at,
                 convo_id,
             )
     except Exception:
@@ -4255,6 +5799,39 @@ async def _process_incoming_message(
         sender_contact,
         channel_binding,
     )
+    if channel == "whatsapp":
+        identity_id = await _upsert_whatsapp_identity_aliases(
+            db,
+            company_id,
+            metadata_payload,
+            customer_id=cid,
+            conversation_id=convo_id,
+            channel_binding=conversation_channel_binding,
+            sender_contact=sender_contact,
+            status="resolved",
+            display_name=conversation_customer.get("name", sender_name or ""),
+            profile_picture_url=str(metadata_payload.get("profile_picture_url") or conversation_customer.get("avatar") or ""),
+        )
+        await _persist_whatsapp_message_context(
+            db,
+            company_id=company_id,
+            message_id=msg_id,
+            conversation_id=convo_id,
+            metadata_payload={
+                **metadata_payload,
+                "external_message_id": inbound_external_message_id,
+            },
+            direction="inbound",
+            source=str(metadata_payload.get("source") or "whatsapp_webhook"),
+            identity_id=identity_id,
+        )
+        if is_group_message:
+            await _upsert_whatsapp_group_participant(
+                db,
+                company_id=company_id,
+                metadata_payload=metadata_payload,
+                participant_customer_id=cid,
+            )
 
     create_safe_detached_task(
         db,
@@ -4279,7 +5856,9 @@ async def _process_incoming_message(
                 "normalized_identity": {
                     "channel": channel,
                     "sender_contact": sender_contact,
-                    "channel_id": channel_binding,
+                    "channel_id": conversation_channel_binding,
+                    "conversation_customer_id": conversation_customer_id,
+                    "group_participant_customer_id": metadata_payload.get("group_participant_customer_id", ""),
                     "customer_phone": customer.get("phone", ""),
                     "customer_email": customer.get("email", ""),
                 },
@@ -4316,11 +5895,62 @@ async def _process_incoming_message(
     if trace_id:
         metadata_payload["trace_id"] = trace_id
 
+    if _metadata_truthy(metadata_payload.get("suppress_ai")):
+        customer_message = await _load_message_with_attachments(db, msg_id)
+        await emit_new_message(convo_id, customer_message)
+        return {
+            "conversation_id": convo_id,
+            "message_id": msg_id,
+            "customer_id": cid,
+            "conversation_customer_id": conversation_customer_id,
+            "lead_id": result.get("lead_id", ""),
+            "customer_message": customer_message,
+            "ai_message": None,
+            "sentiment_analysis": sentiment_gate,
+            "group_message": is_group_message,
+        }
+
+    limit_state = await conversation_limit_status(db, company_id)
+    if not bool(limit_state.get("allowed", True)):
+        customer_message = await _load_message_with_attachments(db, msg_id)
+        await emit_new_message(convo_id, customer_message)
+        notice_message = await _emit_conversation_limit_notice(
+            db,
+            company_id=company_id,
+            conversation_id=convo_id,
+            limit_state=limit_state,
+        )
+        return {
+            "conversation_id": convo_id,
+            "message_id": msg_id,
+            "customer_id": cid,
+            "conversation_customer_id": conversation_customer_id,
+            "lead_id": result.get("lead_id", ""),
+            "customer_message": customer_message,
+            "ai_message": None,
+            "notice_message": notice_message,
+            "outgoing_blocked": True,
+            "sentiment_analysis": {
+                **sentiment_gate,
+                "ai_response_allowed": False,
+                "rate_limit_exhausted": True,
+                "message": conversation_limit_completed_message(
+                    int(limit_state.get("limit") or 0),
+                    limit_state.get("used"),
+                ),
+            },
+            "group_message": is_group_message,
+        }
+
     try:
         msgs_history = await fetch_messages_with_attachments(
             db,
             convo_id,
-            limit=webhook_message_history_fetch_limit(),
+            limit=max(webhook_message_history_fetch_limit(), 500),
+            since_days=10,
+            company_id=company_id,
+            customer_id=cid,
+            include_linked_profiles=True,
         )
         msgs_history = _truncate_history_for_token_budget(
             msgs_history,
@@ -4868,6 +6498,16 @@ async def whatsapp_webhook(request: Request):
         bridge_secret and provided_bridge_secret and hmac.compare_digest(provided_bridge_secret, bridge_secret)
     )
     if trusted_bridge and _is_whatsapp_web_bridge_payload(payload):
+        return_results = _is_truthy(request.headers.get("X-Bridge-Return-Results"))
+        if return_results:
+            result = await _handle_whatsapp_webhook_payload(
+                db,
+                payload,
+                event_id=event_id,
+                allow_direct_company_id=True,
+                return_results=True,
+            )
+            return {"status": "processed", "source": "whatsapp_web_bridge", **dict(result or {})}
         create_safe_detached_task(
             db,
             _handle_whatsapp_webhook_payload(
@@ -5213,11 +6853,45 @@ async def web_chat_webhook(request: Request):
                 msg_id,
                 exc,
             )
+        usage_key_seed = str(payload.get("client_message_id") or "").strip() or msg_id
+        usage_result = await reserve_conversation_usage(
+            db,
+            company_id,
+            channel="web_chat",
+            idempotency_key=f"webchat:{company_id}:{session_id}:{usage_key_seed}",
+        )
+        limit_state = await conversation_limit_status(db, company_id)
+        if usage_result == "denied" or not bool(limit_state.get("allowed", True)):
+            customer_message = await _load_message_with_attachments(db, msg_id)
+            await emit_new_message(convo_id, customer_message)
+            notice_message = await _emit_conversation_limit_notice(
+                db,
+                company_id=company_id,
+                conversation_id=convo_id,
+                limit_state=limit_state,
+            )
+            return {
+                "status": "received_outgoing_blocked",
+                "conversation_id": convo_id,
+                "customer_message": customer_message,
+                "ai_message": None,
+                "notice_message": notice_message,
+                "outgoing_blocked": True,
+                "rate_limit_message": conversation_limit_completed_message(
+                    int(limit_state.get("limit") or 0),
+                    limit_state.get("used"),
+                ),
+                "is_ai": False,
+            }
         try:
             msgs_history = await fetch_messages_with_attachments(
                 db,
                 convo_id,
-                limit=webhook_message_history_fetch_limit(),
+                limit=max(webhook_message_history_fetch_limit(), 500),
+                since_days=10,
+                company_id=company_id,
+                customer_id=customer_id,
+                include_linked_profiles=True,
             )
             msgs_history = _truncate_history_for_token_budget(
                 msgs_history,

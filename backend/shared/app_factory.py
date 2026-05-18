@@ -72,6 +72,11 @@ def _register_security_handlers(app: FastAPI) -> None:
                 "ENTERPRISE_INVITE_REQUIRED",
             ):
                 err = exc.detail
+            elif isinstance(exc.detail, str) and (
+                exc.detail.startswith("Your account is ")
+                or exc.detail.startswith("Session has been revoked")
+            ):
+                err = exc.detail
             return _apply_security_headers(
                 JSONResponse(
                     status_code=exc.status_code,
@@ -85,10 +90,11 @@ def _register_security_handlers(app: FastAPI) -> None:
                 )
             )
         if exc.status_code == 429:
+            detail = exc.detail if isinstance(exc.detail, str) else "Too Many Requests"
             return _apply_security_headers(
                 JSONResponse(
                     status_code=429,
-                    content={"success": False, "error": "Too Many Requests", "data": None, "trace_id": trace_id},
+                    content={"success": False, "error": detail, "detail": detail, "data": None, "trace_id": trace_id},
                 )
             )
         detail = exc.detail if isinstance(exc.detail, str) else "Request failed"

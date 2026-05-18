@@ -366,5 +366,19 @@ async def delete_kb_doc(doc_id: str, request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     cid = get_company_id(cu)
+    doc = r(
+        await db.fetchrow(
+            "SELECT id,is_prebuilt FROM knowledge_base WHERE id=$1 AND company_id=$2 LIMIT 1",
+            doc_id,
+            cid,
+        )
+    )
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    if doc.get("is_prebuilt"):
+        raise HTTPException(
+            403,
+            "Prebuilt knowledge base articles cannot be deleted. Edit the article or disable AI context instead.",
+        )
     await db.execute("DELETE FROM knowledge_base WHERE id=$1 AND company_id=$2", doc_id, cid)
     return {"status": "deleted"}

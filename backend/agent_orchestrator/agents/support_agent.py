@@ -148,7 +148,7 @@ class SupportAgent(BaseAgent):
                 knowledge_context = retrieved_knowledge
             context_package = {
                 "system_prompt": str(prefetched.get("system_prompt") or ""),
-                "conversation_history": conversation_history[-20:],
+                "conversation_history": conversation_history[-80:],
                 "customer_profile": {
                     "name": customer.get("name"),
                     "lifecycle_stage": customer.get("lifecycle_stage"),

@@ -108,7 +108,6 @@ export default function LeadsPage() {
   const [search, setSearch] = useState('');
   const deferredSearch = useDeferredValue(search);
   const [filterGrade, setFilterGrade] = useState('');
-  const [filterTag, setFilterTag] = useState('');
   const [filterSource, setFilterSource] = useState('');
   const [loading, setLoading] = useState(true);
   const [form, setForm] = useState({ name: '', email: '', phone: '', company: '', source: 'web_chat', notes: '' });
@@ -171,7 +170,6 @@ export default function LeadsPage() {
       const params = {};
       if (deferredSearch) params.search = deferredSearch;
       if (filterGrade) params.grade = filterGrade;
-      if (filterTag) params.tag = filterTag;
       if (filterSource) params.source = filterSource;
       const res = await api.get('/leads', { params });
       setLeads(res.data);
@@ -187,7 +185,7 @@ export default function LeadsPage() {
     } finally {
       setLoading(false);
     }
-  }, [deferredSearch, filterGrade, filterTag, filterSource]);
+  }, [deferredSearch, filterGrade, filterSource]);
 
   const loadReferenceData = useCallback(async () => {
     try {

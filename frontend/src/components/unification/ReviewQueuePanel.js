@@ -42,7 +42,7 @@ const asArray = (value) => (Array.isArray(value) ? value : []);
 
 const legacyCandidate = (item, side) => ({
   customer_id: item?.[`customer_id_${side}`] || '',
-  display_name: item?.[`name_${side}`] || item?.[`customer_id_${side}`] || 'Unknown profile',
+  display_name: item?.[`name_${side}`] || 'Unknown profile',
   email: item?.[`email_${side}`] || '',
   phone: item?.[`phone_${side}`] || '',
   avatar_url: item?.[`avatar_${side}`] || '',
@@ -53,71 +53,70 @@ const legacyCandidate = (item, side) => ({
 function CandidateCard({ candidate, label }) {
   const profile = candidate || {};
   const name = normalize(profile.display_name || profile.name) || 'Unknown profile';
-  const id = normalize(profile.customer_id || profile.id);
   const avatarUrl = normalize(profile.avatar_url);
   const channels = asArray(profile.source_channels).filter(Boolean);
   const description = normalize(profile.description || profile.bio);
   const initials = (name.charAt(0) || '?').toUpperCase();
 
   return (
-    <div className="min-w-0 rounded-xl border border-slate-200 bg-white p-4">
-      <div className="flex items-start gap-3">
+    <div className="min-w-0 rounded-lg border border-slate-200 bg-white p-2.5">
+      <div className="flex items-center gap-2.5">
         {avatarUrl ? (
           <img
             src={avatarUrl}
             alt=""
-            className="h-11 w-11 shrink-0 rounded-xl border border-slate-200 object-cover"
+            className="h-9 w-9 shrink-0 rounded-lg border border-slate-200 object-cover"
             onError={(event) => {
               event.currentTarget.style.display = 'none';
             }}
           />
         ) : (
-          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-800 text-sm font-bold text-white">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800 text-xs font-bold text-white">
             {initials}
           </div>
         )}
         <div className="min-w-0 flex-1">
           <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</p>
-          <p className="truncate text-sm font-semibold text-slate-900">{name}</p>
-          <p className="truncate font-mono text-[10px] text-slate-400">{id || 'missing-id'}</p>
+          <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+            <p className="max-w-[13rem] truncate text-sm font-semibold text-slate-900">{name}</p>
+            {channels.slice(0, 2).map((channel) => (
+              <span
+                key={channel}
+                className="rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700"
+              >
+                {signalLabel(channel)}
+              </span>
+            ))}
+          </div>
         </div>
       </div>
 
-      <div className="mt-3 space-y-1.5 text-[11px] text-slate-600">
-        <p className="truncate">
+      <div className="mt-2 grid gap-1 text-[11px] text-slate-600 sm:grid-cols-2">
+        <p className="truncate rounded-md bg-slate-50 px-2 py-1">
           <span className="font-semibold text-slate-500">Email:</span> {profile.email || 'not available'}
         </p>
-        <p className="truncate">
+        <p className="truncate rounded-md bg-slate-50 px-2 py-1">
           <span className="font-semibold text-slate-500">Phone:</span> {profile.phone || 'not available'}
         </p>
         {profile.company_name ? (
-          <p className="truncate">
+          <p className="truncate rounded-md bg-slate-50 px-2 py-1">
             <span className="font-semibold text-slate-500">Company:</span> {profile.company_name}
           </p>
         ) : null}
         {description ? (
-          <p className="line-clamp-2">
+          <p className="line-clamp-2 rounded-md bg-slate-50 px-2 py-1 sm:col-span-2">
             <span className="font-semibold text-slate-500">Bio:</span> {description}
           </p>
         ) : null}
       </div>
 
-      <div className="mt-3 flex flex-wrap gap-1.5">
-        {channels.length > 0 ? (
-          channels.map((channel) => (
-            <span
-              key={channel}
-              className="rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700"
-            >
-              {signalLabel(channel)}
-            </span>
-          ))
-        ) : (
+      {channels.length === 0 ? (
+        <div className="mt-2 flex flex-wrap gap-1.5">
           <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-500">
             Channel unknown
           </span>
-        )}
-      </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -138,8 +137,8 @@ export default function ReviewQueuePanel({
   }, [queue]);
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5">
-      <header className="mb-4 flex items-center justify-between gap-3">
+    <section className="rounded-xl border border-slate-200 bg-white p-3">
+      <header className="mb-3 flex items-center justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-slate-900">Merge Candidates</h3>
           <p className="mt-1 text-xs text-slate-500">Review likely duplicate identities and confirm only safe merges.</p>
@@ -153,15 +152,15 @@ export default function ReviewQueuePanel({
       {loading ? (
         <div className="space-y-2">
           {[1, 2, 3].map((item) => (
-            <div key={item} className="h-40 animate-pulse rounded-xl border border-slate-200 bg-slate-100" />
+            <div key={item} className="h-28 animate-pulse rounded-xl border border-slate-200 bg-slate-100" />
           ))}
         </div>
       ) : pendingQueue.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-8 text-center text-xs text-slate-500">
+        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-6 text-center text-xs text-slate-500">
           No pending suggestions. Run auto-detect to refresh potential matches.
         </div>
       ) : (
-        <div className="max-h-[44rem] space-y-4 overflow-y-auto pr-0.5">
+        <div className="max-h-[32rem] space-y-2.5 overflow-y-auto pr-0.5">
           {pendingQueue.map((item) => {
             const id = normalize(item?.id || item?.review_id);
             const score = Number(item?.match_score || item?.confidence || 0) || 0;
@@ -178,8 +177,8 @@ export default function ReviewQueuePanel({
             const expanded = Boolean(expandedMap[id]);
 
             return (
-              <article key={id} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4" data-testid={`merge-candidate-${id}`}>
-                <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+              <article key={id} className="rounded-xl border border-slate-200 bg-slate-50/70 p-2.5" data-testid={`merge-candidate-${id}`}>
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <p className="text-xs font-semibold text-slate-900">Possible identity match</p>
                     <p className="mt-0.5 text-[11px] text-slate-500">Detected from shared identity signals</p>
@@ -197,7 +196,7 @@ export default function ReviewQueuePanel({
                   <CandidateCard candidate={candidateB} label="Profile B" />
                 </div>
 
-                <div className="mt-3 flex flex-wrap gap-1.5">
+                <div className="mt-2 flex flex-wrap gap-1.5">
                   {matchedFields.length > 0 ? (
                     matchedFields.map((field) => (
                       <span
@@ -215,7 +214,7 @@ export default function ReviewQueuePanel({
                 </div>
 
                 {expanded ? (
-                  <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3 text-[11px] text-slate-600">
+                  <div className="mt-2 rounded-lg border border-slate-200 bg-white p-2.5 text-[11px] text-slate-600">
                     <p className="font-semibold text-slate-700">Review notes</p>
                     <p className="mt-1">{item?.match_reasons || 'No additional reason text provided.'}</p>
                   </div>
@@ -230,12 +229,12 @@ export default function ReviewQueuePanel({
                     }))
                   }
                   placeholder="Optional reviewer notes"
-                  className="mt-3 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[11px] text-slate-700 outline-none ring-blue-300 transition focus:border-blue-300 focus:ring"
+                  className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[11px] text-slate-700 outline-none ring-blue-300 transition focus:border-blue-300 focus:ring"
                   rows={2}
                   disabled={!isAdmin}
                 />
 
-                <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
                   {!isAdmin ? (
                     <span className="inline-flex items-center gap-1 text-[11px] text-amber-700">
                       <ShieldAlert size={12} />

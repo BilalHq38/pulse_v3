@@ -171,6 +171,40 @@ class ProfileMergeHistory(Base):
     merged_by: Mapped[str] = mapped_column(String(32), default="auto")
 
 
+class MergedProfileRecord(Base):
+    __tablename__ = "merged_profile_records"
+
+    record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    unified_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    target_customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unified_customers.customer_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_platforms: Mapped[list] = mapped_column(JSONB, default=list)
+    target_platforms: Mapped[list] = mapped_column(JSONB, default=list)
+    original_identities: Mapped[dict] = mapped_column(JSONB, default=dict)
+    unified_identity_mapping: Mapped[dict] = mapped_column(JSONB, default=dict)
+    merge_history: Mapped[dict] = mapped_column(JSONB, default=dict)
+    merge_reason: Mapped[str] = mapped_column(Text, default="")
+    merged_by: Mapped[str] = mapped_column(String(32), default="auto")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class ReviewQueue(Base):
     __tablename__ = "review_queue"
 

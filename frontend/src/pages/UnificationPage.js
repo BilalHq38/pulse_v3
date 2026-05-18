@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  ChevronDown,
+  ChevronUp,
   GitMerge,
   RefreshCw,
   Search,
@@ -43,10 +45,10 @@ const operationLabel = (operation) => {
 
 function StatCard({ title, value, hint, badge }) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="rounded-xl border border-slate-200 bg-white p-2.5 shadow-sm">
       <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{title}</p>
-      <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
-      <div className="mt-2 flex items-center justify-between gap-2">
+      <p className="mt-1 text-xl font-bold text-slate-900">{value}</p>
+      <div className="mt-1.5 flex items-center justify-between gap-2">
         <p className="text-xs text-slate-500">{hint}</p>
         {badge ? <TagBadge kind={badge.kind} label={badge.label} compact /> : null}
       </div>
@@ -85,6 +87,7 @@ export default function UnificationPage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [tagFilter, setTagFilter] = useState('all');
   const [selectedDetailId, setSelectedDetailId] = useState('');
+  const [guideExpanded, setGuideExpanded] = useState(true);
   const lastOperationToastRef = useRef(0);
   const lastErrorToastRef = useRef('');
 
@@ -99,6 +102,11 @@ export default function UnificationPage() {
     initializeTenantContext,
     refreshAll,
   ]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setGuideExpanded(false), 3500);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     const operationTimestamp = Number(lastOperation?.timestamp || 0) || 0;
@@ -121,7 +129,7 @@ export default function UnificationPage() {
       showToast({
         type: 'success',
         title: 'Split Complete',
-        message: `${response.moved_mapping_count || 0} mapping${response.moved_mapping_count === 1 ? '' : 's'} and ${response.moved_fingerprint_count || 0} fingerprint${response.moved_fingerprint_count === 1 ? '' : 's'} were moved to a new profile.`,
+        message: `${response.moved_mapping_count || 0} mapping${response.moved_mapping_count === 1 ? '' : 's'} and ${response.moved_fingerprint_count || 0} device signal${response.moved_fingerprint_count === 1 ? '' : 's'} were moved to a new profile.`,
       });
       return;
     }
@@ -137,7 +145,7 @@ export default function UnificationPage() {
       showToast({
         type: 'success',
         title: 'Review Updated',
-        message: `Suggestion ${response.suggestion_id || response.resolution_id || ''} was processed successfully.`,
+        message: 'The selected merge suggestion was processed successfully.',
       });
       return;
     }
@@ -145,7 +153,7 @@ export default function UnificationPage() {
       showToast({
         type: 'success',
         title: type === 'unify' ? 'Profiles Linked' : 'Identity Resolved',
-        message: `Profile ${(response.profile || {}).display_name || response.customer_id || 'record'} was updated successfully.`,
+        message: `Profile ${(response.profile || {}).display_name || 'record'} was updated successfully.`,
       });
     }
   }, [lastOperation]);
@@ -195,9 +203,10 @@ export default function UnificationPage() {
 
       const haystack = [
         profile.display_name,
-        profile.id,
-        profile.customer_id,
         profile.platforms_used,
+        profile.primary_email,
+        profile.primary_phone,
+        ...(Array.isArray(profile.source_channels) ? profile.source_channels : []),
       ]
         .map((value) => String(value || '').toLowerCase())
         .join(' ');
@@ -234,8 +243,7 @@ export default function UnificationPage() {
   };
 
   const handleSplit = async ({ profileId, customerId, mappingIds, fingerprintIds }) => {
-    // SplitPanel already shows SplitConfirmModal before invoking this handler,
-    // so run the split directly — no second confirmation dialog needed.
+    // SplitPanel already confirms before invoking this handler, so run the split directly.
     const result = await runSplit({ profileId, customerId, mappingIds, fingerprintIds });
     if (result) {
       await fetchReviewQueue();
@@ -247,42 +255,71 @@ export default function UnificationPage() {
   };
 
   return (
-    <div className="space-y-6 pb-8">
-      <section className="rounded-3xl border border-slate-200 bg-white shadow-sm">
-        <div className="bg-[radial-gradient(circle_at_top_left,_rgba(37,99,235,0.16),_transparent_50%),radial-gradient(circle_at_bottom_right,_rgba(2,132,199,0.2),_transparent_46%)] px-6 py-6">
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <p className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-blue-700">
-                <Shield size={12} />
-                Tenant Scoped Identity
-              </p>
-              <h1 className="mt-3 text-2xl font-bold text-slate-900">Customer Identity Unification</h1>
-              <p className="mt-2 max-w-2xl text-sm text-slate-600">
-                Review candidate matches, merge verified identities, split noisy signals, and preserve auditable tenant boundaries.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap gap-3">
-              <button
-                type="button"
-                onClick={refreshAll}
-                disabled={loadingProfiles || loadingReviewQueue || actionInFlight}
-                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-3 text-sm font-bold text-slate-800 shadow-md shadow-slate-200/70 hover:bg-slate-100 disabled:opacity-50"
-              >
-                <RefreshCw size={18} className={loadingProfiles || loadingReviewQueue ? 'animate-spin' : ''} />
-                Refresh Data
-              </button>
-              <button
-                type="button"
-                onClick={runAutoDetect}
-                disabled={!isAdmin || actionInFlight}
-                className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white shadow-md shadow-blue-200 hover:bg-blue-500 disabled:opacity-50"
-              >
-                <WandSparkles size={18} />
-                Auto Detect Matches
-              </button>
-            </div>
+    <div className="space-y-3 pb-5">
+      <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-700">
+              <Shield size={11} />
+              Tenant Scoped Identity
+            </p>
+            <h1 className="mt-2 text-xl font-bold text-slate-900">Customer Identity Unification</h1>
+            <p className="mt-1 max-w-2xl text-sm text-slate-600">
+              Review matches, merge verified identities, and split noisy signals without exposing internal identifiers.
+            </p>
           </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={refreshAll}
+              disabled={loadingProfiles || loadingReviewQueue || actionInFlight}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 shadow-sm hover:bg-slate-100 disabled:opacity-50"
+            >
+              <RefreshCw size={16} className={loadingProfiles || loadingReviewQueue ? 'animate-spin' : ''} />
+              Refresh Data
+            </button>
+            <button
+              type="button"
+              onClick={runAutoDetect}
+              disabled={!isAdmin || actionInFlight}
+              className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:opacity-50"
+            >
+              <WandSparkles size={16} />
+              Auto Detect Matches
+            </button>
+          </div>
+        </div>
+
+        {guideExpanded ? (
+          <div className="mt-3 grid gap-2 md:grid-cols-4">
+            {[
+              ['1', 'Auto-detect', 'Find likely duplicates'],
+              ['2', 'Review queue', 'Accept or skip suggestions'],
+              ['3', 'Manual merge', 'Select profiles to combine'],
+              ['4', 'Split signals', 'Detach incorrect links'],
+            ].map(([step, title, hint]) => (
+              <div key={step} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-blue-600 text-[10px] font-bold text-white">
+                  {step}
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-semibold text-slate-800">{title}</p>
+                  <p className="truncate text-[10px] text-slate-500">{hint}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <div className="mt-2 flex justify-center">
+          <button
+            type="button"
+            onClick={() => setGuideExpanded((value) => !value)}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-700"
+            aria-label={guideExpanded ? 'Collapse guide' : 'Expand guide'}
+          >
+            {guideExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </button>
         </div>
       </section>
 
@@ -301,7 +338,7 @@ export default function UnificationPage() {
         </div>
       ) : null}
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           title="Unified Profiles"
           value={profiles.length}
@@ -336,13 +373,13 @@ export default function UnificationPage() {
         onResolve={handleResolveSuggestion}
       />
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,2.15fr),minmax(20rem,0.85fr)]">
-        <div className="space-y-6">
-          <section className="rounded-2xl border border-slate-200 bg-white p-5">
+      <div className="grid gap-3 xl:grid-cols-[minmax(0,2.2fr),minmax(20rem,0.8fr)]">
+        <div className="space-y-3">
+          <section className="rounded-xl border border-slate-200 bg-white p-3">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <h2 className="text-sm font-semibold text-slate-900">Unified Profiles</h2>
-                <p className="mt-1 text-xs text-slate-500">Browse unified identities and select candidates for manual merge.</p>
+                <p className="mt-1 text-xs text-slate-500">Browse compact identities and select profiles for manual merge.</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -371,7 +408,7 @@ export default function UnificationPage() {
                 <input
                   value={searchTerm}
                   onChange={(event) => setSearchTerm(event.target.value)}
-                  placeholder="Search name, profile ID, platform"
+                  placeholder="Search name, contact, platform"
                   className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-8 pr-2.5 text-xs text-slate-700"
                 />
               </div>
@@ -391,7 +428,7 @@ export default function UnificationPage() {
             {loadingProfiles ? (
               <div className="space-y-2">
                 {[1, 2, 3].map((item) => (
-                  <div key={item} className="h-40 animate-pulse rounded-2xl border border-slate-200 bg-slate-100" />
+                  <div key={item} className="h-24 animate-pulse rounded-xl border border-slate-200 bg-slate-100" />
                 ))}
               </div>
             ) : filteredProfiles.length === 0 ? (
@@ -399,7 +436,7 @@ export default function UnificationPage() {
                 No profiles match the current filters.
               </div>
             ) : (
-              <div className="space-y-3">
+              <div className="space-y-2">
                 {filteredProfiles.map((profile) => (
                   <ProfileCard
                     key={profile.id}
@@ -415,7 +452,7 @@ export default function UnificationPage() {
           </section>
         </div>
 
-        <div className="space-y-6">
+        <div className="space-y-3 xl:sticky xl:top-4 xl:self-start">
           <SplitPanel
             profileDetail={selectedProfileDetail}
             loading={loadingDetails}

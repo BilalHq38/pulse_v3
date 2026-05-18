@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
 import { Plus, X, Clock, User, ChevronRight } from 'lucide-react';
@@ -17,15 +17,18 @@ export default function TicketsPage() {
   const [noteContent, setNoteContent] = useState('');
   const [loading, setLoading] = useState(true);
   const [searchParams, setSearchParams] = useSearchParams();
+  const closingTicketIdRef = useRef('');
 
   const closeTicketDetail = useCallback(() => {
-    setSelected(null);
+    const closingTicketId = selected?.id || searchParams.get('ticket') || '';
+    closingTicketIdRef.current = closingTicketId;
     if (searchParams.get('ticket')) {
       const nextParams = new URLSearchParams(searchParams);
       nextParams.delete('ticket');
       setSearchParams(nextParams, { replace: true });
     }
-  }, [searchParams, setSearchParams]);
+    setSelected(null);
+  }, [searchParams, selected?.id, setSearchParams]);
 
   const loadTickets = useCallback(async () => {
     try {
@@ -66,7 +69,11 @@ export default function TicketsPage() {
 
   useEffect(() => {
     const requestedTicketId = searchParams.get('ticket');
-    if (!requestedTicketId || loading || selected?.id === requestedTicketId) return;
+    if (!requestedTicketId) {
+      closingTicketIdRef.current = '';
+      return;
+    }
+    if (closingTicketIdRef.current === requestedTicketId || loading || selected?.id === requestedTicketId) return;
     const ticket = tickets.find((item) => item.id === requestedTicketId);
     if (ticket) {
       openTicketDetail(ticket);

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
 import { useSocket } from '@/lib/useSocket';
 import api from '@/lib/api';
 import {
   Activity, AlertCircle, Bot, Clock, Facebook, HeartHandshake, Instagram,
-  Mail, MessageSquare, RefreshCw, ShieldCheck, Sparkles, TrendingUp, Users, WalletCards, Zap
+  Mail, MessageSquare, RefreshCw, ShieldCheck, Sparkles, TrendingUp, Zap
 } from 'lucide-react';
 
 const DEFAULT_DATA = {
@@ -48,7 +49,7 @@ const channelMeta = {
   web_chat: { label: 'Website', color: 'bg-slate-500', icon: Activity },
 };
 
-function MetricCard({ label, value, sub, icon: Icon, tone = 'text-slate-500' }) {
+function MetricCard({ label, value, sub, icon: Icon, tone = 'text-slate-500', onClick }) {
   const bgMap = {
     'text-blue-500': 'bg-blue-50',
     'text-cyan-500': 'bg-cyan-50',
@@ -56,8 +57,8 @@ function MetricCard({ label, value, sub, icon: Icon, tone = 'text-slate-500' }) 
     'text-violet-500': 'bg-violet-50',
     'text-emerald-500': 'bg-emerald-50',
   };
-  return (
-    <div className="bg-white border border-slate-100 rounded-2xl p-3 sm:p-4 pe-card hover:shadow-md transition-all duration-200">
+  const content = (
+    <>
       <div className="flex items-center justify-between mb-2 sm:mb-3">
         <div className={`w-8 h-8 rounded-xl ${bgMap[tone] || 'bg-slate-50'} flex items-center justify-center`}>
           <Icon size={16} className={tone} />
@@ -66,6 +67,21 @@ function MetricCard({ label, value, sub, icon: Icon, tone = 'text-slate-500' }) 
       <p className="text-xl sm:text-2xl font-bold text-slate-900 tabular-nums">{value}</p>
       <p className="text-[11px] sm:text-xs font-semibold text-slate-700 mt-1">{label}</p>
       <p className="text-[10px] sm:text-[11px] text-slate-400 mt-0.5 line-clamp-1">{sub}</p>
+    </>
+  );
+  const className = `w-full bg-white border border-slate-100 rounded-2xl p-3 sm:p-4 pe-card transition-all duration-200 ${
+    onClick ? 'hover:shadow-md hover:border-blue-200 cursor-pointer text-left focus:outline-none focus:ring-2 focus:ring-blue-500/20' : 'hover:shadow-md'
+  }`;
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={className} aria-label={`Open inbox filtered by ${label}`}>
+        {content}
+      </button>
+    );
+  }
+  return (
+    <div className={className}>
+      {content}
     </div>
   );
 }
@@ -101,9 +117,11 @@ function isChannelOnline(channel) {
 
 export default function DashboardPage() {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [data, setData] = useState(DEFAULT_DATA);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [companyName, setCompanyName] = useState(() => localStorage.getItem('pe_company_name') || '');
 
   const fetchLive = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true);
@@ -120,6 +138,23 @@ export default function DashboardPage() {
 
   useEffect(() => { fetchLive(true); }, [fetchLive]);
 
+  useEffect(() => {
+    const onCompanyChanged = (event) => {
+      const nextName = String(
+        event.type === 'storage'
+          ? localStorage.getItem('pe_company_name') || ''
+          : event.detail?.company_name || event.detail || '',
+      ).trim();
+      setCompanyName(nextName);
+    };
+    window.addEventListener('pe-company-changed', onCompanyChanged);
+    window.addEventListener('storage', onCompanyChanged);
+    return () => {
+      window.removeEventListener('pe-company-changed', onCompanyChanged);
+      window.removeEventListener('storage', onCompanyChanged);
+    };
+  }, []);
+
   useSocket((event) => {
     if (['conversation_updated', 'new_message', 'notification'].includes(event)) {
       fetchLive(true);
@@ -133,6 +168,10 @@ export default function DashboardPage() {
       return;
     }
     navigate(action.url);
+  };
+
+  const openInboxFilter = (filter) => {
+    navigate(`/inbox?inbox_filter=${encodeURIComponent(filter)}`);
   };
 
   const messageBars = useMemo(
@@ -150,6 +189,7 @@ export default function DashboardPage() {
   }, [data.micro_visuals.sentiment_distribution]);
 
   const totalSentiment = sentimentBars.reduce((sum, item) => sum + item.value, 0) || 1;
+  const dashboardTitle = companyName || user?.company_name || user?.company?.name || 'Dashboard';
 
   return (
     <div className="p-4 sm:p-6 lg:p-8 space-y-5 sm:space-y-6 animate-fadeIn" data-testid="dashboard-page">
@@ -158,7 +198,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-xl sm:text-2xl font-bold text-slate-900 flex items-center gap-2">
             <Zap size={20} className="text-blue-500" />
-            Live Dashboard
+            {dashboardTitle}
           </h1>
         </div>
         <button
@@ -173,12 +213,12 @@ export default function DashboardPage() {
 
       {/* Real-time activity metrics */}
       <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
-        <MetricCard label="Incoming" value={data.real_time_activity.incoming_messages} sub="messages right now" icon={MessageSquare} tone="text-blue-500" />
-        <MetricCard label="Active Convos" value={data.real_time_activity.active_conversations} sub="open conversations" icon={Activity} tone="text-cyan-500" />
-        <MetricCard label="Pending Replies" value={data.real_time_activity.pending_replies} sub="awaiting response" icon={Clock} tone="text-amber-500" />
-        <MetricCard label="AI Chats" value={data.real_time_activity.ai_active_chats} sub="handled by AI" icon={Bot} tone="text-violet-500" />
-        <MetricCard label="Human Chats" value={data.real_time_activity.human_active_chats} sub="handled by agents" icon={HeartHandshake} tone="text-emerald-500" />
-        <MetricCard label="Unread" value={data.inbox_summary.total_unread} sub="in inbox" icon={AlertCircle} tone="text-blue-500" />
+        <MetricCard label="Incoming Messages" value={data.real_time_activity.incoming_messages} sub="messages today" icon={MessageSquare} tone="text-blue-500" onClick={() => openInboxFilter('incoming_messages')} />
+        <MetricCard label="Active Conversations" value={data.real_time_activity.active_conversations} sub="open conversations" icon={Activity} tone="text-cyan-500" onClick={() => openInboxFilter('active_conversations')} />
+        <MetricCard label="Pending Replies" value={data.real_time_activity.pending_replies} sub="awaiting response" icon={Clock} tone="text-amber-500" onClick={() => openInboxFilter('pending_replies')} />
+        <MetricCard label="AI Chat" value={data.real_time_activity.ai_active_chats} sub="handled by AI" icon={Bot} tone="text-violet-500" onClick={() => openInboxFilter('ai_chats')} />
+        <MetricCard label="Human Chats" value={data.real_time_activity.human_active_chats} sub="handled by agents" icon={HeartHandshake} tone="text-emerald-500" onClick={() => openInboxFilter('human_chats')} />
+        <MetricCard label="Unread" value={data.inbox_summary.total_unread} sub="in inbox" icon={AlertCircle} tone="text-blue-500" onClick={() => openInboxFilter('unread')} />
       </div>
 
       {/* Alerts + System Health */}

@@ -56,7 +56,7 @@ def _normalize_intent_payload(raw: dict) -> dict:
 
 def _render_history_context(conversation_context: list | None) -> str:
     lines: list[str] = []
-    for item in (conversation_context or [])[-10:]:
+    for item in (conversation_context or [])[-80:]:
         if not isinstance(item, dict):
             continue
         sender = str(item.get("sender_type") or "unknown").strip().lower()

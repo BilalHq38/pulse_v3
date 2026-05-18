@@ -269,6 +269,15 @@ async def upsert_customer_interaction_summary(
             bool(payload.get("ai_handled")),
             existing_id,
         )
+        await db.execute(
+            "DELETE FROM customer_interaction_summaries "
+            "WHERE company_id=$1 AND customer_id=$2 AND conversation_id=$3 AND summary_date=$4 AND id<>$5",
+            payload.get("company_id", ""),
+            payload.get("customer_id", ""),
+            payload.get("conversation_id", ""),
+            payload.get("summary_date"),
+            existing_id,
+        )
         return _row_to_dict(await db.fetchrow("SELECT * FROM customer_interaction_summaries WHERE id=$1", existing_id))
     summary_id = str(payload.get("id") or make_id())
     row = await db.fetchrow(
@@ -287,6 +296,15 @@ async def upsert_customer_interaction_summary(
         float(safe_float(payload.get("avg_sentiment"), 0.0) or 0.0),
         bool(payload.get("escalated")),
         bool(payload.get("ai_handled")),
+    )
+    await db.execute(
+        "DELETE FROM customer_interaction_summaries "
+        "WHERE company_id=$1 AND customer_id=$2 AND conversation_id=$3 AND summary_date=$4 AND id<>$5",
+        payload.get("company_id", ""),
+        payload.get("customer_id", ""),
+        payload.get("conversation_id", ""),
+        payload.get("summary_date"),
+        summary_id,
     )
     return _row_to_dict(row)
 

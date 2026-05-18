@@ -59,8 +59,22 @@ def _canonical_e164(raw_value: str, default_region: str | None = None) -> tuple[
         return "", "empty", 0.0
 
     # whatsapp-web.js commonly uses 923001234567@c.us; Meta Cloud uses bare digits.
-    compact = raw.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
-    if compact.lower().startswith("wamid.") or "@" in compact and not compact.endswith(("@c.us", "@s.whatsapp.net")):
+    # @lid JIDs (e.g. "182974364528890@lid") are WhatsApp Linked Device identifiers —
+    # NOT phone numbers.  Strip the known suffixes so the digit-length check can run,
+    # but detect @lid early and return a specific reason so callers can distinguish it
+    # from a genuinely malformed phone.
+    compact = (
+        raw
+        .replace("@c.us", "")
+        .replace("@s.whatsapp.net", "")
+        .strip()
+    )
+
+    # Detect @lid BEFORE stripping to preserve the reason distinction.
+    if "@lid" in raw.lower():
+        return "", "lid_identifier", 0.0
+
+    if compact.lower().startswith("wamid.") or "@" in compact:
         return "", "provider_or_non_phone_identifier", 0.0
 
     digits = _DIGITS_RE.sub("", compact)

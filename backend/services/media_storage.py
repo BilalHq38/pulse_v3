@@ -18,7 +18,17 @@ ALLOWED_IMAGE_MIME_TYPES = {
     "image/webp": ".webp",
     "image/gif": ".gif",
 }
+ALLOWED_VIDEO_MIME_TYPES = {
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+}
+ALLOWED_MEDIA_MIME_TYPES = {
+    **ALLOWED_IMAGE_MIME_TYPES,
+    **ALLOWED_VIDEO_MIME_TYPES,
+}
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_VIDEO_BYTES = 16 * 1024 * 1024
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.IGNORECASE | re.DOTALL)
 _SAFE_SEGMENT_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
@@ -34,24 +44,39 @@ def safe_path_segment(value: str, fallback: str = "default") -> str:
 
 
 def parse_image_data_url(data_url: str) -> tuple[str, bytes]:
-    match = _DATA_URL_RE.match(str(data_url or "").strip())
-    if not match:
-        raise HTTPException(400, "image must be a base64 data URL")
-    mime_type = match.group(1).lower()
+    mime_type, raw = parse_media_data_url(data_url, allowed_mime_types=ALLOWED_IMAGE_MIME_TYPES)
     if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
         raise HTTPException(400, "unsupported image type")
-    try:
-        raw = base64.b64decode(match.group(2), validate=True)
-    except Exception as exc:
-        raise HTTPException(400, "invalid image data") from exc
-    if not raw:
-        raise HTTPException(400, "image is empty")
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(400, f"image exceeds {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
     return mime_type, raw
 
 
-def store_image_data_url(
+def parse_media_data_url(
+    data_url: str,
+    *,
+    allowed_mime_types: dict[str, str] | None = None,
+) -> tuple[str, bytes]:
+    match = _DATA_URL_RE.match(str(data_url or "").strip())
+    if not match:
+        raise HTTPException(400, "media must be a base64 data URL")
+    mime_type = match.group(1).lower()
+    allowed = allowed_mime_types or ALLOWED_MEDIA_MIME_TYPES
+    if mime_type not in allowed:
+        raise HTTPException(400, "unsupported media type")
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+    except Exception as exc:
+        raise HTTPException(400, "invalid media data") from exc
+    if not raw:
+        raise HTTPException(400, "media is empty")
+    limit = MAX_VIDEO_BYTES if mime_type.startswith("video/") else MAX_IMAGE_BYTES
+    if len(raw) > limit:
+        raise HTTPException(400, f"media exceeds {limit // (1024 * 1024)} MB")
+    return mime_type, raw
+
+
+def store_media_data_url(
     data_url: str,
     *,
     category: str,
@@ -59,8 +84,27 @@ def store_image_data_url(
     public_url_prefix: str,
     original_filename: str = "",
 ) -> dict[str, Any]:
-    mime_type, raw = parse_image_data_url(data_url)
-    extension = ALLOWED_IMAGE_MIME_TYPES[mime_type]
+    mime_type, raw = parse_media_data_url(data_url)
+    return _store_media_bytes(
+        raw,
+        mime_type=mime_type,
+        category=category,
+        company_id=company_id,
+        public_url_prefix=public_url_prefix,
+        original_filename=original_filename,
+    )
+
+
+def _store_media_bytes(
+    raw: bytes,
+    *,
+    mime_type: str,
+    category: str,
+    company_id: str,
+    public_url_prefix: str,
+    original_filename: str = "",
+) -> dict[str, Any]:
+    extension = ALLOWED_MEDIA_MIME_TYPES[mime_type]
     safe_company = safe_path_segment(company_id, "company")
     safe_category = safe_path_segment(category, "media")
     file_name = f"{uuid4().hex}{extension}"
@@ -77,6 +121,25 @@ def store_image_data_url(
         "file_size": len(raw),
         "file_name": original_filename.strip() or file_name,
     }
+
+
+def store_image_data_url(
+    data_url: str,
+    *,
+    category: str,
+    company_id: str,
+    public_url_prefix: str,
+    original_filename: str = "",
+) -> dict[str, Any]:
+    mime_type, raw = parse_image_data_url(data_url)
+    return _store_media_bytes(
+        raw,
+        mime_type=mime_type,
+        category=category,
+        company_id=company_id,
+        public_url_prefix=public_url_prefix,
+        original_filename=original_filename,
+    )
 
 
 def store_image_bytes(

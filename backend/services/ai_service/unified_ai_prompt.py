@@ -321,7 +321,7 @@ def _fmt_lead(lead: dict) -> str:
 
 def _fmt_history(conversation_history: list[dict]) -> str:
     lines: list[str] = []
-    for item in (conversation_history or [])[-10:]:
+    for item in (conversation_history or [])[-80:]:
         if not isinstance(item, dict):
             continue
         sender = str(item.get("sender_type") or "unknown").strip().lower()

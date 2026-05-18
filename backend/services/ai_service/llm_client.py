@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 import re
@@ -87,6 +88,12 @@ _PROVIDER_HTTP_TIMEOUT = httpx.Timeout(60.0, connect=3.0, read=60.0, write=10.0,
 _GEMINI_HTTP_TIMEOUT_MS = 60_000
 _MAX_TRANSIENT_RETRIES = 3
 _JSON_MAX_OUTPUT_TOKENS = 512
+_EMAIL_CAMPAIGN_JSON_MIN_TOKENS = 900
+_JSON_FORMAT_RETRY_ATTEMPTS = 3
+_JSON_REPAIR_RAW_CHAR_LIMIT = 3000
+_JSON_RETRY_TOKEN_BONUS = 512
+_JSON_RETRY_MAX_OUTPUT_TOKENS = 4096
+_GEMINI_RESPONSE_MIME_UNSUPPORTED_MODELS: set[str] = set()
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -103,6 +110,8 @@ def _token_limit_for_call(call_type: str = "", call_purpose: str = "", *, defaul
         return 50
     if "summary" in purpose or "summar" in purpose:
         return 250
+    if "email_campaign_copy" in purpose or "email_html_body" in purpose:
+        return max(_coerce_positive_int(default, _EMAIL_CAMPAIGN_JSON_MIN_TOKENS), _EMAIL_CAMPAIGN_JSON_MIN_TOKENS)
     if "json" in purpose:
         return _JSON_MAX_OUTPUT_TOKENS
     if "complex" in purpose or "agent" in purpose:
@@ -127,8 +136,16 @@ def _text_engine(
 
 
 def _json_engine_for_call(engine: dict, *, call_purpose: str = "", max_tokens: int = _JSON_MAX_OUTPUT_TOKENS) -> dict:
-    target = _token_limit_for_call("json", call_purpose, default=max_tokens)
-    return _json_engine(engine, max_tokens=target)
+    configured_max = _coerce_positive_int((engine or {}).get("max_tokens"), max_tokens)
+    target = _token_limit_for_call("json", call_purpose, default=configured_max)
+    selected = _json_engine(engine, max_tokens=target)
+    purpose = str(call_purpose or "").lower()
+    if "email_campaign_copy" in purpose or "email_html_body" in purpose:
+        selected["max_tokens"] = max(
+            _coerce_positive_int(selected.get("max_tokens"), target),
+            _EMAIL_CAMPAIGN_JSON_MIN_TOKENS,
+        )
+    return selected
 
 
 def _gemini_http_options(api_version: str = "v1beta") -> dict[str, Any]:
@@ -246,7 +263,8 @@ def _coerce_supported_runtime_engine(engine: dict, *, use_pro: bool = False) -> 
         selected["configured_model_name"] = model_name
         selected["model_name"] = fallback_model
         logger.warning(
-            "invalid_model_configured_fallback provider=gemini configured_model=%s fallback_model=%s error_type=invalid_model",
+            "invalid_model_configured_fallback provider=gemini configured_model=%s "
+            "fallback_model=%s error_type=invalid_model",
             model_name,
             fallback_model,
         )
@@ -317,6 +335,8 @@ def _generation_opts(engine: Optional[dict], generation_config: Any = None) -> t
             temperature = float(generation_config["temperature"])
         if generation_config.get("max_output_tokens") is not None:
             max_tokens = int(generation_config["max_output_tokens"])
+        if generation_config.get("maxOutputTokens") is not None:
+            max_tokens = int(generation_config["maxOutputTokens"])
         if generation_config.get("max_tokens") is not None:
             max_tokens = int(generation_config["max_tokens"])
     return temperature, max_tokens
@@ -339,8 +359,83 @@ def _gemini_afc_disabled_config() -> Any:
     return {"disable": True}
 
 
-def _build_gemini_config(kwargs: dict[str, Any] | None = None) -> Any:
+def _gemini_config_has_response_mime_type(config: Any) -> bool:
+    if isinstance(config, dict):
+        return bool(config.get("response_mime_type") or config.get("responseMimeType"))
+    return bool(getattr(config, "response_mime_type", None) or getattr(config, "responseMimeType", None))
+
+
+def _gemini_response_mime_cache_key(model_name: str) -> str:
+    model = str(model_name or "").strip()
+    return f"{_gemini_api_version_for_model(model)}:{model}"
+
+
+def _gemini_supports_response_mime_type(engine: dict | None, model_name: str | None = None) -> bool:
+    model = str(model_name or (engine or {}).get("model_name") or "").strip()
+    if not model or not genai_types or "response_mime_type" not in _gemini_config_fields():
+        return False
+    explicit = (engine or {}).get("supports_response_mime_type")
+    if explicit is not None:
+        return bool(explicit)
+    if _gemini_response_mime_cache_key(model) in _GEMINI_RESPONSE_MIME_UNSUPPORTED_MODELS:
+        return False
+    return _gemini_api_version_for_model(model) == "v1beta"
+
+
+def _gemini_config_without_response_mime_type(config: Any) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        payload = dict(config)
+        payload.pop("response_mime_type", None)
+        payload.pop("responseMimeType", None)
+        payload.pop("response_schema", None)
+        payload.pop("responseSchema", None)
+        payload.pop("response_json_schema", None)
+        payload.pop("responseJsonSchema", None)
+        return payload or None
+    if hasattr(config, "model_copy"):
+        try:
+            updates = {
+                field: None
+                for field in ("response_mime_type", "response_schema", "response_json_schema")
+                if hasattr(config, field)
+            }
+            return config.model_copy(update=updates) if updates else config
+        except Exception:
+            return config
+    return config
+
+
+def _normalize_gemini_config_payload(kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = dict(kwargs or {})
+    if payload.get("maxOutputTokens") is not None and payload.get("max_output_tokens") is None:
+        payload["max_output_tokens"] = payload.get("maxOutputTokens")
+    if payload.get("max_tokens") is not None and payload.get("max_output_tokens") is None:
+        payload["max_output_tokens"] = payload.get("max_tokens")
+    if payload.get("responseMimeType") is not None and payload.get("response_mime_type") is None:
+        payload["response_mime_type"] = payload.get("responseMimeType")
+    if payload.get("responseSchema") is not None and payload.get("response_schema") is None:
+        payload["response_schema"] = payload.get("responseSchema")
+    if payload.get("responseJsonSchema") is not None and payload.get("response_json_schema") is None:
+        payload["response_json_schema"] = payload.get("responseJsonSchema")
+    for key in (
+        "maxOutputTokens",
+        "max_tokens",
+        "response_format",
+        "responseMimeType",
+        "responseSchema",
+        "responseJsonSchema",
+    ):
+        payload.pop(key, None)
+    fields = _gemini_config_fields()
+    if fields:
+        payload = {key: value for key, value in payload.items() if key in fields}
+    return payload
+
+
+def _build_gemini_config(kwargs: dict[str, Any] | None = None) -> Any:
+    payload = _normalize_gemini_config_payload(kwargs)
     if _gemini_supports_afc_disable():
         payload.setdefault("automatic_function_calling", _gemini_afc_disabled_config())
     if genai_types:
@@ -350,6 +445,8 @@ def _build_gemini_config(kwargs: dict[str, Any] | None = None) -> Any:
 
 def _prepare_gemini_generation_config(engine: dict, generation_config: Any = None) -> Any:
     temperature, max_tokens = _generation_opts(engine, generation_config)
+    if not _gemini_supports_response_mime_type(engine):
+        generation_config = _gemini_config_without_response_mime_type(generation_config)
     if genai_types and isinstance(generation_config, genai_types.GenerateContentConfig):
         updates: dict[str, Any] = {}
         if temperature is not None and getattr(generation_config, "temperature", None) is None:
@@ -359,7 +456,7 @@ def _prepare_gemini_generation_config(engine: dict, generation_config: Any = Non
         if _gemini_supports_afc_disable() and getattr(generation_config, "automatic_function_calling", None) is None:
             updates["automatic_function_calling"] = _gemini_afc_disabled_config()
         return generation_config.model_copy(update=updates) if updates else generation_config
-    payload = dict(generation_config or {}) if isinstance(generation_config, dict) else {}
+    payload = _normalize_gemini_config_payload(generation_config) if isinstance(generation_config, dict) else {}
     if temperature is not None:
         payload.setdefault("temperature", temperature)
     if max_tokens is not None:
@@ -383,6 +480,17 @@ def _json_only_prompt(prompt: str, schema_payload: dict[str, Any] | None = None)
         schema_text = json.dumps(schema_payload, ensure_ascii=True)
         return f"Return ONLY valid JSON matching this schema.\nSchema: {schema_text}\n\n{prompt}"
     return f"Return ONLY valid JSON. No markdown. No extra text.\n\n{prompt}"
+
+
+def _is_gemini_response_mime_type_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    normalized = message.replace("_", "")
+    return "responsemimetype" in normalized and (
+        "unknown name" in message
+        or "cannot find field" in message
+        or "invalid json payload" in message
+        or "invalid_argument" in message
+    )
 
 
 def _iter_gemini_model_candidates(preferred_model: str | None) -> list[str]:
@@ -497,35 +605,61 @@ async def _stream_gemini(
     errors: list[str] = []
     model_candidates = _iter_gemini_model_candidates(engine.get("model_name"))
     for index, model_name in enumerate(model_candidates):
+        response_mime_retry_used = False
         try:
             client = _gemini_client_for_model(model_name)
             if not client:
                 raise RuntimeError(get_provider_runtime_info("gemini")[1])
-            stream = client.aio.models.generate_content_stream(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-            if hasattr(stream, "__await__"):
-                stream = await stream
-            if hasattr(stream, "__aiter__"):
-                async for chunk in stream:
-                    text = _extract_gemini_chunk_text(chunk)
-                    if text:
-                        yield text, model_name
-            else:
-                for chunk in stream:
-                    text = _extract_gemini_chunk_text(chunk)
-                    if text:
-                        yield text, model_name
-            return
+            model_cache_key = _gemini_response_mime_cache_key(model_name)
+            while True:
+                request_config = (
+                    _gemini_config_without_response_mime_type(config)
+                    if model_cache_key in _GEMINI_RESPONSE_MIME_UNSUPPORTED_MODELS
+                    else config
+                )
+                try:
+                    stream = client.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=contents,
+                        config=request_config,
+                    )
+                    if hasattr(stream, "__await__"):
+                        stream = await stream
+                    if hasattr(stream, "__aiter__"):
+                        async for chunk in stream:
+                            text = _extract_gemini_chunk_text(chunk)
+                            if text:
+                                yield text, model_name
+                    else:
+                        for chunk in stream:
+                            text = _extract_gemini_chunk_text(chunk)
+                            if text:
+                                yield text, model_name
+                    return
+                except Exception as exc:
+                    if (
+                        not response_mime_retry_used
+                        and _gemini_config_has_response_mime_type(request_config)
+                        and _is_gemini_response_mime_type_error(exc)
+                    ):
+                        response_mime_retry_used = True
+                        _GEMINI_RESPONSE_MIME_UNSUPPORTED_MODELS.add(model_cache_key)
+                        config = _gemini_config_without_response_mime_type(config)
+                        logger.warning(
+                            "gemini_response_mime_type_unsupported_retry model=%s error=%s",
+                            model_name,
+                            str(exc).splitlines()[0][:240],
+                        )
+                        continue
+                    raise
         except Exception as exc:
             error_str = str(exc)
             errors.append(f"{model_name}:{exc.__class__.__name__}:{error_str}")
             if _is_invalid_model_error(exc) and index + 1 < len(model_candidates):
                 next_model = model_candidates[index + 1]
                 logger.warning(
-                    "gemini_invalid_model_fallback invalid_model=%s fallback_model=%s error_type=invalid_model error=%s",
+                    "gemini_invalid_model_fallback invalid_model=%s fallback_model=%s "
+                    "error_type=invalid_model error=%s",
                     model_name,
                     next_model,
                     error_str.splitlines()[0][:240],
@@ -959,38 +1093,92 @@ def _extract_json_object(raw: str) -> dict[str, Any]:
     if not candidate:
         return {}
     # Strip markdown fences and optional language tag (e.g. ```json)
-    if candidate.startswith("```"):
-        # Remove all backticks and any leading language marker
-        candidate = candidate.strip("`")
-        candidate = re.sub(r"^json\s*", "", candidate, flags=re.IGNORECASE)
-    # Try to parse the entire candidate as JSON
-    def _load_json(text: str) -> dict[str, Any]:
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidate = fenced.group(1).strip()
+
+    last_error: Exception | None = None
+
+    def _load_json(text: str) -> Optional[dict[str, Any]]:
+        nonlocal last_error
         try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return None
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            try:
+                parsed = json.JSONDecoder(strict=False).decode(text)
+            except json.JSONDecodeError:
+                try:
+                    parsed = ast.literal_eval(text)
+                except (SyntaxError, ValueError) as literal_exc:
+                    last_error = literal_exc
+                    return None
+        if isinstance(parsed, dict):
+            return parsed
+        last_error = ValueError("JSON response was not an object")
+        return None
+
+    def _remove_trailing_commas(text: str) -> str:
+        return re.sub(r",\s*([}\]])", r"\1", text)
+
+    def _quote_keys(text: str) -> str:
+        # Add quotes around bare keys following { or ,
+        return re.sub(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', text)
+
+    def _object_candidates(text: str) -> list[str]:
+        candidates: list[str] = []
+        start = -1
+        depth = 0
+        in_string = False
+        escape = False
+        for index, char in enumerate(text):
+            if start < 0:
+                if char == "{":
+                    start = index
+                    depth = 1
+                continue
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : index + 1])
+                    start = -1
+        return candidates
+
     # First attempt: direct JSON parsing
     parsed = _load_json(candidate)
     if parsed is not None:
         return parsed
-    # Second attempt: locate the first curly-braces object and parse it
-    match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-    if match:
-        obj_str = match.group(0)
+    parsed = _load_json(_remove_trailing_commas(candidate))
+    if parsed is not None:
+        return parsed
+    # Second attempt: locate balanced curly-braces objects and parse them.
+    # This avoids greedy matches that include prose after the JSON object.
+    for obj_str in _object_candidates(candidate):
         parsed = _load_json(obj_str)
+        if parsed is not None:
+            return parsed
+        parsed = _load_json(_remove_trailing_commas(obj_str))
         if parsed is not None:
             return parsed
         # Third attempt: quote unquoted keys within the curly-braces object
         # This handles cases like {subject: "...", body: "..."}
-        def _quote_keys(s: str) -> str:
-            # Add quotes around bare keys following { or ,
-            return re.sub(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', s)
-        fixed_obj = _quote_keys(obj_str)
+        fixed_obj = _remove_trailing_commas(_quote_keys(obj_str))
         parsed = _load_json(fixed_obj)
         if parsed is not None:
             return parsed
-    # If all attempts fail, raise the original JSONDecodeError to trigger fallback
-    raise
+    raise ValueError("Model response did not contain a valid JSON object") from last_error
 
 
 def _error_status_code(exc: Exception) -> int:
@@ -1020,7 +1208,9 @@ def _is_google_api_exception(exc: Exception, *names: str) -> bool:
 def _is_genai_exception(exc: Exception, *names: str) -> bool:
     if not genai_errors:
         return False
-    exception_types = tuple(item for item in (getattr(genai_errors, name, None) for name in names) if isinstance(item, type))
+    exception_types = tuple(
+        item for item in (getattr(genai_errors, name, None) for name in names) if isinstance(item, type)
+    )
     return bool(exception_types) and isinstance(exc, exception_types)
 
 
@@ -1090,6 +1280,61 @@ def _classify_llm_error(exc: Exception) -> str:
     return "provider_error"
 
 
+def _compact_exception_message(exc: Exception | None, limit: int = 300) -> str:
+    if exc is None:
+        return "unknown error"
+    message = str(exc).splitlines()[0].strip() or exc.__class__.__name__
+    return message[:limit]
+
+
+def _json_generation_config(engine: dict) -> dict[str, Any]:
+    _, selected_max_tokens = _generation_opts(engine, None)
+    config: dict[str, Any] = {
+        "response_format": "json_object",
+        "temperature": 0.0,
+        "max_output_tokens": selected_max_tokens or _JSON_MAX_OUTPUT_TOKENS,
+    }
+    provider = str((engine or {}).get("provider") or "").strip().lower()
+    if provider == "gemini" and _gemini_supports_response_mime_type(engine):
+        config["response_mime_type"] = "application/json"
+    return config
+
+
+def _json_engine_for_format_attempt(engine: dict, attempt: int) -> dict:
+    if attempt <= 1:
+        return engine
+    selected = dict(engine or {})
+    current_max = _coerce_positive_int(selected.get("max_tokens"), _JSON_MAX_OUTPUT_TOKENS)
+    retry_max = max(current_max + _JSON_RETRY_TOKEN_BONUS, int(current_max * 1.5))
+    selected["max_tokens"] = min(max(retry_max, current_max), _JSON_RETRY_MAX_OUTPUT_TOKENS)
+    selected["temperature"] = 0.0
+    return selected
+
+
+def _json_response_repair_prompt(
+    original_prompt: str,
+    schema_payload: dict[str, Any],
+    raw_response: str,
+    error: Exception | None,
+) -> str:
+    raw_preview = str(raw_response or "").strip()
+    if len(raw_preview) > _JSON_REPAIR_RAW_CHAR_LIMIT:
+        raw_preview = raw_preview[:_JSON_REPAIR_RAW_CHAR_LIMIT] + "\n[truncated]"
+    repair_task = (
+        "The previous model response was invalid, incomplete, or did not match the required JSON schema.\n"
+        "Return a new complete JSON object only. Do not continue the previous response.\n"
+        "The final output must start with { and end with }.\n"
+        f"Parsing or validation error: {_compact_exception_message(error)}\n"
+        f"Previous invalid response:\n{raw_preview or '<empty>'}\n\n"
+        f"Original task:\n{original_prompt}"
+    )
+    return _json_only_prompt(repair_task, schema_payload)
+
+
+def _validate_json_response(raw: str, schema: type[BaseModel]) -> dict[str, Any]:
+    return schema.model_validate(_extract_json_object(raw)).model_dump()
+
+
 async def call_model_json(
     prompt: str,
     schema: type[BaseModel],
@@ -1108,20 +1353,20 @@ async def call_model_json(
         engine or _default_engine(use_pro=use_pro),
         call_purpose=call_purpose,
     )
-    provider = (selected.get("provider") or "openai").strip().lower()
     schema_payload = _sanitize_schema(schema.model_json_schema())
-    _, selected_max_tokens = _generation_opts(selected, None)
-    if provider == "gemini" and genai_types:
-        config_payload: dict[str, Any] = {
-            "temperature": 0.0,
-            "max_output_tokens": selected_max_tokens or _JSON_MAX_OUTPUT_TOKENS,
-        }
-        json_prompt = _json_only_prompt(prompt, schema_payload)
-        config = _build_gemini_config(config_payload)
+    raw = ""
+    last_format_error: Exception | None = None
+    for format_attempt in range(1, _JSON_FORMAT_RETRY_ATTEMPTS + 1):
+        attempt_engine = _json_engine_for_format_attempt(selected, format_attempt)
+        json_prompt = (
+            _json_only_prompt(prompt, schema_payload)
+            if format_attempt == 1
+            else _json_response_repair_prompt(prompt, schema_payload, raw, last_format_error)
+        )
         raw = await call_model_text(
             json_prompt,
-            engine=selected,
-            generation_config=config,
+            engine=attempt_engine,
+            generation_config=_json_generation_config(attempt_engine),
             image_urls=image_urls,
             call_type="json",
             call_purpose=call_purpose,
@@ -1131,25 +1376,19 @@ async def call_model_json(
             allow_provider_fallback=allow_provider_fallback,
             count_against_budget=count_against_budget,
         )
-    else:
-        raw = await call_model_text(
-            _json_only_prompt(prompt, schema_payload),
-            engine=selected,
-            generation_config={
-                "response_format": "json_object",
-                "temperature": 0.0,
-                "max_output_tokens": selected_max_tokens or _JSON_MAX_OUTPUT_TOKENS,
-            },
-            image_urls=image_urls,
-            call_type="json",
-            call_purpose=call_purpose,
-            function_name=function_name or "call_model_json",
-            agent_name=agent_name,
-            max_provider_attempts=max_provider_attempts,
-            allow_provider_fallback=allow_provider_fallback,
-            count_against_budget=count_against_budget,
-        )
-    return schema.model_validate(_extract_json_object(raw)).model_dump()
+        try:
+            return _validate_json_response(raw, schema)
+        except Exception as exc:
+            last_format_error = exc
+            logger.warning(
+                "llm_json_response_invalid function=%s purpose=%s attempt=%s raw_chars=%s error=%s",
+                function_name or "call_model_json",
+                call_purpose or "-",
+                format_attempt,
+                len(raw or ""),
+                _compact_exception_message(exc),
+            )
+    raise ValueError("Model response did not contain valid JSON matching schema after retries") from last_format_error
 
 
 async def call_gemini(
@@ -1434,16 +1673,13 @@ async def call_model_json_batch(
     try:
         if provider == "gemini" and genai_types:
             _, max_tokens = _generation_opts(selected, None)
-            config_payload: dict[str, Any] = {
-                "temperature": 0.0,
-                "max_output_tokens": max_tokens or selected_max_tokens or _JSON_MAX_OUTPUT_TOKENS,
-            }
+            config_payload = _json_generation_config(selected)
+            config_payload["max_output_tokens"] = max_tokens or selected_max_tokens or _JSON_MAX_OUTPUT_TOKENS
             json_prompt = _json_only_prompt(wrapper_prompt)
-            config = _build_gemini_config(config_payload)
             raw = await call_model_text(
                 json_prompt,
                 engine=selected,
-                generation_config=config,
+                generation_config=config_payload,
                 call_type="json_batch",
                 call_purpose=call_purpose or ",".join(tasks.keys()),
                 function_name=function_name or "call_model_json_batch",
@@ -1455,11 +1691,7 @@ async def call_model_json_batch(
             raw = await call_model_text(
                 _json_only_prompt(wrapper_prompt),
                 engine=selected,
-                generation_config={
-                    "response_format": "json_object",
-                    "temperature": 0.0,
-                    "max_output_tokens": selected_max_tokens or _JSON_MAX_OUTPUT_TOKENS,
-                },
+                generation_config=_json_generation_config(selected),
                 call_type="json_batch",
                 call_purpose=call_purpose or ",".join(tasks.keys()),
                 function_name=function_name or "call_model_json_batch",

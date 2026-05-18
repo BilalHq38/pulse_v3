@@ -55,12 +55,6 @@ async function waitForSelector(selector, root = document) {
   throw new Error(`Expected selector ${selector}`);
 }
 
-function findSection(container, title) {
-  const heading = Array.from(container.querySelectorAll('h4')).find((node) => node.textContent === title);
-  if (!heading) throw new Error(`Missing section ${title}`);
-  return heading.parentElement;
-}
-
 function installApiMocks() {
   mockApi.get.mockImplementation((url) => {
     const dataByUrl = {
@@ -80,6 +74,21 @@ function installApiMocks() {
       '/analytics/customer-summaries': [
         {
           id: 'customer-1',
+          customer_id: 'customer-id-1',
+          conversation_id: 'conversation-id-1',
+          entity_type: 'customer',
+          source_type: 'customer_interaction_summary',
+          type: 'Customer',
+          name: 'Customer Only',
+          date: '2026-05-14',
+          sentiment_label: 'positive',
+          resolution_status: 'resolved',
+          topics: ['AI handled'],
+        },
+        {
+          id: 'customer-duplicate',
+          customer_id: 'customer-id-1',
+          conversation_id: 'conversation-id-1',
           entity_type: 'customer',
           source_type: 'customer_interaction_summary',
           type: 'Customer',
@@ -91,14 +100,33 @@ function installApiMocks() {
         },
         {
           id: 'lead-1',
+          lead_id: 'lead-id-1',
           entity_type: 'lead',
           source_type: 'lead_activity',
+          activity_type: 'nurture',
           type: 'Lead',
           name: 'Lead Only',
           date: '2026-05-14',
           sentiment_label: 'neutral',
           resolution_status: 'new',
           topics: ['nurture'],
+          content: 'Followed up',
+          stage: 'new',
+        },
+        {
+          id: 'lead-duplicate',
+          lead_id: 'lead-id-1',
+          entity_type: 'lead',
+          source_type: 'lead_activity',
+          activity_type: 'nurture',
+          type: 'Lead',
+          name: 'Lead Only',
+          date: '2026-05-14',
+          sentiment_label: 'neutral',
+          resolution_status: 'new',
+          topics: ['nurture'],
+          content: 'Followed up',
+          stage: 'new',
         },
       ],
       '/analytics/daily-summaries': [],
@@ -114,7 +142,11 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-test('interaction summaries render customer and lead records in separate sections by entity type', async () => {
+function countOccurrences(text, token) {
+  return text.split(token).length - 1;
+}
+
+test('interaction summaries render customer and lead rows once after dedupe', async () => {
   installApiMocks();
   const container = document.createElement('div');
   document.body.appendChild(container);
@@ -125,13 +157,13 @@ test('interaction summaries render customer and lead records in separate section
   });
 
   await waitForSelector('[data-testid="customer-interaction-log"]', container);
-  const customerSection = findSection(container, 'Customer Interaction Summary');
-  const leadSection = findSection(container, 'Lead Interaction Summary');
+  const section = container.querySelector('[data-testid="customer-interaction-log"]');
+  const text = section.textContent;
 
-  expect(customerSection.textContent).toContain('Customer Only');
-  expect(customerSection.textContent).not.toContain('Lead Only');
-  expect(leadSection.textContent).toContain('Lead Only');
-  expect(leadSection.textContent).not.toContain('Customer Only');
+  expect(text).toContain('Lead + Customer Interaction Summary');
+  expect(countOccurrences(text, 'Customer Only')).toBe(1);
+  expect(countOccurrences(text, 'Lead Only')).toBe(1);
+  expect(text).toContain('(2 recent)');
 
   await act(async () => root.unmount());
 });

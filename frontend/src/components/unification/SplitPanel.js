@@ -10,6 +10,22 @@ const formatDate = (value) => {
   return date.toLocaleString();
 };
 
+const channelLabel = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return 'Channel';
+  return text
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+};
+
+const firstReadable = (...values) => {
+  for (const value of values) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+  return '';
+};
+
 export default function SplitPanel({
   profileDetail,
   loading = false,
@@ -47,8 +63,8 @@ export default function SplitPanel({
   };
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-4">
-      <header className="mb-4 flex items-center justify-between gap-3">
+    <section className="rounded-xl border border-slate-200 bg-white p-3">
+      <header className="mb-3 flex items-center justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-slate-900">Split Profile Signals</h3>
           <p className="mt-1 text-xs text-slate-500">Detach identity mappings or fingerprints from the selected profile.</p>
@@ -65,24 +81,33 @@ export default function SplitPanel({
       </header>
 
       {!profileId ? (
-        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-8 text-center text-xs text-slate-500">
+        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-6 text-center text-xs text-slate-500">
           Select a profile card to inspect mappings and split signals.
         </div>
       ) : (
         <>
-          <div className="mb-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
-            <p className="text-[11px] font-semibold text-slate-700">Profile: {profileDetail?.display_name || profileId}</p>
-            <p className="mt-1 break-all font-mono text-[10px] text-slate-500">{profileId}</p>
+          <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-2.5">
+            <p className="text-xs font-semibold text-slate-700">{profileDetail?.display_name || 'Selected profile'}</p>
+            <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] text-slate-500">
+              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                {mappings.length} mapping{mappings.length === 1 ? '' : 's'}
+              </span>
+              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                {fingerprints.length} device signal{fingerprints.length === 1 ? '' : 's'}
+              </span>
+            </div>
           </div>
 
           <div className="space-y-3">
             <div>
               <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Identity Mappings</p>
-              <div className="max-h-48 space-y-2 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-2">
+              <div className="max-h-44 space-y-2 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-2">
                 {mappings.length > 0 ? (
                   mappings.map((item) => {
                     const mappingId = normalizeId(item.mapping_id);
                     const selected = mappingSelection.includes(mappingId);
+                    const platform = channelLabel(item.platform);
+                    const contact = firstReadable(item.email, item.phone, item.display_name, item.name);
                     return (
                       <label
                         key={mappingId}
@@ -98,9 +123,15 @@ export default function SplitPanel({
                           className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-rose-600"
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs font-semibold text-slate-700">{item.platform || 'unknown'} / {item.platform_user_id || 'n/a'}</p>
-                          <p className="truncate font-mono text-[10px] text-slate-500">{mappingId}</p>
-                          <p className="mt-1 text-[10px] text-slate-500">Confidence: {Math.round((Number(item.confidence || 0) || 0) * 100)}%</p>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <p className="truncate text-xs font-semibold text-slate-700">{platform} identity</p>
+                            <span className="rounded-full border border-slate-200 bg-white px-1.5 py-0.5 text-[9px] font-semibold text-slate-500">
+                              {Math.round((Number(item.confidence || 0) || 0) * 100)}% confidence
+                            </span>
+                          </div>
+                          <p className="mt-1 truncate text-[10px] text-slate-500">
+                            {contact || 'No public contact on this signal'}
+                          </p>
                         </div>
                       </label>
                     );
@@ -113,7 +144,7 @@ export default function SplitPanel({
 
             <div>
               <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Device Fingerprints</p>
-              <div className="max-h-48 space-y-2 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-2">
+              <div className="max-h-44 space-y-2 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-2">
                 {fingerprints.length > 0 ? (
                   fingerprints.map((item) => {
                     const fingerprintId = normalizeId(item.fingerprint_id);
@@ -133,9 +164,8 @@ export default function SplitPanel({
                           className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-rose-600"
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs font-semibold text-slate-700">{item.fingerprint_hash || 'fingerprint'}</p>
-                          <p className="truncate font-mono text-[10px] text-slate-500">{fingerprintId}</p>
-                          <p className="mt-1 text-[10px] text-slate-500">Seen: {formatDate(item.last_seen)}</p>
+                          <p className="truncate text-xs font-semibold text-slate-700">Device signal</p>
+                          <p className="mt-1 text-[10px] text-slate-500">Last seen: {formatDate(item.last_seen)}</p>
                         </div>
                         <Fingerprint size={14} className="mt-0.5 text-slate-400" />
                       </label>
@@ -148,13 +178,13 @@ export default function SplitPanel({
             </div>
           </div>
 
-          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
             <div className="flex items-start gap-2">
               <AlertTriangle size={14} className="mt-0.5 text-amber-500" />
               <div>
                 <p className="text-xs font-medium text-slate-700">{selectionHint}</p>
                 <p className="mt-1 text-[11px] text-slate-500">
-                  Selected mapping IDs: {mappingSelection.length} | Selected fingerprints: {fingerprintSelection.length}
+                  Selected mappings: {mappingSelection.length} | Selected device signals: {fingerprintSelection.length}
                 </p>
               </div>
             </div>

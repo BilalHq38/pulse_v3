@@ -22,7 +22,9 @@ const {
   progressForState,
 } = require("./session_state");
 const {
+  normalizeInboundPhone,
   resolveInboundSenderIdentity,
+  resolveOutboundRecipientIdentity,
   stringifyIdentityValue,
 } = require("./inbound_identity");
 
@@ -144,6 +146,29 @@ const PUPPETEER_NAVIGATION_TIMEOUT_MS = readEnvInt("PUPPETEER_NAVIGATION_TIMEOUT
 const WHATSAPP_SEND_RETRY_ATTEMPTS = readEnvInt("WHATSAPP_SEND_RETRY_ATTEMPTS", 3);
 const WHATSAPP_SEND_RETRY_BASE_DELAY_MS = readEnvInt("WHATSAPP_SEND_RETRY_BASE_DELAY_MS", 800);
 const WHATSAPP_SEND_RETRY_MAX_DELAY_MS = readEnvInt("WHATSAPP_SEND_RETRY_MAX_DELAY_MS", 5000);
+const WHATSAPP_HISTORY_DEFAULT_LIMIT = readEnvInt("WHATSAPP_HISTORY_DEFAULT_LIMIT", 50);
+const WHATSAPP_HISTORY_MAX_LIMIT = readEnvInt("WHATSAPP_HISTORY_MAX_LIMIT", 100);
+const PLATFORM_OUTBOUND_ECHO_TTL_MS = readEnvInt("WHATSAPP_PLATFORM_ECHO_TTL_MS", 5000);
+const PLATFORM_OUTBOUND_ECHO_BUCKET_MS = readEnvInt("WHATSAPP_PLATFORM_ECHO_BUCKET_MS", 3000);
+const MOBILE_OUTBOUND_BACKFILL_INTERVAL_MS = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_BACKFILL_INTERVAL_MS", 15000);
+const MOBILE_OUTBOUND_BACKFILL_LOOKBACK_MS = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_BACKFILL_LOOKBACK_MS", 10 * 60 * 1000);
+const MOBILE_OUTBOUND_BACKFILL_CHAT_LIMIT = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_BACKFILL_CHAT_LIMIT", 30);
+const MOBILE_OUTBOUND_BACKFILL_MESSAGE_LIMIT = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_MESSAGE_LIMIT", 20);
+const MOBILE_OUTBOUND_FORWARD_CACHE_TTL_MS = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_FORWARD_CACHE_TTL_MS", 60 * 60 * 1000);
+const BRIDGE_WEBHOOK_MIN_INTERVAL_MS = readEnvInt("BRIDGE_WEBHOOK_MIN_INTERVAL_MS", 150);
+const BRIDGE_WEBHOOK_RETRY_ATTEMPTS = readEnvInt("BRIDGE_WEBHOOK_RETRY_ATTEMPTS", 4);
+const BRIDGE_WEBHOOK_RETRY_BASE_DELAY_MS = readEnvInt("BRIDGE_WEBHOOK_RETRY_BASE_DELAY_MS", 1000);
+const BRIDGE_WEBHOOK_RETRY_MAX_DELAY_MS = readEnvInt("BRIDGE_WEBHOOK_RETRY_MAX_DELAY_MS", 12000);
+const BRIDGE_WEBHOOK_DEDUP_TTL_MS = readEnvInt("BRIDGE_WEBHOOK_DEDUP_TTL_MS", 5 * 60 * 1000);
+const OUTBOUND_MEDIA_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+]);
 
 function isPlaceholderValue(value) {
   return /^replace-with-|^your-|^placeholder$/i.test(String(value || "").trim());
@@ -346,31 +371,87 @@ function parseDataUrl(dataUrl) {
   return { mimeType: match[1], data: match[2] };
 }
 
+function inferAttachmentMimeType(attachment, fallback = "") {
+  const explicit = String(
+    (attachment && (attachment.mime_type || attachment.mimeType || attachment.mimetype)) || fallback || "",
+  ).split(";")[0].trim().toLowerCase();
+  if (explicit) return explicit;
+  const type = String((attachment && (attachment.type || attachment.file_type)) || "").trim().toLowerCase();
+  if (type === "video") return "video/mp4";
+  if (type === "image") return "image/jpeg";
+  return "";
+}
+
+function mediaKindForMime(mimeType) {
+  const normalized = String(mimeType || "").trim().toLowerCase();
+  if (normalized.startsWith("image/")) return "image";
+  if (normalized.startsWith("video/")) return "video";
+  return "file";
+}
+
 async function attachmentToMedia(attachment) {
-  if (!attachment || String(attachment.type || "").toLowerCase() !== "image") return null;
+  if (!attachment || typeof attachment !== "object") return null;
   const sourceUrl = String(attachment.url || attachment.file_url || "").trim();
+  const declaredMime = inferAttachmentMimeType(attachment);
+  const declaredKind = mediaKindForMime(declaredMime || String(attachment.type || ""));
+  if (declaredMime && !OUTBOUND_MEDIA_MIME_TYPES.has(declaredMime)) {
+    const error = `Unsupported WhatsApp media type: ${declaredMime}`;
+    logBridgeEvent("warn", "whatsapp.outbound.attachment_unsupported", {
+      media_type: declaredKind,
+      mime_type: declaredMime,
+      size: Number(attachment.size || attachment.file_size || 0),
+      filename: String(attachment.name || attachment.file_name || "").slice(0, 120),
+      reason: error,
+    });
+    throw new Error(error);
+  }
   let parsed = parseDataUrl(sourceUrl);
   if (!parsed && sourceUrl) {
     try {
       const absoluteUrl = sourceUrl.startsWith("/") ? `${PYTHON_BACKEND}${sourceUrl}` : sourceUrl;
       if (/^https?:\/\//i.test(absoluteUrl)) {
         const response = await axios.get(absoluteUrl, { responseType: "arraybuffer", timeout: BRIDGE_FORWARD_TIMEOUT_MS });
-        const mimeType = String(response.headers["content-type"] || attachment.mime_type || "image/jpeg").split(";")[0].trim();
-        if (mimeType.startsWith("image/")) {
+        const mimeType = inferAttachmentMimeType(attachment, response.headers["content-type"]);
+        if (OUTBOUND_MEDIA_MIME_TYPES.has(mimeType)) {
           parsed = { mimeType, data: Buffer.from(response.data).toString("base64") };
+        } else {
+          const error = `Unsupported fetched WhatsApp media type: ${mimeType || "unknown"}`;
+          logBridgeEvent("warn", "whatsapp.outbound.attachment_unsupported", {
+            url: sourceUrl.slice(0, 200),
+            media_type: mediaKindForMime(mimeType),
+            mime_type: mimeType,
+            size: Number(response.headers["content-length"] || attachment.size || attachment.file_size || 0),
+            reason: error,
+          });
+          throw new Error(error);
         }
       }
     } catch (err) {
       logBridgeEvent("warn", "whatsapp.outbound.attachment_fetch_failed", {
         url: sourceUrl.slice(0, 200),
+        media_type: declaredKind,
+        mime_type: declaredMime,
+        size: Number(attachment.size || attachment.file_size || 0),
         error: trimText(err && err.message ? err.message : err, 300),
       });
-      return null;
+      throw err;
     }
   }
-  if (!parsed) return null;
+  if (!parsed) {
+    throw new Error("Attachment media could not be converted for WhatsApp");
+  }
+  parsed.mimeType = String(parsed.mimeType || declaredMime || "").split(";")[0].trim().toLowerCase();
+  if (!OUTBOUND_MEDIA_MIME_TYPES.has(parsed.mimeType)) {
+    throw new Error(`Unsupported WhatsApp media type: ${parsed.mimeType || "unknown"}`);
+  }
   const fallbackExt = parsed.mimeType.split("/")[1] || "jpg";
-  const filename = attachment.name || `image.${fallbackExt}`;
+  const filename = attachment.name || attachment.file_name || `${mediaKindForMime(parsed.mimeType)}.${fallbackExt}`;
+  logBridgeEvent("info", "whatsapp.outbound.attachment_prepared", {
+    media_type: mediaKindForMime(parsed.mimeType),
+    mime_type: parsed.mimeType,
+    size: Number(attachment.size || attachment.file_size || Buffer.byteLength(parsed.data || "", "base64")),
+    filename: String(filename || "").slice(0, 120),
+  });
   return new MessageMedia(parsed.mimeType, parsed.data, filename);
 }
 
@@ -805,21 +886,702 @@ function sessionFromRequest(req) {
   });
 }
 
-async function forwardInboundMessage(session, msg) {
-  if (msg.isGroupMsg || msg.from === "status@broadcast") return;
+function messageTimestampSeconds(msg) {
+  const raw = Number((msg && msg.timestamp) || (msg && msg._data && msg._data.t) || 0);
+  if (Number.isFinite(raw) && raw > 0) {
+    return raw > 10_000_000_000 ? Math.floor(raw / 1000) : Math.floor(raw);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+function normalizeWhatsAppParticipant(value) {
+  const raw = stringifyIdentityValue(value);
+  if (!raw || raw === "status@broadcast" || /@g\.us$/i.test(raw)) {
+    return { raw, phone: "", digits: "" };
+  }
+  const normalized = normalizeInboundPhone(raw) || normalizeInboundPhone(raw.replace(/@(c\.us|s\.whatsapp\.net)$/i, ""));
+  if (normalized) {
+    return { raw, phone: normalized.e164, digits: normalized.digits };
+  }
+  const digits = normalizePhoneNumber(raw);
+  return {
+    raw,
+    phone: digits ? `+${digits}` : "",
+    digits,
+  };
+}
+
+async function resolveOutboundTargetIdentity(msg) {
+  let chat = null;
+  if (msg && typeof msg.getChat === "function") {
+    try {
+      chat = await msg.getChat();
+    } catch {
+      chat = null;
+    }
+  }
+  const candidates = [
+    msg && msg.to,
+    msg && msg.id && msg.id.remote,
+    msg && msg._data && msg._data.to,
+    chat && chat.id,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeWhatsAppParticipant(candidate);
+    if (normalized.digits) {
+      return {
+        ...normalized,
+        chat,
+        name: stringifyIdentityValue((chat && chat.name) || (msg && msg._data && msg._data.notifyName) || ""),
+      };
+    }
+  }
+  return { raw: "", phone: "", digits: "", chat, name: "" };
+}
+
+async function resolveMessageChat(msg) {
+  if (!msg || typeof msg.getChat !== "function") return null;
+  try {
+    return await msg.getChat();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Attempt to resolve a WhatsApp @lid (Linked Device ID) JID to an E.164 phone number.
+ *
+ * WhatsApp's multi-device protocol assigns @lid JIDs (e.g. "182974364528890@lid") to
+ * contacts in some sessions.  These are NOT phone numbers — they are internal device
+ * identifiers — so all normal phone-parsing paths fail for them.
+ *
+ * Resolution strategy:
+ *   1. client.getContactById(lidJid) → contact.number
+ *   2. client.getNumberId(digitsFromLid) → resolved._serialized → strip @c.us
+ *
+ * Both calls are best-effort; failure is silently swallowed.
+ *
+ * @param {object} session - Active bridge session (must have session.client).
+ * @param {string}  lidJid  - Raw JID string such as "182974364528890@lid".
+ * @returns {Promise<{e164: string, digits: string}|null>} Resolved identity or null.
+ */
+async function resolveLidContact(session, lidJid) {
+  const raw = String(lidJid || "").trim();
+  if (!raw || !raw.toLowerCase().includes("@lid") || !session || !session.client) return null;
+
+  // Strategy 1: getContactById — returns the contact object with a .number field
+  if (typeof session.client.getContactById === "function") {
+    try {
+      const contact = await session.client.getContactById(raw);
+      if (contact && contact.number) {
+        const resolved = normalizeInboundPhone(String(contact.number));
+        if (resolved) {
+          logBridgeEvent("info", "whatsapp.outbound.lid_resolved_via_contact", {
+            scope: session.scopeKey,
+            company_id: session.companyId || "",
+            user_id: session.userId || "",
+            raw_lid: raw,
+            resolved_digits: maskPhone(resolved.digits),
+          });
+          return resolved;
+        }
+      }
+    } catch {
+      // getContactById may throw for contacts not yet in the local store; fall through
+    }
+  }
+
+  // Strategy 2: getNumberId — WhatsApp maps the numeric part to a registered @c.us JID
+  const lidDigits = raw.replace(/@lid$/i, "").replace(/\D/g, "");
+  if (lidDigits && typeof session.client.getNumberId === "function") {
+    try {
+      const numberId = await session.client.getNumberId(lidDigits);
+      if (numberId) {
+        const rawUser = String(
+          (typeof numberId === "object" && numberId.user) ||
+          (typeof numberId === "string" && numberId) ||
+          "",
+        ).replace(/@.*$/, "").trim();
+        if (rawUser) {
+          const resolved = normalizeInboundPhone(rawUser);
+          if (resolved) {
+            logBridgeEvent("info", "whatsapp.outbound.lid_resolved_via_number_id", {
+              scope: session.scopeKey,
+              company_id: session.companyId || "",
+              user_id: session.userId || "",
+              raw_lid: raw,
+              resolved_digits: maskPhone(resolved.digits),
+            });
+            return resolved;
+          }
+        }
+      }
+    } catch {
+      // getNumberId may fail for unknown contacts; fall through
+    }
+  }
+
+  return null;
+}
+
+async function fetchProfilePictureUrl(session, identity) {
+  const raw = stringifyIdentityValue(identity);
+  if (!session || !session.client || !raw || typeof session.client.getProfilePicUrl !== "function") return "";
+  try {
+    return stringifyIdentityValue(await session.client.getProfilePicUrl(raw));
+  } catch {
+    return "";
+  }
+}
+
+function chatIdentityValue(value) {
+  const raw = stringifyIdentityValue(value);
+  return raw || "";
+}
+
+function linkedDeviceIdentity(session) {
+  const digits = normalizePhoneNumber((session && session.phone) || MY_NUMBER || "");
+  return {
+    phone: digits ? `+${digits}` : "",
+    digits,
+  };
+}
+
+async function forwardGroupMessage(session, msg, options = {}) {
+  if (!msg || !msg.isGroupMsg || msg.from === "status@broadcast") {
+    return { forwarded: false, skipped: true };
+  }
+
+  const direction = msg.fromMe ? "outbound" : "inbound";
+  const chat = await resolveMessageChat(msg);
+  const rawFrom = stringifyIdentityValue(msg.from);
+  const rawTo = stringifyIdentityValue(msg.to);
+  const msgAuthor = stringifyIdentityValue(msg.author || (msg.id && msg.id.participant));
+  const msgIdRemote = stringifyIdentityValue(msg.id && msg.id.remote);
+  const groupId = chatIdentityValue((chat && chat.id) || msgIdRemote || rawFrom || rawTo);
+  const groupName = stringifyIdentityValue((chat && chat.name) || (msg._data && msg._data.notifyName) || groupId);
+  const messageId = extractMessageId(msg);
+  let mediaPayload = null;
+  const ownIdentity = linkedDeviceIdentity(session);
+
+  let senderIdentity = null;
+  let senderPhone = "";
+  let senderDigits = "";
+  let senderNameSaved = "";
+  let senderPushname = "";
+  let senderName = "";
+
+  if (direction === "inbound") {
+    senderIdentity = await resolveInboundSenderIdentity(msg);
+    senderPhone = senderIdentity.senderPhone || "";
+    senderDigits = senderIdentity.senderPhoneDigits || senderIdentity.rawSenderDigits || "";
+    senderNameSaved = senderIdentity.rawFields.contact_name_saved || "";
+    senderPushname = senderIdentity.rawFields.contact_pushname || (msg._data && msg._data.notifyName) || "";
+    senderName = senderNameSaved || senderPushname || `WhatsApp ${senderPhone || senderDigits || "group participant"}`;
+    if (!senderIdentity.isValid) {
+      logBridgeEvent("warn", "whatsapp.group.inbound.identity_unresolved", {
+        scope: session.scopeKey,
+        company_id: session.companyId || "",
+        user_id: session.userId || "",
+        group_id: groupId,
+        raw_from: rawFrom,
+        msg_author: msgAuthor,
+        msg_id_remote: msgIdRemote,
+        candidates: senderIdentity.candidates.map((item) => ({ label: item.label, raw: item.raw })),
+      });
+      return { forwarded: false, skipped: true, reason: "invalid_group_sender_identity" };
+    }
+  } else {
+    senderPhone = ownIdentity.phone;
+    senderDigits = ownIdentity.digits;
+    senderName = session.companyId ? `Agent (${session.companyId})` : "WhatsApp Linked Device";
+    if (!options.historySync && hasMobileOutboundForwarded(session, msg)) {
+      return { forwarded: false, duplicate: true, skipped: true };
+    }
+    if (!options.historySync && await isPlatformOutboundEcho(session, msg, { digits: groupId })) {
+      rememberMobileOutboundForward(session, msg);
+      logBridgeEvent("info", "whatsapp.group.outbound.duplicate_skipped", {
+        scope: session.scopeKey,
+        company_id: session.companyId || "",
+        user_id: session.userId || "",
+        group_id: groupId,
+        message_id: messageId,
+        reason: "platform_send_echo",
+      });
+      return { forwarded: false, duplicate: true, skipped: true };
+    }
+  }
+
+  try {
+    mediaPayload = await downloadMediaPayload(session, msg, `whatsapp.group.${direction}`);
+    const senderProfilePictureUrl = (senderIdentity && senderIdentity.rawFields.profile_picture_url)
+      ? senderIdentity.rawFields.profile_picture_url
+      : "";
+    const groupProfilePictureUrl = await fetchProfilePictureUrl(session, groupId);
+    const businessAccountId = isPlaceholderValue(WHATSAPP_BUSINESS_ACCOUNT_ID) ? "" : WHATSAPP_BUSINESS_ACCOUNT_ID;
+    const metadata = bridgeMetadata(session, {
+      direction,
+      bridge_event_type: options.historySync || options.source === "history_sync" ? "history_sync" : (direction === "outbound" ? "message_create" : "message"),
+      is_group_message: true,
+      group_id: groupId,
+      group_name: groupName,
+      group_profile_picture_url: groupProfilePictureUrl,
+      suppress_ai: direction !== "inbound",
+    });
+    if (senderProfilePictureUrl) {
+      metadata.profile_picture_url = senderProfilePictureUrl;
+    }
+
+    const messagePayload = {
+      from: direction === "inbound" ? (senderDigits || senderPhone) : groupId,
+      customer_phone: direction === "inbound" ? senderPhone : "",
+      customer_phone_digits: direction === "inbound" ? senderDigits : "",
+      sender_name: senderName,
+      type: mediaPayload ? mediaPayload.type : "text",
+      text: { body: msg.body || "" },
+      timestamp: messageTimestampSeconds(msg),
+      id: messageId,
+      provider_event_id: messageId,
+      idempotency_key: messageId ? `whatsapp:${session.companyId || DEFAULT_BRIDGE_COMPANY_ID || ""}:${direction}:group:${messageId}` : "",
+      web_bridge: {
+        source: "whatsapp_web_bridge",
+        direction,
+        from_me: direction === "outbound",
+        is_group_message: true,
+        suppress_ai: direction !== "inbound",
+        group_id: groupId,
+        group_name: groupName,
+        group_sender_phone: senderPhone,
+        group_sender_phone_digits: senderDigits,
+        group_sender_name: senderName,
+        group_profile_picture_url: groupProfilePictureUrl,
+        sender_name_saved: senderNameSaved,
+        sender_pushname: senderPushname,
+        raw_from: rawFrom,
+        msg_from: rawFrom,
+        msg_to: rawTo,
+        msg_author: msgAuthor,
+        msg_id_remote: msgIdRemote,
+        msg_id_id: stringifyIdentityValue(msg.id && msg.id.id),
+        msg_id_serialized: stringifyIdentityValue(msg.id && msg.id._serialized),
+        raw_sender_id: direction === "inbound" && senderIdentity ? senderIdentity.rawSenderId : senderPhone,
+        provider_sender_id: direction === "inbound" && senderIdentity ? senderIdentity.providerSenderId : (rawFrom || msgIdRemote || groupId),
+        selected_identity_source: direction === "inbound" && senderIdentity ? senderIdentity.selectedSource : "linked_device",
+        sender_phone: senderPhone,
+        sender_phone_digits: senderDigits,
+        chat_id: groupId,
+        profile_picture_url: senderProfilePictureUrl,
+      },
+    };
+    if (mediaPayload) {
+      const payloadForType = { ...mediaPayload };
+      delete payloadForType.type;
+      messagePayload[mediaPayload.type] = payloadForType;
+    }
+
+    const contactProfile = {
+      name: senderName || groupName,
+      name_saved: senderNameSaved,
+      name_push: senderPushname,
+      group_name: groupName,
+      picture: senderProfilePictureUrl || groupProfilePictureUrl,
+      profile_picture: senderProfilePictureUrl || groupProfilePictureUrl,
+    };
+    const payload = {
+      entry: [{
+        id: businessAccountId || `whatsapp-web:${session.scopeKey}`,
+        changes: [{
+          value: {
+            business_account_id: businessAccountId,
+            metadata,
+            messages: [messagePayload],
+            contacts: [{
+              profile: contactProfile,
+              wa_id: senderDigits || groupId,
+              web_bridge: {
+                sender_phone: senderPhone,
+                provider_sender_id: messagePayload.web_bridge.provider_sender_id,
+                contact_id: senderIdentity ? senderIdentity.rawFields.contact_id || "" : "",
+                profile_picture_url: contactProfile.profile_picture,
+                group_profile_picture_url: groupProfilePictureUrl,
+                is_group_message: true,
+                group_id: groupId,
+                group_name: groupName,
+              },
+            }],
+          },
+        }],
+      }],
+    };
+
+    const response = await postWebhookPayload(session, payload, {
+      returnResults: Boolean(options.returnResults),
+    });
+    const duplicate = responseHasDuplicate(response.data);
+    if (direction === "outbound") rememberMobileOutboundForward(session, msg);
+    logBridgeEvent("info", duplicate ? "whatsapp.group.message_duplicate_skipped" : "whatsapp.group.message_forwarded", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      message_id: messageId,
+      group_id: groupId,
+      group_name: groupName,
+      direction,
+      sender: maskPhone(senderDigits || senderPhone),
+      backend_status: response.status,
+    });
+    return { forwarded: !duplicate, duplicate, data: response.data };
+  } catch (err) {
+    const status = err && err.response && err.response.status;
+    if (status === 409) {
+      if (direction === "outbound") rememberMobileOutboundForward(session, msg);
+      return { forwarded: false, duplicate: true, skipped: true };
+    }
+    logBridgeEvent("error", "whatsapp.group.message_forward_failed", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      group_id: groupId,
+      direction,
+      message_id: messageId,
+      error: trimText(err && err.message ? err.message : err, 500),
+    });
+    return { forwarded: false, error: err && err.message ? err.message : String(err || "") };
+  }
+}
+
+async function downloadMediaPayload(session, msg, eventPrefix) {
+  if (!msg || !msg.hasMedia) return null;
+  let mediaPayload = null;
+  try {
+    const media = await msg.downloadMedia();
+    if (media && typeof media.mimetype === "string") {
+      const mimeType = media.mimetype;
+      const mediaType = mimeType.startsWith("image/")
+        ? "image"
+        : mimeType.startsWith("video/")
+          ? "video"
+          : mimeType.startsWith("audio/")
+            ? "audio"
+            : "document";
+      mediaPayload = {
+        type: mediaType,
+        data_url: `data:${media.mimetype};base64,${media.data}`,
+        filename: media.filename || "",
+        mime_type: mimeType,
+        size: Number((msg._data && msg._data.size) || 0),
+        caption: msg.body || "",
+      };
+    }
+  } catch (err) {
+    logBridgeEvent("error", `${eventPrefix}.media_download_failed`, {
+      scope: session.scopeKey,
+      message_id: msg && msg.id ? msg.id.id || msg.id._serialized || "" : "",
+      error: trimText(err && err.message ? err.message : err, 400),
+    });
+    console.error(`[${session.scopeKey}] Media download failed: ${err.message}`);
+  }
+  return mediaPayload;
+}
+
+function bridgeMetadata(session, extra = {}) {
+  const phoneNumberId = isPlaceholderValue(WHATSAPP_PHONE_NUMBER_ID) ? "" : WHATSAPP_PHONE_NUMBER_ID;
+  const metadata = {
+    source: "whatsapp_web_bridge",
+    bridge_scope: session.scopeKey,
+    provider: "whatsapp-web.js",
+  };
+  if (phoneNumberId) {
+    metadata.phone_number_id = phoneNumberId;
+  }
+  if (session.phone || MY_NUMBER) {
+    metadata.display_phone_number = session.phone || MY_NUMBER;
+  }
+  if (session.companyId || DEFAULT_BRIDGE_COMPANY_ID) {
+    metadata.company_id = session.companyId || DEFAULT_BRIDGE_COMPANY_ID;
+  }
+  if (session.userId) {
+    metadata.bridge_user_id = session.userId;
+  }
+  return { ...metadata, ...extra };
+}
+
+function extractPayloadEventKeys(payload) {
+  const keys = [];
+  for (const entry of (payload && payload.entry) || []) {
+    for (const change of (entry && entry.changes) || []) {
+      const value = (change && change.value) || {};
+      const metadata = value.metadata || {};
+      const accountId = String(value.business_account_id || entry.id || metadata.phone_number_id || "").trim();
+      for (const status of value.statuses || []) {
+        const id = String((status && (status.id || status.message_id || status.recipient_id)) || "").trim();
+        if (id) keys.push(`status:${accountId}:${id}:${String(status.status || "")}`);
+      }
+      for (const msg of value.messages || []) {
+        const messageId = String((msg && (msg.id || msg.provider_event_id)) || "").trim();
+        const webBridge = (msg && msg.web_bridge && typeof msg.web_bridge === "object") ? msg.web_bridge : {};
+        const groupId = String(webBridge.group_id || metadata.group_id || "").trim();
+        const eventId = messageId || String(webBridge.msg_id_serialized || webBridge.msg_id_id || "").trim();
+        if (msg && msg.type === "reaction") {
+          const reaction = msg.reaction || {};
+          const target = String(reaction.message_id || reaction.target_message_id || "").trim();
+          const actor = String(msg.from || webBridge.provider_sender_id || webBridge.raw_from || "").trim();
+          const emoji = String(reaction.emoji || "").trim();
+          keys.push(`reaction:${accountId}:${eventId || target}:${actor}:${emoji}:${String(reaction.action || "")}`);
+        } else if (eventId) {
+          keys.push(`${groupId ? "group-message" : "message"}:${accountId}:${eventId}`);
+        }
+      }
+    }
+  }
+  if (keys.length === 0) {
+    keys.push(`payload:${crypto.createHash("sha256").update(JSON.stringify(payload || {})).digest("hex")}`);
+  }
+  return [...new Set(keys.filter(Boolean))];
+}
+
+function pruneWebhookDedup(session) {
+  if (!session || !session.webhookDedup) return;
+  const now = Date.now();
+  for (const [key, expiresAt] of session.webhookDedup.entries()) {
+    if (expiresAt <= now) session.webhookDedup.delete(key);
+  }
+}
+
+function buildDuplicateWebhookResponse(keys) {
+  return {
+    status: 200,
+    data: {
+      processed: true,
+      duplicate: true,
+      status: "duplicate",
+      results: keys.map((key) => ({ duplicate: true, dedup_stage: "bridge_queue", key })),
+    },
+  };
+}
+
+function isRetryableWebhookError(err) {
+  const status = err && err.response && Number(err.response.status);
+  return status === 429 || status === 408 || status >= 500 || !status;
+}
+
+function webhookRetryDelay(attempt) {
+  const base = Math.min(
+    BRIDGE_WEBHOOK_RETRY_MAX_DELAY_MS,
+    BRIDGE_WEBHOOK_RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1)),
+  );
+  return base + Math.floor(Math.random() * Math.min(1000, base));
+}
+
+async function postWebhookPayloadDirect(session, payload, options = {}) {
+  const rawPayload = JSON.stringify(payload);
+  const signature = buildMetaSignature(rawPayload);
+  return axios.post(`${PYTHON_BACKEND}${WHATSAPP_WEBHOOK_PATH}`, rawPayload, {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Hub-Signature-256": signature,
+      "X-Bridge-Secret": BRIDGE_SECRET,
+      "X-Bridge-Company-Id": session.companyId || "",
+      "X-Bridge-User-Id": session.userId || "",
+      "X-Webhook-Timestamp": String(Math.floor(Date.now() / 1000)),
+      ...(options.returnResults ? { "X-Bridge-Return-Results": "true" } : {}),
+    },
+    timeout: options.timeout || BRIDGE_FORWARD_TIMEOUT_MS,
+  });
+}
+
+async function drainWebhookQueue(session) {
+  if (!session || session.webhookQueueRunning) return;
+  session.webhookQueueRunning = true;
+  try {
+    while (session.webhookQueue && session.webhookQueue.length > 0) {
+      const item = session.webhookQueue.shift();
+      const waitMs = Math.max(0, BRIDGE_WEBHOOK_MIN_INTERVAL_MS - (Date.now() - (session.webhookLastSentAt || 0)));
+      if (waitMs > 0) await sleep(waitMs);
+
+      let lastErr = null;
+      for (let attempt = 1; attempt <= BRIDGE_WEBHOOK_RETRY_ATTEMPTS; attempt += 1) {
+        try {
+          const response = await postWebhookPayloadDirect(session, item.payload, item.options);
+          session.webhookLastSentAt = Date.now();
+          item.resolve(response);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const status = err && err.response && err.response.status;
+          if (!isRetryableWebhookError(err) || attempt >= BRIDGE_WEBHOOK_RETRY_ATTEMPTS) break;
+          logBridgeEvent(status === 429 ? "warn" : "info", "whatsapp.webhook.rate_limit_avoided", {
+            scope: session.scopeKey,
+            company_id: session.companyId || "",
+            user_id: session.userId || "",
+            status: status || "",
+            attempt,
+            queue_depth: session.webhookQueue.length,
+          });
+          await sleep(webhookRetryDelay(attempt));
+        }
+      }
+      if (lastErr) {
+        for (const key of item.keys || []) {
+          session.webhookDedup.delete(key);
+        }
+        item.reject(lastErr);
+      }
+    }
+  } finally {
+    session.webhookQueueRunning = false;
+  }
+}
+
+async function postWebhookPayload(session, payload, options = {}) {
+  if (!session) return postWebhookPayloadDirect(session, payload, options);
+  if (!session.webhookQueue) session.webhookQueue = [];
+  if (!session.webhookDedup) session.webhookDedup = new Map();
+  pruneWebhookDedup(session);
+  const keys = extractPayloadEventKeys(payload);
+  const freshKeys = keys.filter((key) => !session.webhookDedup.has(key));
+  if (freshKeys.length === 0) {
+    logBridgeEvent("info", "whatsapp.webhook.duplicate_event_skipped", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      keys: keys.slice(0, 5),
+    });
+    return buildDuplicateWebhookResponse(keys);
+  }
+  const expiresAt = Date.now() + BRIDGE_WEBHOOK_DEDUP_TTL_MS;
+  for (const key of freshKeys) {
+    session.webhookDedup.set(key, expiresAt);
+  }
+  return new Promise((resolve, reject) => {
+    session.webhookQueue.push({ payload, options, keys: freshKeys, resolve, reject });
+    drainWebhookQueue(session).catch((err) => {
+      for (const key of freshKeys) session.webhookDedup.delete(key);
+      reject(err);
+    });
+  });
+}
+
+function responseHasDuplicate(data) {
+  const results = Array.isArray(data && data.results) ? data.results : [];
+  return Boolean((data && data.duplicate) || results.some((item) => item && item.duplicate));
+}
+
+function prunePlatformEchoTrackers(session) {
+  const now = Date.now();
+  for (const [key, expiresAt] of session.platformSentMessageIds || []) {
+    if (expiresAt <= now) session.platformSentMessageIds.delete(key);
+  }
+  for (const [key, expiresAt] of session.platformSendFingerprints || []) {
+    if (expiresAt <= now) session.platformSendFingerprints.delete(key);
+  }
+  for (const [key, expiresAt] of session.mobileOutboundForwarded || []) {
+    if (expiresAt <= now) session.mobileOutboundForwarded.delete(key);
+  }
+}
+
+function platformEchoFingerprint({ chatId = "", phoneDigits = "", message = "", attachmentCount = 0, ts = 0 }) {
+  const timestampMs = Number(ts || Date.now());
+  const bucket = Math.floor(timestampMs / Math.max(PLATFORM_OUTBOUND_ECHO_BUCKET_MS, 1));
+  return [
+    String(chatId || "").trim().toLowerCase(),
+    String(phoneDigits || "").replace(/\D/g, ""),
+    trimText(message || "", 1000),
+    Number(attachmentCount || 0),
+    bucket,
+  ].join("|");
+}
+
+function rememberPlatformOutboundSend(session, data = {}) {
+  if (!session) return;
+  prunePlatformEchoTrackers(session);
+  const expiresAt = Date.now() + PLATFORM_OUTBOUND_ECHO_TTL_MS;
+  const fingerprint = platformEchoFingerprint({ ...data, ts: data.ts || Date.now() });
+  if (fingerprint) {
+    session.platformSendFingerprints.set(fingerprint, expiresAt);
+  }
+  for (const id of data.messageIds || []) {
+    const normalized = String(id || "").trim();
+    if (normalized) session.platformSentMessageIds.set(normalized, expiresAt);
+  }
+}
+
+async function isPlatformOutboundEcho(session, msg, targetIdentity) {
+  prunePlatformEchoTrackers(session);
+  const messageId = extractMessageId(msg);
+  if (messageId && session.platformSentMessageIds.has(messageId)) {
+    session.platformSentMessageIds.delete(messageId);
+    return true;
+  }
+  const chatId = stringifyIdentityValue((msg && msg.to) || (msg && msg.id && msg.id.remote) || "");
+  const msgTimestampMs = messageTimestampSeconds(msg) ? messageTimestampSeconds(msg) * 1000 : Date.now();
+  const fingerprint = platformEchoFingerprint({
+    chatId,
+    phoneDigits: targetIdentity && targetIdentity.digits,
+    message: msg && msg.body,
+    attachmentCount: msg && msg.hasMedia ? 1 : 0,
+    ts: msgTimestampMs,
+  });
+  if (fingerprint && session.platformSendFingerprints.has(fingerprint)) {
+    session.platformSendFingerprints.delete(fingerprint);
+    return true;
+  }
+  return false;
+}
+
+function mobileOutboundCacheKeys(msg) {
+  const keys = [];
+  const messageId = extractMessageId(msg);
+  if (messageId) keys.push(`id:${messageId}`);
+  const chatId = stringifyIdentityValue(
+    (msg && msg.to) || (msg && msg.from) || (msg && msg.id && msg.id.remote) || "",
+  );
+  const fingerprint = platformEchoFingerprint({
+    chatId,
+    message: msg && msg.body,
+    attachmentCount: msg && msg.hasMedia ? 1 : 0,
+    ts: messageTimestampSeconds(msg) ? messageTimestampSeconds(msg) * 1000 : Date.now(),
+  });
+  if (fingerprint && !fingerprint.startsWith("|||0|")) {
+    keys.push(`fp:${messageTimestampSeconds(msg)}:${fingerprint}`);
+  }
+  return keys;
+}
+
+function hasMobileOutboundForwarded(session, msg) {
+  if (!session) return false;
+  if (!session.mobileOutboundForwarded) session.mobileOutboundForwarded = new Map();
+  prunePlatformEchoTrackers(session);
+  return mobileOutboundCacheKeys(msg).some((key) => session.mobileOutboundForwarded.has(key));
+}
+
+function rememberMobileOutboundForward(session, msg) {
+  if (!session) return;
+  if (!session.mobileOutboundForwarded) session.mobileOutboundForwarded = new Map();
+  prunePlatformEchoTrackers(session);
+  const expiresAt = Date.now() + MOBILE_OUTBOUND_FORWARD_CACHE_TTL_MS;
+  for (const key of mobileOutboundCacheKeys(msg)) {
+    session.mobileOutboundForwarded.set(key, expiresAt);
+  }
+}
+
+async function forwardInboundMessage(session, msg, options = {}) {
+  if (!msg || msg.fromMe || msg.from === "status@broadcast") return { forwarded: false, skipped: true };
+  if (msg.isGroupMsg) return forwardGroupMessage(session, msg, { ...options, direction: "inbound" });
 
   const senderIdentity = await resolveInboundSenderIdentity(msg);
   const senderPhone = senderIdentity.senderPhoneDigits || senderIdentity.rawSenderDigits;
   const rawFrom = stringifyIdentityValue(msg.from);
   const msgAuthor = stringifyIdentityValue(msg.author);
   const msgIdRemote = stringifyIdentityValue(msg.id && msg.id.remote);
-  const senderName = (
-    senderIdentity.rawFields.contact_name
-    || (msg._data && msg._data.notifyName)
-    || `WhatsApp ${senderIdentity.senderPhone || senderPhone || "contact"}`
-  );
+  // Prefer the name the bridge owner saved in their phone; fall back to the
+  // contact's own WhatsApp display name; then the WA notify name from the message.
+  const senderNameSaved = senderIdentity.rawFields.contact_name_saved || "";
+  const senderPushname = senderIdentity.rawFields.contact_pushname || (msg._data && msg._data.notifyName) || "";
+  const senderName = senderNameSaved || senderPushname || `WhatsApp ${senderIdentity.senderPhone || senderPhone || "contact"}`;
   const hasMedia = Boolean(msg.hasMedia);
-  let mediaPayload = null;
+  const inboundMessageId = (msg.id && (msg.id.id || msg.id._serialized)) || "";
 
   logBridgeEvent("info", "whatsapp.incoming.received", {
     scope: session.scopeKey,
@@ -851,69 +1613,37 @@ async function forwardInboundMessage(session, msg) {
       provider_sender_id: senderIdentity.providerSenderId,
       candidates: senderIdentity.candidates.map((item) => ({ label: item.label, raw: item.raw })),
     });
+    return {
+      forwarded: false,
+      skipped: true,
+      reason: "invalid_sender_identity",
+      providerSenderId: senderIdentity.providerSenderId,
+      rawSenderId: senderIdentity.rawSenderId,
+    };
   }
 
-  if (hasMedia) {
-    try {
-      const media = await msg.downloadMedia();
-      if (media && typeof media.mimetype === "string") {
-        const mimeType = media.mimetype;
-        const mediaType = mimeType.startsWith("image/")
-          ? "image"
-          : mimeType.startsWith("video/")
-            ? "video"
-            : mimeType.startsWith("audio/")
-              ? "audio"
-              : "document";
-        mediaPayload = {
-          type: mediaType,
-          data_url: `data:${media.mimetype};base64,${media.data}`,
-          filename: media.filename || "",
-          mime_type: mimeType,
-          size: Number((msg._data && msg._data.size) || 0),
-          caption: msg.body || "",
-        };
-      }
-    } catch (err) {
-      logBridgeEvent("error", "whatsapp.incoming.media_download_failed", {
-        scope: session.scopeKey,
-        message_id: msg && msg.id ? msg.id.id || msg.id._serialized || "" : "",
-        error: trimText(err && err.message ? err.message : err, 400),
-      });
-      console.error(`[${session.scopeKey}] Media download failed: ${err.message}`);
-    }
-  }
+  const mediaPayload = await downloadMediaPayload(session, msg, "whatsapp.incoming");
 
   try {
-    const phoneNumberId = isPlaceholderValue(WHATSAPP_PHONE_NUMBER_ID) ? "" : WHATSAPP_PHONE_NUMBER_ID;
     const businessAccountId = isPlaceholderValue(WHATSAPP_BUSINESS_ACCOUNT_ID) ? "" : WHATSAPP_BUSINESS_ACCOUNT_ID;
-    const metadata = {
-      source: "whatsapp_web_bridge",
-      bridge_scope: session.scopeKey,
-      provider: "whatsapp-web.js",
-    };
-    if (phoneNumberId) {
-      metadata.phone_number_id = phoneNumberId;
-    }
-    if (session.phone || MY_NUMBER) {
-      metadata.display_phone_number = session.phone || MY_NUMBER;
-    }
-    if (session.companyId || DEFAULT_BRIDGE_COMPANY_ID) {
-      metadata.company_id = session.companyId || DEFAULT_BRIDGE_COMPANY_ID;
-    }
-    if (session.userId) {
-      metadata.bridge_user_id = session.userId;
-    }
+    const metadata = bridgeMetadata(session, {
+      bridge_event_type: options.source === "history_sync" ? "history_sync" : "message",
+    });
     if (senderIdentity.rawFields.profile_picture_url) {
       metadata.profile_picture_url = senderIdentity.rawFields.profile_picture_url;
     }
 
     const messagePayload = {
       from: senderPhone,
+      // Explicit phone key — backend must use this as the primary customer identity key
+      customer_phone: senderIdentity.senderPhone,
+      customer_phone_digits: senderIdentity.senderPhoneDigits,
       type: mediaPayload ? mediaPayload.type : "text",
       text: { body: msg.body || "" },
-      timestamp: Math.floor(Date.now() / 1000),
-      id: (msg.id && (msg.id.id || msg.id._serialized)) || "",
+      timestamp: messageTimestampSeconds(msg),
+      id: inboundMessageId,
+      provider_event_id: inboundMessageId,
+      idempotency_key: inboundMessageId ? `whatsapp:${session.companyId || DEFAULT_BRIDGE_COMPANY_ID || ""}:in:${inboundMessageId}` : "",
       web_bridge: {
         source: "whatsapp_web_bridge",
         raw_from: rawFrom,
@@ -928,9 +1658,13 @@ async function forwardInboundMessage(session, msg) {
         selected_identity_source: senderIdentity.selectedSource,
         sender_phone: senderIdentity.senderPhone,
         sender_phone_digits: senderIdentity.senderPhoneDigits,
+        // Separate saved name vs push/display name so backend can choose correctly
+        sender_name_saved: senderNameSaved,
+        sender_pushname: senderPushname,
         contact_number: senderIdentity.rawFields.contact_number || "",
         contact_id: senderIdentity.rawFields.contact_id || "",
         chat_id: senderIdentity.rawFields.chat_id || "",
+        profile_picture_url: senderIdentity.rawFields.profile_picture_url || "",
       },
     };
     if (mediaPayload) {
@@ -949,7 +1683,10 @@ async function forwardInboundMessage(session, msg) {
             messages: [messagePayload],
             contacts: [{
               profile: {
+                // Use saved name as primary; pushname as fallback — never mix them
                 name: senderName,
+                name_saved: senderNameSaved,
+                name_push: senderPushname,
                 picture: senderIdentity.rawFields.profile_picture_url || "",
                 profile_picture: senderIdentity.rawFields.profile_picture_url || "",
               },
@@ -966,18 +1703,8 @@ async function forwardInboundMessage(session, msg) {
       }],
     };
 
-    const rawPayload = JSON.stringify(payload);
-    const signature = buildMetaSignature(rawPayload);
-
-    const response = await axios.post(`${PYTHON_BACKEND}${WHATSAPP_WEBHOOK_PATH}`, rawPayload, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Hub-Signature-256": signature,
-        "X-Bridge-Secret": BRIDGE_SECRET,
-        "X-Bridge-Company-Id": session.companyId || "",
-        "X-Bridge-User-Id": session.userId || "",
-      },
-      timeout: BRIDGE_FORWARD_TIMEOUT_MS,
+    const response = await postWebhookPayload(session, payload, {
+      returnResults: Boolean(options.returnResults),
     });
     logBridgeEvent("info", "whatsapp.incoming.forwarded", {
       scope: session.scopeKey,
@@ -995,14 +1722,343 @@ async function forwardInboundMessage(session, msg) {
       backend_customer_id: response.data && response.data.customer_id ? response.data.customer_id : "",
     });
     console.log(`[${session.scopeKey}] Forwarded inbound message to Python backend`);
+    return { forwarded: true, duplicate: responseHasDuplicate(response.data), data: response.data };
   } catch (err) {
+    const status = err && err.response && err.response.status;
+    if (status === 409) {
+      logBridgeEvent("info", "whatsapp.history.duplicate_skipped", {
+        scope: session.scopeKey,
+        message_id: msg && msg.id ? msg.id.id || msg.id._serialized || "" : "",
+        direction: "inbound",
+        reason: "backend_replay",
+      });
+      return { forwarded: false, duplicate: true, skipped: true };
+    }
     logBridgeEvent("error", "whatsapp.incoming.forward_failed", {
       scope: session.scopeKey,
       from: maskPhone(senderPhone),
       error: trimText(err && err.message ? err.message : err, 500),
     });
     console.error(`[${session.scopeKey}] Forward failed: ${err.message}`);
+    return { forwarded: false, error: err && err.message ? err.message : String(err || "") };
   }
+}
+
+async function forwardOutboundMessage(session, msg, options = {}) {
+  if (msg && msg.fromMe && msg.isGroupMsg) {
+    return forwardGroupMessage(session, msg, { ...options, direction: "outbound" });
+  }
+  if (!msg || !msg.fromMe || msg.from === "status@broadcast") {
+    return { forwarded: false, skipped: true };
+  }
+
+  // Use the canonical outbound identity resolver (msg.to → msg.id.remote → chat.id)
+  if (!options.historySync && hasMobileOutboundForwarded(session, msg)) {
+    return { forwarded: false, duplicate: true, skipped: true };
+  }
+
+  const targetIdentity = await resolveOutboundRecipientIdentity(msg);
+  const messageId = extractMessageId(msg);
+  const rawFrom = stringifyIdentityValue(msg.from);
+  const rawTo = stringifyIdentityValue(msg.to);
+  const msgIdRemote = stringifyIdentityValue(msg.id && msg.id.remote);
+  const targetRaw = stringifyIdentityValue(targetIdentity.rawRecipientId || rawTo || msgIdRemote);
+  const targetDigits = targetIdentity.recipientPhoneDigits || targetIdentity.rawRecipientDigits || "";
+  let targetIdentityUnresolved = !targetIdentity.recipientPhoneDigits;
+
+  // ── @lid resolution ────────────────────────────────────────────────────────
+  // WhatsApp multi-device assigns @lid JIDs (e.g. "182974364528890@lid") to some
+  // contacts.  These are internal device identifiers, not phone numbers, so all
+  // standard phone-parsing paths return empty.  We attempt a best-effort lookup
+  // via the WhatsApp client API before deciding the identity is truly unresolvable.
+  if (targetIdentityUnresolved) {
+    const rawLidCandidate = [rawTo, msgIdRemote, targetRaw]
+      .find((v) => v && v.toLowerCase().includes("@lid")) || "";
+    if (rawLidCandidate) {
+      const lidResolved = await resolveLidContact(session, rawLidCandidate);
+      if (lidResolved) {
+        targetIdentity.recipientPhone = lidResolved.e164;
+        targetIdentity.recipientPhoneDigits = lidResolved.digits;
+        targetIdentityUnresolved = false;
+      } else {
+        // LID could not be resolved to a phone — skip gracefully.
+        // This is expected for contacts whose LID the local WhatsApp session
+        // has not yet mapped (e.g. a brand-new contact or a very fresh session).
+        // We log at INFO (not WARN) to avoid noisy alerts; the backfill will
+        // retry on the next cycle once the contact map has been refreshed.
+        logBridgeEvent("info", "whatsapp.outbound.mobile_message_lid_unresolvable", {
+          scope: session.scopeKey,
+          company_id: session.companyId || "",
+          user_id: session.userId || "",
+          message_id: messageId,
+          raw_to: rawTo,
+          msg_id_remote: msgIdRemote,
+          raw_lid: rawLidCandidate,
+          reason: "lid_not_mapped_to_phone",
+        });
+        return { forwarded: false, skipped: true, reason: "lid_unresolvable" };
+      }
+    } else {
+      logBridgeEvent("warn", "whatsapp.outbound.mobile_message_forward_failed", {
+        scope: session.scopeKey,
+        company_id: session.companyId || "",
+        user_id: session.userId || "",
+        message_id: messageId,
+        reason: "target_identity_unresolved",
+        raw_to: rawTo,
+        msg_id_remote: msgIdRemote,
+        target_raw: targetRaw,
+      });
+      return { forwarded: false, skipped: true, reason: "target_identity_unresolved" };
+    }
+  }
+
+  if (!options.historySync && await isPlatformOutboundEcho(session, msg, { digits: targetIdentity.recipientPhoneDigits })) {
+    rememberMobileOutboundForward(session, msg);
+    logBridgeEvent("info", "whatsapp.outbound.mobile_message_duplicate_skipped", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      message_id: messageId,
+      target: maskPhone(targetIdentity.recipientPhoneDigits),
+      reason: "platform_send_echo",
+    });
+    return { forwarded: false, duplicate: true, skipped: true };
+  }
+
+  const hasMedia = Boolean(msg.hasMedia);
+  const mediaPayload = await downloadMediaPayload(session, msg, "whatsapp.outbound");
+  const targetName = targetIdentity.recipientName || `WhatsApp ${targetIdentity.recipientPhone || targetDigits || targetRaw || "contact"}`;
+  const profilePictureUrl = await fetchProfilePictureUrl(session, targetIdentity.selectedRaw || targetRaw || rawTo);
+
+  logBridgeEvent("info", "whatsapp.outbound.mobile_message_detected", {
+    scope: session.scopeKey,
+    company_id: session.companyId || "",
+    user_id: session.userId || "",
+    message_id: messageId,
+    target: maskPhone(targetDigits || targetRaw),
+    has_media: hasMedia,
+    body_length: String(msg.body || "").length,
+    source: options.historySync ? "history_sync" : "message_create",
+    identity_unresolved: targetIdentityUnresolved,
+  });
+
+  try {
+    const businessAccountId = isPlaceholderValue(WHATSAPP_BUSINESS_ACCOUNT_ID) ? "" : WHATSAPP_BUSINESS_ACCOUNT_ID;
+    const metadata = bridgeMetadata(session, {
+      direction: "outbound",
+      bridge_event_type: options.historySync ? "history_sync" : "message_create",
+      profile_picture_url: profilePictureUrl,
+    });
+
+    const messagePayload = {
+      from: targetIdentity.recipientPhoneDigits || targetDigits || targetRaw,
+      sender_name: session.companyId ? `Agent (${session.companyId})` : 'Agent',
+      type: mediaPayload ? mediaPayload.type : "text",
+      text: { body: msg.body || "" },
+      timestamp: messageTimestampSeconds(msg),
+      id: messageId,
+      provider_event_id: messageId,
+      idempotency_key: messageId ? `whatsapp:${session.companyId || DEFAULT_BRIDGE_COMPANY_ID || ""}:out:${messageId}` : "",
+      web_bridge: {
+        source: "whatsapp_web_bridge",
+        direction: "outbound",
+        from_me: true,
+        identity_unresolved: false,
+        pending_identity: false,
+        raw_from: rawFrom,
+        msg_from: rawFrom,
+        msg_to: rawTo,
+        msg_author: stringifyIdentityValue(msg.author),
+        msg_id_remote: msgIdRemote,
+        msg_id_id: stringifyIdentityValue(msg.id && msg.id.id),
+        msg_id_serialized: stringifyIdentityValue(msg.id && msg.id._serialized),
+        raw_sender_id: targetIdentity.selectedRaw || targetRaw,
+        provider_sender_id: rawFrom || msgIdRemote,
+        selected_identity_source: targetIdentity.selectedSource || "msg.to",
+        sender_phone: targetIdentity.recipientPhone,
+        sender_phone_digits: targetIdentity.recipientPhoneDigits,
+        target_phone: targetIdentity.recipientPhone,
+        target_phone_digits: targetIdentity.recipientPhoneDigits,
+        target_raw_id: targetRaw,
+        target_lid_jid: targetRaw.toLowerCase().includes("@lid") ? targetRaw : "",
+        target_identity_source: targetIdentity.selectedSource || "raw_target",
+        profile_picture_url: profilePictureUrl,
+        chat_id: stringifyIdentityValue(targetIdentity.chat && targetIdentity.chat.id),
+      },
+    };
+    if (mediaPayload) {
+      const payloadForType = { ...mediaPayload };
+      delete payloadForType.type;
+      messagePayload[mediaPayload.type] = payloadForType;
+    }
+
+    const payload = {
+      entry: [{
+        id: businessAccountId || `whatsapp-web:${session.scopeKey}`,
+        changes: [{
+          value: {
+            business_account_id: businessAccountId,
+            metadata,
+            messages: [messagePayload],
+            contacts: [{
+              profile: { name: targetName },
+              wa_id: targetIdentity.recipientPhoneDigits || targetDigits || targetRaw,
+              web_bridge: {
+                sender_phone: targetIdentity.recipientPhone,
+                provider_sender_id: targetIdentity.selectedRaw || targetRaw,
+                contact_id: targetIdentity.selectedRaw || targetRaw,
+                target_raw_id: targetRaw,
+                target_lid_jid: targetRaw.toLowerCase().includes("@lid") ? targetRaw : "",
+                profile_picture_url: profilePictureUrl,
+              },
+            }],
+          },
+        }],
+      }],
+    };
+
+    const response = await postWebhookPayload(session, payload, {
+      returnResults: Boolean(options.returnResults),
+    });
+    const duplicate = responseHasDuplicate(response.data);
+    rememberMobileOutboundForward(session, msg);
+    logBridgeEvent("info", duplicate ? "whatsapp.outbound.mobile_message_duplicate_skipped" : "whatsapp.outbound.mobile_message_forwarded", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      message_id: messageId,
+      target: maskPhone(targetDigits || targetRaw),
+      backend_status: response.status,
+      backend_response_status: response.data && response.data.status ? response.data.status : "",
+      source: options.historySync ? "history_sync" : "message_create",
+      identity_unresolved: targetIdentityUnresolved,
+    });
+    return { forwarded: !duplicate, duplicate, data: response.data };
+  } catch (err) {
+    const status = err && err.response && err.response.status;
+    if (status === 409) {
+      rememberMobileOutboundForward(session, msg);
+      logBridgeEvent("info", "whatsapp.outbound.mobile_message_duplicate_skipped", {
+        scope: session.scopeKey,
+        company_id: session.companyId || "",
+        user_id: session.userId || "",
+        message_id: messageId,
+      target: maskPhone(targetDigits || targetRaw),
+      reason: "backend_replay",
+      });
+      return { forwarded: false, duplicate: true, skipped: true };
+    }
+    logBridgeEvent("error", "whatsapp.outbound.mobile_message_forward_failed", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      message_id: messageId,
+      target: maskPhone(targetDigits || targetRaw),
+      error: trimText(err && err.message ? err.message : err, 500),
+    });
+    return { forwarded: false, error: err && err.message ? err.message : String(err || "") };
+  }
+}
+
+async function syncRecentMobileOutboundMessages(session, options = {}) {
+  if (!session || !session.isReady || !session.client || session.mobileOutboundBackfillRunning) return;
+  session.mobileOutboundBackfillRunning = true;
+  const sinceMs = Date.now() - MOBILE_OUTBOUND_BACKFILL_LOOKBACK_MS;
+  let checked = 0;
+  let forwarded = 0;
+  let duplicates = 0;
+  let failed = 0;
+  try {
+    const sourceChats = options.chat
+      ? [options.chat]
+      : (typeof session.client.getChats === "function" ? await session.client.getChats() : []);
+    const chats = (Array.isArray(sourceChats) ? sourceChats : [])
+      .filter((chat) => chat && typeof chat.fetchMessages === "function")
+      .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+      .slice(0, MOBILE_OUTBOUND_BACKFILL_CHAT_LIMIT);
+
+    for (const chat of chats) {
+      let fetched = [];
+      try {
+        fetched = await chat.fetchMessages({ limit: MOBILE_OUTBOUND_BACKFILL_MESSAGE_LIMIT });
+      } catch {
+        failed += 1;
+        continue;
+      }
+      const messages = (Array.isArray(fetched) ? fetched : [])
+        .filter((item) => item && item.fromMe && item.from !== "status@broadcast")
+        .filter((item) => messageTimestampSeconds(item) * 1000 >= sinceMs)
+        .sort((a, b) => messageTimestampSeconds(a) - messageTimestampSeconds(b));
+      for (const item of messages) {
+        checked += 1;
+        const result = await forwardOutboundMessage(session, item, {
+          source: options.source || "mobile_backfill",
+          returnResults: true,
+        });
+        if (result && result.forwarded) forwarded += 1;
+        else if (result && result.duplicate) duplicates += 1;
+        else if (result && result.error) failed += 1;
+      }
+    }
+
+    if (forwarded || failed) {
+      logBridgeEvent(failed ? "warn" : "info", "whatsapp.outbound.mobile_backfill_completed", {
+        scope: session.scopeKey,
+        company_id: session.companyId || "",
+        user_id: session.userId || "",
+        source: options.source || "mobile_backfill",
+        checked,
+        forwarded,
+        duplicates,
+        failed,
+      });
+    }
+  } catch (err) {
+    logBridgeEvent("warn", "whatsapp.outbound.mobile_backfill_failed", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      source: options.source || "mobile_backfill",
+      checked,
+      forwarded,
+      duplicates,
+      failed,
+      error: trimText(err && err.message ? err.message : err, 500),
+    });
+  } finally {
+    session.mobileOutboundBackfillRunning = false;
+  }
+}
+
+function scheduleMobileOutboundBackfill(session, source = "event", chat = null) {
+  if (!session || !session.isReady) return;
+  if (session.mobileOutboundBackfillTimeout) return;
+  session.mobileOutboundBackfillTimeout = setTimeout(() => {
+    session.mobileOutboundBackfillTimeout = null;
+    syncRecentMobileOutboundMessages(session, { source, chat }).catch(() => {});
+  }, 1200);
+  if (typeof session.mobileOutboundBackfillTimeout.unref === "function") {
+    session.mobileOutboundBackfillTimeout.unref();
+  }
+}
+
+function startMobileOutboundBackfill(session) {
+  if (!session || session.mobileOutboundBackfillTimer) return;
+  session.mobileOutboundBackfillTimer = setInterval(() => {
+    syncRecentMobileOutboundMessages(session, { source: "timer" }).catch(() => {});
+  }, MOBILE_OUTBOUND_BACKFILL_INTERVAL_MS);
+  if (typeof session.mobileOutboundBackfillTimer.unref === "function") {
+    session.mobileOutboundBackfillTimer.unref();
+  }
+}
+
+function stopMobileOutboundBackfill(session) {
+  if (!session) return;
+  if (session.mobileOutboundBackfillTimer) clearInterval(session.mobileOutboundBackfillTimer);
+  if (session.mobileOutboundBackfillTimeout) clearTimeout(session.mobileOutboundBackfillTimeout);
+  session.mobileOutboundBackfillTimer = null;
+  session.mobileOutboundBackfillTimeout = null;
 }
 
 async function forwardInboundReaction(session, reaction) {
@@ -1016,7 +2072,8 @@ async function forwardInboundReaction(session, reaction) {
     || `${targetMessageId}:${rawSender}:${reaction && reaction.timestamp ? reaction.timestamp : Date.now()}`;
   const emoji = String((reaction && (reaction.reaction || reaction.emoji)) || "").trim();
   const senderPhone = normalizePhoneNumber(rawSender);
-  if (!senderPhone || !targetMessageId) {
+  const actorIdentity = senderPhone || rawSender;
+  if (!targetMessageId) {
     logBridgeEvent("warn", "whatsapp.incoming.reaction_skipped", {
       scope: session.scopeKey,
       company_id: session.companyId || "",
@@ -1040,10 +2097,12 @@ async function forwardInboundReaction(session, reaction) {
       phone_number_id: phoneNumberId,
     };
     const messagePayload = {
-      from: senderPhone,
+      from: actorIdentity,
       type: "reaction",
       timestamp: Math.floor(Date.now() / 1000),
       id: providerReactionId,
+      provider_event_id: providerReactionId,
+      idempotency_key: providerReactionId ? `whatsapp:${session.companyId || DEFAULT_BRIDGE_COMPANY_ID || ""}:reaction:${providerReactionId}` : "",
       reaction: {
         message_id: targetMessageId,
         emoji,
@@ -1054,6 +2113,9 @@ async function forwardInboundReaction(session, reaction) {
         raw_from: rawSender,
         sender_phone: senderPhone ? `+${senderPhone}` : "",
         sender_phone_digits: senderPhone,
+        provider_event_id: providerReactionId,
+        idempotency_key: providerReactionId ? `whatsapp:${session.companyId || DEFAULT_BRIDGE_COMPANY_ID || ""}:reaction:${providerReactionId}` : "",
+        identity_unresolved: !senderPhone,
         provider_sender_id: rawSender,
       },
     };
@@ -1066,8 +2128,8 @@ async function forwardInboundReaction(session, reaction) {
             metadata,
             messages: [messagePayload],
             contacts: [{
-              profile: { name: `WhatsApp ${senderPhone}` },
-              wa_id: senderPhone,
+              profile: { name: `WhatsApp ${senderPhone || rawSender}` },
+              wa_id: actorIdentity,
               web_bridge: {
                 sender_phone: senderPhone ? `+${senderPhone}` : "",
                 provider_sender_id: rawSender,
@@ -1077,18 +2139,7 @@ async function forwardInboundReaction(session, reaction) {
         }],
       }],
     };
-    const rawPayload = JSON.stringify(payload);
-    const signature = buildMetaSignature(rawPayload);
-    const response = await axios.post(`${PYTHON_BACKEND}${WHATSAPP_WEBHOOK_PATH}`, rawPayload, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Hub-Signature-256": signature,
-        "X-Bridge-Secret": BRIDGE_SECRET,
-        "X-Bridge-Company-Id": session.companyId || "",
-        "X-Bridge-User-Id": session.userId || "",
-      },
-      timeout: BRIDGE_FORWARD_TIMEOUT_MS,
-    });
+    const response = await postWebhookPayload(session, payload, { returnResults: true });
     logBridgeEvent("info", "whatsapp.incoming.reaction_forwarded", {
       scope: session.scopeKey,
       company_id: session.companyId || "",
@@ -1241,9 +2292,12 @@ function attachClientHandlers(session) {
     console.log(
       `[${session.scopeKey}] READY company=${session.companyId || "-"} user=${session.userId || "-"} phone=${session.phone || "-"}`,
     );
+    startMobileOutboundBackfill(session);
+    scheduleMobileOutboundBackfill(session, "ready");
   });
 
   client.on("disconnected", (reason) => {
+    stopMobileOutboundBackfill(session);
     session.isReady = false;
     session.isAuthenticated = false;
     session.lastQrString = "";
@@ -1258,7 +2312,25 @@ function attachClientHandlers(session) {
   });
 
   client.on("message", async (msg) => {
+    if (msg && msg.fromMe) return;
     await forwardInboundMessage(session, msg);
+  });
+
+  client.on("message_create", async (msg) => {
+    if (!msg || !msg.fromMe) return;
+    await forwardOutboundMessage(session, msg);
+  });
+
+  client.on("message_ack", (msg) => {
+    if (msg && msg.fromMe) scheduleMobileOutboundBackfill(session, "message_ack");
+  });
+
+  client.on("chat_update", (chat) => {
+    scheduleMobileOutboundBackfill(
+      session,
+      "chat_update",
+      chat && typeof chat.fetchMessages === "function" ? chat : null,
+    );
   });
 
   client.on("message_reaction", async (reaction) => {
@@ -1295,6 +2367,16 @@ function createSession(scopeInput) {
     lastReadyAt: 0,
     lastQrString: "",
     client: null,
+    platformSentMessageIds: new Map(),
+    platformSendFingerprints: new Map(),
+    mobileOutboundForwarded: new Map(),
+    webhookQueue: [],
+    webhookQueueRunning: false,
+    webhookLastSentAt: 0,
+    webhookDedup: new Map(),
+    mobileOutboundBackfillTimer: null,
+    mobileOutboundBackfillTimeout: null,
+    mobileOutboundBackfillRunning: false,
   };
   session.client = buildClient(session);
   attachClientHandlers(session);
@@ -1565,6 +2647,117 @@ async function destroySession(session) {
   sessions.delete(session.scopeKey);
 }
 
+function parseHistoryLimit(value) {
+  const parsed = Number.parseInt(String(value || WHATSAPP_HISTORY_DEFAULT_LIMIT), 10);
+  const safe = Number.isFinite(parsed) && parsed > 0 ? parsed : WHATSAPP_HISTORY_DEFAULT_LIMIT;
+  return Math.min(Math.max(1, safe), WHATSAPP_HISTORY_MAX_LIMIT);
+}
+
+function parseSinceTimestamp(value) {
+  if (!value) return 0;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 10_000_000_000 ? Math.floor(value / 1000) : Math.floor(value);
+  }
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  if (/^\d+$/.test(text)) {
+    const parsed = Number.parseInt(text, 10);
+    return parsed > 10_000_000_000 ? Math.floor(parsed / 1000) : parsed;
+  }
+  const parsedDate = Date.parse(text);
+  return Number.isFinite(parsedDate) ? Math.floor(parsedDate / 1000) : 0;
+}
+
+async function resolveHistoryChat(session, body = {}) {
+  const chatId = String(body.chat_id || body.chatId || "").trim();
+  if (chatId) {
+    const chat = typeof session.client.getChatById === "function"
+      ? await session.client.getChatById(chatId)
+      : null;
+    if (chat) return { chat, chatId };
+  }
+  const phone = String(body.phone || body.to || "").trim();
+  if (phone) {
+    const target = await resolveChatTarget(session.client, phone);
+    if (!target.ok) {
+      return { error: target.error || "WhatsApp chat could not be resolved", statusCode: target.statusCode || 400 };
+    }
+    const chat = typeof session.client.getChatById === "function"
+      ? await session.client.getChatById(target.chatId)
+      : null;
+    if (chat) return { chat, chatId: target.chatId, phoneDigits: target.phoneDigits };
+  }
+  return { error: "Provide phone or chat_id for history sync", statusCode: 400 };
+}
+
+async function syncChatHistory(session, body = {}) {
+  const limit = parseHistoryLimit(body.limit);
+  const sinceTs = parseSinceTimestamp(body.since || body.since_timestamp || body.sinceTimestamp);
+  try {
+    const target = await resolveHistoryChat(session, body);
+    if (target.error) {
+      return { ok: false, statusCode: target.statusCode || 400, error: target.error };
+    }
+    const chatId = target.chatId || stringifyIdentityValue(target.chat && target.chat.id);
+    logBridgeEvent("info", "whatsapp.history.sync_started", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      chat_id: chatId,
+      target: maskPhone(target.phoneDigits || chatId),
+      limit,
+      since_timestamp: sinceTs || "",
+    });
+    const fetched = await target.chat.fetchMessages({ limit });
+    const messages = (Array.isArray(fetched) ? fetched : [])
+      .filter((item) => item && item.from !== "status@broadcast")
+      .filter((item) => !sinceTs || messageTimestampSeconds(item) >= sinceTs)
+      .sort((a, b) => messageTimestampSeconds(a) - messageTimestampSeconds(b));
+    let forwarded = 0;
+    let duplicates = 0;
+    let failed = 0;
+    for (const historyMessage of messages) {
+      const result = historyMessage.fromMe
+        ? await forwardOutboundMessage(session, historyMessage, { historySync: true, returnResults: true })
+        : await forwardInboundMessage(session, historyMessage, { source: "history_sync", returnResults: true });
+      const messageId = extractMessageId(historyMessage);
+      if (result && result.duplicate) {
+        duplicates += 1;
+        logBridgeEvent("info", "whatsapp.history.duplicate_skipped", {
+          scope: session.scopeKey,
+          message_id: messageId,
+          chat_id: chatId,
+        });
+      } else if (result && result.forwarded) {
+        forwarded += 1;
+        logBridgeEvent("info", "whatsapp.history.message_forwarded", {
+          scope: session.scopeKey,
+          message_id: messageId,
+          chat_id: chatId,
+          direction: historyMessage.fromMe ? "outbound" : "inbound",
+        });
+      } else {
+        failed += 1;
+      }
+    }
+    logBridgeEvent("info", "whatsapp.history.sync_completed", {
+      scope: session.scopeKey,
+      chat_id: chatId,
+      fetched: messages.length,
+      forwarded,
+      duplicates,
+      failed,
+    });
+    return { ok: true, chat_id: chatId, fetched: messages.length, forwarded, duplicates, failed };
+  } catch (err) {
+    logBridgeEvent("error", "whatsapp.history.sync_failed", {
+      scope: session.scopeKey,
+      error: trimText(err && err.message ? err.message : err, 500),
+    });
+    return { ok: false, statusCode: 500, error: err && err.message ? err.message : "History sync failed" };
+  }
+}
+
 async function restoreSavedSessions() {
   const savedScopes = loadSavedScopes();
   // #region agent log
@@ -1668,9 +2861,21 @@ app.post("/send", async (req, res) => {
   if (!requireBridgeSecret(req, res)) return;
 
   const { to, message, attachments } = req.body || {};
-  const mediaItems = Array.isArray(attachments)
-    ? (await Promise.all(attachments.map(attachmentToMedia))).filter(Boolean)
-    : [];
+  let mediaItems = [];
+  try {
+    mediaItems = Array.isArray(attachments)
+      ? (await Promise.all(attachments.map(attachmentToMedia))).filter(Boolean)
+      : [];
+  } catch (err) {
+    logBridgeEvent("error", "whatsapp.outbound.attachment_conversion_failed", {
+      error: trimText(err && err.message ? err.message : err, 400),
+      attachment_count: Array.isArray(attachments) ? attachments.length : 0,
+    });
+    return res.status(400).json({
+      success: false,
+      error: err && err.message ? err.message : "Failed to convert attachment for WhatsApp",
+    });
+  }
   if (!to || (!String(message || "").trim() && mediaItems.length === 0)) {
     return res.status(400).json({ error: "Missing 'to' or content" });
   }
@@ -1729,6 +2934,21 @@ app.post("/send", async (req, res) => {
   try {
     const sentIds = [];
     let captionUsed = false;
+    const echoAttachmentCount = mediaItems.length > 0 ? 1 : 0;
+    rememberPlatformOutboundSend(session, {
+      chatId,
+      phoneDigits: target.phoneDigits,
+      message,
+      attachmentCount: echoAttachmentCount,
+    });
+    if (mediaItems.length > 1) {
+      rememberPlatformOutboundSend(session, {
+        chatId,
+        phoneDigits: target.phoneDigits,
+        message: "",
+        attachmentCount: 1,
+      });
+    }
 
     if (mediaItems.length > 0) {
       for (let index = 0; index < mediaItems.length; index += 1) {
@@ -1736,7 +2956,7 @@ app.post("/send", async (req, res) => {
         const options = index === 0 && String(message || "").trim() ? { caption: message } : {};
         const result = await sendMessageWithRetry(session, chatId, media, options, {
           phoneDigits: target.phoneDigits,
-          messageType: "media",
+          messageType: mediaKindForMime(media.mimetype || media.mimeType || ""),
         });
         sentIds.push(extractMessageId(result));
         if (index === 0 && options.caption) captionUsed = true;
@@ -1750,6 +2970,13 @@ app.post("/send", async (req, res) => {
       });
       sentIds.push(extractMessageId(textResult));
     }
+    rememberPlatformOutboundSend(session, {
+      chatId,
+      phoneDigits: target.phoneDigits,
+      message,
+      attachmentCount: echoAttachmentCount,
+      messageIds: sentIds.filter(Boolean),
+    });
 
     logBridgeEvent("info", "whatsapp.outgoing.sent", {
       scope: session.scopeKey,
@@ -1762,6 +2989,7 @@ app.post("/send", async (req, res) => {
       success: true,
       messageId: sentIds[0] || "",
       messageIds: sentIds,
+      phone: session.phone || "",
       scope: session.scopeKey,
     });
   } catch (err) {
@@ -1780,6 +3008,34 @@ app.post("/send", async (req, res) => {
       scope: session.scopeKey,
     });
   }
+});
+
+app.post("/sync-history", async (req, res) => {
+  if (!requireBridgeSecret(req, res)) return;
+  const session = createSession(sessionFromRequest(req));
+  session.traceId = bridgeTraceId(req);
+  ensureSessionInitialized(session).catch(() => {});
+  if (!isSessionReady(session)) {
+    const snapshot = sessionSnapshot(session);
+    logBridgeEvent("warn", "whatsapp.history.sync_failed", {
+      ...sessionLogContext(session),
+      reason: "session_not_ready",
+      status: snapshot.state,
+    });
+    return res.status(503).json({
+      success: false,
+      code: "WHATSAPP_SESSION_NOT_READY",
+      error: "WhatsApp session is not ready for history sync.",
+      ...snapshot,
+      scope: session.scopeKey,
+    });
+  }
+
+  const result = await syncChatHistory(session, req.body || {});
+  if (!result.ok) {
+    return res.status(result.statusCode || 500).json({ success: false, ...result, scope: session.scopeKey });
+  }
+  return res.json({ success: true, ...result, scope: session.scopeKey });
 });
 
 app.get("/check/:phone", async (req, res) => {

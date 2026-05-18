@@ -35,6 +35,15 @@ def _first_text(*values) -> str:
     return ""
 
 
+def _is_lid_identifier(value: str) -> bool:
+    """Return True if *value* is a WhatsApp @lid JID (Linked Device ID).
+
+    @lid JIDs (e.g. "182974364528890@lid") are internal multi-device identifiers,
+    NOT phone numbers.  They must never be used as a canonical sender phone.
+    """
+    return "@lid" in str(value or "").lower()
+
+
 def _whatsapp_web_bridge_sender_identity(
     msg: dict,
     contact: dict,
@@ -43,17 +52,29 @@ def _whatsapp_web_bridge_sender_identity(
 ) -> tuple:
     web_bridge = msg.get("web_bridge") if isinstance(msg.get("web_bridge"), dict) else {}
     contact_bridge = contact.get("web_bridge") if isinstance(contact.get("web_bridge"), dict) else {}
+    is_group_message = bool(web_bridge.get("is_group_message"))
+    if not is_group_message:
+        raw_from = str(msg.get("from") or web_bridge.get("raw_from") or "").strip().lower()
+        is_group_message = raw_from.endswith("@g.us")
+    group_candidates = [
+        web_bridge.get("group_sender_phone"),
+        web_bridge.get("group_sender_phone_digits"),
+    ]
     candidates = [
+        *(group_candidates if is_group_message else []),
         web_bridge.get("sender_phone"),
         web_bridge.get("sender_phone_digits"),
         contact_bridge.get("sender_phone"),
         contact.get("wa_id"),
-        msg.get("from"),
+        *([] if is_group_message else [msg.get("from")]),
         web_bridge.get("contact_number"),
         web_bridge.get("msg_from"),
         web_bridge.get("raw_from"),
     ]
     for candidate in candidates:
+        # Skip @lid JIDs — they are device identifiers, not phone numbers.
+        if _is_lid_identifier(candidate):
+            continue
         identity = normalize_whatsapp_phone(str(candidate or ""), default_region=default_region)
         if identity.is_valid:
             return identity, web_bridge
@@ -104,6 +125,11 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 "identity_source": identity.get("source", ""),
                 "identity_reason": identity.get("reason", ""),
                 "identity_confidence": identity.get("confidence", 0.0),
+                "is_group_message": normalized.get("is_group_message", False),
+                "group_id": normalized.get("group_id", ""),
+                "group_name": normalized.get("group_name", ""),
+                "group_sender_phone": normalized.get("group_sender_phone", ""),
+                "group_sender_name": normalized.get("group_sender_name", ""),
             },
             attachments=normalized.get("attachments", []),
             reply_to_message_id=normalized.get("reply_to_message_id", ""),
@@ -258,6 +284,11 @@ class WhatsAppAdapter(BaseChannelAdapter):
             "raw_sender_id": "",
             "raw_wa_id": "",
             "sender_identity": {},
+            "is_group_message": False,
+            "group_id": "",
+            "group_name": "",
+            "group_sender_phone": "",
+            "group_sender_name": "",
         }
 
         for entry in raw_payload.get("entry", []) or []:
@@ -267,6 +298,10 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 value = (change or {}).get("value", {}) or {}
                 metadata = value.get("metadata", {}) or {}
                 result["phone_number_id"] = str(metadata.get("phone_number_id") or "").strip()
+                if metadata.get("is_group_message"):
+                    result["is_group_message"] = True
+                    result["group_id"] = str(metadata.get("group_id") or "").strip()
+                    result["group_name"] = str(metadata.get("group_name") or "").strip()
 
                 contacts = value.get("contacts", []) or []
                 if contacts:
@@ -296,8 +331,20 @@ class WhatsAppAdapter(BaseChannelAdapter):
                         contacts[0] if contacts else {},
                         default_region=default_region,
                     )
+                    result["is_group_message"] = bool(
+                        result.get("is_group_message") or web_bridge.get("is_group_message")
+                    )
+                    result["group_id"] = _first_text(result.get("group_id"), web_bridge.get("group_id"))
+                    result["group_name"] = _first_text(result.get("group_name"), web_bridge.get("group_name"))
+                    result["group_sender_phone"] = _first_text(
+                        web_bridge.get("group_sender_phone"),
+                        web_bridge.get("group_sender_phone_digits"),
+                    )
+                    result["group_sender_name"] = _first_text(web_bridge.get("group_sender_name"))
                     result["raw_sender_id"] = _first_text(
                         web_bridge.get("selected_identity_source") and web_bridge.get("raw_sender_id"),
+                        web_bridge.get("group_sender_phone"),
+                        web_bridge.get("group_sender_phone_digits"),
                         web_bridge.get("sender_phone"),
                         web_bridge.get("sender_phone_digits"),
                         msg.get("from"),
@@ -324,7 +371,41 @@ class WhatsAppAdapter(BaseChannelAdapter):
                         )
                         if wa_identity.is_valid:
                             sender_identity = wa_identity
-                result["sender_phone"] = sender_identity.canonical_value
+                fallback_unresolved_identity = ""
+                bridge_direction = str(web_bridge.get("direction") or "").strip().lower()
+                if is_web_bridge and not sender_identity.is_valid and (
+                    bridge_direction == "outbound"
+                    or bool(web_bridge.get("from_me"))
+                    or bool(web_bridge.get("pending_identity"))
+                ):
+                    # Build an ordered list of fallback candidates.
+                    # IMPORTANT: @lid JIDs must be excluded — they are WhatsApp Linked
+                    # Device identifiers, not phone numbers.  Using them as sender_phone
+                    # would corrupt customer lookups with a non-E.164 string.
+                    _raw_target = web_bridge.get("target_raw_id") or ""
+                    _lid_jid = web_bridge.get("target_lid_jid") or ""
+                    fallback_unresolved_identity = _first_text(
+                        web_bridge.get("target_phone"),
+                        web_bridge.get("target_phone_digits"),
+                        # Only use target_raw_id if it is NOT a @lid identifier
+                        "" if _is_lid_identifier(_raw_target) else _raw_target,
+                        # target_lid_jid is by definition a @lid — never a phone number
+                        web_bridge.get("sender_phone"),
+                        web_bridge.get("sender_phone_digits"),
+                        web_bridge.get("raw_sender_id"),
+                        (contacts[0] or {}).get("wa_id") if contacts else "",
+                        msg.get("from"),
+                    )
+                    # Final guard: if the fallback itself resolved to a @lid, discard it.
+                    if _is_lid_identifier(fallback_unresolved_identity):
+                        logger.info(
+                            "WhatsApp outbound @lid identity skipped as sender_phone "
+                            "company_id=%s lid=%s",
+                            tenant_id if "tenant_id" in dir() else "",
+                            _lid_jid or _raw_target,
+                        )
+                        fallback_unresolved_identity = ""
+                result["sender_phone"] = sender_identity.canonical_value or fallback_unresolved_identity
                 result["sender_identity"] = {
                     "raw_value": sender_identity.raw_value,
                     "canonical_value": sender_identity.canonical_value,
@@ -337,6 +418,8 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 if is_web_bridge:
                     result["sender_identity"]["provider_sender_id"] = _first_text(
                         web_bridge.get("provider_sender_id"),
+                        web_bridge.get("target_raw_id"),
+                        web_bridge.get("target_lid_jid"),
                         web_bridge.get("raw_from"),
                         web_bridge.get("msg_id_remote"),
                     )

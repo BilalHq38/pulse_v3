@@ -31,6 +31,27 @@ test('Inbox renders video attachments with an openable preview and fallback', ()
   expect(source).toContain('Video unavailable');
 });
 
+test('Inbox does not select background conversations on realtime updates', () => {
+  expect(source).toContain("if (!activeConvoId || data.conversation_id !== activeConvoId)");
+  expect(source).toContain('loadConversations();');
+  expect(source).not.toContain('loadConversations(data.conversation_id)');
+  expect(source).not.toContain("loadConversations(data?.conversation_id || '')");
+});
+
+test('Inbox composer supports generic image and video media attachments', () => {
+  expect(source).toContain("const CHAT_VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/quicktime']");
+  expect(source).toContain('const CHAT_MEDIA_TYPES = [...CHAT_IMAGE_TYPES, ...CHAT_VIDEO_TYPES]');
+  expect(source).toContain("title=\"Attach media\"");
+  expect(source).toContain("attachment.type === 'video'");
+});
+
+test('Inbox customer sidebar is closed by default on desktop and opens on demand', () => {
+  expect(source).toContain('{showCustomerSidebar && (');
+  expect(source).toContain('Contact Info');
+  expect(source).toContain('customer-sidebar-loading');
+  expect(source).not.toContain('lg:translate-x-0');
+});
+
 test('Inbox handles realtime message reaction updates and renders reactions on bubbles', () => {
   expect(source).toContain("eventName === 'message_reaction_updated'");
   expect(source).toContain('normalizeReactions');
@@ -41,4 +62,23 @@ test('Inbox renders AI paused warning state returned by backend', () => {
   expect(source).toContain('selectedConvo.ai_auto_paused');
   expect(source).toContain('data-testid="ai-paused-warning"');
   expect(source).toContain('AI auto-response is paused because the AI provider is unavailable. Please respond manually.');
+});
+
+test('Inbox renders WhatsApp group names in list, header, and message rows', () => {
+  expect(source).toContain('function isWhatsappGroupConversation');
+  expect(source).toContain('function messageGroupName');
+  expect(source).toContain('data-testid={`msg-${msg.id}-group-name`}');
+  expect(source).toContain('selectedConvoIsGroup');
+});
+
+test('Inbox applies dashboard filter query params to conversation loading', () => {
+  expect(source).toContain('const INBOX_FILTERS = {');
+  expect(source).toContain("searchParams.get('inbox_filter')");
+  expect(source).toContain('inbox_filter: effectiveFilter');
+  expect(source).toContain("api.get('/conversations', params ? { params } : undefined)");
+});
+
+test('Inbox avatar failure state resets when profile picture URL changes', () => {
+  expect(source).toContain('setFailed(false);');
+  expect(source).toContain('}, [url]);');
 });

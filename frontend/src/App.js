@@ -1,7 +1,8 @@
-import { Suspense, lazy } from 'react';
+import { Suspense, lazy, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useSearchParams } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { postAuthDestination } from '@/lib/auth-gates';
+import { API_BASE_URL } from '@/lib/backend-url';
 import Layout from '@/components/Layout';
 import { Toaster } from '@/components/ui/toaster';
 import '@/App.css';
@@ -44,6 +45,105 @@ function defaultRouteForUser(user) {
 
 function Spinner() {
   return <div className="min-h-screen bg-slate-50 flex items-center justify-center"><div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div></div>;
+}
+
+const VISITOR_COOKIE = 'pulse_visitor_session';
+
+function readCookie(name) {
+  return document.cookie
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`))
+    ?.split('=')
+    .slice(1)
+    .join('=') || '';
+}
+
+function writeVisitorCookie(value) {
+  document.cookie = `${VISITOR_COOKIE}=${encodeURIComponent(value)}; Max-Age=31536000; Path=/; SameSite=Lax`;
+}
+
+function visitorSessionId() {
+  const existing = decodeURIComponent(readCookie(VISITOR_COOKIE) || '');
+  if (existing) return existing;
+  const generated = `vis_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  writeVisitorCookie(generated);
+  return generated;
+}
+
+function VisitorTracker() {
+  const location = useLocation();
+  const { user } = useAuth();
+  const sessionIdRef = useRef('');
+  const lastClickAtRef = useRef(0);
+
+  useEffect(() => {
+    sessionIdRef.current = visitorSessionId();
+  }, []);
+
+  useEffect(() => {
+    if (!sessionIdRef.current) sessionIdRef.current = visitorSessionId();
+    const payload = {
+      session_id: sessionIdRef.current,
+      event_type: 'page_view',
+      page_url: window.location.href,
+      path: `${location.pathname}${location.search || ''}`,
+      referrer: document.referrer || '',
+      company_id: user?.company_id || '',
+      user_id: user?.id || '',
+      metadata: {
+        title: document.title || '',
+        viewport: `${window.innerWidth}x${window.innerHeight}`,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+      },
+    };
+    fetch(`${API_BASE_URL}/visitor/track`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      keepalive: true,
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  }, [location.pathname, location.search, user?.company_id, user?.id]);
+
+  useEffect(() => {
+    const onClick = (event) => {
+      const now = Date.now();
+      if (now - lastClickAtRef.current < 1500) return;
+      lastClickAtRef.current = now;
+      const target = event.target?.closest?.('button,a,[role="button"],input[type="submit"]');
+      if (!target) return;
+      const label = (target.getAttribute('aria-label') || target.getAttribute('title') || target.textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120);
+      fetch(`${API_BASE_URL}/visitor/track`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        keepalive: true,
+        body: JSON.stringify({
+          session_id: sessionIdRef.current || visitorSessionId(),
+          event_type: 'click',
+          page_url: window.location.href,
+          path: `${window.location.pathname}${window.location.search || ''}`,
+          referrer: document.referrer || '',
+          company_id: user?.company_id || '',
+          user_id: user?.id || '',
+          element: label,
+          metadata: {
+            tag: target.tagName?.toLowerCase?.() || '',
+            id: target.id || '',
+            testid: target.getAttribute('data-testid') || '',
+          },
+        }),
+      }).catch(() => {});
+    };
+    document.addEventListener('click', onClick, true);
+    return () => document.removeEventListener('click', onClick, true);
+  }, [user?.company_id, user?.id]);
+
+  return null;
 }
 
 function ProtectedRoute({ children }) {
@@ -117,6 +217,7 @@ function App() {
   return (
     <AuthProvider>
       <BrowserRouter>
+        <VisitorTracker />
         <Suspense fallback={<Spinner />}>
           <Routes>
             <Route path="/" element={<PublicRoute><LandingPage /></PublicRoute>} />

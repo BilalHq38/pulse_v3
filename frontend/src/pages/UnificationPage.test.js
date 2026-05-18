@@ -185,13 +185,16 @@ test('Unification page focuses on identity resolution without backend auth reque
   expect(container.textContent).not.toContain('Tenant ID');
   expect(container.textContent).not.toContain('Auth Path');
   expect(container.textContent).not.toContain('backend identity contract');
+  expect(container.textContent).not.toContain('profile-a');
+  expect(container.textContent).not.toContain('profile-b');
+  expect(container.textContent).not.toContain('suggestion-1');
 
   const refresh = Array.from(container.querySelectorAll('button')).find((button) => button.textContent.includes('Refresh Data'));
   const autoDetect = Array.from(container.querySelectorAll('button')).find((button) => button.textContent.includes('Auto Detect Matches'));
 
-  expect(refresh.className).toContain('px-5');
+  expect(refresh.className).toContain('px-3');
   expect(refresh.className).toContain('text-sm');
-  expect(autoDetect.className).toContain('px-5');
+  expect(autoDetect.className).toContain('px-3');
   expect(autoDetect.className).toContain('text-sm');
 
   await act(async () => root.unmount());

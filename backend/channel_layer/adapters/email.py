@@ -362,7 +362,7 @@ class EmailAdapter(BaseChannelAdapter):
                 channel_type=ChannelType.EMAIL,
             )
 
-        subject = message.subject or "Message from Pulse Engine"
+        subject = message.subject or ""
         tenant_id = (message.tenant_id or "").strip()
         if not tenant_id:
             return SendResult(

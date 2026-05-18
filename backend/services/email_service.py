@@ -14,6 +14,7 @@ import logging
 import os
 import smtplib
 from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 from typing import List
 
@@ -39,6 +40,16 @@ def _email_send_timeout_seconds(default: float = 60.0) -> float:
 def _email_http_timeout() -> httpx.Timeout:
     read_timeout = _email_send_timeout_seconds()
     return httpx.Timeout(read_timeout, connect=3.0, read=read_timeout, write=10.0, pool=5.0)
+
+
+def _email_header_text(value: str, default: str = "") -> str:
+    cleaned = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split()).strip()
+    return cleaned or default
+
+
+def _tenant_sender_name(company_name: str, fallback: str = "") -> str:
+    base = _email_header_text(company_name) or _email_header_text(fallback) or "Business"
+    return f"Message from {base}"
 
 
 # ── Logo helper ────────────────────────────────────────────────────────────────
@@ -411,9 +422,11 @@ def _send_smtp_tenant(
     body: str,
     html_body: str,
     use_tls: bool,
+    sender_name: str = "",
 ) -> None:
     msg = EmailMessage()
-    msg["From"] = smtp_from
+    clean_sender_name = _email_header_text(sender_name)
+    msg["From"] = formataddr((clean_sender_name, smtp_from)) if clean_sender_name else smtp_from
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.set_content(body or "")
@@ -434,12 +447,19 @@ def _send_smtp_tenant(
     logger.info("Tenant SMTP email sent to %s", to_email)
 
 
-def _send_tenant_email_from_credentials(creds: dict, to_email: str, subject: str, body: str, html_body: str) -> None:
+def _send_tenant_email_from_credentials(
+    creds: dict,
+    to_email: str,
+    subject: str,
+    body: str,
+    html_body: str,
+    sender_name: str = "",
+) -> None:
     prov = str(creds.get("email_provider") or "smtp_imap").strip().lower()
+    clean_sender_name = _email_header_text(sender_name) or _tenant_sender_name("", str(creds.get("display_name") or ""))
     if prov == "brevo":
         api_key = str(creds.get("api_key") or "").strip()
         sender_email = str(creds.get("email_address") or creds.get("smtp_user") or "").strip()
-        sender_name = str(creds.get("display_name") or "").strip() or "Business"
         if not api_key or not sender_email:
             raise HTTPException(
                 status_code=400,
@@ -448,7 +468,7 @@ def _send_tenant_email_from_credentials(creds: dict, to_email: str, subject: str
         _send_brevo_tenant(
             api_key=api_key,
             sender_email=sender_email,
-            sender_name=sender_name,
+            sender_name=clean_sender_name,
             to_email=to_email,
             subject=subject,
             body=body,
@@ -480,6 +500,7 @@ def _send_tenant_email_from_credentials(creds: dict, to_email: str, subject: str
         body=body,
         html_body=html_body,
         use_tls=True,
+        sender_name=clean_sender_name,
     )
 
 
@@ -501,22 +522,29 @@ async def send_tenant_email_async(
     if not company_id or not to_email:
         raise HTTPException(status_code=400, detail="Company and recipient are required for tenant email.")
 
-    row = await db.fetchrow(
-        "SELECT * FROM channel_settings WHERE company_id=$1 AND channel='email' AND enabled=TRUE LIMIT 1",
-        company_id,
-    )
+    from shared.database import company_context
+
+    async with company_context(db, company_id):
+        row = await db.fetchrow(
+            "SELECT * FROM channel_settings WHERE company_id=$1 AND channel='email' AND enabled=TRUE LIMIT 1",
+            company_id,
+        )
+        company_name = str(
+            await db.fetchval("SELECT NULLIF(BTRIM(name), '') FROM companies WHERE id=$1 LIMIT 1", company_id) or ""
+        )
     if not row:
         raise HTTPException(status_code=400, detail="Email channel is not configured.")
     creds = dict(row)
     if creds.get("email_send_enabled") is False:
         raise HTTPException(status_code=400, detail="Email channel is not configured.")
+    sender_name = _tenant_sender_name(company_name, str(creds.get("display_name") or ""))
+    subject = _email_header_text(subject) or sender_name
 
     async def _send() -> None:
         prov = str(creds.get("email_provider") or "smtp_imap").strip().lower()
         if prov == "brevo":
             api_key = str(creds.get("api_key") or "").strip()
             sender_email = str(creds.get("email_address") or creds.get("smtp_user") or "").strip()
-            sender_name = str(creds.get("display_name") or "").strip() or "Business"
             if not api_key or not sender_email:
                 raise HTTPException(status_code=400, detail="Email channel is not configured.")
             await _send_brevo_async(
@@ -530,6 +558,14 @@ async def send_tenant_email_async(
                 label="Tenant Brevo",
             )
             return
-        await asyncio.to_thread(_send_tenant_email_from_credentials, creds, to_email, subject, body, html_body)
+        await asyncio.to_thread(
+            _send_tenant_email_from_credentials,
+            creds,
+            to_email,
+            subject,
+            body,
+            html_body,
+            sender_name,
+        )
 
     return await _run_email_with_retries(_send, label="tenant", raise_on_failure=raise_on_failure)

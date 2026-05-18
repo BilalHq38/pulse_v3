@@ -17,6 +17,7 @@ from services.identity_service.app.db.models import (
     ConsentLedger,
     DeviceFingerprint,
     IdentityMapping,
+    MergedProfileRecord,
     ProfileMergeHistory,
     ResolutionAuditLog,
     ReviewQueue,
@@ -100,6 +101,26 @@ class CandidateScore:
 
 def _customer_cache_key(tenant_id: str, customer_id: str | uuid.UUID) -> str:
     return f"tenant:{tenant_id}:customer:{customer_id}"
+
+
+def _mapping_snapshot(mapping: IdentityMapping) -> dict[str, Any]:
+    return {
+        "mapping_id": str(mapping.mapping_id),
+        "customer_id": str(mapping.customer_id),
+        "platform": mapping.platform,
+        "platform_user_id": mapping.platform_user_id,
+        "platform_username": mapping.platform_username,
+        "phone": mapping.phone,
+        "email": mapping.email,
+        "name": mapping.name,
+        "confidence": mapping.confidence_score if mapping.confidence_score is not None else mapping.confidence,
+        "is_primary_platform": mapping.is_primary_platform,
+        "linked_at": mapping.linked_at.isoformat() if mapping.linked_at else None,
+    }
+
+
+def _platforms_from_snapshots(items: list[dict[str, Any]]) -> list[str]:
+    return sorted({str(item.get("platform") or "").strip() for item in items if str(item.get("platform") or "").strip()})
 
 
 async def _emit_event_safe(
@@ -569,6 +590,35 @@ async def get_identity_profile(db: AsyncSession, tenant_id: str, customer_id: st
         .order_by(ProfileMergeHistory.merged_at.desc())
     )
     history_rows = merge_result.scalars().all()
+    merged_result = await db.execute(
+        select(MergedProfileRecord)
+        .where(
+            MergedProfileRecord.tenant_id == tenant_id,
+            (MergedProfileRecord.unified_customer_id == customer.customer_id)
+            | (MergedProfileRecord.source_customer_id == customer.customer_id)
+            | (MergedProfileRecord.target_customer_id == customer.customer_id),
+        )
+        .order_by(MergedProfileRecord.created_at.desc())
+    )
+    merged_rows = merged_result.scalars().all()
+    merged_profiles = [
+        {
+            "record_id": str(row.record_id),
+            "unified_customer_id": str(row.unified_customer_id) if row.unified_customer_id else None,
+            "source_customer_id": str(row.source_customer_id) if row.source_customer_id else None,
+            "target_customer_id": str(row.target_customer_id) if row.target_customer_id else None,
+            "source_platforms": row.source_platforms or [],
+            "target_platforms": row.target_platforms or [],
+            "original_identities": row.original_identities or {},
+            "unified_identity_mapping": row.unified_identity_mapping or {},
+            "merge_history": row.merge_history or {},
+            "merge_reason": row.merge_reason,
+            "merged_by": row.merged_by,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+        for row in merged_rows
+    ]
 
     profile = IdentityProfileResponse(
         customer_id=str(customer.customer_id),
@@ -595,6 +645,7 @@ async def get_identity_profile(db: AsyncSession, tenant_id: str, customer_id: st
             }
             for row in history_rows
         ],
+        merged_profiles=merged_profiles,
     )
     await set_json(cache_key, profile.model_dump(mode="json"), ttl_seconds=300)
     return profile
@@ -611,10 +662,15 @@ async def merge_customers(
     if source_id == target_id:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Source and target cannot match")
 
-    source = await _get_customer(db, tenant_id, source_id)
-    target = await _get_customer(db, tenant_id, target_id)
+    source = await _get_customer(db, tenant_id, source_id, with_related=True)
+    target = await _get_customer(db, tenant_id, target_id, with_related=True)
     if source is None or target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Merge customer not found")
+
+    source_identity_snapshot = [_mapping_snapshot(item) for item in list(source.mappings or [])]
+    target_identity_snapshot = [_mapping_snapshot(item) for item in list(target.mappings or [])]
+    source_platforms = _platforms_from_snapshots(source_identity_snapshot)
+    target_platforms = _platforms_from_snapshots(target_identity_snapshot)
 
     if source.primary_phone_hash and not target.primary_phone_hash:
         target.primary_phone_hash = source.primary_phone_hash
@@ -646,6 +702,36 @@ async def merge_customers(
         merged_by=merged_by,
     )
     db.add(merge_record)
+    db.add(
+        MergedProfileRecord(
+            tenant_id=tenant_id,
+            unified_customer_id=target_id,
+            source_customer_id=source_id,
+            target_customer_id=target_id,
+            source_platforms=source_platforms,
+            target_platforms=target_platforms,
+            original_identities={
+                "source": source_identity_snapshot,
+                "target": target_identity_snapshot,
+            },
+            unified_identity_mapping={
+                "customer_id": str(target_id),
+                "primary_name": target.primary_name,
+                "primary_phone_hash": target.primary_phone_hash,
+                "primary_email_hash": target.primary_email_hash,
+                "platforms": sorted(set(source_platforms + target_platforms)),
+            },
+            merge_history={
+                "source_customer_id": str(source_id),
+                "target_customer_id": str(target_id),
+                "merge_reason": payload.merge_reason,
+                "merged_by": merged_by,
+                "merged_at": utcnow().isoformat(),
+            },
+            merge_reason=payload.merge_reason,
+            merged_by=merged_by,
+        )
+    )
     await db.commit()
 
     await delete_keys(

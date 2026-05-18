@@ -10,12 +10,28 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import phonenumbers
 from phonenumbers import PhoneNumberFormat
 
 logger = logging.getLogger(__name__)
+
+_ZERO_DECIMAL_PHONE_RE = re.compile(r"^(\+?\d+)\.0+$")
+_SCIENTIFIC_PHONE_RE = re.compile(r"^\+?\d+(?:\.\d+)?[eE][+-]?\d+$")
+_COUNTRY_NAME_REGION_ALIASES = {
+    "america": "US",
+    "england": "GB",
+    "great britain": "GB",
+    "pakistan": "PK",
+    "uk": "GB",
+    "united kingdom": "GB",
+    "united states": "US",
+    "united states of america": "US",
+    "usa": "US",
+}
 
 
 def get_default_phone_region() -> Optional[str]:
@@ -25,11 +41,65 @@ def get_default_phone_region() -> Optional[str]:
     return None
 
 
+def _clean_phone_text(raw: str) -> str:
+    text = unicodedata.normalize("NFKC", str(raw or ""))
+    text = (
+        text.replace("\u00a0", " ")
+        .replace("\u2007", " ")
+        .replace("\u202f", " ")
+        .replace("\u200b", "")
+        .replace("\ufeff", "")
+    )
+    text = text.strip().strip("'\"")
+    compact = re.sub(r"\s+", "", text)
+
+    zero_decimal = _ZERO_DECIMAL_PHONE_RE.match(compact)
+    if zero_decimal:
+        return zero_decimal.group(1)
+
+    if _SCIENTIFIC_PHONE_RE.match(compact):
+        try:
+            value = Decimal(compact)
+        except InvalidOperation:
+            return text
+        integral = value.to_integral_value()
+        if value == integral:
+            return format(integral, "f")
+
+    return text
+
+
+def phone_region_from_country_hint(*hints: str) -> Optional[str]:
+    """Return an ISO alpha-2 region from upload hints such as PK, +92, or United States."""
+    for hint in hints:
+        cleaned = _clean_phone_text(str(hint or ""))
+        if not cleaned:
+            continue
+
+        alpha = re.sub(r"[^A-Za-z]", "", cleaned).upper()
+        if len(alpha) == 2 and phonenumbers.country_code_for_region(alpha):
+            return alpha
+
+        alias_key = re.sub(r"[^a-z]+", " ", cleaned.lower()).strip()
+        alias_region = _COUNTRY_NAME_REGION_ALIASES.get(alias_key)
+        if alias_region:
+            return alias_region
+
+        digits = re.sub(r"\D", "", cleaned)
+        if not digits or len(digits) > 3:
+            continue
+        region = phonenumbers.region_code_for_country_code(int(digits))
+        if region and len(region) == 2 and region.isalpha():
+            return region
+
+    return None
+
+
 def _parse_to_valid_e164_digits(raw: str, fallback_region: Optional[str]) -> Optional[str]:
     """If *raw* is a valid phone (any supported parse path), return E.164 digits without +. Else None."""
     if not (raw or "").strip():
         return None
-    raw = raw.strip()
+    raw = _clean_phone_text(raw)
     region = fallback_region
 
     try:
@@ -41,6 +111,14 @@ def _parse_to_valid_e164_digits(raw: str, fallback_region: Optional[str]) -> Opt
         logger.debug("E.164 parse failed for %s: %s", raw, e)
 
     digits = re.sub(r"\D", "", raw)
+    if raw.startswith("00") and len(digits) >= 10:
+        try:
+            parsed = phonenumbers.parse("+" + digits[2:], None)
+            if phonenumbers.is_valid_number(parsed):
+                return phonenumbers.format_number(parsed, PhoneNumberFormat.E164).lstrip("+")
+        except Exception as e:
+            logger.debug("E.164 parse failed for +%s: %s", digits[2:], e)
+
     if not raw.startswith("+") and len(digits) >= 8:
         try:
             parsed = phonenumbers.parse("+" + digits, None)
@@ -82,11 +160,12 @@ def normalize_to_e164_digits(raw: str, fallback_region: Optional[str] = None) ->
         return v
     if not (raw or "").strip():
         return ""
+    cleaned = _clean_phone_text(raw)
     logger.warning(
         "Could not parse %s as valid international number, using raw digits",
-        (raw or "").strip(),
+        cleaned,
     )
-    return re.sub(r"\D", "", raw.strip())
+    return re.sub(r"\D", "", cleaned)
 
 
 def _last_n_digits(digits: str, n: int) -> str:
@@ -100,7 +179,7 @@ def phone_lookup_candidates(raw: str, fallback_region: Optional[str] = None) -> 
     """Possible stored `customers.phone` values: E.164 (loose), raw, last-10 legacy (collision-prone)."""
     if not (raw or "").strip():
         return []
-    raw = raw.strip()
+    raw = _clean_phone_text(raw)
     e164 = normalize_to_e164_digits(raw, fallback_region=fallback_region)
     out: list[str] = []
     for c in (e164, raw):

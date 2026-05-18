@@ -11,6 +11,10 @@ def _tiny_png_data_url() -> str:
     return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
 
 
+def _tiny_mp4_data_url() -> str:
+    return "data:video/mp4;base64," + base64.b64encode(b"\x00\x00\x00\x18ftypmp42").decode("ascii")
+
+
 def test_store_image_data_url_writes_file_and_returns_media_url(tmp_path, monkeypatch):
     monkeypatch.setenv("UPLOAD_STORAGE_DIR", str(tmp_path))
 
@@ -46,3 +50,35 @@ def test_normalize_attachment_payload_preserves_image_metadata():
     assert payload["mime_type"] == "image/png"
     assert payload["provider_media_id"] == "wamedia-1"
     assert payload["raw_metadata"]["source"] == "whatsapp"
+
+
+def test_store_video_data_url_writes_file_and_returns_media_url(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    stored = media_storage.store_media_data_url(
+        _tiny_mp4_data_url(),
+        category="message-attachments",
+        company_id="company-1",
+        public_url_prefix="/api/conversations/attachments/media",
+        original_filename="clip.mp4",
+    )
+
+    assert stored["url"].startswith("/api/conversations/attachments/media/company-1/")
+    assert stored["mime_type"] == "video/mp4"
+    assert stored["file_name"] == "clip.mp4"
+    assert (tmp_path / stored["storage_key"]).exists()
+
+
+def test_normalize_attachment_payload_detects_video_data_url():
+    payload = normalize_attachment_payload(
+        {
+            "type": "video",
+            "data_url": _tiny_mp4_data_url(),
+            "name": "clip.mp4",
+            "mime_type": "video/mp4",
+        }
+    )
+
+    assert payload["type"] == "video"
+    assert payload["url"].startswith("data:video/mp4")
+    assert payload["mime_type"] == "video/mp4"

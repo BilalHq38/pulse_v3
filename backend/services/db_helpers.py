@@ -43,7 +43,7 @@ from services.ai_service.model_catalog import (
     model_supports as catalog_model_supports,
     supported_model_names,
 )
-from services.media_storage import store_image_data_url
+from services.media_storage import store_media_data_url
 from shared.database import company_context
 from shared.auth.dependencies import forbidden_exception, resolve_request_user, unauthorized_exception
 
@@ -692,6 +692,9 @@ async def resolve_refresh_token_rotation(db, refresh_token: str, request: Option
         raise unauthorized_exception()
     user = await ensure_user_company_assignment(db, user)
     user = await enrich_user_session_fields(db, user)
+    account_status = str(user.get("status") or "active").strip().lower()
+    if account_status in {"paused", "blocked", "inactive"}:
+        raise unauthorized_exception()
     if _token_version(user) != int(payload.get("token_version", 0) or 0):
         raise unauthorized_exception()
     raw_token, token_hash = token_candidates(refresh_token)
@@ -1618,6 +1621,23 @@ def is_data_url_image(url: str) -> bool:
         return False
 
 
+def is_data_url_video(url: str) -> bool:
+    if not isinstance(url, str) or not url.startswith("data:video/"):
+        return False
+    try:
+        header, payload = url.split(",", 1)
+        if ";base64" not in header:
+            return False
+        raw = base64.b64decode(payload, validate=True)
+        return 0 < len(raw) <= 16 * 1024 * 1024
+    except Exception:
+        return False
+
+
+def is_data_url_media(url: str) -> bool:
+    return is_data_url_image(url) or is_data_url_video(url)
+
+
 async def ensure_message_attachment_schema(db) -> None:
     global _message_attachment_schema_ready
     if _message_attachment_schema_ready or not db:
@@ -1662,6 +1682,8 @@ def normalize_attachment_payload(attachment: dict) -> Optional[dict]:
     atype = str(attachment.get("type") or attachment.get("file_type") or "").strip().lower() or "unknown"
     if is_data_url_image(url):
         atype = "image"
+    elif is_data_url_video(url):
+        atype = "video"
     size = attachment.get("size", attachment.get("file_size", 0))
     try:
         size = max(0, int(size or 0))
@@ -1741,8 +1763,8 @@ async def save_message_attachments(db, message_id: str, attachments: Optional[li
         normalized = normalize_attachment_payload(item)
         if not normalized:
             continue
-        if is_data_url_image(normalized["url"]):
-            stored = store_image_data_url(
+        if is_data_url_media(normalized["url"]):
+            stored = store_media_data_url(
                 normalized["url"],
                 category="message-attachments",
                 company_id=company_id,
@@ -2030,12 +2052,112 @@ async def save_message_reaction(
         return normalize_reaction_row(dict(row)) if row else {}
 
 
-async def fetch_messages_with_attachments(db, convo_id: str, limit: int = 500) -> List[dict]:
-    rows = await db.fetch(
-        "SELECT * FROM messages WHERE conversation_id=$1 ORDER BY created_at ASC LIMIT $2",
-        convo_id,
-        limit,
+async def _linked_context_conversation_ids(
+    db,
+    *,
+    convo_id: str,
+    company_id: str = "",
+    customer_id: str = "",
+) -> list[str]:
+    scoped_company_id = str(company_id or "").strip()
+    scoped_customer_id = str(customer_id or "").strip()
+    scoped_convo_id = str(convo_id or "").strip()
+    if not scoped_company_id or not scoped_customer_id:
+        return [scoped_convo_id] if scoped_convo_id else []
+    try:
+        profile_id = str(
+            await db.fetchval(
+                "SELECT metadata #>> '{identity_unification,profile_id}' "
+                "FROM customers WHERE id=$1 AND company_id=$2 LIMIT 1",
+                scoped_customer_id,
+                scoped_company_id,
+            )
+            or ""
+        ).strip()
+        if not profile_id:
+            return [scoped_convo_id] if scoped_convo_id else []
+        profile_ids = [profile_id]
+        try:
+            merged_rows = await db.fetch(
+                "SELECT source_customer_id::text AS source_customer_id, "
+                "target_customer_id::text AS target_customer_id, unified_customer_id::text AS unified_customer_id "
+                "FROM merged_profile_records WHERE tenant_id=$1 "
+                "AND $2 = ANY(ARRAY[source_customer_id::text,target_customer_id::text,unified_customer_id::text]) "
+                "ORDER BY created_at DESC LIMIT 20",
+                scoped_company_id,
+                profile_id,
+            )
+            for row in merged_rows or []:
+                for key in ("source_customer_id", "target_customer_id", "unified_customer_id"):
+                    value = str(dict(row).get(key) or "").strip()
+                    if value and value not in profile_ids:
+                        profile_ids.append(value)
+        except Exception:
+            pass
+        rows = await db.fetch(
+            "SELECT id FROM conversations WHERE company_id=$1 "
+            "AND customer_id IN ("
+            "  SELECT id FROM customers WHERE company_id=$1 "
+            "  AND metadata #>> '{identity_unification,profile_id}' = ANY($2::text[])"
+            ") "
+            "ORDER BY last_message_at DESC LIMIT 20",
+            scoped_company_id,
+            profile_ids,
+        )
+        ids = [str(dict(row).get("id") or "").strip() for row in rows]
+        ids = [item for item in ids if item]
+        if scoped_convo_id and scoped_convo_id not in ids:
+            ids.insert(0, scoped_convo_id)
+        return ids or ([scoped_convo_id] if scoped_convo_id else [])
+    except Exception as exc:
+        logger.debug("linked context lookup skipped conversation_id=%s: %s", scoped_convo_id, exc)
+        return [scoped_convo_id] if scoped_convo_id else []
+
+
+async def fetch_messages_with_attachments(
+    db,
+    convo_id: str,
+    limit: int = 500,
+    *,
+    since_days: int | None = None,
+    company_id: str = "",
+    customer_id: str = "",
+    include_linked_profiles: bool = False,
+) -> List[dict]:
+    scoped_limit = max(1, int(limit or 500))
+    conversation_ids = (
+        await _linked_context_conversation_ids(
+            db,
+            convo_id=convo_id,
+            company_id=company_id,
+            customer_id=customer_id,
+        )
+        if include_linked_profiles
+        else [str(convo_id or "").strip()]
     )
+    conversation_ids = [item for item in conversation_ids if item]
+    if not conversation_ids:
+        return []
+    if since_days and int(since_days) > 0:
+        rows = await db.fetch(
+            "SELECT * FROM ("
+            "SELECT * FROM messages WHERE conversation_id = ANY($1::text[]) "
+            "AND created_at >= NOW() - ($3::int * INTERVAL '1 day') "
+            "ORDER BY created_at DESC LIMIT $2"
+            ") recent ORDER BY created_at ASC",
+            conversation_ids,
+            scoped_limit,
+            int(since_days),
+        )
+    else:
+        rows = await db.fetch(
+            "SELECT * FROM ("
+            "SELECT * FROM messages WHERE conversation_id = ANY($1::text[]) "
+            "ORDER BY created_at DESC LIMIT $2"
+            ") recent ORDER BY created_at ASC",
+            conversation_ids,
+            scoped_limit,
+        )
     messages = [dict(row) for row in rows]
     if not messages:
         return []
@@ -2712,7 +2834,7 @@ async def get_or_create_contact_conversation(
         customer.get("avatar", ""),
         channel,
         normalized_channel_id,
-        f"Profile outreach ({source})",
+        "Profile outreach",
         current_user.get("sub", ""),
         current_user.get("name", ""),
     )

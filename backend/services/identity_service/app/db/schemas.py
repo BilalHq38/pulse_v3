@@ -246,6 +246,7 @@ class IdentityProfileResponse(BaseModel):
     mappings: list[IdentityMappingOut] = Field(default_factory=list)
     fingerprints: list[DeviceFingerprintOut] = Field(default_factory=list)
     merge_history: list[dict[str, Any]] = Field(default_factory=list)
+    merged_profiles: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ReviewQueueItemResponse(BaseModel):

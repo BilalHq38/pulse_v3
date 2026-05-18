@@ -171,6 +171,47 @@ function mapTechnicalErrorMessage(text, fallback) {
   const lower = normalized.toLowerCase()
   if (!normalized) return fallback
   if (
+    lower.includes("workspace user limit reached")
+    || lower.includes("seat(s) on your plan")
+    || (lower.includes("user limit") && lower.includes("plan"))
+    || lower.includes("max_users")
+  ) {
+    const seatMatch = normalized.match(/\((\d+\s+seat(?:\(s\)|s)?(?:\s+on your plan)?)\)/i)
+    const seatText = seatMatch?.[1] ? ` (${seatMatch[1]})` : ""
+    return `Team member limit reached${seatText}. Upgrade your plan or remove pending invitations/users before adding another teammate.`
+  }
+  if (
+    lower === "authentication failed"
+    || lower.includes("not authenticated")
+    || lower.includes("invalid token")
+    || lower.includes("session has been revoked")
+  ) {
+    return "Your session is no longer valid. Sign in again to continue."
+  }
+  if (
+    lower.includes("insufficient permissions")
+    || lower === "forbidden"
+    || lower.includes("admin permissions")
+    || lower.includes("not authorized")
+  ) {
+    return "You do not have permission to perform this action."
+  }
+  if (lower.includes("plan_selection_required")) {
+    return "Choose a billing plan before continuing."
+  }
+  if (lower.includes("onboarding_required")) {
+    return "Complete onboarding before continuing."
+  }
+  if (lower.includes("email_verification_required")) {
+    return "Verify your email before continuing."
+  }
+  if (lower.includes("enterprise_invite_required")) {
+    return "Send the required workspace invitation before continuing."
+  }
+  if (lower.includes("prebuilt knowledge base articles cannot be deleted")) {
+    return "Prebuilt knowledge base articles cannot be deleted. Edit the article or disable AI context instead."
+  }
+  if (
     lower.includes("request body must be valid json")
     || lower.includes("bulk upload body must be valid json")
     || lower.includes("invalid multipart upload")

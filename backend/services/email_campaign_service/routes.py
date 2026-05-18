@@ -116,6 +116,10 @@ async def create_campaign_route(request: Request):
     body = str(payload.get("body") or "").strip()
     html_body = str(payload.get("html_body") or "").strip()
     filters = dict(payload.get("filters") or {})
+    attachments = list(payload.get("attachments") or [])
+    metadata = dict(payload.get("metadata") or {})
+    if isinstance(payload.get("settings"), dict):
+        metadata["settings"] = dict(payload.get("settings") or {})
 
     if not subject:
         raise HTTPException(status_code=400, detail="Subject is required")
@@ -131,6 +135,8 @@ async def create_campaign_route(request: Request):
             body=body,
             html_body=html_body,
             filters=filters,
+            attachments=attachments,
+            metadata=metadata,
             created_by=str(cu.get("sub") or cu.get("email") or ""),
         )
     except ValueError as exc:
@@ -161,6 +167,10 @@ async def update_campaign_route(campaign_id: str, request: Request):
     body = str(payload.get("body") or "").strip()
     html_body = str(payload.get("html_body") or "").strip()
     filters = dict(payload.get("filters") or {})
+    attachments = list(payload.get("attachments") or [])
+    metadata = dict(payload.get("metadata") or {})
+    if isinstance(payload.get("settings"), dict):
+        metadata["settings"] = dict(payload.get("settings") or {})
 
     if not subject:
         raise HTTPException(status_code=400, detail="Subject is required")
@@ -177,6 +187,8 @@ async def update_campaign_route(campaign_id: str, request: Request):
             body=body,
             html_body=html_body,
             filters=filters,
+            attachments=attachments,
+            metadata=metadata,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

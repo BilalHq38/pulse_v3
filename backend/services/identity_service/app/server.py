@@ -352,6 +352,32 @@ def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
             }
         )
 
+    merged_profiles = list(getattr(profile, "merged_profiles", []) or [])
+    for record in merged_profiles:
+        originals = dict((record or {}).get("original_identities") or {})
+        for identity in list(originals.get("source") or []):
+            platform = str((identity or {}).get("platform") or "").strip()
+            platform_user_id = str((identity or {}).get("platform_user_id") or "").strip()
+            if not platform or not platform_user_id:
+                continue
+            snapshot_id = str((identity or {}).get("mapping_id") or platform_user_id)
+            if any(str(item.get("mapping_id") or "") == snapshot_id for item in members):
+                continue
+            members.append(
+                {
+                    "customer_id": (record or {}).get("source_customer_id") or "",
+                    "mapping_id": snapshot_id,
+                    "platform_user_id": platform_user_id,
+                    "platform": platform,
+                    "name": (identity or {}).get("name") or (identity or {}).get("platform_username") or platform_user_id,
+                    "email": (identity or {}).get("email") or "",
+                    "phone": (identity or {}).get("phone") or "",
+                    "match_method": "merged_snapshot",
+                    "is_primary": False,
+                    "merged": True,
+                }
+            )
+
     platforms = sorted({item.get("platform", "") for item in members if item.get("platform")})
     return {
         "id": profile.customer_id,
@@ -367,6 +393,9 @@ def _profile_summary(profile: IdentityProfileResponse) -> dict[str, Any]:
         "all_conversations": [],
         "confidence_score": profile.profile_confidence,
         "profile_confidence": profile.profile_confidence,
+        "merge_history": list(profile.merge_history or []),
+        "merged_profiles": merged_profiles,
+        "merged_profile_count": len(merged_profiles),
     }
 
 

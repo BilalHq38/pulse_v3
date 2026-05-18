@@ -32,6 +32,21 @@ function isProviderIdentifier(rawValue) {
   return raw.includes("@") && !raw.endsWith("@c.us") && !raw.endsWith("@s.whatsapp.net");
 }
 
+/**
+ * Returns true if the value is a WhatsApp Linked Device ID (@lid JID).
+ *
+ * @lid JIDs (e.g. "182974364528890@lid") are internal multi-device identifiers
+ * assigned by WhatsApp's multi-device protocol.  They are NOT phone numbers and
+ * cannot be resolved through standard phone-parsing.  The bridge resolves them
+ * via client.getContactById() / client.getNumberId() before this module is invoked.
+ *
+ * @param {string} rawValue
+ * @returns {boolean}
+ */
+function isLidIdentifier(rawValue) {
+  return String(rawValue || "").toLowerCase().includes("@lid");
+}
+
 function normalizeInboundPhone(value, fallbackCountry) {
   const raw = stringifyIdentityValue(value);
   if (!raw || isProviderIdentifier(raw)) return null;
@@ -117,7 +132,11 @@ async function resolveInboundSenderIdentity(msg = {}, options = {}) {
   if (contact) {
     rawFields.contact_number = stringifyIdentityValue(contact.number);
     rawFields.contact_id = stringifyIdentityValue(contact.id);
-    rawFields.contact_name = stringifyIdentityValue(contact.name || contact.pushname || contact.shortName);
+    // Separate saved name (what bridge owner saved in their phone) from push/display name
+    rawFields.contact_name_saved = stringifyIdentityValue(contact.name || contact.shortName);
+    rawFields.contact_pushname = stringifyIdentityValue(contact.pushname);
+    // Unified fallback for backward compatibility
+    rawFields.contact_name = rawFields.contact_name_saved || rawFields.contact_pushname;
     if (typeof contact.getProfilePicUrl === "function") {
       try {
         rawFields.profile_picture_url = stringifyIdentityValue(await contact.getProfilePicUrl());
@@ -170,10 +189,65 @@ async function resolveInboundSenderIdentity(msg = {}, options = {}) {
   };
 }
 
+async function resolveOutboundRecipientIdentity(msg = {}, options = {}) {
+  const fallbackCountry = options.fallbackCountry !== undefined ? options.fallbackCountry : getFallbackRegion();
+  const data = msg._data || {};
+  const dataId = data.id || {};
+  let chat = null;
+  if (typeof msg.getChat === "function") {
+    try { chat = await msg.getChat(); } catch { chat = null; }
+  }
+
+  // For fromMe messages the recipient is msg.to / msg.id.remote
+  const candidateSources = [
+    { label: "msg.to", value: msg.to },
+    { label: "msg.id.remote", value: msg.id && msg.id.remote },
+    { label: "msg._data.to", value: data.to },
+    { label: "msg._data.id.remote", value: dataId.remote },
+    { label: "msg._data.id._serialized", value: dataId._serialized },
+    { label: "msg._data.chatId", value: data.chatId },
+    { label: "chat.id", value: chat && chat.id },
+  ];
+
+  let selected = null;
+  for (const src of candidateSources) {
+    const raw = stringifyIdentityValue(src.value);
+    if (!raw) continue;
+    const normalized = normalizeInboundPhone(raw, fallbackCountry);
+    if (normalized) {
+      selected = { ...normalized, source: src.label };
+      break;
+    }
+  }
+
+  const rawTo = stringifyIdentityValue(msg.to)
+    || stringifyIdentityValue(msg.id && msg.id.remote)
+    || stringifyIdentityValue(data.to)
+    || stringifyIdentityValue(dataId.remote)
+    || "";
+  const recipientName = stringifyIdentityValue(
+    (chat && chat.name) || data.notifyName || ""
+  );
+
+  return {
+    isValid: Boolean(selected),
+    recipientPhone: selected ? selected.e164 : "",
+    recipientPhoneDigits: selected ? selected.digits : "",
+    selectedRaw: selected ? selected.raw : "",
+    selectedSource: selected ? selected.source : "",
+    rawRecipientId: selected ? selected.raw : rawTo,
+    rawRecipientDigits: rawDigits(rawTo),
+    recipientName,
+    chat,
+  };
+}
+
 module.exports = {
+  isLidIdentifier,
   isProviderIdentifier,
   normalizeInboundPhone,
   rawMessageIdentityFields,
   resolveInboundSenderIdentity,
+  resolveOutboundRecipientIdentity,
   stringifyIdentityValue,
 };

@@ -422,7 +422,7 @@ export const useIdentityUnificationStore = create((set, get) => ({
   runSplit: async ({ profileId, customerId = '', mappingIds = [], fingerprintIds = [] }) => {
     const safeProfileId = normalizeId(profileId);
     if (!safeProfileId) {
-      set({ errorMessage: 'Profile ID is required for split.' });
+      set({ errorMessage: 'Select a profile before splitting.' });
       return null;
     }
 

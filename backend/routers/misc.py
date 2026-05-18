@@ -1,13 +1,14 @@
 """routers/misc.py — Security, Notifications, System, Search, Journey — PostgreSQL."""
 
 import hashlib
+import json
 import logging
 import os
 import secrets
 import socket as _socket
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Query, Request
+from typing import Any, Optional
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from core.utils import format_response_minutes, make_id
 from services.db_helpers import (
     r,
@@ -30,6 +31,152 @@ misc_router = APIRouter()
 
 def _db(req):
     return req.app.state.db
+
+
+def _text(value: Any, limit: int = 500) -> str:
+    return str(value or "").replace("\x00", "").strip()[:limit]
+
+
+def _client_ip_hash(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    ip = forwarded or (request.client.host if request.client else "")
+    salt = (os.environ.get("VISITOR_TRACKING_SALT") or os.environ.get("JWT_SECRET") or "pulse-visitor").strip()
+    return hashlib.sha256(f"{salt}:{ip}".encode("utf-8")).hexdigest() if ip else ""
+
+
+async def _ensure_visitor_tracking_schema(db) -> None:
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS visitor_sessions ("
+        "id TEXT PRIMARY KEY, company_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', "
+        "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+        "page_url TEXT NOT NULL DEFAULT '', referrer TEXT NOT NULL DEFAULT '', landing_path TEXT NOT NULL DEFAULT '', "
+        "user_agent TEXT NOT NULL DEFAULT '', ip_hash TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+    )
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS visitor_events ("
+        "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES visitor_sessions(id) ON DELETE CASCADE, "
+        "company_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL DEFAULT 'page_view', "
+        "page_url TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', referrer TEXT NOT NULL DEFAULT '', "
+        "element TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+        "occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_visitor_sessions_company_seen ON visitor_sessions(company_id, last_seen_at DESC)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_visitor_events_company_time ON visitor_events(company_id, occurred_at DESC)"
+    )
+
+
+@misc_router.post("/visitor/track")
+async def track_visitor(request: Request, response: Response):
+    db = _db(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    await _ensure_visitor_tracking_schema(db)
+    session_id = _text(
+        body.get("session_id") or request.cookies.get("pulse_visitor_session") or request.headers.get("X-Visitor-Session"),
+        120,
+    )
+    if not session_id:
+        session_id = f"vis_{make_id()}"
+    event_type = _text(body.get("event_type") or "page_view", 80) or "page_view"
+    page_url = _text(body.get("page_url"), 1500)
+    path = _text(body.get("path"), 500)
+    referrer = _text(body.get("referrer"), 1500)
+    company_id = _text(body.get("company_id"), 120)
+    user_id = _text(body.get("user_id"), 120)
+    element = _text(body.get("element"), 300)
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    user_agent = _text(request.headers.get("user-agent"), 600)
+    ip_hash = _client_ip_hash(request)
+    await db.execute(
+        "INSERT INTO visitor_sessions(id,company_id,user_id,page_url,referrer,landing_path,user_agent,ip_hash,metadata,created_at,updated_at) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NOW(),NOW()) "
+        "ON CONFLICT (id) DO UPDATE SET company_id=COALESCE(NULLIF(EXCLUDED.company_id,''),visitor_sessions.company_id), "
+        "user_id=COALESCE(NULLIF(EXCLUDED.user_id,''),visitor_sessions.user_id), page_url=EXCLUDED.page_url, "
+        "referrer=COALESCE(NULLIF(visitor_sessions.referrer,''),EXCLUDED.referrer), user_agent=EXCLUDED.user_agent, "
+        "ip_hash=COALESCE(NULLIF(visitor_sessions.ip_hash,''),EXCLUDED.ip_hash), metadata=visitor_sessions.metadata || EXCLUDED.metadata, "
+        "last_seen_at=NOW(), updated_at=NOW()",
+        session_id,
+        company_id,
+        user_id,
+        page_url,
+        referrer,
+        path,
+        user_agent,
+        ip_hash,
+        json.dumps(metadata, ensure_ascii=True, default=str),
+    )
+    event_id = make_id()
+    await db.execute(
+        "INSERT INTO visitor_events(id,session_id,company_id,user_id,event_type,page_url,path,referrer,element,metadata,occurred_at,created_at) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,NOW(),NOW())",
+        event_id,
+        session_id,
+        company_id,
+        user_id,
+        event_type,
+        page_url,
+        path,
+        referrer,
+        element,
+        json.dumps(metadata, ensure_ascii=True, default=str),
+    )
+    response.set_cookie(
+        "pulse_visitor_session",
+        session_id,
+        max_age=60 * 60 * 24 * 365,
+        httponly=False,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+    )
+    return {"ok": True, "session_id": session_id, "event_id": event_id}
+
+
+@misc_router.get("/visitor/tracking")
+async def list_visitor_tracking(
+    request: Request,
+    session_id: Optional[str] = None,
+    company_id: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    await _ensure_visitor_tracking_schema(db)
+    scoped_company_id = company_id if cu.get("role") == "super_admin" else cu.get("company_id", "")
+    args: list[Any] = []
+    filters: list[str] = []
+    if scoped_company_id:
+        args.append(scoped_company_id)
+        filters.append(f"company_id=${len(args)}")
+    if session_id:
+        args.append(session_id)
+        filters.append(f"id=${len(args)}")
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    args.append(limit)
+    sessions = rs(
+        await db.fetch(
+            f"SELECT * FROM visitor_sessions {where} ORDER BY last_seen_at DESC LIMIT ${len(args)}",
+            *args,
+        )
+    )
+    session_ids = [row.get("id", "") for row in sessions if row.get("id")]
+    events = []
+    if session_ids:
+        events = rs(
+            await db.fetch(
+                "SELECT * FROM visitor_events WHERE session_id=ANY($1::text[]) ORDER BY occurred_at DESC LIMIT $2",
+                session_ids,
+                limit,
+            )
+        )
+    return {"sessions": sessions, "events": events}
 
 
 async def _ensure_meta_verify_token(db, company_id: str) -> str:

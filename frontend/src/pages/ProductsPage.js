@@ -3,7 +3,6 @@ import api from '@/lib/api';
 import { resolveMediaUrl } from '@/lib/backend-url';
 import BulkUploadModal from '@/components/BulkUploadModal';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
-import * as XLSX from 'xlsx';
 import {
   Package,
   Plus,
@@ -44,134 +43,6 @@ const EMPTY_FORM = {
   name: '', product_title: '', description: '', price: '', price_currency: 'USD',
   category: 'general', product_type: '', images: [],
 };
-
-function normalizeBulkHeader(value) {
-  return String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-}
-
-function parseBulkPrice(value) {
-  const raw = String(value ?? '').trim();
-  if (!raw) return '';
-  const normalized = raw.replace(/[, ]+/g, '').replace(/[^0-9.-]/g, '');
-  if (!normalized || normalized === '.' || normalized === '-' || normalized === '-.') return null;
-  const parsed = Number(normalized);
-  if (Number.isNaN(parsed)) return null;
-  return String(parsed);
-}
-
-function parseProductRowsFromSheet(rows) {
-  const errors = [];
-  if (!Array.isArray(rows) || rows.length === 0) {
-    return { items: [], errors: [{ row: 1, error: 'The file is empty.' }] };
-  }
-
-  const headerRowIndex = rows.findIndex(
-    (row) => Array.isArray(row) && row.some((cell) => String(cell ?? '').trim()),
-  );
-  if (headerRowIndex === -1) {
-    return { items: [], errors: [{ row: 1, error: 'No header row found.' }] };
-  }
-
-  const headerRow = rows[headerRowIndex];
-  const headerIndex = {};
-  headerRow.forEach((cell, index) => {
-    const key = normalizeBulkHeader(cell);
-    if (key && headerIndex[key] === undefined) {
-      headerIndex[key] = index;
-    }
-  });
-
-  if (headerIndex.name === undefined) {
-    return { items: [], errors: [{ row: headerRowIndex + 1, error: 'Missing required `name` header.' }] };
-  }
-
-  const items = [];
-  for (let rowIndex = headerRowIndex + 1; rowIndex < rows.length; rowIndex += 1) {
-    const row = Array.isArray(rows[rowIndex]) ? rows[rowIndex] : [];
-    const rowNumber = rowIndex + 1;
-    const isBlankRow = row.every((cell) => String(cell ?? '').trim() === '');
-    if (isBlankRow) continue;
-
-    const readCell = (...aliases) => {
-      for (const alias of aliases) {
-        const index = headerIndex[alias];
-        if (index !== undefined) return row[index];
-      }
-      return '';
-    };
-
-    const name = String(readCell('name')).trim();
-    if (!name) {
-      errors.push({ row: rowNumber, error: 'Missing required product name.' });
-      continue;
-    }
-
-    const price = parseBulkPrice(readCell('price'));
-    if (price === null) {
-      errors.push({ row: rowNumber, error: 'Invalid price value.' });
-      continue;
-    }
-
-    const category = String(readCell('category')).trim().toLowerCase().replace(/\s+/g, '_') || 'general';
-    const priceCurrency = String(readCell('price_currency', 'currency')).trim().toUpperCase() || 'USD';
-    const productType = String(readCell('product_type', 'type')).trim() || 'standard';
-
-    // Collect image URLs from:
-    //   - `image_url` column (pipe-separated for multiple)
-    //   - `image_url_1`, `image_url_2`, `image_url_3` individual columns
-    //   - `image` as an alias for `image_url`
-    const rawImageUrl = String(readCell('image_url', 'image_url_1', 'image') ?? '').trim();
-    const rawImageUrls = rawImageUrl
-      ? rawImageUrl.split('|').map((u) => u.trim()).filter(Boolean)
-      : [];
-    // Additional numbered columns
-    for (const col of ['image_url_2', 'image_url_3']) {
-      const extra = String(readCell(col) ?? '').trim();
-      if (extra) rawImageUrls.push(extra);
-    }
-    // Deduplicate and cap at MAX_PRODUCT_IMAGES (3)
-    const imageUrls = [...new Set(rawImageUrls)].slice(0, 3);
-
-    items.push({
-      rowNumber,
-      payload: {
-        name,
-        product_title: String(readCell('product_title', 'sku', 'product_code')).trim(),
-        description: String(readCell('description', 'details')).trim(),
-        price,
-        price_currency: priceCurrency,
-        category,
-        product_type: productType,
-        // Pass raw URLs — the backend stores them directly as image URLs.
-        // The card's ImageGrid already renders string URLs, so no conversion needed.
-        images: imageUrls,
-        features: [],
-      },
-    });
-  }
-
-  return { items, errors };
-}
-
-async function parseProductSpreadsheet(file) {
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array', raw: false });
-  const firstSheetName = workbook.SheetNames[0];
-  if (!firstSheetName) {
-    throw new Error('No worksheet found in the selected file.');
-  }
-  const worksheet = workbook.Sheets[firstSheetName];
-  const rows = XLSX.utils.sheet_to_json(worksheet, {
-    header: 1,
-    defval: '',
-    blankrows: false,
-  });
-  return parseProductRowsFromSheet(rows);
-}
 
 function ImageGrid({ images, onClickImage }) {
   if (!Array.isArray(images) || images.length === 0) {
@@ -624,7 +495,6 @@ export default function ProductsPage() {
                     {/* Code */}
                     <td className="px-4 py-3">
                       <span className="text-xs text-slate-700">{p.product_title || '—'}</span>
-                      <p className="text-[10px] text-slate-300 font-mono mt-0.5" title={p.id}>{p.id}</p>
                     </td>
                     {/* Category */}
                     <td className="px-4 py-3">
@@ -689,10 +559,9 @@ export default function ProductsPage() {
                     <h3 className="text-sm font-semibold text-slate-800 truncate group-hover:text-blue-700 transition-colors">{p.name}</h3>
                     {p.product_title && (
                       <p className="text-xs text-slate-500 truncate mt-0.5">
-                        <span className="text-slate-400 font-medium">ID: </span>{p.product_title}
+                        <span className="text-slate-400 font-medium">Code: </span>{p.product_title}
                       </p>
                     )}
-                    <p className="text-[10px] text-slate-300 font-mono truncate mt-0.5" title={p.id}>{p.id}</p>
                   </div>
                   <div className="flex gap-1 flex-shrink-0">
                     <button
@@ -770,10 +639,9 @@ export default function ProductsPage() {
                   <h3 className="text-xl font-bold text-slate-900 truncate">{selectedProduct.name}</h3>
                   {selectedProduct.product_title && (
                     <p className="text-sm text-slate-500 mt-0.5">
-                      <span className="text-slate-400 text-xs font-medium">ID: </span>{selectedProduct.product_title}
+                      <span className="text-slate-400 text-xs font-medium">Code: </span>{selectedProduct.product_title}
                     </p>
                   )}
-                  <p className="text-[11px] text-slate-300 font-mono mt-0.5 select-all" title="System product ID">{selectedProduct.id}</p>
                 </div>
                 <div className="flex items-center gap-2 flex-shrink-0">
                   <button

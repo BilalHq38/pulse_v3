@@ -225,14 +225,15 @@ async def count_pending_invitations(db, company_id: str) -> int:
 
 async def assert_workspace_seat_available(db, company_id: str) -> None:
     """Raise HTTPException when a new user/invite would exceed max_users for the workspace."""
-    sub = await db.fetchrow("SELECT plan_code, max_users FROM subscriptions WHERE company_id=$1 LIMIT 1", company_id)
+    await db.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"workspace-seats:{company_id}")
+    sub = await db.fetchrow("SELECT plan_code, max_users FROM subscriptions WHERE company_id=$1 FOR UPDATE", company_id)
     cap = effective_max_users(dict(sub) if sub else None)
     used = await count_workspace_seats_used(db, company_id)
     pending = await count_pending_invitations(db, company_id)
     if used + pending >= cap:
         raise HTTPException(
             status_code=403,
-            detail=f"Workspace user limit reached ({cap} seat(s) on your plan). Upgrade or remove users to add more.",
+            detail="You cannot add a new team member because your limit has been reached.",
         )
 
 

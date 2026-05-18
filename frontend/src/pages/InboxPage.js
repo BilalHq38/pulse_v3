@@ -37,10 +37,60 @@ const CHANNELS = [
   { key: 'web_chat', label: 'Website', color: 'bg-violet-500', lightBg: 'bg-violet-50', text: 'text-violet-600', border: 'border-violet-200' },
 ];
 
+const INBOX_FILTERS = {
+  incoming_messages: { label: 'Incoming Messages', empty: 'No incoming messages today' },
+  active_conversations: { label: 'Active Conversations', empty: 'No active conversations' },
+  pending_replies: { label: 'Pending Replies', empty: 'No conversations awaiting replies' },
+  ai_chats: { label: 'AI Chat', empty: 'No active AI-handled chats' },
+  human_chats: { label: 'Human Chats', empty: 'No active human-handled chats' },
+  unread: { label: 'Unread', empty: 'No unread conversations' },
+};
+
+function normalizeInboxFilter(value) {
+  const key = String(value || '').trim().toLowerCase().replace(/-/g, '_');
+  const aliases = {
+    incoming: 'incoming_messages',
+    incoming_messages: 'incoming_messages',
+    active: 'active_conversations',
+    active_conversations: 'active_conversations',
+    pending: 'pending_replies',
+    pending_replies: 'pending_replies',
+    ai: 'ai_chats',
+    ai_chat: 'ai_chats',
+    ai_chats: 'ai_chats',
+    human: 'human_chats',
+    human_chat: 'human_chats',
+    human_chats: 'human_chats',
+    unread: 'unread',
+  };
+  return aliases[key] || '';
+}
+
 const CHAT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const CHAT_VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/quicktime'];
+const CHAT_MEDIA_TYPES = [...CHAT_IMAGE_TYPES, ...CHAT_VIDEO_TYPES];
 const MAX_CHAT_IMAGE_SIZE_MB = 8;
-const MAX_CHAT_IMAGES = 4;
+const MAX_CHAT_VIDEO_SIZE_MB = 16;
+const MAX_CHAT_MEDIA = 4;
 const LONG_REQUEST_TIMEOUT_MS = 120000;
+const COMPOSER_DRAFTS_STORAGE_KEY = 'pulse:inbox-composer-drafts:v1';
+
+function readComposerDrafts() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(COMPOSER_DRAFTS_STORAGE_KEY) || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeComposerDrafts(drafts) {
+  try {
+    localStorage.setItem(COMPOSER_DRAFTS_STORAGE_KEY, JSON.stringify(drafts || {}));
+  } catch {
+    // Ignore storage quota/private-mode failures; composer still works in memory.
+  }
+}
 
 function isLikelyValidDisplayPhone(value) {
   const text = String(value || '').trim();
@@ -156,6 +206,9 @@ function ChatVideoThumb({ attachment, onOpen }) {
 function ContactAvatar({ entity, name, channelMeta, className = 'w-10 h-10', textClass = 'text-sm' }) {
   const [failed, setFailed] = useState(false);
   const url = resolveMediaUrl(entity?.avatar || entity?.customer_avatar || entity?.profile_picture_url || '');
+  useEffect(() => {
+    setFailed(false);
+  }, [url]);
   const initial = (name || entity?.customer_name || entity?.name || '?').charAt(0);
   return (
     <div className={`${className} rounded-full ${channelMeta?.lightBg || 'bg-slate-100'} flex items-center justify-center ${textClass} font-bold ${channelMeta?.text || 'text-slate-600'} overflow-hidden flex-shrink-0`}>
@@ -166,12 +219,40 @@ function ContactAvatar({ entity, name, channelMeta, className = 'w-10 h-10', tex
   );
 }
 
+function isWhatsappGroupConversation(convo) {
+  return Boolean(convo?.is_group || convo?.group_id || convo?.channel_id?.endsWith?.('@g.us'));
+}
+
+function conversationDisplayName(convo) {
+  if (!convo) return '';
+  return convo.group_name || convo.subject || convo.customer_name || convo.name || '';
+}
+
+function messageGroupName(message, selectedConvo) {
+  return message?.whatsapp_group_name || message?.group_name || selectedConvo?.group_name || (isWhatsappGroupConversation(selectedConvo) ? conversationDisplayName(selectedConvo) : '');
+}
+
+function messageParticipantName(message) {
+  return message?.whatsapp_participant_name || message?.group_participant_name || message?.sender_name || '';
+}
+
+function resolveSenderName(message) {
+  const raw = normalizeMessageText(message.sender_name);
+  if (raw) return raw;
+  const t = String(message.sender_type || '').toLowerCase();
+  if (t === 'ai') return 'AI';
+  if (t === 'agent' || t === 'business') return 'Agent';
+  if (t === 'customer') return 'Customer';
+  if (message.from_me || message.web_bridge?.from_me) return 'Agent';
+  return 'Agent';
+}
+
 function normalizeMessage(message) {
   if (!message || typeof message !== 'object') return message;
   return {
     ...message,
     content: normalizeMessageText(message.content),
-    sender_name: normalizeMessageText(message.sender_name) || 'Unknown sender',
+    sender_name: resolveSenderName(message),
     attachments: normalizeAttachments(message.attachments),
     reactions: normalizeReactions(message.reactions),
   };
@@ -224,7 +305,7 @@ function getDeliveryStatusMeta(status) {
   if (normalized === 'failed') return { label: 'Failed', className: 'bg-red-50 text-red-700 border-red-200' };
   if (normalized === 'delivered') return { label: 'Delivered', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
   if (normalized === 'sent') return { label: 'Sent', className: 'bg-blue-50 text-blue-700 border-blue-200' };
-  if (normalized === 'pending') return { label: 'Sending', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+  if (normalized === 'pending' || normalized === 'sending') return { label: 'Sending', className: 'bg-amber-50 text-amber-700 border-amber-200' };
   return null;
 }
 
@@ -383,15 +464,19 @@ export default function InboxPage() {
   const composerFileRef = useRef(null);
   const customerSidebarRef = useRef(null);
   const selectedConvoIdRef = useRef('');
+  const skipNextDraftSaveRef = useRef('');
   const [searchParams, setSearchParams] = useSearchParams();
+  const inboxFilter = normalizeInboxFilter(searchParams.get('inbox_filter') || searchParams.get('filter'));
 
-  const loadConversations = useCallback(async (preferredConversationId = '') => {
+  const loadConversations = useCallback(async ({ selectConversationId = '', filterOverride } = {}) => {
     try {
-      const res = await api.get('/conversations');
+      const effectiveFilter = filterOverride === undefined ? inboxFilter : normalizeInboxFilter(filterOverride);
+      const params = effectiveFilter ? { inbox_filter: effectiveFilter } : undefined;
+      const res = await api.get('/conversations', params ? { params } : undefined);
       const items = Array.isArray(res.data) ? res.data : [];
       setConversations(items);
       setSelectedConvo(prev => {
-        const targetId = preferredConversationId || prev?.id || '';
+        const targetId = selectConversationId || prev?.id || '';
         if (!targetId) return prev;
         const refreshed = items.find(c => c.id === targetId);
         return refreshed || prev;
@@ -404,7 +489,7 @@ export default function InboxPage() {
         message: 'Conversations could not be loaded. Refresh the page or contact support if this continues.',
       });
     }
-  }, []);
+  }, [inboxFilter]);
 
   const loadNotificationSettings = useCallback(async () => {
     try {
@@ -420,6 +505,37 @@ export default function InboxPage() {
   }, [selectedConvo?.id]);
 
   useEffect(() => {
+    const convoId = selectedConvo?.id || '';
+    if (!convoId) return;
+    const draft = readComposerDrafts()[convoId] || {};
+    skipNextDraftSaveRef.current = convoId;
+    setNewMessage(String(draft.content || ''));
+    setComposerAttachments(Array.isArray(draft.attachments) ? draft.attachments.slice(0, MAX_CHAT_MEDIA) : []);
+  }, [selectedConvo?.id]);
+
+  useEffect(() => {
+    const convoId = selectedConvo?.id || '';
+    if (!convoId) return;
+    if (skipNextDraftSaveRef.current === convoId) {
+      skipNextDraftSaveRef.current = '';
+      return;
+    }
+    const drafts = readComposerDrafts();
+    if (newMessage.trim() || composerAttachments.length) {
+      drafts[convoId] = {
+        content: newMessage,
+        attachments: composerAttachments.slice(0, MAX_CHAT_MEDIA),
+        customer_id: selectedConvo?.customer_id || '',
+        channel: selectedConvo?.channel || '',
+        updated_at: new Date().toISOString(),
+      };
+    } else {
+      delete drafts[convoId];
+    }
+    writeComposerDrafts(drafts);
+  }, [selectedConvo?.id, selectedConvo?.customer_id, selectedConvo?.channel, newMessage, composerAttachments]);
+
+  useEffect(() => {
     aiLoadingRef.current = aiLoading;
   }, [aiLoading]);
 
@@ -429,7 +545,7 @@ export default function InboxPage() {
       if (!data?.conversation_id || !data?.message) return;
       const activeConvoId = selectedConvoIdRef.current;
       if (!activeConvoId || data.conversation_id !== activeConvoId) {
-        loadConversations(data.conversation_id);
+        loadConversations();
         if (notifyNewMessage) {
           const senderName =
             data.message?.sender_name ||
@@ -473,7 +589,7 @@ export default function InboxPage() {
         setAiLoading(false);
       }
     } else if (eventName === 'conversation_updated') {
-      loadConversations(data?.conversation_id || '');
+      loadConversations();
     } else if (eventName === 'message_updated') {
       if (data?.conversation_id && data?.message) {
         setMessages(prev => prev.map(m => m.id === data.message.id ? mergeMessageUpdate(m, data.message) : m));
@@ -516,7 +632,7 @@ export default function InboxPage() {
 
     const directConversationId = searchParams.get('conversation');
     if (directConversationId) {
-      loadConversations(directConversationId).then(() => {
+      loadConversations({ selectConversationId: directConversationId, filterOverride: '' }).then(() => {
         setMaximized(true);
       }).finally(() => {
         if (platform) setSearchParams({ platform }, { replace: true });
@@ -584,20 +700,25 @@ export default function InboxPage() {
   useEffect(() => {
     const convoId = selectedConvo?.id;
     const customerId = selectedConvo?.customer_id;
-    if (convoId) {
-      loadMessages(convoId);
-      markConversationRead(convoId);
-      if (customerId) {
-        api.get(`/customers/${customerId}`).then(r => setCustomerInfo(r.data)).catch(() => {});
-        api.get(`/identity/customer/${customerId}`).then(r => {
-          setUnificationMatch(r.data?.unified ? r.data.profile : null);
-        }).catch(() => setUnificationMatch(null));
-      } else {
-        setCustomerInfo(null);
-        setUnificationMatch(null);
-      }
-      joinConversation(convoId);
+    if (!convoId) return;
+    let cancelled = false;
+    setCustomerInfo(null);
+    setUnificationMatch(null);
+    loadMessages(convoId);
+    markConversationRead(convoId);
+    if (customerId) {
+      api.get(`/customers/${customerId}`).then(r => {
+        if (!cancelled) setCustomerInfo(r.data);
+      }).catch(() => {});
+      api.get(`/identity/customer/${customerId}`).then(r => {
+        if (!cancelled) setUnificationMatch(r.data?.unified ? r.data.profile : null);
+      }).catch(() => { if (!cancelled) setUnificationMatch(null); });
+    } else {
+      setCustomerInfo(null);
+      setUnificationMatch(null);
     }
+    joinConversation(convoId);
+    return () => { cancelled = true; };
   }, [selectedConvo?.id, selectedConvo?.customer_id, joinConversation]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
@@ -740,31 +861,39 @@ export default function InboxPage() {
     const files = Array.from(fileList || []);
     if (!files.length) return;
     setComposerError('');
-    const availableSlots = Math.max(0, MAX_CHAT_IMAGES - composerAttachments.length);
+    const availableSlots = Math.max(0, MAX_CHAT_MEDIA - composerAttachments.length);
     const selectedFiles = files.slice(0, availableSlots);
     if (selectedFiles.length < files.length) {
-      setComposerError(`You can send up to ${MAX_CHAT_IMAGES} images at once.`);
+      setComposerError(`You can send up to ${MAX_CHAT_MEDIA} media files at once.`);
     }
     try {
       const nextAttachments = [];
       for (const file of selectedFiles) {
-        if (!CHAT_IMAGE_TYPES.includes(file.type)) {
-          setComposerError('Only JPG, PNG, WEBP, and GIF images are supported.');
+        if (!CHAT_MEDIA_TYPES.includes(file.type)) {
+          setComposerError('Only JPG, PNG, WEBP, GIF, MP4, WEBM, and MOV media are supported.');
           continue;
         }
-        if (file.size > MAX_CHAT_IMAGE_SIZE_MB * 1024 * 1024) {
-          setComposerError(`Each image must be ${MAX_CHAT_IMAGE_SIZE_MB}MB or smaller.`);
+        const isVideo = CHAT_VIDEO_TYPES.includes(file.type);
+        const maxSizeMb = isVideo ? MAX_CHAT_VIDEO_SIZE_MB : MAX_CHAT_IMAGE_SIZE_MB;
+        if (file.size > maxSizeMb * 1024 * 1024) {
+          setComposerError(`Each ${isVideo ? 'video' : 'image'} must be ${maxSizeMb}MB or smaller.`);
           continue;
         }
         const url = await fileToDataUrl(file);
-        nextAttachments.push({ type: 'image', url, name: file.name, size: file.size });
+        nextAttachments.push({
+          type: isVideo ? 'video' : 'image',
+          url,
+          name: file.name,
+          size: file.size,
+          mime_type: file.type,
+        });
       }
       if (nextAttachments.length) {
-        setComposerAttachments((prev) => [...prev, ...nextAttachments].slice(0, MAX_CHAT_IMAGES));
+        setComposerAttachments((prev) => [...prev, ...nextAttachments].slice(0, MAX_CHAT_MEDIA));
       }
     } catch (err) {
       console.error('Attachment read failed:', err);
-      setComposerError('Failed to read one of the selected images.');
+      setComposerError('Failed to read one of the selected media files.');
     } finally {
       if (composerFileRef.current) composerFileRef.current.value = '';
     }
@@ -803,7 +932,12 @@ export default function InboxPage() {
       );
       if (res.data.message) {
         setMessages(prev => {
-          const nextMessage = normalizeMessage(res.data.message);
+          const base = res.data.message;
+          const isPendingStatus = !base.delivery_status || base.delivery_status === 'pending' || base.delivery_status === 'sending';
+          const nextMessage = normalizeMessage({
+            ...base,
+            delivery_status: isPendingStatus ? 'sent' : base.delivery_status,
+          });
           if (prev.some(m => m.id === nextMessage.id)) return prev;
           return [...prev, nextMessage];
         });
@@ -1068,9 +1202,6 @@ export default function InboxPage() {
 
   const openCustomerProfileSidebar = useCallback(() => {
     setShowCustomerSidebar(true);
-    requestAnimationFrame(() => {
-      customerSidebarRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
   }, []);
 
   const openCustomerEdit = async (convo) => {
@@ -1191,6 +1322,8 @@ export default function InboxPage() {
   const chInfo = selectedConvo
     ? CHANNELS.find(c => c.key === selectedConvo.channel) || CHANNELS.find(c => c.key === 'web_chat')
     : null;
+  const selectedConvoIsGroup = isWhatsappGroupConversation(selectedConvo);
+  const selectedConvoDisplayName = conversationDisplayName(selectedConvo);
   const selectedConvoSentiment = getSentimentMeta(selectedConvo?.sentiment_score, selectedConvo?.sentiment_label);
   const channelDisconnectMessage = getChannelDisconnectMessage(selectedConvo);
   const channelDisconnected = Boolean(channelDisconnectMessage);
@@ -1199,19 +1332,48 @@ export default function InboxPage() {
   const displayChannel = platformView || activeChannel;
   const filteredConvos = displayChannel ? grouped[displayChannel] || [] : conversations;
   const desktopChannels = platformView ? CHANNELS.filter((ch) => ch.key === platformView) : CHANNELS;
+  const inboxFilterMeta = INBOX_FILTERS[inboxFilter] || null;
+  const clearPlatformView = () => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('platform');
+    setSearchParams(nextParams, { replace: true });
+    setPlatformView(null);
+    setActiveChannel(null);
+  };
+  const clearInboxFilter = () => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('inbox_filter');
+    nextParams.delete('filter');
+    setSearchParams(nextParams, { replace: true });
+  };
 
   return (
     <>
     <div className="flex h-[calc(100vh-3.5rem)]" data-testid="inbox-page">
-      {platformView && (
-        <div className="absolute top-2 right-4 z-20 bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
-          Viewing: {CHANNELS.find((c) => c.key === platformView)?.label}
-          <button
-            onClick={() => navigate('/inbox')}
-            className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
-          >
-            Show all
-          </button>
+      {(platformView || inboxFilterMeta) && (
+        <div className="absolute top-2 right-4 z-20 flex max-w-[calc(100%-2rem)] flex-wrap items-center gap-2 bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
+          {platformView && (
+            <span>
+              Viewing: {CHANNELS.find((c) => c.key === platformView)?.label}
+              <button
+                onClick={clearPlatformView}
+                className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
+              >
+                Show all
+              </button>
+            </span>
+          )}
+          {inboxFilterMeta && (
+            <span>
+              Filter: {inboxFilterMeta.label}
+              <button
+                onClick={clearInboxFilter}
+                className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
+              >
+                Clear
+              </button>
+            </span>
+          )}
         </div>
       )}
       {/* Mobile: Channel Tabs + Conversation List */}
@@ -1255,6 +1417,8 @@ export default function InboxPage() {
             {filteredConvos.map(convo => {
               const ch = CHANNELS.find(c => c.key === convo.channel) || CHANNELS.find(c => c.key === 'web_chat') || CHANNELS[0];
               const convoSentiment = getSentimentMeta(convo.sentiment_score, convo.sentiment_label);
+              const isGroup = isWhatsappGroupConversation(convo);
+              const displayName = conversationDisplayName(convo);
               return (
                 <div
                   key={convo.id}
@@ -1263,10 +1427,10 @@ export default function InboxPage() {
                   data-testid={`convo-card-${convo.id}`}
                 >
                   <div className="flex items-start gap-3">
-                    <ContactAvatar entity={convo} name={convo.customer_name} channelMeta={ch} />
+                    <ContactAvatar entity={convo} name={displayName} channelMeta={ch} />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between mb-1">
-                        <span className="text-sm font-semibold text-slate-800 truncate">{convo.customer_name}</span>
+                        <span className="text-sm font-semibold text-slate-800 truncate">{displayName}</span>
                         <div className="flex items-center gap-1.5">
                           <div className="relative" onClick={(e) => e.stopPropagation()}>
                             <button
@@ -1302,6 +1466,7 @@ export default function InboxPage() {
                       </div>
                       <div className="flex items-center gap-2 mb-1.5">
                         <span className={`text-[10px] px-1.5 py-0.5 rounded ${ch.lightBg} ${ch.text} font-medium inline-flex items-center gap-1`}><ChannelLogo channelKey={ch.key} size={11} />{ch.label}</span>
+                        {isGroup && <span className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-700 font-medium">Group</span>}
                         <span className="text-[11px] text-slate-400">{new Date(convo.last_message_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         {convoSentiment && (
                           <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${convoSentiment.accentClass}`}>
@@ -1324,7 +1489,7 @@ export default function InboxPage() {
             {filteredConvos.length === 0 && (
               <div className="text-center py-12 text-slate-300">
                 <MessageSquare size={32} className="mx-auto mb-2 opacity-40" />
-                <p className="text-sm">No conversations</p>
+                <p className="text-sm">{inboxFilterMeta?.empty || 'No conversations'}</p>
               </div>
             )}
           </div>
@@ -1436,6 +1601,8 @@ export default function InboxPage() {
                   <div className="flex-1 overflow-y-auto p-2 space-y-2">
                     {items.map(convo => {
                       const convoSentiment = getSentimentMeta(convo.sentiment_score, convo.sentiment_label);
+                      const isGroup = isWhatsappGroupConversation(convo);
+                      const displayName = conversationDisplayName(convo);
                       return (
                         <div
                           key={convo.id}
@@ -1444,10 +1611,10 @@ export default function InboxPage() {
                           data-testid={`convo-card-${convo.id}`}
                         >
                           <div className="flex items-start gap-2.5 mb-2">
-                            <ContactAvatar entity={convo} name={convo.customer_name} channelMeta={ch} className="w-8 h-8" textClass="text-xs" />
+                            <ContactAvatar entity={convo} name={displayName} channelMeta={ch} className="w-8 h-8" textClass="text-xs" />
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center justify-between">
-                                <span className="text-[13px] font-semibold text-slate-800 truncate">{convo.customer_name}</span>
+                                <span className="text-[13px] font-semibold text-slate-800 truncate">{displayName}</span>
                                 <div className="flex items-center gap-1">
                                   <div className="relative" onClick={(e) => e.stopPropagation()}>
                                     <button
@@ -1487,6 +1654,7 @@ export default function InboxPage() {
                                     {convoSentiment.percentage}%
                                   </span>
                                 )}
+                                {isGroup && <span className="text-[10px] px-1.5 py-0.5 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 font-medium">Group</span>}
                               </div>
                             </div>
                           </div>
@@ -1509,7 +1677,7 @@ export default function InboxPage() {
                     {items.length === 0 && (
                       <div className="text-center py-8 text-slate-300">
                         <MessageSquare size={24} className="mx-auto mb-2 opacity-40" />
-                        <p className="text-xs">No conversations</p>
+                        <p className="text-xs">{inboxFilterMeta?.empty || 'No conversations'}</p>
                       </div>
                     )}
                   </div>
@@ -1536,10 +1704,11 @@ export default function InboxPage() {
                   onClick={openCustomerProfileSidebar}
                   className="flex items-center gap-2 sm:gap-3 min-w-0 rounded-xl px-1.5 py-1 -mx-1.5 hover:bg-slate-50 transition-colors text-left"
                 >
-                  <ContactAvatar entity={selectedConvo} name={selectedConvo.customer_name} channelMeta={chInfo} className="w-8 h-8 sm:w-10 sm:h-10" textClass="text-xs sm:text-sm" />
+                  <ContactAvatar entity={selectedConvo} name={selectedConvoDisplayName} channelMeta={chInfo} className="w-8 h-8 sm:w-10 sm:h-10" textClass="text-xs sm:text-sm" />
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-slate-900 truncate">{selectedConvo.customer_name}</h3>
+                      <h3 className="text-sm font-semibold text-slate-900 truncate">{selectedConvoDisplayName}</h3>
+                      {selectedConvoIsGroup && <span className="inline-flex text-[10px] px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-700 font-medium">Group</span>}
                       <span className="hidden md:inline-flex items-center text-[10px] text-slate-400">View profile <ChevronRight size={11} className="ml-0.5" /></span>
                     </div>
                   </div>
@@ -1704,6 +1873,8 @@ export default function InboxPage() {
                 const reactions = Array.isArray(msg.reactions) ? msg.reactions : [];
                 const messageTime = formatMessageTimestamp(msg.created_at);
                 const messageContent = normalizeMessageText(msg.content);
+                const groupName = messageGroupName(msg, selectedConvo);
+                const participantName = messageParticipantName(msg);
 
                 if (isSystem && isManualAiWithheldSystemMessage(messageContent)) {
                   return null;
@@ -1728,7 +1899,12 @@ export default function InboxPage() {
                   <div key={msg.id} className={`flex ${isCustomer ? 'justify-start' : 'justify-end'} animate-fadeIn`} data-testid={`msg-${msg.id}`}>
                     <div className={editingMessageId === msg.id ? 'w-full max-w-[92%] sm:max-w-[760px]' : 'max-w-[85%] sm:max-w-[65%]'}>
                       <div className={`flex items-center gap-1.5 mb-1 ${isCustomer ? '' : 'justify-end'}`}>
-                        <span className="text-[10px] text-slate-400 font-medium">{msg.sender_name}</span>
+                        <span className="text-[10px] text-slate-400 font-medium">{participantName}</span>
+                        {groupName && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-700 font-medium" data-testid={`msg-${msg.id}-group-name`}>
+                            {groupName}
+                          </span>
+                        )}
                         {messageTime && <span className="text-[10px] text-slate-300">{messageTime}</span>}
                         {msg.edited_at && <span className="text-[10px] text-slate-300 italic">(edited)</span>}
                         {isAI && <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-50 text-purple-500 font-medium">AI {msg.ai_confidence ? `${Math.round(msg.ai_confidence * 100)}%` : ''}</span>}
@@ -1852,7 +2028,11 @@ export default function InboxPage() {
                 <div className="mb-3 flex flex-wrap gap-2">
                   {composerAttachments.map((attachment, index) => (
                     <div key={`${attachment.name || 'attachment'}-${index}`} className="relative w-16 h-16 rounded-xl overflow-hidden border border-slate-200 bg-slate-50">
-                      <img src={attachment.url} alt={attachment.name || 'attachment'} className="w-full h-full object-cover" />
+                      {attachment.type === 'video' ? (
+                        <video src={attachment.url} className="w-full h-full object-cover" muted preload="metadata" />
+                      ) : (
+                        <img src={attachment.url} alt={attachment.name || 'attachment'} className="w-full h-full object-cover" />
+                      )}
                       <button
                         type="button"
                         onClick={() => setComposerAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index))}
@@ -1876,7 +2056,7 @@ export default function InboxPage() {
                 <input
                   ref={composerFileRef}
                   type="file"
-                  accept={CHAT_IMAGE_TYPES.join(',')}
+                  accept={CHAT_MEDIA_TYPES.join(',')}
                   multiple
                   className="hidden"
                   onChange={(e) => handleComposerFiles(e.target.files)}
@@ -1885,7 +2065,7 @@ export default function InboxPage() {
                   type="button"
                   onClick={() => composerFileRef.current?.click()}
                   className="p-2 sm:p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-slate-500 hover:bg-slate-100 transition-colors flex-shrink-0"
-                  title="Attach image"
+                  title="Attach media"
                 >
                   <ImageIcon size={16} />
                 </button>
@@ -1969,22 +2149,18 @@ export default function InboxPage() {
             </div>
           )}
 
-          {/* Customer Sidebar - Desktop always visible, Mobile as overlay */}
-          {customerInfo && (
-            <>
-              {/* Mobile Overlay */}
+          {/* Customer Sidebar - opened on demand */}
               {showCustomerSidebar && (
-                <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setShowCustomerSidebar(false)} />
-              )}
+                customerInfo && customerInfo.id === selectedConvo?.customer_id ? (
+                  <>
+              <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setShowCustomerSidebar(false)} />
               <div className={`
                 fixed lg:relative inset-y-0 right-0 z-50 lg:z-0
                 w-72 flex-shrink-0 border-l border-slate-100 bg-white overflow-y-auto
-                transform transition-transform duration-300 lg:transform-none
-                ${showCustomerSidebar ? 'translate-x-0' : 'translate-x-full lg:translate-x-0'}
+                transform transition-transform duration-300 translate-x-0
               `} data-testid="customer-sidebar" ref={customerSidebarRef}>
-                {/* Mobile close button */}
-                <div className="lg:hidden h-14 px-4 flex items-center justify-between border-b border-slate-100">
-                  <span className="text-sm font-semibold text-slate-900">Customer Info</span>
+                <div className="h-14 px-4 flex items-center justify-between border-b border-slate-100">
+                  <span className="text-sm font-semibold text-slate-900">Contact Info</span>
                   <button onClick={() => setShowCustomerSidebar(false)} className="p-1.5 rounded-md hover:bg-slate-100 text-slate-400">
                     <X size={18} />
                   </button>
@@ -2054,12 +2230,12 @@ export default function InboxPage() {
 
                     {customerInfo.social_profiles && Object.keys(customerInfo.social_profiles).length > 0 && (
                       <div>
-                        <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Channel IDs</p>
+                        <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">Linked Channels</p>
                         <div className="space-y-1.5">
-                          {Object.entries(customerInfo.social_profiles).map(([platform, profileId]) => (
+                          {Object.keys(customerInfo.social_profiles).map((platform) => (
                             <div key={platform} className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
                               <p className="text-[10px] font-semibold text-slate-500 capitalize">{platform}</p>
-                              <p className="text-[11px] text-slate-700 break-all">{profileId}</p>
+                              <p className="text-[11px] text-slate-700">Connected</p>
                             </div>
                           ))}
                         </div>
@@ -2077,8 +2253,20 @@ export default function InboxPage() {
                   </div>
                 </div>
               </div>
-            </>
-          )}
+                  </>
+                ) : (
+                  <>
+              <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setShowCustomerSidebar(false)} />
+              <div className="
+                fixed lg:relative inset-y-0 right-0 z-50 lg:z-0
+                w-72 flex-shrink-0 border-l border-slate-100 bg-white
+                flex items-center justify-center px-4 text-center
+              " data-testid="customer-sidebar-loading">
+                <span className="text-xs font-medium text-slate-400">Loading contact...</span>
+              </div>
+                  </>
+                )
+              )}
         </div>
       )}
     </div>

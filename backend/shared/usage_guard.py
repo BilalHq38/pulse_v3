@@ -40,6 +40,16 @@ ReservationResult = Literal["recorded", "duplicate", "denied", "recorded_relaxed
 InboundGateResult = Literal["allow", "denied", "duplicate"]
 
 
+def conversation_limit_completed_message(limit: int, used: int | float | None = None) -> str:
+    assigned = max(0, int(limit or 0))
+    usage = "" if used is None else f" Used: {int(float(used or 0)):,}/{assigned:,}."
+    return (
+        "You cannot send this message because your conversation rate limit has been completed. "
+        f"Your assigned limit is {assigned:,} conversation{'s' if assigned != 1 else ''}."
+        f"{usage}"
+    )
+
+
 def _relaxed_billing_env() -> bool:
     for key in ("DEMO_MODE", "STRIPE_OPTIONAL"):
         raw = (os.environ.get(key, "") or "").strip().lower()
@@ -324,9 +334,7 @@ async def check_conversation_limit(request: Request) -> None:
         )
         raise HTTPException(
             status_code=429,
-            detail=(
-                f"Monthly conversation limit reached ({int(total):,}/{msg_limit:,}). Upgrade your plan to continue."
-            ),
+            detail=conversation_limit_completed_message(msg_limit, total),
         )
 
 
@@ -347,11 +355,47 @@ async def conversation_quota_allows_under_lock(conn, company_id: str) -> bool:
     return total < cap
 
 
+async def conversation_limit_status_under_lock(conn, company_id: str) -> dict[str, Any]:
+    if not company_id or _relaxed_billing_env():
+        return {"allowed": True, "used": 0, "limit": 0, "relaxed": True}
+    month_start = month_start_utc()
+    await advisory_lock_billing_month(conn, company_id, month_start)
+    sub = await conn.fetchrow(
+        "SELECT plan_code, monthly_conversation_limit FROM subscriptions WHERE company_id=$1 FOR UPDATE",
+        company_id,
+    )
+    cap = effective_monthly_conversation_limit(dict(sub) if sub else None)
+    total = await _sum_conversation_usage_month(conn, company_id, month_start)
+    return {
+        "allowed": total < cap,
+        "used": int(total),
+        "limit": int(cap),
+        "relaxed": False,
+    }
+
+
 async def conversation_quota_allows(db, company_id: str) -> bool:
     if not company_id or _relaxed_billing_env():
         return True
     async with db.transaction() as conn:
         return await conversation_quota_allows_under_lock(conn, company_id)
+
+
+async def conversation_limit_status(db, company_id: str) -> dict[str, Any]:
+    if not company_id or _relaxed_billing_env():
+        return {"allowed": True, "used": 0, "limit": 0, "relaxed": True}
+    async with db.transaction() as conn:
+        return await conversation_limit_status_under_lock(conn, company_id)
+
+
+def raise_conversation_limit_completed(status: dict[str, Any]) -> None:
+    raise HTTPException(
+        status_code=429,
+        detail=conversation_limit_completed_message(
+            int(status.get("limit") or 0),
+            status.get("used"),
+        ),
+    )
 
 
 async def reserve_conversation_usage(

@@ -4,6 +4,25 @@ import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import { BookOpen, Search, Plus, X, Eye, Edit3, Trash2, Tag, User, Calendar, Upload, FileText, Download, Users } from 'lucide-react';
 
+const CATEGORY_LABELS = {
+  getting_started: 'Getting Started',
+  integration: 'Integration',
+  ai: 'AI',
+  sales: 'Sales',
+  general: 'General',
+  troubleshooting: 'Troubleshooting',
+};
+
+function formatCategoryLabel(value) {
+  const key = String(value || '').trim().toLowerCase();
+  if (!key) return 'General';
+  return CATEGORY_LABELS[key] || key
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
 export default function KnowledgeBasePage() {
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
   // ── Tab state ──────────────────────────────────────────────
@@ -69,6 +88,14 @@ export default function KnowledgeBasePage() {
 
   const deleteDoc = async (docId) => {
     const doc = docs.find((item) => item.id === docId);
+    if (doc?.is_prebuilt) {
+      showToast({
+        type: 'warning',
+        title: 'Prebuilt Article Protected',
+        message: 'Prebuilt AI context articles cannot be deleted. Edit the article or disable AI context instead.',
+      });
+      return;
+    }
     requestConfirmation({
       title: 'Delete Article',
       description: `Delete ${doc?.title || 'this article'} from the knowledge base. This cannot be undone.`,
@@ -77,7 +104,8 @@ export default function KnowledgeBasePage() {
         try {
           await api.delete(`/knowledge-base/${docId}`);
           if (selected?.id === docId) setSelected(null);
-          loadDocs();
+          setDocs((prev) => prev.filter((item) => item.id !== docId));
+          await loadDocs();
           showToast({
             type: 'success',
             title: 'Article Deleted',
@@ -285,7 +313,7 @@ export default function KnowledgeBasePage() {
               <div className="flex gap-1 overflow-x-auto">
                 <button onClick={() => setFilterCategory('')} className={`px-3 py-1.5 text-xs rounded-lg font-medium capitalize transition-colors whitespace-nowrap ${!filterCategory ? 'bg-blue-50 text-blue-600 border border-blue-200' : 'text-slate-400 hover:text-slate-600 border border-slate-200'}`}>All</button>
                 {categories.map(c => (
-                  <button key={c} onClick={() => setFilterCategory(c)} className={`px-3 py-1.5 text-xs rounded-lg font-medium capitalize transition-colors whitespace-nowrap ${filterCategory === c ? 'bg-blue-50 text-blue-600 border border-blue-200' : 'text-slate-400 hover:text-slate-600 border border-slate-200'}`}>{c.replace('_', ' ')}</button>
+                  <button key={c} onClick={() => setFilterCategory(c)} className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors whitespace-nowrap ${filterCategory === c ? 'bg-blue-50 text-blue-600 border border-blue-200' : 'text-slate-400 hover:text-slate-600 border border-slate-200'}`}>{formatCategoryLabel(c)}</button>
                 ))}
               </div>
             </div>
@@ -309,7 +337,7 @@ export default function KnowledgeBasePage() {
               <div key={doc.id} className="bg-white border border-slate-100 rounded-xl p-5 hover:border-blue-200 transition-all group" data-testid={`kb-doc-${doc.id}`}>
                 <div className="flex items-start justify-between mb-3">
                   <div className="flex items-center gap-2">
-                    <span className="text-[10px] px-2 py-0.5 rounded bg-blue-50 text-blue-600 capitalize">{doc.category?.replace('_', ' ')}</span>
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-blue-50 text-blue-600">{formatCategoryLabel(doc.category)}</span>
                     {doc.is_prebuilt && <span className="text-[10px] px-2 py-0.5 rounded bg-violet-50 text-violet-700">Prebuilt</span>}
                   </div>
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -424,7 +452,7 @@ export default function KnowledgeBasePage() {
             <div className="p-6">
               <div className="flex items-start justify-between mb-6">
                 <div>
-                  <span className="text-[10px] px-2 py-0.5 rounded bg-blue-50 text-blue-600 capitalize">{selected.category?.replace('_', ' ')}</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-blue-50 text-blue-600">{formatCategoryLabel(selected.category)}</span>
                   {selected.is_prebuilt && <span className="ml-2 text-[10px] px-2 py-0.5 rounded bg-violet-50 text-violet-700">Prebuilt</span>}
                   <h3 className="text-xl font-bold text-slate-900 mt-2">{selected.title}</h3>
                   <div className="flex items-center gap-3 mt-2 text-xs text-slate-400">
@@ -504,7 +532,7 @@ export default function KnowledgeBasePage() {
               <div className="space-y-4">
                 <input value={form.title} onChange={(e) => setForm({...form, title: e.target.value})} placeholder="Article Title *" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-title" required />
                 <select value={form.category} onChange={(e) => setForm({...form, category: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-category">
-                  {categories.map(c => <option key={c} value={c}>{c.replace('_', ' ')}</option>)}
+                  {categories.map(c => <option key={c} value={c}>{formatCategoryLabel(c)}</option>)}
                 </select>
                 <textarea value={form.content} onChange={(e) => setForm({...form, content: e.target.value})} placeholder="Article content..." rows={10} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20 resize-none" data-testid="kb-form-content" />
                 <textarea value={form.key_points} onChange={(e) => setForm({...form, key_points: e.target.value})} placeholder="Key points / how AI should use this article..." rows={4} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20 resize-none" />

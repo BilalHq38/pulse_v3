@@ -1,10 +1,12 @@
 """routers/conversations.py - PostgreSQL version."""
 
 import logging
+import re
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from agent_orchestrator.agents.adaptive_qualification import _update_qualification_silently
 from agent_orchestrator.schemas import MessageWorkflowRequest
@@ -49,14 +51,29 @@ from services.db_helpers import (
     rs,
     save_message_attachments,
 )
+from services.messaging_service import _persist_outbound_message_state
 from services.lead_stage_service import apply_message_stage_transition
 from services.media_storage import serve_stored_media
 
-from shared.usage_guard import check_conversation_limit, reserve_conversation_usage
+from shared.usage_guard import (
+    conversation_limit_completed_message,
+    conversation_limit_status,
+    raise_conversation_limit_completed,
+    reserve_conversation_usage,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-_send_message_dep = Depends(check_conversation_limit)
+
+async def _reserve_outbound_or_raise(db, company_id: str, *, channel: str, idempotency_key: str) -> None:
+    reservation = await reserve_conversation_usage(
+        db,
+        company_id,
+        channel=channel,
+        idempotency_key=idempotency_key,
+    )
+    if reservation == "denied":
+        raise_conversation_limit_completed(await conversation_limit_status(db, company_id))
 
 CONVERSATION_UPDATE_FIELDS = {
     "subject",
@@ -129,6 +146,36 @@ def _resolve_conversation_recipient(channel: str, convo: dict, customer: dict) -
     return ""
 
 
+def _email_sender_label(company_name: str, fallback: str = "") -> str:
+    base = " ".join(str(company_name or fallback or "Business").replace("\r", " ").replace("\n", " ").split()).strip()
+    return f"Message from {base or 'Business'}"
+
+
+def _clean_email_subject(subject: str, company_name: str) -> str:
+    value = re.sub(r"\s+", " ", str(subject or "").replace("\r", " ").replace("\n", " ")).strip()
+    value = re.sub(r"\s*\([^)]*(?:inbox|channel|_)[^)]*\)\s*", " ", value, flags=re.IGNORECASE).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"^(?:re:\s*)+", "", value, flags=re.IGNORECASE).strip()
+    if not value or re.search(r"\binbox_[a-z0-9_+-]+\b", value, re.IGNORECASE):
+        return _email_sender_label(company_name)
+    return value
+
+
+def _reply_email_subject(subject: str, company_name: str) -> str:
+    cleaned = _clean_email_subject(subject, company_name)
+    default_subject = _email_sender_label(company_name)
+    return cleaned if cleaned == default_subject else f"Re: {cleaned}"
+
+
+async def _company_email_sender_name(db, company_id: str) -> str:
+    if not company_id:
+        return _email_sender_label("")
+    company_name = str(
+        await db.fetchval("SELECT NULLIF(BTRIM(name), '') FROM companies WHERE id=$1 LIMIT 1", company_id) or ""
+    )
+    return _email_sender_label(company_name)
+
+
 async def _mark_outbound_message_failed(
     db,
     *,
@@ -141,11 +188,11 @@ async def _mark_outbound_message_failed(
     if not db or not scoped_company_id or not local_message_id:
         return
     try:
-        await db.execute(
-            "UPDATE messages SET delivery_status='failed', failed_at=COALESCE(failed_at, NOW()), updated_at=NOW() "
-            "WHERE id=$1 AND company_id=$2",
-            local_message_id,
-            scoped_company_id,
+        await _persist_outbound_message_state(
+            db,
+            company_id=scoped_company_id,
+            db_message_id=local_message_id,
+            delivery_status="failed",
         )
     except Exception as exc:
         logger.warning(
@@ -246,7 +293,87 @@ async def _send_outbound_via_channel_layer(
         attachments=attachments or [],
         db_message_id=db_message_id,
     )
+    if result.success:
+        await _persist_outbound_message_state(
+            db,
+            company_id=company_id,
+            db_message_id=db_message_id,
+            delivery_status="sent",
+            external_message_id=str(result.external_message_id or ""),
+        )
+    else:
+        await _persist_outbound_message_state(
+            db,
+            company_id=company_id,
+            db_message_id=db_message_id,
+            delivery_status="failed",
+        )
     return bool(result.success), str(result.error or "")
+
+
+_INBOX_VISIBILITY_SCHEMA_READY = False
+
+
+async def _ensure_inbox_visibility_schema(db) -> None:
+    global _INBOX_VISIBILITY_SCHEMA_READY
+    if _INBOX_VISIBILITY_SCHEMA_READY:
+        return
+    statements = (
+        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "CREATE INDEX IF NOT EXISTS idx_customer_channels_visible_channel ON customer_channels(channel, is_active, is_visible)",
+        "CREATE INDEX IF NOT EXISTS idx_customer_social_profiles_visible_platform ON customer_social_profiles(platform, is_active, is_visible)",
+    )
+    for statement in statements:
+        await db.execute(statement)
+    _INBOX_VISIBILITY_SCHEMA_READY = True
+
+
+async def _ensure_visible_social_conversations(db, company_id: str) -> None:
+    scoped_company_id = str(company_id or "").strip()
+    if not scoped_company_id:
+        return
+    await _ensure_inbox_visibility_schema(db)
+    rows = await db.fetch(
+        "SELECT c.id AS customer_id,c.name AS customer_name,c.avatar,cc.channel,"
+        "COALESCE(csp.profile_id,'') AS channel_id "
+        "FROM customers c "
+        "JOIN customer_channels cc ON cc.customer_id=c.id "
+        "LEFT JOIN customer_social_profiles csp ON csp.customer_id=c.id AND csp.platform=cc.channel "
+        "WHERE c.company_id=$1 AND cc.channel IN ('facebook','instagram') "
+        "AND cc.is_active=TRUE AND cc.is_visible=TRUE "
+        "AND COALESCE(csp.is_active, TRUE)=TRUE AND COALESCE(csp.is_visible, TRUE)=TRUE "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM conversations x "
+        "  WHERE x.company_id=c.company_id AND x.customer_id=c.id AND x.channel=cc.channel "
+        "  AND x.status=ANY($2)"
+        ") "
+        "ORDER BY c.updated_at DESC LIMIT 200",
+        scoped_company_id,
+        ["open", "pending", "escalated"],
+    )
+    for row in rows or []:
+        await db.execute(
+            "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,channel_id,"
+            "subject,status,priority,assigned_to,assigned_name,ai_handled,sentiment_score,sentiment_label,"
+            "message_count,last_message,last_message_at,unread_count,created_at,updated_at) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,'open','medium','','',TRUE,0,'neutral',0,'',NOW(),0,NOW(),NOW()) "
+            "ON CONFLICT DO NOTHING",
+            make_id(),
+            scoped_company_id,
+            row["customer_id"],
+            row["customer_name"] or "Unknown Contact",
+            row["avatar"] or "",
+            row["channel"],
+            row["channel_id"] or "",
+            f"New {format_channel_name(row['channel'])} conversation",
+        )
 
 
 def _float_or_none(value) -> Optional[float]:
@@ -266,6 +393,9 @@ def _message_preview(content: str, attachments: Optional[list], sender_type: str
     has_image = any(str(item.get("type") or item.get("file_type") or "").lower() == "image" for item in normalized)
     if has_image:
         return "Received image" if sender_type == "customer" else "Sent image"
+    has_video = any(str(item.get("type") or item.get("file_type") or "").lower() == "video" for item in normalized)
+    if has_video:
+        return "Received video" if sender_type == "customer" else "Sent video"
     return "Received attachment" if sender_type == "customer" else "Sent attachment"
 
 
@@ -346,7 +476,12 @@ def _decorate_conversation_channel_status(conversation: dict, statuses: dict) ->
 
 
 @router.get("/conversations")
-async def list_conversations(request: Request, status: Optional[str] = None, channel: Optional[str] = None):
+async def list_conversations(
+    request: Request,
+    status: Optional[str] = None,
+    channel: Optional[str] = None,
+    inbox_filter: Optional[str] = None,
+):
     db = _db(request)
     cu = await get_current_user_flexible(request)
     cid = get_company_id(cu)
@@ -358,12 +493,54 @@ async def list_conversations(request: Request, status: Optional[str] = None, cha
         args.append(cid)
     else:
         return []
+    await _ensure_visible_social_conversations(db, cid)
     if status:
         where.append(f"c.status=${len(args) + 1}")
         args.append(status)
     if channel:
         where.append(f"c.channel=${len(args) + 1}")
         args.append(channel)
+    normalized_filter = str(inbox_filter or "").strip().lower().replace("-", "_")
+    aliases = {
+        "incoming": "incoming_messages",
+        "incoming_messages": "incoming_messages",
+        "active": "active_conversations",
+        "active_conversations": "active_conversations",
+        "pending": "pending_replies",
+        "pending_replies": "pending_replies",
+        "ai": "ai_chats",
+        "ai_chat": "ai_chats",
+        "ai_chats": "ai_chats",
+        "human": "human_chats",
+        "human_chat": "human_chats",
+        "human_chats": "human_chats",
+        "unread": "unread",
+    }
+    normalized_filter = aliases.get(normalized_filter, "")
+    active_statuses = ["open", "pending", "escalated"]
+    if normalized_filter in {"active_conversations", "pending_replies", "ai_chats", "human_chats"}:
+        where.append(f"c.status=ANY(${len(args) + 1})")
+        args.append(active_statuses)
+    if normalized_filter == "incoming_messages":
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        where.append(
+            "EXISTS (SELECT 1 FROM messages m "
+            "WHERE m.company_id=c.company_id AND m.conversation_id=c.id "
+            f"AND m.sender_type='customer' AND m.created_at >= ${len(args) + 1})"
+        )
+        args.append(today_start)
+    elif normalized_filter == "pending_replies":
+        where.append(
+            "(SELECT m.sender_type FROM messages m "
+            "WHERE m.company_id=c.company_id AND m.conversation_id=c.id "
+            "ORDER BY m.created_at DESC LIMIT 1)='customer'"
+        )
+    elif normalized_filter == "ai_chats":
+        where.append("c.ai_handled=TRUE")
+    elif normalized_filter == "human_chats":
+        where.append("c.ai_handled=FALSE")
+    elif normalized_filter == "unread":
+        where.append("c.unread_count > 0")
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY c.last_message_at DESC LIMIT 500"
@@ -395,7 +572,7 @@ async def start_conversation(request: Request):
     return {"conversation": convo, "customer": customer}
 
 
-@router.post("/conversations/start-outbound", dependencies=[_send_message_dep])
+@router.post("/conversations/start-outbound")
 async def start_outbound_conversation(request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
@@ -452,15 +629,24 @@ async def start_outbound_conversation(request: Request):
     )
 
     msg_id = make_id()
+    await _reserve_outbound_or_raise(
+        db,
+        cid,
+        channel=channel,
+        idempotency_key=f"api:{cid}:msg:{msg_id}",
+    )
+    company_sender_name = await _company_email_sender_name(db, cid) if channel == "email" else ""
+    message_sender_name = company_sender_name or cu.get("name", "") or cu.get("email", "")
     await db.execute(
-        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,read,created_at) "
-        "VALUES($1,$2,$3,$4,'agent',$5,$6,FALSE,NOW())",
+        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
+        "delivery_status,read,created_at) "
+        "VALUES($1,$2,$3,$4,'agent',$5,$6,'sending',FALSE,NOW())",
         msg_id,
         cu.get("company_id", ""),
         convo["id"],
         initial_message,
         cu.get("sub", ""),
-        cu.get("name", ""),
+        message_sender_name,
     )
 
     outbound_recipient = contact_ref if channel == "whatsapp" else recipient_id
@@ -482,6 +668,7 @@ async def start_outbound_conversation(request: Request):
             "normalized_sender_id": outbound_recipient,
             "selected_outbound_recipient": outbound_recipient,
         },
+        subject=_email_sender_label(company_sender_name.replace("Message from ", "", 1)) if channel == "email" else "",
     )
     await db.execute(
         "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,ai_handled=FALSE "
@@ -497,20 +684,10 @@ async def start_outbound_conversation(request: Request):
             "conversation_id": convo["id"],
             "content": initial_message,
             "sender_type": "agent",
-            "sender_name": cu.get("name", ""),
+            "sender_name": message_sender_name,
             "created_at": now_ts(),
         },
     )
-    if sent:
-        res = await reserve_conversation_usage(
-            db,
-            cid,
-            channel=channel,
-            idempotency_key=f"api:{cid}:msg:{msg_id}",
-        )
-        if res == "denied":
-            await db.execute("DELETE FROM messages WHERE id=$1 AND company_id=$2", msg_id, cid)
-            raise HTTPException(429, "Monthly conversation limit reached")
     updated_convo = r(
         await db.fetchrow(
             "SELECT * FROM conversations WHERE id=$1 AND company_id=$2",
@@ -699,7 +876,7 @@ async def get_conversation_attachment_media(company_id: str, filename: str) -> F
     return serve_stored_media(category="message-attachments", company_id=company_id, filename=filename)
 
 
-@router.post("/conversations/{convo_id}/messages", dependencies=[_send_message_dep])
+@router.post("/conversations/{convo_id}/messages")
 async def send_message(convo_id: str, request: Request):
     db = _db(request)
     cu = await get_current_user_flexible(request)
@@ -730,23 +907,39 @@ async def send_message(convo_id: str, request: Request):
     trace_id = _trace_id_from_context()
     outbound_delivered = True
     outbound_error = ""
+    outbound_channel_name = str(convo.get("channel") or "")
+    is_outbound_agent_message = sender_type == "agent" and outbound_channel_name in ("whatsapp", "facebook", "instagram", "email")
+    if sender_type == "agent":
+        await _reserve_outbound_or_raise(
+            db,
+            company_id,
+            channel=str(convo.get("channel") or "web_chat"),
+            idempotency_key=f"api:{company_id}:msg:{msg_id}",
+        )
+    company_sender_name = await _company_email_sender_name(db, company_id) if outbound_channel_name == "email" else ""
+    message_sender_name = (
+        company_sender_name
+        if sender_type == "agent" and outbound_channel_name == "email"
+        else (cu.get("name", "") if sender_type != "customer" else convo.get("customer_name", ""))
+    ) or cu.get("email", "")
 
     await db.execute(
         "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
-        "sentiment_score,sentiment_emotion,sentiment_confidence,intent_type,intent_confidence,read,created_at) "
-        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,NOW())",
+        "sentiment_score,sentiment_emotion,sentiment_confidence,intent_type,intent_confidence,delivery_status,read,created_at) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,NOW())",
         msg_id,
         company_id,
         convo_id,
         content,
         sender_type,
         cu["sub"] if sender_type != "customer" else convo.get("customer_id", ""),
-        cu.get("name", "") if sender_type != "customer" else convo.get("customer_name", ""),
+        message_sender_name,
         sent_score,
         sent_emotion,
         sent_conf,
         intent_type,
         intent_conf,
+        "sending" if is_outbound_agent_message else "pending",
     )
     saved_attachments = await save_message_attachments(db, msg_id, attachments)
     preview = _message_preview(content, saved_attachments, sender_type)
@@ -758,7 +951,7 @@ async def send_message(convo_id: str, request: Request):
             "conversation_id": convo_id,
             "content": content,
             "sender_type": sender_type,
-            "sender_name": cu.get("name", "") if sender_type != "customer" else convo.get("customer_name", ""),
+            "sender_name": message_sender_name,
             "attachments": saved_attachments,
             "created_at": now_ts(),
         },
@@ -771,7 +964,7 @@ async def send_message(convo_id: str, request: Request):
         convo_id,
         sender_type == "agent",
     )
-    if sender_type in ("customer", "agent"):
+    if sender_type == "customer":
         res = await reserve_conversation_usage(
             db,
             company_id,
@@ -779,93 +972,123 @@ async def send_message(convo_id: str, request: Request):
             idempotency_key=f"api:{company_id}:msg:{msg_id}",
         )
         if res == "denied":
-            await db.execute("DELETE FROM messages WHERE id=$1 AND company_id=$2", msg_id, company_id)
-            raise HTTPException(
-                429,
-                "Monthly conversation limit reached. Upgrade your plan to continue.",
+            logger.info(
+                "Inbound customer message accepted without usage increment because conversation limit is exhausted company_id=%s conversation_id=%s message_id=%s",
+                company_id,
+                convo_id,
+                msg_id,
             )
     workflow = None
     support_plan: dict = {}
     capture: dict = {}
     intent: dict = {}
+    outbound_limit_exhausted = False
     if sender_type == "customer":
-        try:
-            cust_full = r(
-                await db.fetchrow(
-                    "SELECT * FROM customers WHERE id=$1 LIMIT 1",
-                    convo.get("customer_id", ""),
-                )
-            )
-            msgs_history = await fetch_messages_with_attachments(db, convo_id, limit=20)
-            workflow = await orchestrate_message_workflow(
-                MessageWorkflowRequest(
-                    trace_id=trace_id,
-                    company_id=company_id,
-                    conversation_id=convo_id,
-                    customer_id=convo.get("customer_id", ""),
-                    message_id=msg_id,
-                    channel=str(convo.get("channel") or "web_chat"),
-                    source=str(convo.get("channel") or "conversation"),
-                    message_text=content,
-                    sender_name=str(convo.get("customer_name") or ""),
-                    actor_user_id=cu.get("sub", ""),
-                    actor_user_role=cu.get("role", ""),
-                    conversation_context=msgs_history,
-                    customer=cust_full or {},
-                    metadata={"source": "send_message", "trace_id": trace_id},
-                ),
-                authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
-                db=db,
-            )
-            capture = workflow.agent_outputs.capture
-            support_plan = workflow.agent_outputs.support
-            sentiment = dict(capture.get("sentiment") or {})
-            conversation_sentiment = dict(capture.get("conversation_sentiment") or {})
-            intent = dict(capture.get("intent") or {})
-            sentiment_gate = dict(capture.get("sentiment_gate") or {}) or build_sentiment_gate(content, sentiment)
-            sent_score = _float_or_none(sentiment.get("score"))
-            sent_emotion = str(sentiment.get("emotion", "neutral"))
-            sent_conf = _float_or_none(sentiment.get("confidence"))
-            intent_type = str(intent.get("intent", ""))
-            intent_conf = _float_or_none(intent.get("confidence"))
-            await db.execute(
-                "UPDATE messages SET sentiment_score=$1,sentiment_emotion=$2,sentiment_confidence=$3,"
-                "intent_type=$4,intent_confidence=$5 WHERE id=$6",
-                sent_score,
-                sent_emotion,
-                sent_conf,
-                intent_type,
-                intent_conf,
-                msg_id,
-            )
-            conversation_score = _float_or_none((conversation_sentiment or {}).get("score"))
-            conversation_label = str(
-                (conversation_sentiment or {}).get("sentiment_label")
-                or (conversation_sentiment or {}).get("label")
-                or (conversation_sentiment or {}).get("emotion")
-                or sent_emotion
-                or "neutral"
-            )
-            await db.execute(
-                "UPDATE conversations SET sentiment_score=$1,sentiment_label=$2 WHERE id=$3",
-                conversation_score,
-                conversation_label,
+        limit_state = await conversation_limit_status(db, company_id)
+        outbound_limit_exhausted = not bool(limit_state.get("allowed", True))
+        if outbound_limit_exhausted:
+            logger.info(
+                "Skipping customer-triggered AI workflow because conversation outbound limit is exhausted company_id=%s conversation_id=%s limit=%s used=%s",
+                company_id,
                 convo_id,
+                limit_state.get("limit"),
+                limit_state.get("used"),
             )
-            if not sentiment_gate.get("ai_response_allowed", True):
-                for tag in ["toxic", "escalating"]:
-                    await db.execute(
-                        "INSERT INTO conversation_tags(conversation_id,tag) VALUES($1,$2) ON CONFLICT DO NOTHING",
-                        convo_id,
-                        tag,
+            sentiment_gate = {
+                **sentiment_gate,
+                "ai_response_allowed": False,
+                "rate_limit_exhausted": True,
+                "message": conversation_limit_completed_message(
+                    int(limit_state.get("limit") or 0),
+                    limit_state.get("used"),
+                ),
+            }
+        else:
+            try:
+                cust_full = r(
+                    await db.fetchrow(
+                        "SELECT * FROM customers WHERE id=$1 LIMIT 1",
+                        convo.get("customer_id", ""),
                     )
-                if dict(sentiment_gate.get("risk_flags") or {}).get("possible_hate_speech"):
-                    await db.execute(
-                        "INSERT INTO conversation_tags(conversation_id,tag) VALUES($1,'possible-hate-speech') ON CONFLICT DO NOTHING",  # noqa: E501
-                        convo_id,
-                    )
-        except Exception as e:
-            logger.error(f"Message orchestration failed: {e}")
+                )
+                msgs_history = await fetch_messages_with_attachments(
+                    db,
+                    convo_id,
+                    limit=500,
+                    since_days=10,
+                    company_id=company_id,
+                    customer_id=str(convo.get("customer_id") or ""),
+                    include_linked_profiles=True,
+                )
+                workflow = await orchestrate_message_workflow(
+                    MessageWorkflowRequest(
+                        trace_id=trace_id,
+                        company_id=company_id,
+                        conversation_id=convo_id,
+                        customer_id=convo.get("customer_id", ""),
+                        message_id=msg_id,
+                        channel=str(convo.get("channel") or "web_chat"),
+                        source=str(convo.get("channel") or "conversation"),
+                        message_text=content,
+                        sender_name=str(convo.get("customer_name") or ""),
+                        actor_user_id=cu.get("sub", ""),
+                        actor_user_role=cu.get("role", ""),
+                        conversation_context=msgs_history,
+                        customer=cust_full or {},
+                        metadata={"source": "send_message", "trace_id": trace_id},
+                    ),
+                    authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
+                    db=db,
+                )
+                capture = workflow.agent_outputs.capture
+                support_plan = workflow.agent_outputs.support
+                sentiment = dict(capture.get("sentiment") or {})
+                conversation_sentiment = dict(capture.get("conversation_sentiment") or {})
+                intent = dict(capture.get("intent") or {})
+                sentiment_gate = dict(capture.get("sentiment_gate") or {}) or build_sentiment_gate(content, sentiment)
+                sent_score = _float_or_none(sentiment.get("score"))
+                sent_emotion = str(sentiment.get("emotion", "neutral"))
+                sent_conf = _float_or_none(sentiment.get("confidence"))
+                intent_type = str(intent.get("intent", ""))
+                intent_conf = _float_or_none(intent.get("confidence"))
+                await db.execute(
+                    "UPDATE messages SET sentiment_score=$1,sentiment_emotion=$2,sentiment_confidence=$3,"
+                    "intent_type=$4,intent_confidence=$5 WHERE id=$6",
+                    sent_score,
+                    sent_emotion,
+                    sent_conf,
+                    intent_type,
+                    intent_conf,
+                    msg_id,
+                )
+                conversation_score = _float_or_none((conversation_sentiment or {}).get("score"))
+                conversation_label = str(
+                    (conversation_sentiment or {}).get("sentiment_label")
+                    or (conversation_sentiment or {}).get("label")
+                    or (conversation_sentiment or {}).get("emotion")
+                    or sent_emotion
+                    or "neutral"
+                )
+                await db.execute(
+                    "UPDATE conversations SET sentiment_score=$1,sentiment_label=$2 WHERE id=$3",
+                    conversation_score,
+                    conversation_label,
+                    convo_id,
+                )
+                if not sentiment_gate.get("ai_response_allowed", True):
+                    for tag in ["toxic", "escalating"]:
+                        await db.execute(
+                            "INSERT INTO conversation_tags(conversation_id,tag) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                            convo_id,
+                            tag,
+                        )
+                    if dict(sentiment_gate.get("risk_flags") or {}).get("possible_hate_speech"):
+                        await db.execute(
+                            "INSERT INTO conversation_tags(conversation_id,tag) VALUES($1,'possible-hate-speech') ON CONFLICT DO NOTHING",  # noqa: E501
+                            convo_id,
+                        )
+            except Exception as e:
+                logger.error(f"Message orchestration failed: {e}")
     message = await _load_message_with_attachments(db, msg_id)
     await emit_new_message(convo_id, message)
     if sender_type in {"agent", "customer"}:
@@ -932,16 +1155,12 @@ async def send_message(convo_id: str, request: Request):
             )
             or {}
         )
-        outbound_channel = str(convo.get("channel") or "")
+        outbound_channel = outbound_channel_name
         recipient_id = _resolve_conversation_recipient(outbound_channel, convo, cust)
         outbound_attachments = saved_attachments if outbound_channel == "whatsapp" else []
         outbound_subject = ""
         if outbound_channel == "email":
-            base_subj = str(convo.get("subject") or "").strip()
-            if base_subj:
-                outbound_subject = base_subj if base_subj.lower().startswith("re:") else f"Re: {base_subj}"
-            else:
-                outbound_subject = "Re: your message"
+            outbound_subject = _reply_email_subject(str(convo.get("subject") or ""), company_sender_name.replace("Message from ", "", 1))
         sent, error = await _send_outbound_via_channel_layer(
             db=db,
             company_id=company_id,
@@ -978,6 +1197,7 @@ async def send_message(convo_id: str, request: Request):
     cust_full = None
     if (
         sender_type == "customer"
+        and not outbound_limit_exhausted
         and convo.get("ai_handled", True)
         and not conversation_ai_auto_paused(convo)
         and await is_company_ai_enabled(db, company_id)
@@ -1073,14 +1293,48 @@ async def send_message(convo_id: str, request: Request):
                 ai_started_at = time.monotonic()
                 await wait_for_ai_response_timing(content, ai_started_at)
                 ai_id = make_id()
+                ai_reservation = await reserve_conversation_usage(
+                    db,
+                    company_id,
+                    channel=str(convo.get("channel") or "web_chat"),
+                    idempotency_key=f"api:{company_id}:ai:{ai_id}",
+                )
+                if ai_reservation == "denied":
+                    limit_state = await conversation_limit_status(db, company_id)
+                    logger.info(
+                        "AI auto-response blocked by conversation limit company_id=%s conversation_id=%s limit=%s used=%s",
+                        company_id,
+                        convo_id,
+                        limit_state.get("limit"),
+                        limit_state.get("used"),
+                    )
+                    return {
+                        "message": message,
+                        "ai_response": None,
+                        "sentiment_analysis": {
+                            **sentiment_gate,
+                            "ai_response_allowed": False,
+                            "rate_limit_exhausted": True,
+                            "message": conversation_limit_completed_message(
+                                int(limit_state.get("limit") or 0),
+                                limit_state.get("used"),
+                            ),
+                        },
+                    }
+                outbound_channel = str(convo.get("channel") or "")
+                ai_sender_name = company_sender_name if outbound_channel == "email" else "AI Assistant"
+                ai_delivery_status = "sending" if outbound_channel in ("whatsapp", "facebook", "instagram", "email") else "pending"
                 await db.execute(
-                    "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,read,created_at) "  # noqa: E501
-                    "VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,FALSE,NOW())",
+                    "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
+                    "ai_confidence,delivery_status,read,created_at) "
+                    "VALUES($1,$2,$3,$4,'ai','ai-assistant',$5,$6,$7,FALSE,NOW())",
                     ai_id,
                     company_id,
                     convo_id,
                     result["response"],
+                    ai_sender_name,
                     float(result.get("confidence", 0.0) or 0.0),
+                    ai_delivery_status,
                 )
                 ai_attachments = await save_message_attachments(
                     db,
@@ -1095,7 +1349,7 @@ async def send_message(convo_id: str, request: Request):
                         "conversation_id": convo_id,
                         "content": result["response"],
                         "sender_type": "ai",
-                        "sender_name": "AI Assistant",
+                        "sender_name": ai_sender_name,
                         "attachments": ai_attachments,
                         "created_at": now_ts(),
                     },
@@ -1132,7 +1386,6 @@ async def send_message(convo_id: str, request: Request):
                 )
                 ai_response = await _load_message_with_attachments(db, ai_id)
                 await emit_new_message(convo_id, ai_response)
-                outbound_channel = str(convo.get("channel") or "")
                 if outbound_channel in ("whatsapp", "facebook", "instagram", "email"):
                     recipient_id = _resolve_conversation_recipient(
                         outbound_channel,
@@ -1143,8 +1396,7 @@ async def send_message(convo_id: str, request: Request):
                         outbound_attachments = ai_attachments if outbound_channel == "whatsapp" else []
                         ai_subject = ""
                         if outbound_channel == "email":
-                            base_subj = str(convo.get("subject") or "").strip()
-                            ai_subject = base_subj if base_subj.lower().startswith("re:") else (f"Re: {base_subj}" if base_subj else "Re: your message")
+                            ai_subject = _reply_email_subject(str(convo.get("subject") or ""), company_sender_name.replace("Message from ", "", 1))
                         sent, error = await _send_outbound_via_channel_layer(
                             db=db,
                             company_id=company_id,
@@ -1173,6 +1425,13 @@ async def send_message(convo_id: str, request: Request):
                                 outbound_channel,
                                 error,
                             )
+                    else:
+                        await _persist_outbound_message_state(
+                            db,
+                            company_id=company_id,
+                            db_message_id=ai_id,
+                            delivery_status="failed",
+                        )
                 lead_for_qualification = dict(capture.get("lead") or {})
                 if not lead_for_qualification and cust_full:
                     lead_for_qualification = {"id": str(cust_full.get("lead_id") or "")}
@@ -1490,7 +1749,15 @@ async def _run_manual_ai_response_workflow(
             )
         raise HTTPException(409, convo.get("ai_paused_reason") or AI_API_EXHAUSTED_MANUAL_MESSAGE)
     trace_id = trace_id or _trace_id_from_context()
-    msgs_history = await fetch_messages_with_attachments(db, convo_id, limit=20)
+    msgs_history = await fetch_messages_with_attachments(
+        db,
+        convo_id,
+        limit=500,
+        since_days=10,
+        company_id=company_id,
+        customer_id=str(convo.get("customer_id") or ""),
+        include_linked_profiles=True,
+    )
     cust = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1 LIMIT 1", convo.get("customer_id", "")))
     last_cust_msg_record = next(
         (dict(m or {}) for m in reversed(msgs_history) if (m or {}).get("sender_type") == "customer"),
@@ -1650,14 +1917,27 @@ async def _run_manual_ai_response_workflow(
     if not result.get("response"):
         raise HTTPException(409, "AI response withheld for manual review.")
     ai_id = make_id()
+    outbound_channel = str(convo.get("channel") or "")
+    await _reserve_outbound_or_raise(
+        db,
+        company_id,
+        channel=outbound_channel or "web_chat",
+        idempotency_key=f"api:{company_id}:manual-ai:{ai_id}",
+    )
+    company_sender_name = await _company_email_sender_name(db, company_id) if outbound_channel == "email" else ""
+    ai_sender_name = company_sender_name if outbound_channel == "email" else "AI Assistant"
+    ai_delivery_status = "sending" if outbound_channel in ("whatsapp", "facebook", "instagram", "email") else "pending"
     await db.execute(
-        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,read,created_at) "  # noqa: E501
-        "VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,FALSE,NOW())",
+        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
+        "ai_confidence,delivery_status,read,created_at) "
+        "VALUES($1,$2,$3,$4,'ai','ai-assistant',$5,$6,$7,FALSE,NOW())",
         ai_id,
         company_id,
         convo_id,
         result["response"],
+        ai_sender_name,
         float(result.get("confidence", 0.0) or 0.0),
+        ai_delivery_status,
     )
     ai_attachments = await save_message_attachments(
         db,
@@ -1672,7 +1952,7 @@ async def _run_manual_ai_response_workflow(
             "conversation_id": convo_id,
             "content": result["response"],
             "sender_type": "ai",
-            "sender_name": "AI Assistant",
+            "sender_name": ai_sender_name,
             "attachments": ai_attachments,
             "created_at": now_ts(),
         },
@@ -1707,15 +1987,13 @@ async def _run_manual_ai_response_workflow(
     )
     ai_msg = await _load_message_with_attachments(db, ai_id)
     await emit_new_message(convo_id, ai_msg)
-    outbound_channel = str(convo.get("channel") or "")
     if outbound_channel in ("whatsapp", "facebook", "instagram", "email"):
         recipient_id = _resolve_conversation_recipient(outbound_channel, convo, cust or {})
         if recipient_id:
             outbound_attachments = ai_attachments if outbound_channel == "whatsapp" else []
             ai_subject = ""
             if outbound_channel == "email":
-                base_subj = str(convo.get("subject") or "").strip()
-                ai_subject = base_subj if base_subj.lower().startswith("re:") else (f"Re: {base_subj}" if base_subj else "Re: your message")
+                ai_subject = _reply_email_subject(str(convo.get("subject") or ""), company_sender_name.replace("Message from ", "", 1))
             sent, error = await _send_outbound_via_channel_layer(
                 db=db,
                 company_id=company_id,
@@ -1744,6 +2022,13 @@ async def _run_manual_ai_response_workflow(
                     outbound_channel,
                     error,
                 )
+        else:
+            await _persist_outbound_message_state(
+                db,
+                company_id=company_id,
+                db_message_id=ai_id,
+                delivery_status="failed",
+            )
     return ai_msg
 
 
@@ -1824,22 +2109,13 @@ async def send_email_message(request: Request):
     if not content:
         raise HTTPException(400, "Email body is required")
     company_id = get_company_id(current_user)
-    email_task_id = make_id()
-    create_safe_detached_task(
+    await send_tenant_email_async(
         db,
-        send_tenant_email_async(
-            db,
-            company_id,
-            to_email=to_email,
-            subject=subject,
-            body=content,
-            html_body=html_body,
-            raise_on_failure=False,
-        ),
-        name=f"tenant-email-send-{email_task_id}",
-        event_id=email_task_id,
-        company_id=company_id,
-        channel="email",
-        metadata={"source": "manual_email_send"},
+        company_id,
+        to_email=to_email,
+        subject=subject,
+        body=content,
+        html_body=html_body,
+        raise_on_failure=True,
     )
-    return {"status": "queued", "to_email": to_email}
+    return {"status": "sent", "to_email": to_email}
