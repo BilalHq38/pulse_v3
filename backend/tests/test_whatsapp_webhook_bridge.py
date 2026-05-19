@@ -68,6 +68,84 @@ def test_whatsapp_bridge_outbound_message_is_detected_from_web_bridge_metadata()
     )
 
 
+def test_whatsapp_reaction_only_payload_is_ignored_before_resolution(monkeypatch):
+    asyncio.run(_run_whatsapp_reaction_only_payload_is_ignored_before_resolution(monkeypatch))
+
+
+async def _run_whatsapp_reaction_only_payload_is_ignored_before_resolution(monkeypatch):
+    def fail_registry():
+        raise AssertionError("registry should not be used for reaction-only payloads")
+
+    monkeypatch.setattr(webhooks, "get_channel_registry", fail_registry)
+    result = await webhooks._handle_whatsapp_webhook_payload(
+        object(),
+        {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "metadata": {"source": "whatsapp_web_bridge"},
+                                "messages": [
+                                    {
+                                        "id": "reaction-1",
+                                        "type": "reaction",
+                                        "reaction": {"message_id": "wamid.1", "emoji": "👍"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        event_id="evt-reaction",
+        return_results=True,
+    )
+
+    assert result["processed"] is True
+    assert result["status"] == "ignored_reaction"
+    assert result["results"][0]["reason"] == "whatsapp_reactions_disabled"
+
+
+class _QueuedReactionDb:
+    def __init__(self):
+        self.updated = []
+
+    async def fetch(self, *_args):
+        return [
+            {
+                "channel": "whatsapp",
+                "event_id": "evt-reaction",
+                "retry_count": 0,
+                "raw_payload": (
+                    '{"entry":[{"changes":[{"value":{"messages":[{"id":"reaction-1","type":"reaction"}]}}]}]}'
+                ),
+            }
+        ]
+
+    async def fetchval(self, *_args):
+        return None
+
+    async def execute(self, query, *args):
+        self.updated.append((query, args))
+        return None
+
+
+def test_queued_whatsapp_reaction_retry_is_dropped(monkeypatch):
+    asyncio.run(_run_queued_whatsapp_reaction_retry_is_dropped(monkeypatch))
+
+
+async def _run_queued_whatsapp_reaction_retry_is_dropped(monkeypatch):
+    db = _QueuedReactionDb()
+    monkeypatch.setattr(webhooks, "_ensure_unprocessed_events_table", lambda *_args, **_kwargs: _async_none())
+
+    await webhooks._retry_unprocessed_events(db, channel="whatsapp")
+
+    assert db.updated
+    assert "whatsapp_reactions_disabled" in db.updated[0][0]
+
+
 class _LeadCaptureFakeDb:
     def __init__(self):
         self.customer = {

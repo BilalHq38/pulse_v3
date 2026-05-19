@@ -18,10 +18,23 @@ from services.db_helpers import r, rs
 
 logger = logging.getLogger(__name__)
 
+def normalize_meta_api_version(value: str = "") -> str:
+    version = (value or "").strip()
+    if not version:
+        version = (
+            os.environ.get("META_GRAPH_API_VERSION", "")
+            or os.environ.get("META_API_VERSION", "")
+            or "v21.0"
+        ).strip()
+    if not version:
+        return "v21.0"
+    return version if version.lower().startswith("v") else f"v{version}"
+
+
 META_GRAPH_BASE = (
     os.environ.get("META_GRAPH_API_BASE", "https://graph.facebook.com") or "https://graph.facebook.com"
 ).rstrip("/")
-META_DEFAULT_VERSION = (os.environ.get("META_GRAPH_API_VERSION", "v21.0") or "v21.0").strip()
+META_DEFAULT_VERSION = normalize_meta_api_version()
 META_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("META_REQUEST_TIMEOUT_SECONDS", "20") or 20)
 META_RETRY_ATTEMPTS = max(1, int(os.environ.get("META_RETRY_ATTEMPTS", "3") or 3))
 
@@ -82,23 +95,139 @@ def mask_secret(value: str, *, prefix: int = 4, suffix: int = 2) -> str:
 
 def normalize_meta_config(row: dict | None, *, include_secrets: bool = False) -> dict:
     data = dict(row or {})
-    access_token = decrypt_meta_secret(data.get("access_token_enc", "")) if data.get("access_token_enc") else ""
-    app_secret = decrypt_meta_secret(data.get("app_secret_enc", "")) if data.get("app_secret_enc") else ""
-    webhook_secret = decrypt_meta_secret(data.get("webhook_secret_enc", "")) if data.get("webhook_secret_enc") else ""
+    if not data:
+        return {}
+    try:
+        access_token = (
+            decrypt_meta_secret(data.get("access_token_enc", ""))
+            if data.get("access_token_enc")
+            else str(data.get("access_token") or "").strip()
+        )
+        app_secret = (
+            decrypt_meta_secret(data.get("app_secret_enc", ""))
+            if data.get("app_secret_enc")
+            else str(data.get("app_secret") or "").strip()
+        )
+        webhook_secret = (
+            decrypt_meta_secret(data.get("webhook_secret_enc", ""))
+            if data.get("webhook_secret_enc")
+            else str(data.get("webhook_secret") or "").strip()
+        )
+    except HTTPException:
+        logger.warning(
+            "Meta credential decrypt failed company_id=%s channel=%s config_id=%s source=%s",
+            data.get("company_id", ""),
+            data.get("channel", ""),
+            data.get("id", ""),
+            data.get("runtime_config_source") or data.get("config_source") or "tenant_meta_config",
+        )
+        raise
     data["access_token_configured"] = bool(access_token)
     data["app_secret_configured"] = bool(app_secret)
     data["webhook_secret_configured"] = bool(webhook_secret)
     data["access_token_masked"] = mask_secret(access_token)
     data["app_secret_masked"] = mask_secret(app_secret)
     data["webhook_secret_masked"] = mask_secret(webhook_secret)
+    data["api_version"] = normalize_meta_api_version(str(data.get("api_version") or ""))
+    if not str(data.get("page_id") or "").strip():
+        data["page_id"] = str(data.get("business_account_id") or data.get("catalog_id") or "").strip()
     if include_secrets:
         data["access_token"] = access_token
         data["app_secret"] = app_secret
         data["webhook_secret"] = webhook_secret
+    else:
+        data.pop("access_token", None)
+        data.pop("app_secret", None)
+        data.pop("webhook_secret", None)
     data.pop("access_token_enc", None)
     data.pop("app_secret_enc", None)
     data.pop("webhook_secret_enc", None)
     return data
+
+
+def _required_meta_runtime_fields(config: dict, *, channel: str) -> list[str]:
+    missing: list[str] = []
+    if not config.get("access_token_configured") and not str(config.get("access_token") or "").strip():
+        missing.append("access_token")
+    channel_name = (channel or config.get("channel") or "whatsapp").strip().lower()
+    if channel_name == "whatsapp":
+        if not str(config.get("phone_number_id") or "").strip():
+            missing.append("phone_number_id")
+    elif channel_name in {"facebook", "instagram"}:
+        if not str(config.get("page_id") or config.get("business_account_id") or config.get("catalog_id") or "").strip():
+            missing.append("page_id")
+    return missing
+
+
+def _legacy_channel_settings_config(
+    row: dict | None,
+    *,
+    company_id: str,
+    channel: str,
+    include_secrets: bool = False,
+) -> dict:
+    data = dict(row or {})
+    if not data:
+        return {}
+    if not bool(data.get("enabled", True)):
+        return {}
+    channel_name = (channel or data.get("channel") or "whatsapp").strip().lower()
+    page_id = str(data.get("page_id") or "").strip()
+    token = str(data.get("access_token") or "").strip()
+    phone_number_id = str(data.get("phone_number_id") or "").strip()
+    if not token and not phone_number_id and not page_id:
+        return {}
+    return normalize_meta_config(
+        {
+            "id": "",
+            "company_id": company_id,
+            "channel": channel_name,
+            "config_name": "channel_settings",
+            "provider_mode": "cloud_api",
+            "api_version": normalize_meta_api_version(""),
+            "access_token": token,
+            "verify_token": str(data.get("verify_token") or "").strip(),
+            "webhook_secret": str(data.get("api_secret") or "").strip(),
+            "phone_number_id": phone_number_id,
+            "business_account_id": page_id if channel_name == "whatsapp" else page_id,
+            "catalog_id": "",
+            "requests_per_minute": 120,
+            "credit_limit_per_day": 1000,
+            "is_default": False,
+            "is_active": bool(data.get("enabled", True)),
+            "runtime_config_source": "channel_settings",
+        },
+        include_secrets=include_secrets,
+    )
+
+
+def _merge_missing_meta_config_fields(primary: dict, fallback: dict, *, include_secrets: bool) -> dict:
+    merged = dict(primary or {})
+    if not merged:
+        return dict(fallback or {})
+    if not fallback:
+        return merged
+    for key in (
+        "phone_number_id",
+        "business_account_id",
+        "catalog_id",
+        "page_id",
+        "verify_token",
+        "api_version",
+        "requests_per_minute",
+        "credit_limit_per_day",
+    ):
+        if not str(merged.get(key) or "").strip() and str(fallback.get(key) or "").strip():
+            merged[key] = fallback.get(key)
+    if not merged.get("access_token_configured") and fallback.get("access_token_configured"):
+        if include_secrets:
+            merged["access_token"] = fallback.get("access_token", "")
+        merged["access_token_configured"] = True
+        merged["access_token_masked"] = fallback.get("access_token_masked", "")
+    merged["runtime_config_source"] = (
+        f"{merged.get('runtime_config_source') or 'tenant_meta_config'}+channel_settings"
+    )
+    return merged
 
 
 async def get_meta_config(
@@ -113,6 +242,7 @@ async def get_meta_config(
     if not company_id:
         raise HTTPException(400, "Company context is required")
     row = None
+    source = "tenant_meta_config"
     if config_id:
         row = await db.fetchrow(
             "SELECT * FROM tenant_meta_config WHERE id=$1 AND company_id=$2 LIMIT 1",
@@ -127,9 +257,70 @@ async def get_meta_config(
             company_id,
             channel,
         )
-    config = normalize_meta_config(r(row), include_secrets=include_secrets)
+    config = normalize_meta_config(r(row), include_secrets=include_secrets) if row else {}
+    legacy_config = {}
+    if not config_id:
+        legacy_row = await db.fetchrow(
+            "SELECT * FROM channel_settings WHERE company_id=$1 AND channel=$2 LIMIT 1",
+            company_id,
+            channel,
+        )
+        legacy_config = _legacy_channel_settings_config(
+            legacy_row,
+            company_id=company_id,
+            channel=channel,
+            include_secrets=include_secrets,
+        )
+
+    if config and not config.get("runtime_config_source"):
+        config["runtime_config_source"] = source
+    if config and legacy_config:
+        missing = _required_meta_runtime_fields(config, channel=channel)
+        if missing:
+            logger.warning(
+                "Meta config missing runtime fields company_id=%s channel=%s config_id=%s source=%s missing=%s",
+                company_id,
+                channel,
+                config.get("id", ""),
+                config.get("runtime_config_source", source),
+                ",".join(missing),
+            )
+            config = _merge_missing_meta_config_fields(config, legacy_config, include_secrets=include_secrets)
+            source = str(config.get("runtime_config_source") or source)
+    elif legacy_config and not config:
+        config = legacy_config
+        source = "channel_settings"
+
     if not config:
+        logger.warning(
+            "Meta config load failed company_id=%s channel=%s config_id=%s reason=not_found",
+            company_id,
+            channel,
+            config_id,
+        )
         raise HTTPException(404, "Meta configuration not found")
+    missing = _required_meta_runtime_fields(config, channel=channel)
+    if missing:
+        logger.warning(
+            "Meta config loaded with missing fields company_id=%s channel=%s config_id=%s source=%s missing=%s",
+            company_id,
+            channel,
+            config.get("id", ""),
+            source,
+            ",".join(missing),
+        )
+    else:
+        logger.info(
+            "Meta config loaded company_id=%s channel=%s config_id=%s source=%s api_version=%s phone_number_id=%s business_account_id=%s token_configured=%s",
+            company_id,
+            channel,
+            config.get("id", ""),
+            source,
+            config.get("api_version", ""),
+            config.get("phone_number_id", ""),
+            config.get("business_account_id", ""),
+            bool(config.get("access_token_configured")),
+        )
     return config
 
 
@@ -150,6 +341,104 @@ async def list_meta_configs(db, company_id: str, *, channel: str = "") -> list[d
             company_id,
         )
     return [normalize_meta_config(row) for row in rs(rows)]
+
+
+async def sync_channel_settings_meta_config(db, company_id: str, channel_settings: dict) -> None:
+    company_id = (company_id or "").strip()
+    settings = dict(channel_settings or {})
+    channel = str(settings.get("channel") or "").strip().lower()
+    if not company_id or channel not in {"whatsapp", "facebook", "instagram"}:
+        return
+
+    access_token = str(settings.get("access_token") or "").strip()
+    phone_number_id = str(settings.get("phone_number_id") or "").strip()
+    page_id = str(settings.get("page_id") or "").strip()
+    verify_token = str(settings.get("verify_token") or "").strip()
+    enabled = bool(settings.get("enabled", True))
+    required_channel_id = phone_number_id if channel == "whatsapp" else page_id
+    is_active = bool(enabled and access_token and required_channel_id)
+    config_name = "settings"
+    config_id = str(settings.get("meta_config_id") or "").strip()
+    existing = None
+    if config_id:
+        existing = r(
+            await db.fetchrow(
+                "SELECT * FROM tenant_meta_config WHERE id=$1 AND company_id=$2 LIMIT 1",
+                config_id,
+                company_id,
+            )
+        )
+    if not existing:
+        existing = r(
+            await db.fetchrow(
+                "SELECT * FROM tenant_meta_config WHERE company_id=$1 AND channel=$2 AND config_name=$3 LIMIT 1",
+                company_id,
+                channel,
+                config_name,
+            )
+        )
+    row_id = str((existing or {}).get("id") or "").strip() or make_id()
+    if is_active:
+        await db.execute(
+            "UPDATE tenant_meta_config SET is_default=FALSE, updated_at=NOW() WHERE company_id=$1 AND channel=$2 AND id<>$3",
+            company_id,
+            channel,
+            row_id,
+        )
+    encrypted_token = encrypt_meta_secret(access_token) if access_token else ""
+    encrypted_webhook_secret = encrypt_meta_secret(str(settings.get("api_secret") or "").strip())
+    business_account_id = page_id
+    catalog_id = "" if channel == "whatsapp" else page_id
+    if existing:
+        await db.execute(
+            "UPDATE tenant_meta_config SET provider_mode='cloud_api', api_version=$1, access_token_enc=$2, "
+            "access_token_last4=$3, verify_token=$4, webhook_secret_enc=$5, phone_number_id=$6, "
+            "business_account_id=$7, catalog_id=$8, is_default=$9, is_active=$10, updated_at=NOW() "
+            "WHERE id=$11 AND company_id=$12",
+            normalize_meta_api_version(""),
+            encrypted_token,
+            access_token[-4:] if access_token else "",
+            verify_token,
+            encrypted_webhook_secret,
+            phone_number_id,
+            business_account_id,
+            catalog_id,
+            is_active,
+            is_active,
+            row_id,
+            company_id,
+        )
+    else:
+        await db.execute(
+            "INSERT INTO tenant_meta_config(id,company_id,channel,config_name,provider_mode,api_version,access_token_enc,"
+            "access_token_last4,verify_token,webhook_secret_enc,phone_number_id,business_account_id,catalog_id,"
+            "credit_limit_per_day,requests_per_minute,is_default,is_active,created_at,updated_at) "
+            "VALUES($1,$2,$3,$4,'cloud_api',$5,$6,$7,$8,$9,$10,$11,$12,1000,120,$13,$14,NOW(),NOW())",
+            row_id,
+            company_id,
+            channel,
+            config_name,
+            normalize_meta_api_version(""),
+            encrypted_token,
+            access_token[-4:] if access_token else "",
+            verify_token,
+            encrypted_webhook_secret,
+            phone_number_id,
+            business_account_id,
+            catalog_id,
+            is_active,
+            is_active,
+        )
+    logger.info(
+        "Meta config synced from channel_settings company_id=%s channel=%s config_id=%s active=%s phone_number_id=%s business_account_id=%s token_configured=%s",
+        company_id,
+        channel,
+        row_id,
+        is_active,
+        phone_number_id,
+        business_account_id,
+        bool(access_token),
+    )
 
 
 async def record_meta_usage(
@@ -253,9 +542,17 @@ async def meta_api_request(
     normalized = normalize_meta_config(config, include_secrets=True)
     access_token = (normalized.get("access_token") or "").strip()
     if not access_token:
+        logger.warning(
+            "Meta API request blocked missing access token company_id=%s channel=%s endpoint=%s config_id=%s source=%s",
+            company_id,
+            channel,
+            path,
+            normalized.get("id", ""),
+            normalized.get("runtime_config_source") or "tenant_meta_config",
+        )
         raise HTTPException(400, "Meta access token is not configured")
     await enforce_meta_quotas(db, company_id, normalized, channel=channel)
-    version = (normalized.get("api_version") or META_DEFAULT_VERSION).strip() or META_DEFAULT_VERSION
+    version = normalize_meta_api_version(str(normalized.get("api_version") or META_DEFAULT_VERSION))
     url = f"{META_GRAPH_BASE}/{version}/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {access_token}"}
     if files is None:
@@ -296,6 +593,18 @@ async def meta_api_request(
         raise HTTPException(503, "Meta API is temporarily unavailable")
     if response.status_code >= 400:
         error_code, detail = _meta_error_detail(payload)
+        if response.status_code == 401 or error_code == "190":
+            logger.warning(
+                "Meta token validation failed company_id=%s channel=%s endpoint=%s config_id=%s source=%s status=%s error_code=%s detail=%s",
+                company_id,
+                channel,
+                path,
+                normalized.get("id", ""),
+                normalized.get("runtime_config_source") or "tenant_meta_config",
+                response.status_code,
+                error_code,
+                detail,
+            )
         await record_meta_usage(
             db,
             company_id,

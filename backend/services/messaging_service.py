@@ -693,6 +693,15 @@ async def _send_via_tenant_meta(
         return False, str(exc), ""
 
 
+def _tenant_meta_error_allows_bridge_fallback(error: str) -> bool:
+    lowered = str(error or "").strip().lower()
+    return bool(
+        "phone_number_id is not configured" in lowered
+        or "meta whatsapp is not configured" in lowered
+        or "not configured for this tenant" in lowered
+    )
+
+
 async def send_whatsapp_message(
     to_phone: str,
     message_text: str,
@@ -705,6 +714,7 @@ async def send_whatsapp_message(
     conversation_id: str = "",
     customer_id: str = "",
     idempotency_key: str = "",
+    single_dispatch: bool = False,
 ) -> tuple[bool, str]:
     scoped_company_id = (company_id or "").strip()
     local_message_id = (db_message_id or "").strip()
@@ -757,6 +767,26 @@ async def send_whatsapp_message(
                         company_id=scoped_company_id,
                         db_message_id=local_message_id,
                         delivery_status="sent",
+                        external_message_id=external_message_id,
+                    )
+                return sent, error
+            if single_dispatch and not _tenant_meta_error_allows_bridge_fallback(error):
+                logger.warning(
+                    "whatsapp_outbound_bridge_fallback_suppressed company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s idempotency_key=%s error=%s",
+                    scoped_company_id,
+                    scoped_user_id,
+                    scoped_conversation_id,
+                    scoped_customer_id,
+                    local_message_id,
+                    scoped_idempotency_key,
+                    error or "unknown",
+                )
+                if local_message_id:
+                    await _persist_outbound_message_state(
+                        db,
+                        company_id=scoped_company_id,
+                        db_message_id=local_message_id,
+                        delivery_status="failed",
                         external_message_id=external_message_id,
                     )
                 return sent, error

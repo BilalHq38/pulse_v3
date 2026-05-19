@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from core.utils import make_id, now_ts, parse_dt
 from services.db_helpers import get_company_id, get_current_user_flexible, r, rs
 from services.media_storage import serve_stored_media, store_image_bytes
+from services.meta_service import sync_channel_settings_meta_config
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -367,7 +368,7 @@ class ChannelSettingsUpdate(BaseModel):
     phone_number: Optional[str] = Field(default=None, max_length=64)
     phone_number_id: Optional[str] = Field(default=None, max_length=255)
     page_id: Optional[str] = Field(default=None, max_length=255)
-    access_token: Optional[str] = Field(default=None, max_length=1000)
+    access_token: Optional[str] = Field(default=None, max_length=4000)
     webhook_url: Optional[str] = Field(default=None, max_length=500)
     widget_color: Optional[str] = Field(default=None, max_length=20)
     welcome_message: Optional[str] = Field(default=None, max_length=1000)
@@ -841,7 +842,10 @@ async def update_channel_settings(channel: str, body: ChannelSettingsUpdate, req
             channel_key,
             row["id"],
         )
-        return r(await db.fetchrow("SELECT * FROM channel_settings WHERE id=$1", row["id"]))
+        saved = r(await db.fetchrow("SELECT * FROM channel_settings WHERE id=$1", row["id"]))
+        if channel_key in _META_VERIFY_CHANNELS:
+            await sync_channel_settings_meta_config(db, cid, saved)
+        return saved
     safe["id"] = make_id()
     safe["company_id"] = cid
     safe["channel"] = channel_key
@@ -849,7 +853,10 @@ async def update_channel_settings(channel: str, body: ChannelSettingsUpdate, req
     cols = ",".join(safe.keys())
     placeholders = ",".join(f"${i + 1}" for i in range(len(safe)))
     await db.execute(f"INSERT INTO channel_settings({cols}) VALUES({placeholders})", *safe.values())
-    return r(await db.fetchrow("SELECT * FROM channel_settings WHERE id=$1", safe["id"]))
+    saved = r(await db.fetchrow("SELECT * FROM channel_settings WHERE id=$1", safe["id"]))
+    if channel_key in _META_VERIFY_CHANNELS:
+        await sync_channel_settings_meta_config(db, cid, saved)
+    return saved
 
 
 @router.get("/settings/templates")

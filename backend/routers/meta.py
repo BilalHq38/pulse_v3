@@ -16,6 +16,7 @@ from services.meta_service import (
     list_meta_configs,
     mask_secret,
     meta_api_request,
+    normalize_meta_api_version,
     sync_meta_templates,
 )
 
@@ -97,7 +98,13 @@ class CatalogProductUpsert(BaseModel):
     config_id: str = Field(default="", max_length=255)
 
 
-async def _sync_legacy_channel_settings(db, company_id: str, payload: MetaConfigUpsert) -> None:
+async def _sync_legacy_channel_settings(
+    db,
+    company_id: str,
+    payload: MetaConfigUpsert,
+    *,
+    access_token: str | None = None,
+) -> None:
     row = r(
         await db.fetchrow(
             "SELECT id FROM channel_settings WHERE company_id=$1 AND channel=$2 LIMIT 1",
@@ -117,10 +124,25 @@ async def _sync_legacy_channel_settings(db, company_id: str, payload: MetaConfig
         "page_id": payload.business_account_id
         if payload.channel == "whatsapp"
         else payload.business_account_id or payload.catalog_id,
+        "access_token": (payload.access_token if access_token is None else access_token or "").strip(),
         "verify_token": payload.verify_token,
         "updated_at": "NOW()",
     }
     if row:
+        if values["access_token"]:
+            await db.execute(
+                "UPDATE channel_settings SET display_name=$1, enabled=$2, phone_number_id=$3, phone_number=$4, "
+                "page_id=$5, access_token=$6, verify_token=$7, updated_at=NOW() WHERE id=$8",
+                values["display_name"],
+                values["enabled"],
+                values["phone_number_id"],
+                values["phone_number"],
+                values["page_id"],
+                values["access_token"],
+                values["verify_token"],
+                row["id"],
+            )
+            return
         await db.execute(
             "UPDATE channel_settings SET display_name=$1, enabled=$2, phone_number_id=$3, phone_number=$4, page_id=$5, verify_token=$6, updated_at=NOW() "  # noqa: E501
             "WHERE id=$7",
@@ -134,8 +156,8 @@ async def _sync_legacy_channel_settings(db, company_id: str, payload: MetaConfig
         )
         return
     await db.execute(
-        "INSERT INTO channel_settings(id,company_id,channel,display_name,enabled,phone_number_id,phone_number,page_id,verify_token,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())",
+        "INSERT INTO channel_settings(id,company_id,channel,display_name,enabled,phone_number_id,phone_number,page_id,access_token,verify_token,created_at,updated_at) "  # noqa: E501
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())",
         make_id(),
         company_id,
         payload.channel,
@@ -144,6 +166,7 @@ async def _sync_legacy_channel_settings(db, company_id: str, payload: MetaConfig
         values["phone_number_id"],
         values["phone_number"],
         values["page_id"],
+        values["access_token"],
         values["verify_token"],
     )
 
@@ -251,7 +274,7 @@ async def create_meta_config(payload: MetaConfigUpsert, request: Request):
         payload.channel,
         payload.config_name.strip(),
         payload.provider_mode,
-        payload.api_version.strip(),
+        normalize_meta_api_version(payload.api_version),
         payload.app_id.strip(),
         encrypt_meta_secret(payload.app_secret),
         encrypt_meta_secret(payload.access_token),
@@ -267,7 +290,7 @@ async def create_meta_config(payload: MetaConfigUpsert, request: Request):
         payload.is_default,
         payload.is_active,
     )
-    await _sync_legacy_channel_settings(db, company_id, payload)
+    await _sync_legacy_channel_settings(db, company_id, payload, access_token=payload.access_token)
     await _sync_whatsapp_channel(db, company_id, config_id, payload)
     return _masked_config_response(await get_meta_config(db, company_id, config_id=config_id, include_secrets=True))
 
@@ -278,6 +301,7 @@ async def update_meta_config(config_id: str, payload: MetaConfigUpsert, request:
     current_user = await require_roles(request, ["admin", "super_admin"])
     company_id = (current_user.get("company_id", "") or "").strip()
     existing = await get_meta_config(db, company_id, config_id=config_id, include_secrets=True)
+    effective_access_token = (payload.access_token or existing.get("access_token", "") or "").strip()
     if payload.is_default:
         await db.execute(
             "UPDATE tenant_meta_config SET is_default=FALSE, updated_at=NOW() WHERE company_id=$1 AND channel=$2 AND id<>$3",  # noqa: E501
@@ -293,15 +317,13 @@ async def update_meta_config(config_id: str, payload: MetaConfigUpsert, request:
         payload.channel,
         payload.config_name.strip(),
         payload.provider_mode,
-        payload.api_version.strip(),
+        normalize_meta_api_version(payload.api_version),
         payload.app_id.strip(),
         encrypt_meta_secret(payload.app_secret)
         if payload.app_secret
         else encrypt_meta_secret(existing.get("app_secret", "")),
-        encrypt_meta_secret(payload.access_token)
-        if payload.access_token
-        else encrypt_meta_secret(existing.get("access_token", "")),
-        ((payload.access_token or existing.get("access_token", "")) or "")[-4:],
+        encrypt_meta_secret(effective_access_token),
+        effective_access_token[-4:],
         payload.verify_token.strip(),
         encrypt_meta_secret(payload.webhook_secret)
         if payload.webhook_secret
@@ -317,7 +339,7 @@ async def update_meta_config(config_id: str, payload: MetaConfigUpsert, request:
         config_id,
         company_id,
     )
-    await _sync_legacy_channel_settings(db, company_id, payload)
+    await _sync_legacy_channel_settings(db, company_id, payload, access_token=effective_access_token)
     await _sync_whatsapp_channel(db, company_id, config_id, payload)
     return _masked_config_response(await get_meta_config(db, company_id, config_id=config_id, include_secrets=True))
 

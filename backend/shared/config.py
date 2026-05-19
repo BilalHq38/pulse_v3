@@ -907,4 +907,5 @@ def meta_message_send_timeout_seconds(default: float = 15.0) -> float:
 
 
 def meta_graph_api_version(default: str = "v21.0") -> str:
-    return (os.environ.get("META_GRAPH_API_VERSION", default) or default).strip()
+    version = (os.environ.get("META_GRAPH_API_VERSION") or os.environ.get("META_API_VERSION") or default or "v21.0").strip()
+    return version if version.lower().startswith("v") else f"v{version}"

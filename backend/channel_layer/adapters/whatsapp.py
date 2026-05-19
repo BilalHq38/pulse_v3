@@ -44,6 +44,10 @@ def _is_lid_identifier(value: str) -> bool:
     return "@lid" in str(value or "").lower()
 
 
+def _is_ai_auto_response_idempotency_key(value: str) -> bool:
+    return str(value or "").strip().startswith("ai:auto_response:")
+
+
 def _whatsapp_web_bridge_sender_identity(
     msg: dict,
     contact: dict,
@@ -178,6 +182,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
             conversation_id=conversation_id or str(message.metadata.get("conversation_id") or ""),
             customer_id=customer_id,
             idempotency_key=idempotency_key,
+            single_dispatch=_is_ai_auto_response_idempotency_key(idempotency_key),
         )
 
         return SendResult(
