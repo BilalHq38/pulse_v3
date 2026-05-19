@@ -2,7 +2,12 @@ import asyncio
 from datetime import datetime, timezone
 
 import routers.webhooks as webhooks
-from routers.webhooks import _extract_sender_contact_fields, _is_whatsapp_web_bridge_payload
+from routers.webhooks import (
+    _extract_sender_contact_fields,
+    _is_whatsapp_web_bridge_payload,
+    _whatsapp_contact_for_message,
+    _whatsapp_profile_name,
+)
 from channel_layer.normalizer import MessageNormalizer
 from channel_layer.schemas import ChannelType, MessageDirection, UnifiedMessage
 
@@ -40,6 +45,28 @@ def test_whatsapp_contact_fields_preserve_normalized_sender_over_provider_id():
 
     assert fields["phone"] == "+923445563662"
     assert fields["channel_id"] == "+923445563662"
+
+
+def test_whatsapp_contact_for_message_matches_wa_id_when_contacts_are_not_indexed():
+    contacts = [
+        {"wa_id": "923001111111", "profile": {"name": "Wrong Contact"}},
+        {"wa_id": "923445563662", "profile": {"name": "Bilal"}},
+    ]
+
+    contact = _whatsapp_contact_for_message(contacts, {"from": "923445563662"}, fallback_index=0)
+
+    assert contact["profile"]["name"] == "Bilal"
+
+
+def test_whatsapp_profile_name_ignores_empty_provider_names():
+    assert (
+        _whatsapp_profile_name(
+            {"wa_id": "923445563662", "profile": {"name": None}},
+            {"sender_pushname": "Bilal", "profile_name": "null"},
+            fallback="WhatsApp +923445563662",
+        )
+        == "Bilal"
+    )
 
 
 def test_whatsapp_contact_fields_reject_provider_id_without_valid_sender():

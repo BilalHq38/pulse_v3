@@ -12,6 +12,8 @@ from services.db_helpers import r
 
 logger = logging.getLogger(__name__)
 
+TEAM_MEMBER_LIMIT_REACHED_MESSAGE = "Team member limit reached. Upgrade your plan to add more users."
+
 
 async def ensure_subscriptions_limit_columns(db) -> None:
     """
@@ -233,7 +235,7 @@ async def assert_workspace_seat_available(db, company_id: str) -> None:
     if used + pending >= cap:
         raise HTTPException(
             status_code=403,
-            detail="You cannot add a new team member because your limit has been reached.",
+            detail=TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
         )
 
 

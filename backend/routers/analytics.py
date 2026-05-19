@@ -31,6 +31,40 @@ def _sentiment_label(score: float | int | None) -> str:
     return "neutral"
 
 
+def _summary_dedupe_key(item: dict) -> tuple[str, ...]:
+    entity_type = str(item.get("entity_type") or "").strip().lower()
+    date = str(item.get("date") or item.get("summary_date") or "")[:10].strip()
+    if entity_type == "customer":
+        return (
+            "customer",
+            str(item.get("customer_id") or "").strip(),
+            str(item.get("conversation_id") or "").strip(),
+            date,
+        )
+    if entity_type == "lead":
+        return (
+            "lead",
+            str(item.get("lead_id") or "").strip(),
+            date,
+            str(item.get("activity_type") or item.get("type") or "").strip().lower(),
+            str(item.get("stage") or item.get("status") or "").strip().lower(),
+            str(item.get("content") or item.get("summary_text") or "").strip(),
+        )
+    return (str(item.get("id") or ""),)
+
+
+def _dedupe_summary_items(items: list[dict]) -> list[dict]:
+    seen: set[tuple[str, ...]] = set()
+    unique: list[dict] = []
+    for item in items:
+        key = _summary_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 @router.get("/analytics/overview")
 async def analytics_overview(request: Request):
     db = _db(request)
@@ -291,6 +325,17 @@ async def analytics_customer_summaries(
                   FROM lead_activities la
                   JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
                   WHERE la.company_id=$1 AND la.created_at::date=$2
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM customers c2
+                      JOIN customer_interaction_summaries cis2
+                        ON cis2.company_id=c2.company_id
+                       AND cis2.customer_id=c2.id
+                       AND cis2.summary_date=la.created_at::date
+                      WHERE c2.company_id=l.company_id
+                        AND c2.lead_id=l.id
+                        AND c2.lifecycle_stage='customer'
+                    )
                   ORDER BY la.lead_id, la.type, la.stage, la.content, la.created_at::date, la.created_at DESC
                 ) deduped
                 ORDER BY created_at DESC
@@ -342,6 +387,17 @@ async def analytics_customer_summaries(
                   FROM lead_activities la
                   JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
                   WHERE la.company_id=$1
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM customers c2
+                      JOIN customer_interaction_summaries cis2
+                        ON cis2.company_id=c2.company_id
+                       AND cis2.customer_id=c2.id
+                       AND cis2.summary_date=la.created_at::date
+                      WHERE c2.company_id=l.company_id
+                        AND c2.lead_id=l.id
+                        AND c2.lifecycle_stage='customer'
+                    )
                   ORDER BY la.lead_id, la.type, la.stage, la.content, la.created_at::date, la.created_at DESC
                 ) deduped
                 ORDER BY created_at DESC
@@ -388,7 +444,7 @@ async def analytics_customer_summaries(
             }
         )
     rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-    return rows[:limit]
+    return _dedupe_summary_items(rows)[:limit]
 
 
 @router.get("/analytics/daily-summaries")

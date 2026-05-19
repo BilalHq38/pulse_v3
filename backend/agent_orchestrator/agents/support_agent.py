@@ -13,7 +13,11 @@ from services.ai_service.facade import (
     should_auto_escalate,
 )
 from services.ai_service.llm_tracking import log_llm_reuse
-from services.db_helpers import AI_API_EXHAUSTED_MANUAL_MESSAGE, is_ai_api_exhaustion_payload
+from services.db_helpers import (
+    AI_API_EXHAUSTED_MANUAL_MESSAGE,
+    auto_disable_ai_after_failure_fallback,
+    is_ai_api_exhaustion_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +92,8 @@ class SupportAgent(BaseAgent):
         conversation_id = str(getattr(request, "conversation_id", "") or "").strip()
         if context.db and conversation_id:
             ai_disabled = await context.db.fetchval(
-                "SELECT ai_disabled_until > NOW() FROM conversations WHERE id = $1",
+                "SELECT COALESCE(ai_auto_paused,FALSE) OR COALESCE(ai_disabled_until > NOW(),FALSE) "
+                "FROM conversations WHERE id = $1",
                 conversation_id,
             )
             if ai_disabled:
@@ -260,15 +265,19 @@ class SupportAgent(BaseAgent):
             escalate = True
             escalation_reason = AI_API_EXHAUSTED_MANUAL_MESSAGE
             if context.db and conversation_id:
-                await context.db.execute(
-                    """
-                    UPDATE conversations
-                    SET
-                        ai_disabled_until = NOW() + INTERVAL '15 minutes',
-                        ai_failure_count = COALESCE(ai_failure_count, 0) + 1
-                    WHERE id = $1
-                    """,
+                await auto_disable_ai_after_failure_fallback(
+                    context.db,
+                    context.company_id,
                     conversation_id,
+                    {
+                        **ai_result,
+                        "api_error": True,
+                        "fallback_used": True,
+                        "static_fallback_served": True,
+                        "review_reason": AI_API_EXHAUSTED_MANUAL_MESSAGE,
+                    },
+                    channel=str(getattr(request, "channel", "") or ""),
+                    trace_id=str(getattr(request, "trace_id", "") or ""),
                 )
                 logger.warning(
                     "AI disabled for conversation %s due to provider failure", conversation_id

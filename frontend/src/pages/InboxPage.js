@@ -320,6 +320,20 @@ function getChannelDisconnectMessage(conversation) {
   return String(conversation.channel_error || `${channelName} is not connected. Reconnect the channel before sending.`).trim();
 }
 
+function isConversationAiDisabled(conversation) {
+  if (!conversation) return false;
+  const paused = Boolean(conversation.ai_auto_paused || (!conversation.ai_handled && conversation.ai_paused_reason));
+  const disabledUntil = Date.parse(conversation.ai_disabled_until || '');
+  return paused || (Number.isFinite(disabledUntil) && disabledUntil > Date.now());
+}
+
+function getAiDisabledReason(conversation) {
+  return String(
+    conversation?.ai_paused_reason ||
+    'AI auto-response is paused because the AI provider is unavailable. Please respond manually.'
+  ).trim();
+}
+
 function fileToDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1154,7 +1168,7 @@ export default function InboxPage() {
   const toggleAIMode = async () => {
     if (!selectedConvo || aiToggling) return;
     setAiToggling(true);
-    const newAiState = !selectedConvo.ai_handled;
+    const newAiState = isConversationAiDisabled(selectedConvo) ? true : !selectedConvo.ai_handled;
     try {
       const res = await api.put(`/conversations/${selectedConvo.id}/toggle-ai`, {
         enable_ai: newAiState
@@ -1327,6 +1341,8 @@ export default function InboxPage() {
   const selectedConvoSentiment = getSentimentMeta(selectedConvo?.sentiment_score, selectedConvo?.sentiment_label);
   const channelDisconnectMessage = getChannelDisconnectMessage(selectedConvo);
   const channelDisconnected = Boolean(channelDisconnectMessage);
+  const selectedAiDisabled = isConversationAiDisabled(selectedConvo);
+  const selectedAiToggleOn = Boolean(selectedConvo?.ai_handled && !selectedAiDisabled);
 
   // Get filtered conversations for mobile
   const displayChannel = platformView || activeChannel;
@@ -1419,11 +1435,12 @@ export default function InboxPage() {
               const convoSentiment = getSentimentMeta(convo.sentiment_score, convo.sentiment_label);
               const isGroup = isWhatsappGroupConversation(convo);
               const displayName = conversationDisplayName(convo);
+              const aiDisabled = isConversationAiDisabled(convo);
               return (
                 <div
                   key={convo.id}
                   onClick={() => handleSelectConvo(convo)}
-                  className="bg-white rounded-xl p-3.5 border border-slate-100 cursor-pointer transition-all hover:shadow-md active:scale-[0.98]"
+                  className={`rounded-xl p-3.5 border cursor-pointer transition-all hover:shadow-md active:scale-[0.98] ${aiDisabled ? 'bg-amber-50/60 border-amber-200' : 'bg-white border-slate-100'}`}
                   data-testid={`convo-card-${convo.id}`}
                 >
                   <div className="flex items-start gap-3">
@@ -1478,6 +1495,12 @@ export default function InboxPage() {
                         <div className="mb-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg flex items-center gap-1.5">
                           <AlertTriangle size={10} className="text-red-500 flex-shrink-0" />
                           <span className="text-[10px] text-red-700 font-semibold uppercase tracking-wide truncate">{convo.escalation_notice}</span>
+                        </div>
+                      )}
+                      {aiDisabled && (
+                        <div className="mb-1.5 px-2 py-1 bg-amber-100 border border-amber-200 rounded-lg flex items-center gap-1.5" data-testid={`convo-${convo.id}-ai-disabled`}>
+                          <AlertTriangle size={10} className="text-amber-600 flex-shrink-0" />
+                          <span className="text-[10px] text-amber-800 font-semibold uppercase tracking-wide truncate">AI paused</span>
                         </div>
                       )}
                       <p className="text-xs text-slate-500 line-clamp-1">{convo.last_message}</p>
@@ -1603,11 +1626,12 @@ export default function InboxPage() {
                       const convoSentiment = getSentimentMeta(convo.sentiment_score, convo.sentiment_label);
                       const isGroup = isWhatsappGroupConversation(convo);
                       const displayName = conversationDisplayName(convo);
+                      const aiDisabled = isConversationAiDisabled(convo);
                       return (
                         <div
                           key={convo.id}
                           onClick={() => handleSelectConvo(convo)}
-                          className="bg-white rounded-xl p-3.5 border border-slate-100 cursor-pointer transition-all duration-150 hover:shadow-md hover:border-slate-200"
+                          className={`rounded-xl p-3.5 border cursor-pointer transition-all duration-150 hover:shadow-md ${aiDisabled ? 'bg-amber-50/60 border-amber-200 hover:border-amber-300' : 'bg-white border-slate-100 hover:border-slate-200'}`}
                           data-testid={`convo-card-${convo.id}`}
                         >
                           <div className="flex items-start gap-2.5 mb-2">
@@ -1664,12 +1688,22 @@ export default function InboxPage() {
                               <span className="text-[10px] text-red-700 font-semibold uppercase tracking-wide truncate">{convo.escalation_notice}</span>
                             </div>
                           )}
+                          {aiDisabled && (
+                            <div className="mb-2 px-2 py-1.5 bg-amber-100 border border-amber-200 rounded-lg flex items-center gap-1.5" data-testid={`convo-${convo.id}-ai-disabled`}>
+                              <AlertTriangle size={11} className="text-amber-600 flex-shrink-0" />
+                              <span className="text-[10px] text-amber-800 font-semibold uppercase tracking-wide truncate">AI paused</span>
+                            </div>
+                          )}
                           <p className="text-xs text-slate-500 line-clamp-2 mb-2 leading-relaxed">{convo.last_message}</p>
                           <div className="flex flex-wrap gap-1">
                             {(convo.tags || []).slice(0, 3).map(tag => (
                               <span key={tag} className={`text-[10px] px-1.5 py-0.5 rounded-md border font-medium ${getTagColor(tag)}`}>{tag}</span>
                             ))}
-                            {convo.ai_handled && <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-purple-50 text-purple-600 border border-purple-200 font-medium">AI</span>}
+                            {aiDisabled ? (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-700 border border-amber-200 font-medium">AI paused</span>
+                            ) : convo.ai_handled && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-purple-50 text-purple-600 border border-purple-200 font-medium">AI</span>
+                            )}
                           </div>
                         </div>
                       );
@@ -1748,23 +1782,27 @@ export default function InboxPage() {
                   onClick={toggleAIMode}
                   disabled={aiToggling}
                   className={`flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 rounded-lg text-[10px] sm:text-[11px] font-medium border transition-all duration-200 ${
-                    selectedConvo.ai_handled
+                    selectedAiDisabled
+                      ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'
+                      : selectedConvo.ai_handled
                       ? 'bg-purple-50 text-purple-600 border-purple-200 hover:bg-purple-100'
                       : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
                   } disabled:opacity-50`}
                   data-testid="ai-toggle-btn"
-                  title={selectedConvo.ai_handled ? 'AI is ON — Click to switch to human agent' : 'AI is OFF — Click to enable AI automation'}
+                  title={selectedAiDisabled ? 'AI is paused - Click to enable AI automation' : selectedConvo.ai_handled ? 'AI is ON — Click to switch to human agent' : 'AI is OFF — Click to enable AI automation'}
                 >
                   {aiToggling ? (
                     <div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin"></div>
+                  ) : selectedAiDisabled ? (
+                    <AlertTriangle size={14} />
                   ) : selectedConvo.ai_handled ? (
                     <Bot size={14} />
                   ) : (
                     <User size={14} />
                   )}
-                  <span className="hidden sm:inline">{selectedConvo.ai_handled ? 'AI Auto' : 'Human'}</span>
-                  <div className={`relative w-6 sm:w-8 h-3 sm:h-4 rounded-full transition-colors ${selectedConvo.ai_handled ? 'bg-purple-500' : 'bg-slate-300'}`}>
-                    <span className={`absolute top-0.5 left-0.5 w-2 sm:w-3 h-2 sm:h-3 bg-white rounded-full transition-transform ${selectedConvo.ai_handled ? 'translate-x-3 sm:translate-x-4' : ''}`}></span>
+                  <span className="hidden sm:inline">{selectedAiDisabled ? 'AI Paused' : selectedConvo.ai_handled ? 'AI Auto' : 'Human'}</span>
+                  <div className={`relative w-6 sm:w-8 h-3 sm:h-4 rounded-full transition-colors ${selectedAiToggleOn ? 'bg-purple-500' : selectedAiDisabled ? 'bg-amber-400' : 'bg-slate-300'}`}>
+                    <span className={`absolute top-0.5 left-0.5 w-2 sm:w-3 h-2 sm:h-3 bg-white rounded-full transition-transform ${selectedAiToggleOn ? 'translate-x-3 sm:translate-x-4' : ''}`}></span>
                   </div>
                 </button>
 
@@ -1786,11 +1824,11 @@ export default function InboxPage() {
               </div>
             )}
 
-            {selectedConvo.ai_auto_paused && (
+            {selectedAiDisabled && (
               <div className="px-3 sm:px-4 py-2 bg-amber-50 border-b border-amber-200 flex items-center gap-2" data-testid="ai-paused-warning">
                 <AlertTriangle size={13} className="text-amber-600 flex-shrink-0" />
                 <span className="text-xs text-amber-800 font-medium">
-                  {selectedConvo.ai_paused_reason || 'AI auto-response is paused because the AI provider is unavailable. Please respond manually.'}
+                  {getAiDisabledReason(selectedConvo)}
                 </span>
               </div>
             )}

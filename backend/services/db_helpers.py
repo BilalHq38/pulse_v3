@@ -1298,9 +1298,43 @@ def is_ai_api_exhaustion_payload(payload: Optional[dict]) -> bool:
     return classify_ai_provider_failure(payload) in SERIOUS_AI_PROVIDER_ERROR_TYPES
 
 
+def is_ai_failure_fallback_payload(payload: Optional[dict]) -> bool:
+    data = dict(payload or {})
+    if not data:
+        return False
+    provider_failure = is_ai_api_exhaustion_payload(data)
+    api_error = bool(data.get("api_error") or data.get("provider_error"))
+    static_fallback = bool(data.get("static_fallback_served"))
+    if static_fallback and (api_error or provider_failure):
+        return True
+    return bool(data.get("fallback_used") and api_error and provider_failure)
+
+
 def conversation_ai_auto_paused(conversation: Optional[dict]) -> bool:
     convo = dict(conversation or {})
-    return bool(convo.get("ai_auto_paused") or (convo.get("ai_handled") is False and convo.get("ai_paused_reason")))
+    if convo.get("ai_auto_paused") or (convo.get("ai_handled") is False and convo.get("ai_paused_reason")):
+        return True
+    disabled_until = convo.get("ai_disabled_until")
+    if disabled_until:
+        try:
+            disabled_dt = parse_dt(disabled_until) if isinstance(disabled_until, str) else disabled_until
+            if disabled_dt and disabled_dt.tzinfo is None:
+                disabled_dt = disabled_dt.replace(tzinfo=timezone.utc)
+            return bool(disabled_dt and disabled_dt > datetime.now(timezone.utc))
+        except Exception:
+            return False
+    return False
+
+
+def _ai_failure_payload_reason(payload: Optional[dict]) -> str:
+    data = dict(payload or {})
+    return str(
+        data.get("review_reason")
+        or data.get("error_reason")
+        or data.get("fallback_reason")
+        or data.get("error_type")
+        or AI_API_EXHAUSTED_MANUAL_MESSAGE
+    ).strip()
 
 
 async def pause_ai_auto_response(
@@ -1314,6 +1348,7 @@ async def pause_ai_auto_response(
     model: str = "",
     scope: str = "conversation",
     status: str = "open",
+    increment_failure_count: bool = False,
 ) -> None:
     if not company_id or not conversation_id:
         return
@@ -1323,10 +1358,22 @@ async def pause_ai_auto_response(
     clean_model = str(model or "").strip()[:120]
     clean_scope = str(scope or "conversation").strip()[:40]
     next_status = "escalated" if status == "escalated" else "open"
+    failure_count_sql = ",ai_failure_count=COALESCE(ai_failure_count,0)+1" if increment_failure_count else ""
+    logger.warning(
+        "AI auto-disable trigger company_id=%s conversation_id=%s reason=%s error_type=%s provider=%s model=%s scope=%s status=%s",
+        company_id,
+        conversation_id,
+        clean_reason[:300],
+        clean_error_type,
+        clean_provider,
+        clean_model,
+        clean_scope,
+        next_status,
+    )
     await db.execute(
         "UPDATE conversations SET ai_handled=FALSE,ai_auto_paused=TRUE,ai_paused_at=NOW(),"
         "ai_paused_reason=$1,ai_paused_error_type=$2,ai_paused_provider=$3,ai_paused_model=$4,"
-        "ai_paused_scope=$5,escalation_notice=$1,status=$6,updated_at=NOW() "
+        f"ai_paused_scope=$5,ai_disabled_until=NULL{failure_count_sql},escalation_notice=$1,status=$6,updated_at=NOW() "
         "WHERE id=$7 AND company_id=$8",
         clean_reason,
         clean_error_type,
@@ -1337,6 +1384,70 @@ async def pause_ai_auto_response(
         conversation_id,
         company_id,
     )
+    logger.info(
+        "Chat AI-disabled state changed company_id=%s conversation_id=%s ai_auto_paused=true status=%s reason=%s",
+        company_id,
+        conversation_id,
+        next_status,
+        clean_reason[:300],
+    )
+
+
+async def auto_disable_ai_after_failure_fallback(
+    db,
+    company_id: str,
+    conversation_id: str,
+    payload: Optional[dict],
+    *,
+    channel: str = "",
+    trace_id: str = "",
+) -> bool:
+    if not db or not company_id or not conversation_id or not is_ai_failure_fallback_payload(payload):
+        return False
+    data = dict(payload or {})
+    already_paused = False
+    try:
+        existing = r(
+            await db.fetchrow(
+                "SELECT * FROM conversations WHERE id=$1 AND company_id=$2 LIMIT 1",
+                conversation_id,
+                company_id,
+            )
+        )
+        already_paused = conversation_ai_auto_paused(existing)
+    except Exception as exc:
+        logger.warning(
+            "AI fallback pause state lookup failed company_id=%s conversation_id=%s channel=%s trace_id=%s error=%s",
+            company_id,
+            conversation_id,
+            channel,
+            trace_id,
+            exc,
+        )
+    reason = _ai_failure_payload_reason(data) or AI_API_EXHAUSTED_MANUAL_MESSAGE
+    error_type = str(data.get("error_type") or classify_ai_provider_failure(data) or "provider_failure")
+    logger.warning(
+        "Fallback escalation auto-disable company_id=%s conversation_id=%s channel=%s trace_id=%s already_paused=%s error_type=%s",
+        company_id,
+        conversation_id,
+        channel,
+        trace_id,
+        already_paused,
+        error_type,
+    )
+    await pause_ai_auto_response(
+        db,
+        company_id,
+        conversation_id,
+        reason=reason,
+        error_type=error_type,
+        provider=str(data.get("provider") or ""),
+        model=str(data.get("model_name") or data.get("model") or ""),
+        scope="conversation",
+        status="open",
+        increment_failure_count=not already_paused,
+    )
+    return True
 
 
 async def disable_company_ai_after_api_exhaustion(
@@ -1362,6 +1473,7 @@ async def disable_company_ai_after_api_exhaustion(
             model=model,
             scope="conversation",
             status="open",
+            increment_failure_count=True,
         )
     else:
         logger.warning(
@@ -2323,11 +2435,19 @@ async def escalate_conversation_to_human(
 ):
     escalation_notice = "Conversation escalated"
     pause_reason = str(reason or "Conversation escalated to human. AI auto-response is paused.").strip()
+    logger.warning(
+        "Fallback escalation company_id=%s conversation_id=%s channel=%s automatic=%s reason=%s",
+        company_id,
+        convo_id,
+        channel,
+        automatic,
+        pause_reason[:300],
+    )
     await db.execute(
         "UPDATE conversations SET ai_handled=FALSE,ai_auto_paused=TRUE,ai_paused_at=COALESCE(ai_paused_at,NOW()),"
         "ai_paused_reason=$1,ai_paused_error_type=COALESCE(NULLIF(ai_paused_error_type,''),'conversation_escalated'),"
         "ai_paused_scope='conversation',"
-        "status='escalated',escalation_notice=$2,escalated_at=NOW(),escalated_to=$3,escalated_to_name=$4,updated_at=NOW() "
+        "ai_disabled_until=NULL,status='escalated',escalation_notice=$2,escalated_at=NOW(),escalated_to=$3,escalated_to_name=$4,updated_at=NOW() "
         "WHERE id=$5",
         pause_reason[:500],
         escalation_notice,
@@ -2361,6 +2481,12 @@ async def escalate_conversation_to_human(
         "created_at": datetime.now(timezone.utc),
     }
     conversation = r(await db.fetchrow("SELECT * FROM conversations WHERE id=$1", convo_id)) or {}
+    logger.info(
+        "Chat AI-disabled state changed company_id=%s conversation_id=%s ai_auto_paused=true status=escalated message_id=%s",
+        company_id,
+        convo_id,
+        msg_id,
+    )
     return {
         "conversation": conversation,
         "message": message,

@@ -32,6 +32,7 @@ from shared.webhook_task_runner import create_safe_detached_task
 from services.db_helpers import (
     AI_API_EXHAUSTED_MANUAL_MESSAGE,
     _notify_agents_handoff,
+    auto_disable_ai_after_failure_fallback,
     conversation_ai_auto_paused,
     disable_company_ai_after_api_exhaustion,
     escalate_conversation_to_human,
@@ -801,7 +802,8 @@ async def toggle_ai_mode(convo_id: str, request: Request):
         await db.execute(
             "UPDATE conversations SET ai_handled=TRUE,status='open',escalation_notice=NULL,escalated_at=NULL,"
             "escalated_to='',escalated_to_name='',ai_auto_paused=FALSE,ai_paused_at=NULL,ai_paused_reason='',"
-            "ai_paused_error_type='',ai_paused_provider='',ai_paused_model='',ai_paused_scope='',updated_at=NOW() "
+            "ai_paused_error_type='',ai_paused_provider='',ai_paused_model='',ai_paused_scope='',"
+            "ai_disabled_until=NULL,ai_failure_count=0,updated_at=NOW() "
             "WHERE id=$1 AND company_id=$2",
             convo_id,
             cid,
@@ -1384,6 +1386,14 @@ async def send_message(convo_id: str, request: Request):
                     _message_preview(result["response"], ai_attachments, "ai"),
                     convo_id,
                 )
+                await auto_disable_ai_after_failure_fallback(
+                    db,
+                    company_id,
+                    convo_id,
+                    result,
+                    channel=str(convo.get("channel") or ""),
+                    trace_id=trace_id,
+                )
                 ai_response = await _load_message_with_attachments(db, ai_id)
                 await emit_new_message(convo_id, ai_response)
                 if outbound_channel in ("whatsapp", "facebook", "instagram", "email"):
@@ -1885,15 +1895,14 @@ async def _run_manual_ai_response_workflow(
         sys_message = r(await db.fetchrow("SELECT * FROM messages WHERE id=$1", sys_id))
         await emit_new_message(convo_id, sys_message)
         return sys_message
-    if draft_only and result.get("static_fallback_served") and str(result.get("provider") or "") == "static_fallback":
-        await disable_company_ai_after_api_exhaustion(
+    if draft_only:
+        await auto_disable_ai_after_failure_fallback(
             db,
             company_id,
-            conversation_id=convo_id,
-            reason=str(result.get("review_reason") or result.get("error_reason") or AI_API_EXHAUSTED_MANUAL_MESSAGE),
-            error_type=str(result.get("error_type") or "static_fallback"),
-            provider=str(result.get("provider") or ""),
-            model=str(result.get("model_name") or ""),
+            convo_id,
+            result,
+            channel=str(convo.get("channel") or ""),
+            trace_id=trace_id,
         )
     if draft_only:
         draft_payload = _build_manual_ai_draft_payload(

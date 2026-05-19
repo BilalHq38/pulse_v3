@@ -9,10 +9,13 @@ from services.ai_service import llm_client
 from services.ai_service.model_catalog import is_supported_model, model_capabilities, supported_model_catalog
 from services.db_helpers import (
     AI_API_EXHAUSTED_MANUAL_MESSAGE,
+    auto_disable_ai_after_failure_fallback,
+    conversation_ai_auto_paused,
     ensure_conversation_ai_pause_schema,
     ensure_default_llm_engine,
     escalate_conversation_to_human,
     is_ai_api_exhaustion_payload,
+    is_ai_failure_fallback_payload,
     pause_ai_auto_response,
 )
 
@@ -225,6 +228,27 @@ def test_serious_provider_failures_are_detected():
     assert is_ai_api_exhaustion_payload({"error_reason": "invalid model"})
 
 
+def test_static_provider_fallback_requires_ai_shutdown():
+    assert is_ai_failure_fallback_payload(
+        {
+            "static_fallback_served": True,
+            "api_error": True,
+            "error_type": "quota_exhausted",
+        }
+    )
+    assert not is_ai_failure_fallback_payload({"fallback_used": True, "api_error": False})
+
+
+def test_ai_disabled_until_counts_as_paused():
+    assert conversation_ai_auto_paused(
+        {
+            "ai_handled": True,
+            "ai_auto_paused": False,
+            "ai_disabled_until": "2999-01-01T00:00:00+00:00",
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_provider_failure_persists_conversation_pause_state():
     db = FakePauseDb()
@@ -246,6 +270,33 @@ async def test_provider_failure_persists_conversation_pause_state():
     assert args[1] == "quota_exhausted"
     assert args[2] == "gemini"
     assert args[3] == "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_static_fallback_auto_disables_conversation_ai():
+    db = FakePauseDb()
+    db.conversation = {"id": "convo-1", "company_id": "co-1", "ai_auto_paused": False, "ai_handled": True}
+
+    disabled = await auto_disable_ai_after_failure_fallback(
+        db,
+        "co-1",
+        "convo-1",
+        {
+            "static_fallback_served": True,
+            "api_error": True,
+            "error_type": "quota_exhausted",
+            "provider": "static_fallback",
+            "model_name": "static-fallback",
+        },
+        channel="web_chat",
+        trace_id="trace-1",
+    )
+
+    sql, args = db.executed[0]
+    assert disabled is True
+    assert "ai_auto_paused=TRUE" in sql
+    assert "ai_failure_count=COALESCE(ai_failure_count,0)+1" in sql
+    assert args[1] == "quota_exhausted"
 
 
 @pytest.mark.asyncio

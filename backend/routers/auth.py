@@ -27,6 +27,7 @@ from core.utils import make_id, validate_password, seconds_until
 from models.reference_data import resolve_role_id
 from services.billing_helpers import (
     PLAN_CATALOG,
+    TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
     assert_stripe_ready,
     assert_workspace_seat_available,
     count_pending_invitations,
@@ -1296,7 +1297,7 @@ async def accept_invitation(request: Request, background_tasks: BackgroundTasks)
         if used + pending_ct > cap:
             raise HTTPException(
                 403,
-                "You cannot add a new team member because your limit has been reached.",
+                TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
             )
         user_id = make_id()
         await db.execute(

@@ -59,9 +59,15 @@ test('Inbox handles realtime message reaction updates and renders reactions on b
 });
 
 test('Inbox renders AI paused warning state returned by backend', () => {
-  expect(source).toContain('selectedConvo.ai_auto_paused');
+  expect(source).toContain('isConversationAiDisabled(selectedConvo)');
   expect(source).toContain('data-testid="ai-paused-warning"');
   expect(source).toContain('AI auto-response is paused because the AI provider is unavailable. Please respond manually.');
+});
+
+test('Inbox visually marks AI-disabled conversation cards', () => {
+  expect(source).toContain('data-testid={`convo-${convo.id}-ai-disabled`}');
+  expect(source).toContain('AI paused');
+  expect(source).toContain("selectedAiDisabled ? 'AI Paused'");
 });
 
 test('Inbox renders WhatsApp group names in list, header, and message rows', () => {

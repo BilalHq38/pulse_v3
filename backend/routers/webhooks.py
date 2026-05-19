@@ -76,6 +76,7 @@ from shared.usage_guard import (
 )
 from services.db_helpers import (
     AI_API_EXHAUSTED_MANUAL_MESSAGE,
+    auto_disable_ai_after_failure_fallback,
     conversation_ai_auto_paused,
     convert_lead_to_customer_state,
     disable_company_ai_after_api_exhaustion,
@@ -281,6 +282,56 @@ def _safe_provider_avatar_url(value: str) -> str:
         [(key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True) if key.lower() not in private_params]
     )
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))[:2000]
+
+
+_EMPTY_PROFILE_NAMES = {"", "null", "none", "undefined", "unknown", "unknown contact"}
+
+
+def _clean_display_name(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return "" if text.lower() in _EMPTY_PROFILE_NAMES else text
+
+
+def _whatsapp_contact_for_message(contacts: list, msg: dict, fallback_index: int = 0) -> dict:
+    if not contacts:
+        return {}
+    raw_sender = str((msg or {}).get("from") or "").strip()
+    sender_identity = normalize_whatsapp_phone(raw_sender)
+    sender_digits = _identity_digits(sender_identity.canonical_value or raw_sender)
+
+    for contact in contacts or []:
+        if not isinstance(contact, dict):
+            continue
+        wa_id = str(contact.get("wa_id") or "").strip()
+        contact_identity = normalize_whatsapp_phone(wa_id)
+        contact_digits = _identity_digits(contact_identity.canonical_value or wa_id)
+        if wa_id and raw_sender and wa_id == raw_sender:
+            return contact
+        if sender_digits and contact_digits and sender_digits == contact_digits:
+            return contact
+
+    if 0 <= fallback_index < len(contacts) and isinstance(contacts[fallback_index], dict):
+        return contacts[fallback_index]
+    first = contacts[0]
+    return first if isinstance(first, dict) else {}
+
+
+def _whatsapp_profile_name(contact: dict | None, metadata_payload: dict | None = None, fallback: str = "") -> str:
+    payload = dict(metadata_payload or {})
+    profile = ((contact or {}).get("profile") or {}) if isinstance(contact, dict) else {}
+    name = (
+        _clean_display_name((contact or {}).get("name") if isinstance(contact, dict) else "")
+        or _clean_display_name(profile.get("name"))
+        or _clean_display_name(profile.get("push_name"))
+        or _clean_display_name(profile.get("formatted_name"))
+        or _clean_display_name(payload.get("sender_name_saved"))
+        or _clean_display_name(payload.get("contact_name_saved"))
+        or _clean_display_name(payload.get("sender_pushname"))
+        or _clean_display_name(payload.get("group_sender_name"))
+        or _clean_display_name(payload.get("profile_name"))
+        or _clean_display_name(fallback)
+    )
+    return name
 
 
 def _extract_sender_contact_fields(channel: str, sender_contact: str, metadata_payload: dict | None) -> dict[str, str]:
@@ -1986,7 +2037,7 @@ async def _handle_whatsapp_webhook_payload(
                         )
                         processed_any = True
                         continue
-                    contact = contacts[i] if i < len(contacts) else {}
+                    contact = _whatsapp_contact_for_message(contacts, msg or {}, i)
                     web_bridge = (msg or {}).get("web_bridge") if isinstance((msg or {}).get("web_bridge"), dict) else {}
                     is_bridge_outbound = is_web_bridge and _is_whatsapp_bridge_outbound_message(msg or {}, value_metadata)
                     is_group_message = bool(
@@ -2231,10 +2282,15 @@ async def _handle_whatsapp_webhook_payload(
                             )
 
                     sender_name = (
-                        str(web_bridge.get("sender_name_saved") or "").strip()
-                        or str(((contact or {}).get("profile") or {}).get("name") or "").strip()
-                        or str(web_bridge.get("group_sender_name") or "").strip()
-                        or str((unified_message.metadata or {}).get("profile_name") or "").strip()
+                        _whatsapp_profile_name(
+                            contact,
+                            {
+                                **(unified_message.metadata or {}),
+                                **web_bridge,
+                                "group_sender_name": web_bridge.get("group_sender_name") or "",
+                            },
+                        )
+                        or _clean_display_name(web_bridge.get("group_sender_name"))
                         or f"WhatsApp {unified_message.external_user_id}"
                     )
                     if not (str(unified_message.content or "").strip() or unified_message.attachments):
@@ -4854,7 +4910,14 @@ async def _auto_capture_lead(
                 if contact_fields["phone"]
                 else ""
             )
-            display_sender_name = _preferred_sender_name(channel, sender_name, metadata_payload)
+            display_sender_name = (
+                _clean_display_name(_preferred_sender_name(channel, sender_name, metadata_payload))
+                or (
+                    f"WhatsApp {contact_fields['phone'] or contact_fields['channel_id']}"
+                    if normalized_channel == "whatsapp"
+                    else ""
+                )
+            )
             await db.execute(
                 "INSERT INTO customers(id,company_id,name,email,phone,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,"  # noqa: E501
                 "recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) "
@@ -4874,7 +4937,9 @@ async def _auto_capture_lead(
                 customer_updates.append(f"company_id=${len(args) + 1}")
                 args.append(company_id)
                 existing["company_id"] = company_id
-            display_sender_name = _preferred_sender_name(channel, sender_name, metadata_payload, existing.get("name", ""))
+            display_sender_name = _clean_display_name(
+                _preferred_sender_name(channel, sender_name, metadata_payload, existing.get("name", ""))
+            )
             if _should_update_sender_name(channel, display_sender_name, metadata_payload, existing.get("name", "")):
                 customer_updates.append(f"name=${len(args) + 1}")
                 args.append(display_sender_name)
@@ -4961,7 +5026,12 @@ async def _auto_capture_lead(
             )
         if not existing_lead:
             lid = make_id()
-            display_lead_name = _preferred_sender_name(channel, sender_name, metadata_payload, existing.get("name", ""))
+            display_lead_name = (
+                _clean_display_name(
+                    _preferred_sender_name(channel, sender_name, metadata_payload, existing.get("name", ""))
+                )
+                or existing.get("name", "")
+            )
             await db.execute(
                 "INSERT INTO leads(id,company_id,name,email,phone,source,status,score,grade,phase,notes,assigned_to,assigned_name,created_at,updated_at) "  # noqa: E501
                 "VALUES($1,$2,$3,$4,$5,$6,'new',0,'cold','awareness',$7,'','',NOW(),NOW())",
@@ -5030,7 +5100,9 @@ async def _auto_capture_lead(
         if company_id and not existing_lead.get("company_id"):
             lead_updates.append(f"company_id=${len(args) + 1}")
             args.append(company_id)
-        display_lead_name = _preferred_sender_name(channel, sender_name, metadata_payload, existing_lead.get("name", ""))
+        display_lead_name = _clean_display_name(
+            _preferred_sender_name(channel, sender_name, metadata_payload, existing_lead.get("name", ""))
+        )
         if _should_update_sender_name(channel, display_lead_name, metadata_payload, existing_lead.get("name", "")):
             lead_updates.append(f"name=${len(args) + 1}")
             args.append(display_lead_name)
@@ -5979,7 +6051,11 @@ async def _process_incoming_message(
     conversation_customer_id = cid
     conversation_channel_binding = channel_binding
     message_sender_id = cid
-    message_sender_name = customer.get("name", "Unknown")
+    message_sender_name = (
+        _clean_display_name(customer.get("name"))
+        or _clean_display_name(sender_name)
+        or "Unknown Contact"
+    )
     if is_group_message:
         metadata_payload["group_participant_customer_id"] = cid
         metadata_payload["group_participant_name"] = message_sender_name
@@ -6127,7 +6203,7 @@ async def _process_incoming_message(
                     convo_id,
                     company_id,
                     conversation_customer_id,
-                    conversation_customer.get("name", "Unknown"),
+                    _clean_display_name(conversation_customer.get("name")) or message_sender_name,
                     conversation_customer.get("avatar", ""),
                     channel,
                     str(metadata_payload.get("group_name") or "") if is_group_message else f"New {channel} conversation",
@@ -6255,7 +6331,7 @@ async def _process_incoming_message(
                 },
                 conversation_channel_binding=conversation_channel_binding,
                 sender_contact=sender_contact,
-                display_name=conversation_customer.get("name", sender_name or ""),
+                display_name=_clean_display_name(conversation_customer.get("name")) or message_sender_name,
                 profile_picture_url=str(metadata_payload.get("profile_picture_url") or conversation_customer.get("avatar") or ""),
                 is_group_message=is_group_message,
             ),
@@ -6663,6 +6739,14 @@ async def _process_incoming_message(
                         existing_ai_message.get("id", ""),
                         ai_idempotency_key,
                     )
+                    await auto_disable_ai_after_failure_fallback(
+                        db,
+                        company_id,
+                        convo_id,
+                        support_result,
+                        channel=channel,
+                        trace_id=trace_id,
+                    )
                     ai_message = existing_ai_message
                     return {
                         "conversation_id": convo_id,
@@ -6698,6 +6782,14 @@ async def _process_incoming_message(
                             convo_id,
                             existing_ai_message.get("id", ""),
                             ai_idempotency_key,
+                        )
+                        await auto_disable_ai_after_failure_fallback(
+                            db,
+                            company_id,
+                            convo_id,
+                            support_result,
+                            channel=channel,
+                            trace_id=trace_id,
                         )
                         ai_message = existing_ai_message
                         return {
@@ -6761,6 +6853,14 @@ async def _process_incoming_message(
                     "UPDATE conversations SET last_message=$1,last_message_at=NOW(),message_count=message_count+1 WHERE id=$2",  # noqa: E501
                     _message_preview(support_result["response"], ai_attachments, "ai"),
                     convo_id,
+                )
+                await auto_disable_ai_after_failure_fallback(
+                    db,
+                    company_id,
+                    convo_id,
+                    support_result,
+                    channel=channel,
+                    trace_id=trace_id,
                 )
                 create_safe_detached_task(
                     db,
@@ -7658,6 +7758,14 @@ async def web_chat_webhook(request: Request):
                         "UPDATE conversations SET last_message=$1,last_message_at=NOW(),message_count=message_count+1 WHERE id=$2",  # noqa: E501
                         _message_preview(support_result["response"], ai_attachments, "ai"),
                         convo_id,
+                    )
+                    await auto_disable_ai_after_failure_fallback(
+                        db,
+                        company_id,
+                        convo_id,
+                        support_result,
+                        channel="web_chat",
+                        trace_id=trace_id,
                     )
                     create_safe_detached_task(
                         db,
