@@ -166,6 +166,12 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 "data_url": att.data_url,
                 "mime_type": att.mime_type,
                 "name": att.name,
+                "raw_metadata": dict(att.raw_metadata or {}),
+                "caption": str((att.raw_metadata or {}).get("caption") or ""),
+                "product_id": str((att.raw_metadata or {}).get("product_id") or ""),
+                "product_name": str((att.raw_metadata or {}).get("product_name") or ""),
+                "product_title": str((att.raw_metadata or {}).get("product_title") or ""),
+                "product_category": str((att.raw_metadata or {}).get("product_category") or ""),
             }
             for att in (message.attachments or [])
             if att.url or att.data_url

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from difflib import SequenceMatcher
@@ -188,18 +186,4 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_ai_reply_delay_seconds(source_text: str) -> float:
-    _ = source_text
-    return 0.0
 
-
-async def wait_for_ai_response_timing(source_text: str, started_at: float | None = None) -> None:
-    delay = get_ai_reply_delay_seconds(source_text)
-    if delay <= 0:
-        return
-    if started_at is None:
-        await asyncio.sleep(delay)
-        return
-    remaining = delay - max(0.0, time.monotonic() - started_at)
-    if remaining > 0:
-        await asyncio.sleep(remaining)

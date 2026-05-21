@@ -13,6 +13,7 @@ from services.ai_service.facade import (
     should_auto_escalate,
 )
 from services.ai_service.llm_tracking import log_llm_reuse
+from services.ai_service.response_safety import sanitize_ai_response_for_delivery
 from services.db_helpers import (
     AI_API_EXHAUSTED_MANUAL_MESSAGE,
     auto_disable_ai_after_failure_fallback,
@@ -52,6 +53,15 @@ def _is_manual_ai_draft_request(request) -> bool:
 
 def _manual_ai_safe_fallback_draft() -> str:
     return "Hi, thanks for reaching out. Let me check this and get back to you shortly."
+
+
+def _company_name_for_safety(request, customer: dict) -> str:
+    metadata = dict(getattr(request, "metadata", {}) or {})
+    return (
+        str(metadata.get("company_name") or metadata.get("business_name") or "").strip()
+        or str((customer or {}).get("company_name") or (customer or {}).get("company") or "").strip()
+        or "this business"
+    )
 
 
 class SupportAgent(BaseAgent):
@@ -240,6 +250,19 @@ class SupportAgent(BaseAgent):
             ai_result["fallback_used"] = True
             ai_result["fallback_reason"] = "empty_model_response"
             ai_response_text = str(ai_result.get("response") or "").strip()
+        if ai_response_text:
+            safe_response_text, safety_blocked, safety_issues = sanitize_ai_response_for_delivery(
+                ai_response_text,
+                company_name=_company_name_for_safety(request, customer),
+            )
+            ai_result["response"] = safe_response_text
+            ai_result["safety_validated"] = True
+            ai_result["safety_blocked"] = safety_blocked
+            ai_result["safety_issues"] = safety_issues
+            ai_response_text = safe_response_text
+            if safety_blocked:
+                ai_result["fallback_used"] = True
+                ai_result["fallback_reason"] = "response_safety_blocked"
         confidence = float(ai_result.get("confidence", 0.0) or 0.0)
         static_fallback_served = bool(ai_result.get("static_fallback_served"))
         provider_failure = bool(
@@ -251,15 +274,16 @@ class SupportAgent(BaseAgent):
             sentiment=sentiment,
             intent=intent,
         )
+        low_confidence = confidence < threshold
         escalate = bool(
-            not sentiment_gate.get("ai_response_allowed", True) or escalate_for_signal or confidence < threshold
+            not sentiment_gate.get("ai_response_allowed", True) or escalate_for_signal
         )
         escalation_reason = ""
         if not sentiment_gate.get("ai_response_allowed", True):
             escalation_reason = "Sentiment safety gate blocked autonomous response."
         elif escalate_for_signal:
             escalation_reason = "Intent and sentiment indicate a human handoff is safer."
-        elif confidence < threshold:
+        elif low_confidence:
             escalation_reason = f"AI confidence {confidence:.2f} is below threshold {threshold:.2f}."
         if provider_failure:
             escalate = True
@@ -298,7 +322,7 @@ class SupportAgent(BaseAgent):
             "llm_id": str(ai_result.get("llm_id") or ""),
             "knowledge_context": knowledge_context,
             "manual_draft": manual_draft_mode,
-            "requires_review": bool(escalate or confidence < threshold),
+            "requires_review": bool(escalate or low_confidence),
             "review_reason": escalation_reason,
             "deliver_response": (
                 bool(ai_result.get("response")) and not provider_failure
@@ -320,6 +344,9 @@ class SupportAgent(BaseAgent):
             "fallback_used": bool(ai_result.get("fallback_used")),
             "fallback_reason": str(ai_result.get("fallback_reason") or ""),
             "static_fallback_served": static_fallback_served,
+            "safety_validated": bool(ai_result.get("safety_validated", bool(ai_result.get("response")))),
+            "safety_blocked": bool(ai_result.get("safety_blocked")),
+            "safety_issues": list(ai_result.get("safety_issues") or []),
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
 

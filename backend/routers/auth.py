@@ -27,7 +27,7 @@ from core.utils import make_id, validate_password, seconds_until
 from models.reference_data import resolve_role_id
 from services.billing_helpers import (
     PLAN_CATALOG,
-    TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
+    user_limit_reached_detail,
     assert_stripe_ready,
     assert_workspace_seat_available,
     count_pending_invitations,
@@ -44,6 +44,8 @@ from services.billing_helpers import (
     uses_local_billing_customer_id,
 )
 from services.db_helpers import (
+    ACCOUNT_LOGIN_BLOCKED_STATUSES,
+    account_status_error_detail,
     bump_user_token_version,
     build_auth_payload,
     close_login_sessions,
@@ -67,6 +69,7 @@ from services.db_helpers import (
     get_company_id,
     set_company_context,
     set_public_auth_context,
+    normalize_account_status,
 )
 from services.email_service import render_platform_email_html, send_email_async
 from services.oauth_service import (
@@ -409,13 +412,13 @@ async def login(request: Request):
         )
     user = password_matches[0]
     user = await ensure_user_company_assignment(db, user)
-    account_status = str(user.get("status") or "active").strip().lower()
-    if account_status in {"paused", "blocked", "inactive"}:
+    account_status = normalize_account_status(user.get("status"))
+    if account_status in ACCOUNT_LOGIN_BLOCKED_STATUSES:
         await _record_auth_event_safe(db, user["id"], "login", request, False, email)
         logger.warning("auth login_failed method=email reason=account_%s", account_status)
         return JSONResponse(
             status_code=403,
-            content={"detail": f"Your account is {account_status}. Please contact your administrator."},
+            content=account_status_error_detail(account_status),
         )
     if user.get("role") == "super_admin" and not relaxed_billing_env():
         logger.warning("auth login_failed method=email reason=super_admin_requires_admin_login")
@@ -1297,7 +1300,7 @@ async def accept_invitation(request: Request, background_tasks: BackgroundTasks)
         if used + pending_ct > cap:
             raise HTTPException(
                 403,
-                TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
+                user_limit_reached_detail(used=used + pending_ct, limit=cap),
             )
         user_id = make_id()
         await db.execute(

@@ -20,6 +20,7 @@ from shared.config import (
 )
 
 logger = logging.getLogger(__name__)
+IDENTITY_SCHEMA_MIGRATION = "backend/sql_migrations/012_identity_runtime_schema_hardening.sql"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
@@ -85,6 +86,30 @@ def _vector_enabled() -> bool:
     }
 
 
+async def _identity_schema_ready(conn) -> bool:
+    required_relations = (
+        "unified_customers",
+        "identity_mappings",
+        "review_queue",
+        "identity_events",
+        "event_outbox",
+        "dead_letter_queue",
+    )
+    missing: list[str] = []
+    for relation in required_relations:
+        exists = await conn.scalar(text("SELECT to_regclass(:relation) IS NOT NULL"), {"relation": relation})
+        if not bool(exists):
+            missing.append(f"relation:{relation}")
+    if missing:
+        logger.error(
+            "runtime_schema_migration_required area=identity_service migration=%s missing=%s",
+            IDENTITY_SCHEMA_MIGRATION,
+            ",".join(missing),
+        )
+        return False
+    return True
+
+
 def _default_tenant_id() -> str:
     return identity_default_tenant_id("demo_tenant") or "demo_tenant"
 
@@ -137,80 +162,7 @@ async def init_db_schema() -> None:
     # Import models lazily so metadata includes every mapped table before create_all.
     from services.identity_service.app.db import models  # noqa: F401
 
-    fallback_tenant = _default_tenant_id()
-    compatibility_patches = [
-        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
-        "ALTER TABLE IF EXISTS unified_customers ADD COLUMN IF NOT EXISTS id UUID",
-        "UPDATE unified_customers SET id = customer_id WHERE id IS NULL",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_unified_customers_id ON unified_customers(id)",
-        "ALTER TABLE IF EXISTS unified_customers ADD COLUMN IF NOT EXISTS primary_identity TEXT",
-        "UPDATE unified_customers SET primary_identity = COALESCE(primary_identity, primary_phone_hash, primary_email_hash, customer_id::text)",  # noqa: E501
-        "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS id UUID",
-        "UPDATE identity_mappings SET id = mapping_id WHERE id IS NULL",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_mappings_id ON identity_mappings(id)",
-        "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS phone TEXT",
-        "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS email TEXT",
-        "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS name TEXT",
-        "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS fingerprint TEXT",
-        "ALTER TABLE IF EXISTS identity_mappings ADD COLUMN IF NOT EXISTS confidence_score DOUBLE PRECISION",
-        "UPDATE identity_mappings SET confidence_score = COALESCE(confidence_score, confidence)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_mappings_mapping_id ON identity_mappings(mapping_id)",
-        "CREATE INDEX IF NOT EXISTS idx_unified_customers_customer_id ON unified_customers(customer_id)",
-        "ALTER TABLE IF EXISTS review_queue ADD COLUMN IF NOT EXISTS source VARCHAR(64)",
-        "UPDATE review_queue SET source = 'internal' WHERE source IS NULL OR BTRIM(source) = ''",
-        "CREATE INDEX IF NOT EXISTS idx_review_queue_source ON review_queue(source)",
-        "CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status)",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS task_name TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT ''",
-        "UPDATE resolution_audit_log ral SET customer_id = NULL WHERE customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = ral.customer_id)",  # noqa: E501
-        "UPDATE profile_merge_history pmh SET source_customer_id = NULL WHERE source_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = pmh.source_customer_id)",  # noqa: E501
-        "UPDATE profile_merge_history pmh SET target_customer_id = NULL WHERE target_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = pmh.target_customer_id)",  # noqa: E501
-        "UPDATE review_queue rq SET source_customer_id = NULL WHERE source_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = rq.source_customer_id)",  # noqa: E501
-        "UPDATE review_queue rq SET candidate_customer_id = NULL WHERE candidate_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unified_customers uc WHERE uc.customer_id = rq.candidate_customer_id)",  # noqa: E501
-        "ALTER TABLE IF EXISTS profile_merge_history ALTER COLUMN source_customer_id DROP NOT NULL",
-        "ALTER TABLE IF EXISTS profile_merge_history ALTER COLUMN target_customer_id DROP NOT NULL",
-        "CREATE TABLE IF NOT EXISTS merged_profile_records (record_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id VARCHAR(128) NOT NULL, unified_customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL, source_customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL, target_customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL, source_platforms JSONB NOT NULL DEFAULT '[]'::jsonb, target_platforms JSONB NOT NULL DEFAULT '[]'::jsonb, original_identities JSONB NOT NULL DEFAULT '{}'::jsonb, unified_identity_mapping JSONB NOT NULL DEFAULT '{}'::jsonb, merge_history JSONB NOT NULL DEFAULT '{}'::jsonb, merge_reason TEXT NOT NULL DEFAULT '', merged_by VARCHAR(32) NOT NULL DEFAULT 'auto', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",  # noqa: E501
-        "CREATE INDEX IF NOT EXISTS idx_merged_profile_records_tenant ON merged_profile_records(tenant_id)",
-        "CREATE INDEX IF NOT EXISTS idx_merged_profile_records_unified ON merged_profile_records(unified_customer_id)",
-        "CREATE INDEX IF NOT EXISTS idx_merged_profile_records_source ON merged_profile_records(source_customer_id)",
-        "CREATE INDEX IF NOT EXISTS idx_merged_profile_records_target ON merged_profile_records(target_customer_id)",
-        "ALTER TABLE IF EXISTS review_queue ALTER COLUMN source_customer_id DROP NOT NULL",
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_resolution_audit_log_customer_id') THEN ALTER TABLE resolution_audit_log ADD CONSTRAINT fk_resolution_audit_log_customer_id FOREIGN KEY (customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_profile_merge_history_source_customer_id') THEN ALTER TABLE profile_merge_history ADD CONSTRAINT fk_profile_merge_history_source_customer_id FOREIGN KEY (source_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_profile_merge_history_target_customer_id') THEN ALTER TABLE profile_merge_history ADD CONSTRAINT fk_profile_merge_history_target_customer_id FOREIGN KEY (target_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_review_queue_source_customer_id') THEN ALTER TABLE review_queue ADD CONSTRAINT fk_review_queue_source_customer_id FOREIGN KEY (source_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_review_queue_candidate_customer_id') THEN ALTER TABLE review_queue ADD CONSTRAINT fk_review_queue_candidate_customer_id FOREIGN KEY (candidate_customer_id) REFERENCES unified_customers(customer_id) ON DELETE SET NULL; END IF; END $$",  # noqa: E501
-        f"CREATE TABLE IF NOT EXISTS identity_history (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id VARCHAR(128) NOT NULL DEFAULT '{fallback_tenant}', customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE CASCADE, event_type TEXT NOT NULL, data_snapshot JSONB NOT NULL DEFAULT '{{}}'::jsonb, timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW())",  # noqa: E501
-        "ALTER TABLE IF EXISTS identity_history ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(128)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_history_customer ON identity_history(customer_id)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_history_timestamp ON identity_history(timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_history_tenant ON identity_history(tenant_id)",
-        f"UPDATE identity_history ih SET tenant_id = COALESCE(NULLIF(ih.tenant_id, ''), (SELECT uc.tenant_id FROM unified_customers uc WHERE uc.customer_id = ih.customer_id), '{fallback_tenant}')",  # noqa: E501
-        "ALTER TABLE IF EXISTS identity_history ALTER COLUMN tenant_id SET NOT NULL",
-        f"CREATE TABLE IF NOT EXISTS consent_records (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id VARCHAR(128) NOT NULL DEFAULT '{fallback_tenant}', customer_id UUID REFERENCES unified_customers(customer_id) ON DELETE SET NULL, consent_given BOOLEAN NOT NULL DEFAULT FALSE, timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW())",  # noqa: E501
-        "ALTER TABLE IF EXISTS consent_records ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(128)",
-        "CREATE INDEX IF NOT EXISTS idx_consent_records_customer ON consent_records(customer_id)",
-        "CREATE INDEX IF NOT EXISTS idx_consent_records_timestamp ON consent_records(timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_consent_records_tenant ON consent_records(tenant_id)",
-        f"UPDATE consent_records cr SET tenant_id = COALESCE(NULLIF(cr.tenant_id, ''), (SELECT uc.tenant_id FROM unified_customers uc WHERE uc.customer_id = cr.customer_id), '{fallback_tenant}')",  # noqa: E501
-        "ALTER TABLE IF EXISTS consent_records ALTER COLUMN tenant_id SET NOT NULL",
-        "CREATE TABLE IF NOT EXISTS identity_events (event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id VARCHAR(128) NOT NULL, event_type VARCHAR(64) NOT NULL, aggregate_customer_id UUID, idempotency_key VARCHAR(191), payload JSONB NOT NULL DEFAULT '{}'::jsonb, status VARCHAR(32) NOT NULL DEFAULT 'pending', error_message TEXT, published_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",  # noqa: E501
-        "CREATE INDEX IF NOT EXISTS idx_identity_events_tenant ON identity_events(tenant_id)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_events_event_type ON identity_events(event_type)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_events_created_at ON identity_events(created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_events_status ON identity_events(status)",
-        "CREATE INDEX IF NOT EXISTS idx_identity_events_aggregate_customer ON identity_events(aggregate_customer_id)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_identity_events_tenant_idempotency ON identity_events(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL",  # noqa: E501
-        "CREATE TABLE IF NOT EXISTS event_outbox (outbox_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), event_id UUID NOT NULL UNIQUE REFERENCES identity_events(event_id) ON DELETE CASCADE, tenant_id VARCHAR(128) NOT NULL, stream_name VARCHAR(128) NOT NULL DEFAULT 'identity.events', idempotency_key VARCHAR(191), payload JSONB NOT NULL DEFAULT '{}'::jsonb, status VARCHAR(32) NOT NULL DEFAULT 'queued', retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at TIMESTAMPTZ, last_error TEXT, published_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",  # noqa: E501
-        "CREATE INDEX IF NOT EXISTS idx_event_outbox_tenant ON event_outbox(tenant_id)",
-        "CREATE INDEX IF NOT EXISTS idx_event_outbox_status ON event_outbox(status)",
-        "CREATE INDEX IF NOT EXISTS idx_event_outbox_next_retry ON event_outbox(next_retry_at)",
-        "CREATE INDEX IF NOT EXISTS idx_event_outbox_created_at ON event_outbox(created_at)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_event_outbox_tenant_idempotency ON event_outbox(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL",  # noqa: E501
-    ]
+    # Runtime schema mutation was moved to sql_migrations/012_identity_runtime_schema_hardening.sql.
 
     attempts = db_startup_retries()
     base_delay = db_startup_retry_backoff_seconds()
@@ -219,26 +171,6 @@ async def init_db_schema() -> None:
             async with engine.begin() as conn:
                 await _assert_database_role_security(conn)
                 if _vector_enabled():
-                    await conn.execute(
-                        text(
-                            """
-                            DO $$
-                            BEGIN
-                                BEGIN
-                                    CREATE EXTENSION IF NOT EXISTS vector;
-                                EXCEPTION
-                                    WHEN undefined_file THEN
-                                        RAISE NOTICE 'pgvector not installed, IDENTITY_USE_VECTOR cannot be enabled.';
-                                    WHEN feature_not_supported THEN
-                                        RAISE NOTICE 'pgvector not supported on this PostgreSQL instance.';
-                                    WHEN insufficient_privilege THEN
-                                        RAISE NOTICE 'insufficient privilege to create pgvector extension.';
-                                END;
-                            END
-                            $$;
-                            """
-                        )
-                    )
                     extension_available = await conn.scalar(
                         text("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')")
                     )
@@ -247,10 +179,8 @@ async def init_db_schema() -> None:
                             "IDENTITY_USE_VECTOR is enabled but pgvector extension is unavailable. "
                             "Disable IDENTITY_USE_VECTOR or install pgvector."
                         )
-
-                await conn.run_sync(Base.metadata.create_all)
-                for statement in compatibility_patches:
-                    await conn.execute(text(statement))
+                if not await _identity_schema_ready(conn):
+                    raise RuntimeError(f"Identity DB schema is missing required objects. Run {IDENTITY_SCHEMA_MIGRATION}.")
             return
         except Exception as exc:
             if attempt >= attempts:

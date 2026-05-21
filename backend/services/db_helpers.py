@@ -38,6 +38,7 @@ from models.reference_data import ensure_company_reference_data, resolve_role_id
 from services.email_service import render_platform_email_html, send_email_async
 from services.ai_service.model_catalog import (
     DEFAULT_GEMINI_MODEL,
+    GEMINI_PROVIDER_KEYS,
     capability_labels,
     model_capabilities as catalog_model_capabilities,
     model_supports as catalog_model_supports,
@@ -63,6 +64,104 @@ AI_STATIC_FALLBACK_DEFAULT = (
     os.environ.get("AI_STATIC_FALLBACK_MESSAGE", "").strip()
     or "Thanks for your message. A team member will respond shortly."
 )
+DEPLOYMENT_SCHEMA_MIGRATION = "backend/sql_migrations/011_deployment_runtime_schema_hardening.sql"
+ACCOUNT_PENDING_APPROVAL_MESSAGE = (
+    "Your account is pending admin approval. You will get access to Pulse Engine after Super Admin verification."
+)
+ACCOUNT_REJECTED_MESSAGE = (
+    "Your account request was not approved. Please contact the administrator for more information."
+)
+ACCOUNT_BLOCKED_MESSAGE = "Your account has been blocked. Please contact your administrator to restore access."
+ACCOUNT_PAUSED_MESSAGE = "Your account has been paused. Please contact your administrator."
+ACCOUNT_INACTIVE_MESSAGE = "Your account is inactive. Please contact your administrator."
+ACCOUNT_RESTRICTED_STATUSES = {"pending_approval", "rejected", "blocked", "paused", "inactive"}
+ACCOUNT_LOGIN_BLOCKED_STATUSES = {"blocked", "paused", "inactive"}
+
+
+def normalize_account_status(status: str | None) -> str:
+    return str(status or "active").strip().lower() or "active"
+
+
+def account_status_code(status: str | None) -> str:
+    normalized = normalize_account_status(status)
+    return {
+        "pending_approval": "ACCOUNT_PENDING_APPROVAL",
+        "rejected": "ACCOUNT_REJECTED",
+        "blocked": "ACCOUNT_BLOCKED",
+        "paused": "ACCOUNT_PAUSED",
+        "inactive": "ACCOUNT_INACTIVE",
+    }.get(normalized, "")
+
+
+def account_status_message(status: str | None) -> str:
+    normalized = normalize_account_status(status)
+    return {
+        "pending_approval": ACCOUNT_PENDING_APPROVAL_MESSAGE,
+        "rejected": ACCOUNT_REJECTED_MESSAGE,
+        "blocked": ACCOUNT_BLOCKED_MESSAGE,
+        "paused": ACCOUNT_PAUSED_MESSAGE,
+        "inactive": ACCOUNT_INACTIVE_MESSAGE,
+    }.get(normalized, "")
+
+
+def account_status_error_detail(status: str | None) -> dict:
+    normalized = normalize_account_status(status)
+    return {
+        "code": account_status_code(normalized) or "ACCOUNT_RESTRICTED",
+        "status": normalized,
+        "message": account_status_message(normalized) or "Your account cannot access this resource.",
+    }
+
+
+async def runtime_schema_ready(
+    db,
+    area: str,
+    *,
+    required_relations: tuple[str, ...] = (),
+    required_columns: tuple[tuple[str, str], ...] = (),
+    required_indexes: tuple[str, ...] = (),
+    raise_on_missing: bool = False,
+) -> bool:
+    missing: list[str] = []
+    try:
+        for relation in required_relations:
+            exists = bool(await db.fetchval("SELECT to_regclass($1) IS NOT NULL", relation))
+            if not exists:
+                missing.append(f"relation:{relation}")
+        for table, column in required_columns:
+            exists = bool(
+                await db.fetchval(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=$1 AND column_name=$2"
+                    ")",
+                    table,
+                    column,
+                )
+            )
+            if not exists:
+                missing.append(f"column:{table}.{column}")
+        for index in required_indexes:
+            exists = bool(await db.fetchval("SELECT to_regclass($1) IS NOT NULL", index))
+            if not exists:
+                missing.append(f"index:{index}")
+    except Exception as exc:
+        logger.warning("runtime_schema_check_failed area=%s migration=%s error=%s", area, DEPLOYMENT_SCHEMA_MIGRATION, exc)
+        if raise_on_missing:
+            raise RuntimeError(f"Database schema check failed for {area}. Run {DEPLOYMENT_SCHEMA_MIGRATION}.") from exc
+        return False
+
+    if missing:
+        logger.error(
+            "runtime_schema_migration_required area=%s migration=%s missing=%s",
+            area,
+            DEPLOYMENT_SCHEMA_MIGRATION,
+            ",".join(missing),
+        )
+        if raise_on_missing:
+            raise RuntimeError(f"Database schema is missing required objects for {area}. Run {DEPLOYMENT_SCHEMA_MIGRATION}.")
+        return False
+    return True
 
 
 def _normalize_lookup_email(value: str | None) -> str:
@@ -281,6 +380,8 @@ def build_user_payload(user: dict) -> dict:
         "onboarding_required": not bool(user.get("onboarding_completed")),
         "plan_selected": bool(user.get("plan_selected", True)),
         "billing_status": bs,
+        "status": normalize_account_status(user.get("status")),
+        "account_status": normalize_account_status(user.get("status")),
         "auth_provider": user.get("auth_provider", "email"),
         "email_verified": bool(user.get("email_verified")),
         "subscription_plan_code": plan_code,
@@ -461,52 +562,26 @@ async def ensure_unique_company_role(db, current_user: dict, role: str, exclude_
 
 async def ensure_auth_security_primitives(db) -> None:
     global _auth_security_ready
-    # Older DBs predate this column; runs before the early return so it applies on every call (cheap if present).
-    await db.execute("ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS link_user_id TEXT")
     if _auth_security_ready:
         return
     async with _auth_security_lock:
         if _auth_security_ready:
             return
-        await db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0")
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS refresh_tokens (
-                id TEXT PRIMARY KEY,
-                company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                token_hash TEXT NOT NULL,
-                token_version INTEGER NOT NULL DEFAULT 0,
-                user_agent TEXT NOT NULL DEFAULT '',
-                ip_address TEXT NOT NULL DEFAULT '',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expires_at TIMESTAMPTZ NOT NULL,
-                last_used_at TIMESTAMPTZ,
-                revoked_at TIMESTAMPTZ,
-                revoke_reason TEXT NOT NULL DEFAULT '',
-                rotated_to TEXT NOT NULL DEFAULT '',
-                CONSTRAINT uq_refresh_tokens_hash UNIQUE (token_hash)
-            )
-            """
+        await runtime_schema_ready(
+            db,
+            "auth_security_primitives",
+            required_relations=("refresh_tokens",),
+            required_columns=(
+                ("oauth_states", "link_user_id"),
+                ("users", "token_version"),
+                ("users", "plan_selected"),
+                ("users", "billing_status"),
+                ("company_settings", "preferred_channels"),
+                ("company_settings", "ai_static_fallback_message"),
+            ),
+            required_indexes=("idx_refresh_tokens_user_active", "idx_refresh_tokens_company_active"),
+            raise_on_missing=True,
         )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_active ON refresh_tokens(user_id, revoked_at, expires_at)"  # noqa: E501
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_company_active ON refresh_tokens(company_id, revoked_at, expires_at)"  # noqa: E501
-        )
-        await db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_selected BOOLEAN NOT NULL DEFAULT TRUE")
-        await db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_status TEXT NOT NULL DEFAULT 'active'")
-        try:
-            await db.execute(
-                "ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS preferred_channels JSONB NOT NULL DEFAULT '[]'::jsonb"  # noqa: E501
-            )
-            await db.execute(
-                "ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS ai_static_fallback_message TEXT NOT NULL "
-                "DEFAULT 'Thanks for your message. A team member will respond shortly.'"
-            )
-        except Exception:
-            logger.debug("company_settings lightweight migration skipped", exc_info=True)
         _auth_security_ready = True
 
 
@@ -517,20 +592,23 @@ async def ensure_conversation_ai_pause_schema(db) -> None:
     async with _conversation_ai_pause_schema_lock:
         if _conversation_ai_pause_schema_ready:
             return
-        statements = (
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFAULT 'generic'",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_auto_paused BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_at TIMESTAMPTZ",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_reason TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_error_type TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_provider TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_model TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_paused_scope TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_disabled_until TIMESTAMPTZ",
-            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS ai_failure_count INT DEFAULT 0",
+        await runtime_schema_ready(
+            db,
+            "conversation_ai_pause",
+            required_columns=(
+                ("conversations", "agent_type"),
+                ("conversations", "ai_auto_paused"),
+                ("conversations", "ai_paused_at"),
+                ("conversations", "ai_paused_reason"),
+                ("conversations", "ai_paused_error_type"),
+                ("conversations", "ai_paused_provider"),
+                ("conversations", "ai_paused_model"),
+                ("conversations", "ai_paused_scope"),
+                ("conversations", "ai_disabled_until"),
+                ("conversations", "ai_failure_count"),
+            ),
+            raise_on_missing=True,
         )
-        for statement in statements:
-            await db.execute(statement)
         _conversation_ai_pause_schema_ready = True
 
 
@@ -692,8 +770,8 @@ async def resolve_refresh_token_rotation(db, refresh_token: str, request: Option
         raise unauthorized_exception()
     user = await ensure_user_company_assignment(db, user)
     user = await enrich_user_session_fields(db, user)
-    account_status = str(user.get("status") or "active").strip().lower()
-    if account_status in {"paused", "blocked", "inactive"}:
+    account_status = normalize_account_status(user.get("status"))
+    if account_status in ACCOUNT_LOGIN_BLOCKED_STATUSES:
         raise unauthorized_exception()
     if _token_version(user) != int(payload.get("token_version", 0) or 0):
         raise unauthorized_exception()
@@ -991,25 +1069,14 @@ async def ensure_embedding_vector_optimizations(db) -> None:
             vector_extension_available = bool(
                 await db.fetchval("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')")
             )
-            await db.execute(
-                "DELETE FROM embeddings a USING embeddings b "
-                "WHERE a.company_id=b.company_id AND a.source_type=b.source_type "
-                "AND a.source_id=b.source_id AND a.chunk_index=b.chunk_index "
-                "AND a.ctid < b.ctid"
-            )
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_embeddings_company_source_chunk "
-                "ON embeddings(company_id, source_type, source_id, chunk_index)"
-            )
-            if vector_extension_available:
-                await db.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_embeddings_vector_cosine "
-                    "ON embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
-                )
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_embeddings_company_source_lookup "
-                "ON embeddings(company_id, source_type, source_id)"
-            )
+            missing_indexes = []
+            for index_name in (
+                "uq_embeddings_company_source_chunk",
+                "idx_embeddings_company_source_lookup",
+                "idx_embeddings_vector_cosine" if vector_extension_available else "",
+            ):
+                if index_name and not bool(await db.fetchval("SELECT to_regclass($1) IS NOT NULL", index_name)):
+                    missing_indexes.append(index_name)
             duplicate_groups = await db.fetchval(
                 "SELECT COUNT(*) FROM ("
                 "SELECT 1 FROM embeddings "
@@ -1019,20 +1086,38 @@ async def ensure_embedding_vector_optimizations(db) -> None:
             )
             if int(duplicate_groups or 0):
                 logger.warning(
-                    "Embedding optimization finished with %s duplicate groups still present",
+                    "embedding_runtime_schema_warning reason=duplicate_embedding_groups count=%s migration=%s",
                     duplicate_groups,
+                    DEPLOYMENT_SCHEMA_MIGRATION,
                 )
-            await db.execute("ANALYZE embeddings")
+            if missing_indexes:
+                logger.warning(
+                    "runtime_schema_migration_required area=embedding_vector_optimizations migration=%s missing=%s",
+                    DEPLOYMENT_SCHEMA_MIGRATION,
+                    ",".join(f"index:{item}" for item in missing_indexes),
+                )
             _embedding_vector_ready = True
-            logger.info("Embedding vector optimizations applied")
+            logger.info("Embedding vector schema checked")
         except Exception as exc:
             logger.warning("Embedding vector optimization skipped: %s", exc)
 
 
 def provider_has_credentials(provider: str) -> bool:
     provider = (provider or "").strip().lower()
-    if provider == "gemini":
+    vertex_env_ready = bool(
+        os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        and os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+    )
+    vertex_auto_enabled = (
+        os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {"1", "true", "yes", "on"}
+        or os.environ.get("VERTEX_AI_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    if provider == "vertex_ai":
+        return vertex_env_ready
+    if provider == "gemini_api":
         return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    if provider == "gemini":
+        return (vertex_auto_enabled and vertex_env_ready) or bool(os.environ.get("GEMINI_API_KEY", "").strip())
     if provider == "openai":
         return bool(os.environ.get("OPENAI_API_KEY", "").strip())
     if provider == "anthropic":
@@ -1044,12 +1129,14 @@ def provider_configuration_status(provider: str, *, is_active: bool = True) -> t
     provider = (provider or "").strip().lower()
     if not is_active:
         return "disabled", "Engine is disabled"
-    if provider not in {"gemini", "openai", "anthropic"}:
+    if provider not in {*GEMINI_PROVIDER_KEYS, "openai", "anthropic"}:
         return "unavailable", f"Unsupported provider: {provider or 'unknown'}"
     if provider_has_credentials(provider):
         return "configured", ""
     key_name = {
-        "gemini": "GEMINI_API_KEY",
+        "gemini": "GEMINI_API_KEY or Vertex AI environment",
+        "gemini_api": "GEMINI_API_KEY",
+        "vertex_ai": "GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
     }[provider]
@@ -1349,6 +1436,12 @@ async def pause_ai_auto_response(
     scope: str = "conversation",
     status: str = "open",
     increment_failure_count: bool = False,
+    disable_reason: str = "static_fallback",
+    trigger_message_id: str = "",
+    actor_type: str = "",
+    trigger: str = "",
+    message_type: str = "",
+    media_type: str = "",
 ) -> None:
     if not company_id or not conversation_id:
         return
@@ -1360,9 +1453,15 @@ async def pause_ai_auto_response(
     next_status = "escalated" if status == "escalated" else "open"
     failure_count_sql = ",ai_failure_count=COALESCE(ai_failure_count,0)+1" if increment_failure_count else ""
     logger.warning(
-        "AI auto-disable trigger company_id=%s conversation_id=%s reason=%s error_type=%s provider=%s model=%s scope=%s status=%s",
+        "ai_auto_disabled company_id=%s conversation_id=%s trigger=%s reason=%s trigger_message_id=%s actor_type=%s message_type=%s media_type=%s detail=%s error_type=%s provider=%s model=%s scope=%s status=%s",
         company_id,
         conversation_id,
+        str(trigger or disable_reason or "static_fallback").strip()[:80],
+        str(disable_reason or "static_fallback").strip()[:80],
+        str(trigger_message_id or "").strip()[:120],
+        str(actor_type or "").strip()[:80],
+        str(message_type or "").strip()[:80],
+        str(media_type or "").strip()[:80],
         clean_reason[:300],
         clean_error_type,
         clean_provider,
@@ -1385,11 +1484,12 @@ async def pause_ai_auto_response(
         company_id,
     )
     logger.info(
-        "Chat AI-disabled state changed company_id=%s conversation_id=%s ai_auto_paused=true status=%s reason=%s",
+        "Chat AI-disabled state changed company_id=%s conversation_id=%s ai_auto_paused=true status=%s reason=%s disable_reason=%s",
         company_id,
         conversation_id,
         next_status,
         clean_reason[:300],
+        str(disable_reason or "static_fallback").strip()[:80],
     )
 
 
@@ -1446,6 +1546,8 @@ async def auto_disable_ai_after_failure_fallback(
         scope="conversation",
         status="open",
         increment_failure_count=not already_paused,
+        disable_reason="static_fallback",
+        trigger="static_fallback",
     )
     return True
 
@@ -1474,6 +1576,8 @@ async def disable_company_ai_after_api_exhaustion(
             scope="conversation",
             status="open",
             increment_failure_count=True,
+            disable_reason="static_fallback",
+            trigger="static_fallback",
         )
     else:
         logger.warning(
@@ -1757,28 +1861,33 @@ async def ensure_message_attachment_schema(db) -> None:
     async with _message_attachment_schema_lock:
         if _message_attachment_schema_ready:
             return
-        statements = (
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS conversation_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS original_filename TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS mime_type TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS storage_url TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS thumbnail_url TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS provider_media_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_status TEXT NOT NULL DEFAULT 'skipped'",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_summary TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_detected_objects JSONB NOT NULL DEFAULT '[]'::jsonb",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_ocr_text TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_model TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS image_analysis_error TEXT NOT NULL DEFAULT ''",
-            "CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_id ON message_attachments(conversation_id)",
-            "CREATE INDEX IF NOT EXISTS idx_message_attachments_customer_id ON message_attachments(customer_id)",
-            "CREATE INDEX IF NOT EXISTS idx_message_attachments_image_analysis_status ON message_attachments(image_analysis_status)",
+        await runtime_schema_ready(
+            db,
+            "message_attachments",
+            required_columns=(
+                ("message_attachments", "conversation_id"),
+                ("message_attachments", "customer_id"),
+                ("message_attachments", "channel"),
+                ("message_attachments", "original_filename"),
+                ("message_attachments", "mime_type"),
+                ("message_attachments", "storage_url"),
+                ("message_attachments", "thumbnail_url"),
+                ("message_attachments", "provider_media_id"),
+                ("message_attachments", "raw_metadata"),
+                ("message_attachments", "image_analysis_status"),
+                ("message_attachments", "image_analysis_summary"),
+                ("message_attachments", "image_detected_objects"),
+                ("message_attachments", "image_ocr_text"),
+                ("message_attachments", "image_analysis_model"),
+                ("message_attachments", "image_analysis_error"),
+            ),
+            required_indexes=(
+                "idx_message_attachments_conversation_id",
+                "idx_message_attachments_customer_id",
+                "idx_message_attachments_image_analysis_status",
+            ),
+            raise_on_missing=True,
         )
-        for statement in statements:
-            await db.execute(statement)
         _message_attachment_schema_ready = True
 
 
@@ -1804,6 +1913,17 @@ def normalize_attachment_payload(attachment: dict) -> Optional[dict]:
     raw_metadata = attachment.get("raw_metadata") or attachment.get("metadata") or {}
     if not isinstance(raw_metadata, dict):
         raw_metadata = {"value": str(raw_metadata)}
+    for key in (
+        "product_id",
+        "product_name",
+        "product_title",
+        "product_category",
+        "image_index",
+        "caption",
+    ):
+        value = attachment.get(key)
+        if value not in (None, "") and key not in raw_metadata:
+            raw_metadata[key] = value
     return {
         "type": atype,
         "url": url,
@@ -1845,6 +1965,11 @@ def normalize_attachment_row(row: dict) -> dict:
         "thumbnail_url": str(data.get("thumbnail_url") or ""),
         "provider_media_id": str(data.get("provider_media_id") or ""),
         "raw_metadata": raw_metadata,
+        "product_id": str(raw_metadata.get("product_id") or ""),
+        "product_name": str(raw_metadata.get("product_name") or ""),
+        "product_title": str(raw_metadata.get("product_title") or ""),
+        "product_category": str(raw_metadata.get("product_category") or ""),
+        "caption": str(raw_metadata.get("caption") or ""),
         "image_analysis_status": str(data.get("image_analysis_status") or "skipped"),
         "image_analysis_summary": str(data.get("image_analysis_summary") or ""),
         "image_detected_objects": detected_objects,
@@ -1985,36 +2110,11 @@ async def ensure_message_reaction_schema(db, *, force: bool = False) -> None:
         if exists is True:
             _message_reaction_schema_ready.add(scope)
             return
-        statements = (
-            "CREATE TABLE IF NOT EXISTS message_reactions ("
-            "id TEXT PRIMARY KEY,"
-            "company_id TEXT NOT NULL DEFAULT '',"
-            "conversation_id TEXT NOT NULL DEFAULT '',"
-            "message_id TEXT NOT NULL DEFAULT '',"
-            "provider_message_id TEXT NOT NULL DEFAULT '',"
-            "target_provider_message_id TEXT NOT NULL DEFAULT '',"
-            "channel TEXT NOT NULL DEFAULT '',"
-            "actor_type TEXT NOT NULL DEFAULT 'customer',"
-            "actor_id TEXT NOT NULL DEFAULT '',"
-            "emoji TEXT NOT NULL DEFAULT '',"
-            "action TEXT NOT NULL DEFAULT 'added',"
-            "raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,"
-            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-            "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-            ")",
-            "CREATE INDEX IF NOT EXISTS idx_message_reactions_conversation_id ON message_reactions(conversation_id)",
-            "CREATE INDEX IF NOT EXISTS idx_message_reactions_message_id ON message_reactions(message_id)",
-            "CREATE INDEX IF NOT EXISTS idx_message_reactions_target_provider ON message_reactions(company_id,channel,target_provider_message_id)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_message_reactions_provider_event "
-            "ON message_reactions(company_id,channel,provider_message_id) WHERE BTRIM(provider_message_id) <> ''",
+        logger.warning(
+            "runtime_schema_migration_required area=message_reactions migration=%s missing=relation:message_reactions schema=%s",
+            DEPLOYMENT_SCHEMA_MIGRATION,
+            scope,
         )
-        for statement in statements:
-            await db.execute(statement)
-        exists = await _message_reaction_relation_exists(db)
-        if exists is False:
-            logger.warning("message_reactions schema creation did not expose relation in schema=%s", scope)
-            return
-        _message_reaction_schema_ready.add(scope)
 
 
 def normalize_reaction_row(row: dict) -> dict:
@@ -2058,6 +2158,8 @@ async def save_message_reaction(
     if not db:
         return {}
     await ensure_message_reaction_schema(db)
+    if await _message_reaction_relation_exists(db) is False:
+        return {}
     scoped_company_id = str(company_id or "").strip()
     scoped_channel = str(channel or "").strip().lower()
     target_provider_id = str(target_provider_message_id or "").strip()
@@ -2283,27 +2385,22 @@ async def fetch_messages_with_attachments(
         item = normalize_attachment_row(dict(row))
         by_message.setdefault(str(row["message_id"]), []).append(item)
     await ensure_message_reaction_schema(db)
-    try:
-        reactions = await db.fetch(
-            "SELECT * FROM message_reactions WHERE message_id = ANY($1::text[]) AND action <> 'removed' "
-            "ORDER BY created_at ASC",
-            message_ids,
-        )
-    except Exception as exc:
-        if not _is_message_reaction_missing_error(exc):
-            raise
-        logger.warning("message_reactions missing while loading conversation messages; retrying schema creation")
-        await ensure_message_reaction_schema(db, force=True)
+    if await _message_reaction_relation_exists(db) is False:
+        reactions = []
+    else:
         try:
             reactions = await db.fetch(
                 "SELECT * FROM message_reactions WHERE message_id = ANY($1::text[]) AND action <> 'removed' "
                 "ORDER BY created_at ASC",
                 message_ids,
             )
-        except Exception as retry_exc:
-            if not _is_message_reaction_missing_error(retry_exc):
+        except Exception as exc:
+            if not _is_message_reaction_missing_error(exc):
                 raise
-            logger.warning("message_reactions still unavailable after schema retry; returning messages without reactions")
+            logger.warning(
+                "runtime_schema_migration_required area=message_reactions migration=%s missing=relation:message_reactions",
+                DEPLOYMENT_SCHEMA_MIGRATION,
+            )
             reactions = []
     reactions_by_message: dict[str, list] = {}
     for row in reactions:
@@ -2441,6 +2538,16 @@ async def escalate_conversation_to_human(
         convo_id,
         channel,
         automatic,
+        pause_reason[:300],
+    )
+    logger.warning(
+        "ai_auto_disabled company_id=%s conversation_id=%s trigger=escalation reason=escalation trigger_message_id=%s actor_type=%s message_type=%s media_type=%s detail=%s",
+        company_id,
+        convo_id,
+        "",
+        "system" if automatic else "agent",
+        "",
+        "",
         pause_reason[:300],
     )
     await db.execute(

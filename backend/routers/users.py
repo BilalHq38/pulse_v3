@@ -65,6 +65,9 @@ async def _revoke_user_access_after_status_change(db, user_id: str, status: str)
     await close_login_sessions(db, user_id)
 
 
+_SUPER_ADMIN_ALLOWED_USER_STATUSES = {"pending_approval", "active", "rejected", "blocked", "paused", "inactive"}
+
+
 @router.get("/users")
 async def list_users(request: Request):
     db = _db(request)
@@ -208,6 +211,8 @@ async def super_admin_overview(request: Request):
         "active_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='active'") or 0,
         "paused_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='paused'") or 0,
         "blocked_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='blocked'") or 0,
+        "pending_approval_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='pending_approval'") or 0,
+        "rejected_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='rejected'") or 0,
         "inactive_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='inactive'") or 0,
         "total_leads": await db.fetchval("SELECT COUNT(*) FROM leads") or 0,
         "total_customers": await db.fetchval("SELECT COUNT(*) FROM customers") or 0,
@@ -249,15 +254,61 @@ async def super_admin_update_user_status(user_id: str, request: Request):
     cu = await require_roles(request, ["super_admin"])
     body = await request.json()
     status = body.get("status", "")
-    allowed = ("active", "paused", "blocked", "inactive")
+    allowed = _SUPER_ADMIN_ALLOWED_USER_STATUSES
     if status not in allowed:
-        raise HTTPException(400, f"Invalid status. Must be one of: {', '.join(allowed)}")
+        raise HTTPException(400, f"Invalid status. Must be one of: {', '.join(sorted(allowed))}")
     if user_id == cu["sub"]:
         raise HTTPException(400, "Cannot change your own status")
-    if not await db.fetchval("SELECT id FROM users WHERE id=$1", user_id):
+    target = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", user_id))
+    if not target:
         raise HTTPException(404, "User not found")
-    await db.execute("UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2", status, user_id)
+    previous_status = str(target.get("status") or "active").strip().lower()
+    logger.info(
+        "super_admin_user_action_requested actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        cu.get("sub", ""),
+        user_id,
+        target.get("company_id", ""),
+        previous_status,
+        status,
+        str(body.get("reason") or "").strip()[:512],
+    )
+    if target.get("role") == "super_admin" and previous_status == "active" and status != "active":
+        other_active_super_admins = int(
+            await db.fetchval(
+                "SELECT COUNT(*) FROM users WHERE role='super_admin' AND status='active' AND id<>$1",
+                user_id,
+            )
+            or 0
+        )
+        if other_active_super_admins < 1:
+            raise HTTPException(400, "Cannot disable the last active super admin")
+    if status == "active" and previous_status != "active" and target.get("role") in {"admin", "company_agent"}:
+        async with db.transaction() as conn:
+            await assert_workspace_seat_available(conn, str(target.get("company_id") or ""))
+            await conn.execute("UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2", status, user_id)
+    else:
+        await db.execute("UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2", status, user_id)
     await _revoke_user_access_after_status_change(db, user_id, status)
+    action = {
+        "active": "super_admin_user_approved",
+        "rejected": "super_admin_user_rejected",
+        "blocked": "super_admin_user_blocked",
+        "paused": "super_admin_user_paused",
+        "inactive": "super_admin_user_paused",
+        "pending_approval": "super_admin_approval_requested",
+    }.get(status, "super_admin_user_action")
+    if previous_status in {"blocked", "paused", "inactive"} and status == "active":
+        action = "super_admin_user_resumed"
+    logger.info(
+        "%s actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        action,
+        cu.get("sub", ""),
+        user_id,
+        target.get("company_id", ""),
+        previous_status,
+        status,
+        str(body.get("reason") or "").strip()[:512],
+    )
     return {"status": "ok", "user_id": user_id, "new_status": status}
 
 

@@ -17,6 +17,9 @@ from services.db_helpers import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+_ANALYTICS_INCLUDED_CONVERSATION_STATUSES = ["open", "pending", "escalated", "resolved"]
+_ANALYTICS_ACTIVE_CONVERSATION_STATUSES = ["open", "pending", "escalated"]
+
 
 def _db(req):
     return req.app.state.db
@@ -71,8 +74,16 @@ async def analytics_overview(request: Request):
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
 
-    total = await db.fetchval("SELECT COUNT(*) FROM conversations WHERE company_id=$1", cid)
-    ai_handled = await db.fetchval("SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE", cid)
+    total = await db.fetchval(
+        "SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND status=ANY($2)",
+        cid,
+        _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
+    )
+    ai_handled = await db.fetchval(
+        "SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND status=ANY($2)",
+        cid,
+        _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
+    )
     open_conversations = await db.fetchval("SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND status='open'", cid)
     total_leads = await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1", cid)
     hot_leads = await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot'", cid)
@@ -89,8 +100,10 @@ async def analytics_overview(request: Request):
     avg_resp = await get_average_response_minutes(db, cid)
     channel_counts = await db.fetch(
         "SELECT channel, COUNT(*) AS cnt FROM conversations WHERE company_id=$1 "
+        "AND status=ANY($2) "
         "AND channel IN ('whatsapp','instagram','facebook','web_chat') GROUP BY channel",
         cid,
+        _ANALYTICS_ACTIVE_CONVERSATION_STATUSES,
     )
 
     total = int(total or 0)
@@ -140,8 +153,9 @@ async def analytics_conversations(request: Request, days: int = 30):
     if not rows:
         rows = await db.fetch(
             "SELECT DATE(created_at) AS date,COUNT(*) AS count,SUM(CASE WHEN ai_handled THEN 1 ELSE 0 END) AS ai_handled "  # noqa: E501
-            "FROM conversations WHERE company_id=$1 GROUP BY DATE(created_at) ORDER BY date DESC LIMIT $2",
+            "FROM conversations WHERE company_id=$1 AND status=ANY($2) GROUP BY DATE(created_at) ORDER BY date DESC LIMIT $3",
             cid,
+            _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
             days,
         )
     ordered_rows = list(reversed(rows))

@@ -72,8 +72,12 @@ def test_embedding_cache_key_is_company_scoped():
     )
 
 
-def test_rag_does_not_skip_short_followup_with_history():
-    assert _should_skip_rag_query("yes", intent_name="follow_up_continue", has_history=True) == (False, "")
+def test_rag_skips_yes_no_acknowledgement_even_with_history():
+    assert _should_skip_rag_query("yes", intent_name="follow_up_continue", has_history=True) == (
+        True,
+        "low_value_message",
+    )
+    assert _should_skip_rag_query("show me more", intent_name="follow_up_continue", has_history=True) == (False, "")
 
 
 @pytest.mark.asyncio

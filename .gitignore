@@ -8,6 +8,7 @@
 *.env
 *.env.*
 credentials.json
+*.json
 *.credentials
 *token.json*
 *credentials.json*
@@ -89,6 +90,7 @@ backend/.wwebjs_auth/
 backend/.wwebjs_cache/
 .wwebjs_auth/
 .wwebjs_cache/
+backend/secrets/
 
 # OS files
 .DS_Store

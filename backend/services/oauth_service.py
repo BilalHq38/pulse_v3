@@ -353,7 +353,7 @@ async def upsert_oauth_user(
         "INSERT INTO users("
         "id,email,password_hash,name,role,role_id,sub_role,status,avatar,company_id,phone,"
         "onboarding_completed,plan_selected,billing_status,auth_provider,email_verified,created_at,updated_at"
-        ") VALUES ($1,$2,$3,$4,'admin',$5,'','active','',$6,'',"
+        ") VALUES ($1,$2,$3,$4,'admin',$5,'','pending_approval','',$6,'',"
         "FALSE,FALSE,'active',$7,$8,NOW(),NOW())",
         user_id,
         norm,
@@ -387,6 +387,15 @@ async def upsert_oauth_user(
         company_id,
         norm,
         provider,
+    )
+    logger.info(
+        "user_pending_approval_created actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        user_id,
+        user_id,
+        company_id,
+        "",
+        "pending_approval",
+        f"oauth_{provider}",
     )
     return await ensure_user_company_assignment(db, refreshed or {})
 

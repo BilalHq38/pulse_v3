@@ -113,7 +113,7 @@ export default function SignInPage() {
       } else if (code === 'admin_login_required' || /\/admin\/login/i.test(String(detail || ''))) {
         setError('This account is a platform super admin. Use the dedicated admin sign-in page.');
       } else {
-        setError(err.response?.data?.error || detail || 'Authentication failed');
+        setError(err.response?.data?.message || err.response?.data?.error || detail || 'Authentication failed');
       }
     }
     finally { setLoading(false); }

@@ -8,25 +8,43 @@ from typing import Any, Optional
 from fastapi import HTTPException
 
 from core.utils import make_id
-from services.db_helpers import r
+from services.db_helpers import r, runtime_schema_ready
 
 logger = logging.getLogger(__name__)
 
-TEAM_MEMBER_LIMIT_REACHED_MESSAGE = "Team member limit reached. Upgrade your plan to add more users."
+USER_LIMIT_REACHED_CODE = "USER_LIMIT_REACHED"
+TEAM_MEMBER_LIMIT_REACHED_MESSAGE = "User limit reached. Please upgrade your package to add more users."
+
+
+def user_limit_reached_detail(*, used: int | None = None, limit: int | None = None) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "code": USER_LIMIT_REACHED_CODE,
+        "message": TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
+    }
+    if used is not None:
+        detail["used"] = int(used)
+    if limit is not None:
+        detail["limit"] = int(limit)
+    return detail
 
 
 async def ensure_subscriptions_limit_columns(db) -> None:
     """
     Databases created before sql_migrations/001_subscription_conversation_and_seats.sql
-    may be missing conversation/seat columns on subscriptions. Apply additively so
-    auth-service demo seed (upsert_subscription) does not fail at startup.
+    may be missing conversation/seat columns on subscriptions. Runtime DDL is disabled;
+    deployment must apply the migration before startup.
     """
     if getattr(ensure_subscriptions_limit_columns, "_done", False):
         return
-    await db.execute(
-        "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS monthly_conversation_limit INTEGER NOT NULL DEFAULT 0"
+    await runtime_schema_ready(
+        db,
+        "subscription_limits",
+        required_columns=(
+            ("subscriptions", "monthly_conversation_limit"),
+            ("subscriptions", "max_users"),
+        ),
+        raise_on_missing=True,
     )
-    await db.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS max_users INTEGER NOT NULL DEFAULT 0")
     ensure_subscriptions_limit_columns._done = True  # type: ignore[attr-defined]
 
 
@@ -232,11 +250,33 @@ async def assert_workspace_seat_available(db, company_id: str) -> None:
     cap = effective_max_users(dict(sub) if sub else None)
     used = await count_workspace_seats_used(db, company_id)
     pending = await count_pending_invitations(db, company_id)
+    logger.info(
+        "plan_limit_check company_id=%s limit_type=user used=%s pending=%s limit=%s",
+        company_id,
+        used,
+        pending,
+        cap,
+    )
     if used + pending >= cap:
+        logger.warning(
+            "plan_limit_blocked company_id=%s limit_type=user used=%s pending=%s limit=%s code=%s",
+            company_id,
+            used,
+            pending,
+            cap,
+            USER_LIMIT_REACHED_CODE,
+        )
         raise HTTPException(
             status_code=403,
-            detail=TEAM_MEMBER_LIMIT_REACHED_MESSAGE,
+            detail=user_limit_reached_detail(used=used + pending, limit=cap),
         )
+    logger.info(
+        "plan_limit_allowed company_id=%s limit_type=user used=%s pending=%s limit=%s",
+        company_id,
+        used,
+        pending,
+        cap,
+    )
 
 
 def get_public_signup_plans() -> list[dict[str, Any]]:

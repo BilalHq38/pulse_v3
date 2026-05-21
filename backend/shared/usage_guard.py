@@ -27,6 +27,8 @@ from shared.cache import get_cache_client
 logger = logging.getLogger(__name__)
 
 USAGE_TYPE_CONVERSATION = "conversation_message"
+CONVERSATION_LIMIT_REACHED_CODE = "CONVERSATION_LIMIT_REACHED"
+CONVERSATION_LIMIT_REACHED_MESSAGE = "Conversation limit reached. Please upgrade your package to continue this service."
 
 # Must match uq_usage_ledger_company_conv_idem (partial unique index) for INSERT ... ON CONFLICT.
 _CONV_USAGE_ON_CONFLICT_RETURNING = (
@@ -43,11 +45,16 @@ InboundGateResult = Literal["allow", "denied", "duplicate"]
 def conversation_limit_completed_message(limit: int, used: int | float | None = None) -> str:
     assigned = max(0, int(limit or 0))
     usage = "" if used is None else f" Used: {int(float(used or 0)):,}/{assigned:,}."
-    return (
-        "You cannot send this message because your conversation rate limit has been completed. "
-        f"Your assigned limit is {assigned:,} conversation{'s' if assigned != 1 else ''}."
-        f"{usage}"
-    )
+    return f"{CONVERSATION_LIMIT_REACHED_MESSAGE}{usage}"
+
+
+def conversation_limit_reached_detail(limit: int, used: int | float | None = None) -> dict[str, Any]:
+    return {
+        "code": CONVERSATION_LIMIT_REACHED_CODE,
+        "message": conversation_limit_completed_message(limit, used),
+        "limit": int(limit or 0),
+        "used": int(float(used or 0)),
+    }
 
 
 def _relaxed_billing_env() -> bool:
@@ -154,8 +161,30 @@ async def inbound_conversation_billing_precheck(
     )
     cap = effective_monthly_conversation_limit(dict(sub) if sub else None)
     total = await _sum_conversation_usage_month(conn, company_id, month_start)
+    logger.info(
+        "plan_limit_check company_id=%s limit_type=conversation used=%.0f limit=%s idempotency_key=%s",
+        company_id,
+        total,
+        cap,
+        ik,
+    )
     if total >= cap:
+        logger.warning(
+            "plan_limit_blocked company_id=%s limit_type=conversation used=%.0f limit=%s code=%s idempotency_key=%s",
+            company_id,
+            total,
+            cap,
+            CONVERSATION_LIMIT_REACHED_CODE,
+            ik,
+        )
         return "denied"
+    logger.info(
+        "plan_limit_allowed company_id=%s limit_type=conversation used=%.0f limit=%s idempotency_key=%s",
+        company_id,
+        total,
+        cap,
+        ik,
+    )
     return "allow"
 
 
@@ -327,15 +356,22 @@ async def check_conversation_limit(request: Request) -> None:
 
     if total >= msg_limit:
         logger.warning(
-            "usage_guard: conversation limit exceeded company_id=%s used=%.0f limit=%d",
+            "plan_limit_blocked company_id=%s limit_type=conversation used=%.0f limit=%d code=%s",
             company_id,
             total,
             msg_limit,
+            CONVERSATION_LIMIT_REACHED_CODE,
         )
         raise HTTPException(
             status_code=429,
-            detail=conversation_limit_completed_message(msg_limit, total),
+            detail=conversation_limit_reached_detail(msg_limit, total),
         )
+    logger.info(
+        "plan_limit_allowed company_id=%s limit_type=conversation used=%.0f limit=%d",
+        company_id,
+        total,
+        msg_limit,
+    )
 
 
 check_message_limit = check_conversation_limit
@@ -352,7 +388,23 @@ async def conversation_quota_allows_under_lock(conn, company_id: str) -> bool:
     )
     cap = effective_monthly_conversation_limit(dict(sub) if sub else None)
     total = await _sum_conversation_usage_month(conn, company_id, month_start)
-    return total < cap
+    logger.info(
+        "plan_limit_check company_id=%s limit_type=conversation used=%.0f limit=%s",
+        company_id,
+        total,
+        cap,
+    )
+    allowed = total < cap
+    logger.log(
+        logging.INFO if allowed else logging.WARNING,
+        "%s company_id=%s limit_type=conversation used=%.0f limit=%s code=%s",
+        "plan_limit_allowed" if allowed else "plan_limit_blocked",
+        company_id,
+        total,
+        cap,
+        "" if allowed else CONVERSATION_LIMIT_REACHED_CODE,
+    )
+    return allowed
 
 
 async def conversation_limit_status_under_lock(conn, company_id: str) -> dict[str, Any]:
@@ -366,8 +418,24 @@ async def conversation_limit_status_under_lock(conn, company_id: str) -> dict[st
     )
     cap = effective_monthly_conversation_limit(dict(sub) if sub else None)
     total = await _sum_conversation_usage_month(conn, company_id, month_start)
+    logger.info(
+        "plan_limit_check company_id=%s limit_type=conversation used=%.0f limit=%s",
+        company_id,
+        total,
+        cap,
+    )
+    allowed = total < cap
+    logger.log(
+        logging.INFO if allowed else logging.WARNING,
+        "%s company_id=%s limit_type=conversation used=%.0f limit=%s code=%s",
+        "plan_limit_allowed" if allowed else "plan_limit_blocked",
+        company_id,
+        total,
+        cap,
+        "" if allowed else CONVERSATION_LIMIT_REACHED_CODE,
+    )
     return {
-        "allowed": total < cap,
+        "allowed": allowed,
         "used": int(total),
         "limit": int(cap),
         "relaxed": False,
@@ -391,7 +459,7 @@ async def conversation_limit_status(db, company_id: str) -> dict[str, Any]:
 def raise_conversation_limit_completed(status: dict[str, Any]) -> None:
     raise HTTPException(
         status_code=429,
-        detail=conversation_limit_completed_message(
+        detail=conversation_limit_reached_detail(
             int(status.get("limit") or 0),
             status.get("used"),
         ),

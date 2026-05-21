@@ -87,7 +87,7 @@ async def test_intent_quota_failure_returns_local_fallback(monkeypatch):
     monkeypatch.setattr(intent, "call_model_json", fail_json)
 
     result = await intent.classify_intent(
-        "What is the price of this product?",
+        "What are the charges for this option?",
         db=None,
         company_id="company-1",
     )

@@ -66,6 +66,37 @@ def _relaxed_billing_env() -> bool:
 _BLOCKED_STATUSES = {"canceled", "unpaid", "past_due", "incomplete"}
 # Subscription statuses that mean the subscription is healthy.
 _ACTIVE_STATUSES = {"active", "trialing"}
+_ACCOUNT_STATUS_MESSAGES = {
+    "pending_approval": (
+        "Your account is pending admin approval. You will get access to Pulse Engine after Super Admin verification."
+    ),
+    "rejected": "Your account request was not approved. Please contact the administrator for more information.",
+    "blocked": "Your account has been blocked. Please contact your administrator to restore access.",
+    "paused": "Your account has been paused. Please contact your administrator.",
+    "inactive": "Your account is inactive. Please contact your administrator.",
+}
+_ACCOUNT_STATUS_CODES = {
+    "pending_approval": "ACCOUNT_PENDING_APPROVAL",
+    "rejected": "ACCOUNT_REJECTED",
+    "blocked": "ACCOUNT_BLOCKED",
+    "paused": "ACCOUNT_PAUSED",
+    "inactive": "ACCOUNT_INACTIVE",
+}
+_ACCOUNT_RESTRICTED_STATUSES = set(_ACCOUNT_STATUS_MESSAGES)
+_PENDING_APPROVAL_ALLOWED_PREFIXES = (
+    "/api/auth/onboarding",
+    "/api/auth/billing/plan",
+    "/api/auth/session",
+    "/api/auth/refresh",
+    "/api/auth/logout",
+    "/api/settings/company",
+)
+_REJECTED_ALLOWED_PREFIXES = (
+    "/api/auth/session",
+    "/api/auth/refresh",
+    "/api/auth/logout",
+)
+_BLOCKED_ALLOWED_PREFIXES = ("/api/auth/logout",)
 
 # Paths that bypass all billing checks (auth + billing management + health).
 _EXEMPT_PATH_PREFIXES = (
@@ -152,6 +183,18 @@ def _is_enterprise_invite_exempt(path: str) -> bool:
     return any(path == p or path.startswith(p) for p in _ENTERPRISE_INVITE_EXEMPT_PREFIXES)
 
 
+def _path_matches(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == prefix or path.startswith(prefix) for prefix in prefixes)
+
+
+def _account_status_detail(status: str) -> dict[str, Any]:
+    return {
+        "code": _ACCOUNT_STATUS_CODES.get(status, "ACCOUNT_RESTRICTED"),
+        "status": status,
+        "message": _ACCOUNT_STATUS_MESSAGES.get(status, "Your account cannot access this resource."),
+    }
+
+
 def _get_auth_context(request: Request) -> dict[str, Any]:
     return getattr(request.state, "auth_context", {}) or {}
 
@@ -233,15 +276,44 @@ async def check_user_status_active(request: Request) -> None:
     user_id = _user_id(auth)
     if not user_id:
         return
-    row = await _db(request).fetchrow("SELECT status FROM users WHERE id=$1 LIMIT 1", user_id)
+    row = await _db(request).fetchrow(
+        "SELECT id,company_id,status,role,onboarding_completed,plan_selected FROM users WHERE id=$1 LIMIT 1",
+        user_id,
+    )
     if not row:
         raise HTTPException(status_code=401, detail="Session has been revoked. Please log in again.")
     status = str(row.get("status") or "active").strip().lower()
-    if status in {"paused", "blocked", "inactive"}:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Your account is {status}. Please contact your administrator.",
-        )
+    if status not in _ACCOUNT_RESTRICTED_STATUSES:
+        return
+    path = request.url.path
+    if status == "pending_approval" and _path_matches(path, _PENDING_APPROVAL_ALLOWED_PREFIXES):
+        return
+    if status == "rejected" and _path_matches(path, _REJECTED_ALLOWED_PREFIXES):
+        return
+    if status in {"blocked", "paused", "inactive"} and _path_matches(path, _BLOCKED_ALLOWED_PREFIXES):
+        return
+    event_name = {
+        "pending_approval": "pending_user_access_denied",
+        "rejected": "rejected_user_access_denied",
+        "blocked": "blocked_user_access_denied",
+        "paused": "paused_user_access_denied",
+        "inactive": "inactive_user_access_denied",
+    }.get(status, "restricted_user_access_denied")
+    logger.warning(
+        "%s actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s path=%s",
+        event_name,
+        user_id,
+        user_id,
+        str(row.get("company_id") or _company_id(auth)),
+        status,
+        status,
+        "account_status_restricted",
+        path,
+    )
+    raise HTTPException(
+        status_code=403,
+        detail=_account_status_detail(status),
+    )
 
 
 async def enforce_access_gates(request: Request) -> None:

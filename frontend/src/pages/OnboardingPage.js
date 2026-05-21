@@ -734,6 +734,11 @@ export default function OnboardingPage() {
     }
     if (user.onboarding_completed === true && user.plan_selected !== false) {
       clearOnboardingDraft();
+      const status = user.account_status || user.status || 'active';
+      if (status === 'pending_approval' || status === 'rejected' || status === 'blocked' || status === 'paused') {
+        navigate('/account-status', { replace: true });
+        return;
+      }
       navigate('/dashboard', { replace: true });
     }
   }, [navigate, user]);
@@ -768,6 +773,11 @@ export default function OnboardingPage() {
         setAuthFromOAuth(response.data.user, response.data.token);
       } else {
         setOnboardingComplete();
+      }
+      const status = refreshedUser?.account_status || refreshedUser?.status || user?.account_status || user?.status || 'active';
+      if (status === 'pending_approval' || status === 'rejected' || status === 'blocked' || status === 'paused') {
+        navigate('/account-status', { replace: true });
+        return;
       }
       if ((refreshedUser?.role || user?.role) === 'admin') {
         navigate('/settings?tab=users&invite=1&onboarding=1', { replace: true });

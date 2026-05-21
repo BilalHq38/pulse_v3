@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from core.utils import make_id, normalize_reference_key, now_ts
 from services.ai_service.intent import classify_intent
 from services.ai_service.llm_client import get_provider_runtime_info, validate_live_engine
-from services.ai_service.model_catalog import supported_model_catalog, validate_model_selection
+from services.ai_service.model_catalog import GEMINI_PROVIDER_KEYS, supported_model_catalog, validate_model_selection
 from services.ai_service.response_generator import clear_engine_cache
 from services.ai_service.sentiment import analyze_sentiment, build_sentiment_gate
 from services.db_helpers import (
@@ -78,6 +78,8 @@ SOCIAL_POST_FIELDS = {
     "sentiment",
     "posted_at",
 }
+LLM_PROVIDER_KEYS = {*GEMINI_PROVIDER_KEYS, "openai", "anthropic"}
+LLM_PROVIDER_ERROR = "provider must be openai, anthropic, gemini, gemini_api, or vertex_ai"
 
 
 def _filter_update_fields(body: dict, allowed: set[str]) -> dict:
@@ -349,8 +351,8 @@ async def create_llm_engine(request: Request):
     provider = normalize_reference_key(body.get("provider", ""))
     if not model_name:
         raise HTTPException(400, "model_name is required")
-    if provider not in {"openai", "anthropic", "gemini"}:
-        raise HTTPException(400, "provider must be openai, anthropic, or gemini")
+    if provider not in LLM_PROVIDER_KEYS:
+        raise HTTPException(400, LLM_PROVIDER_ERROR)
     _validate_llm_model_or_400(provider, model_name)
     eid = make_id()
     await db.execute(
@@ -378,8 +380,8 @@ async def update_llm_engine(llm_id: str, request: Request):
     body.pop("_id", None)
     if "provider" in body:
         body["provider"] = normalize_reference_key(body["provider"])
-        if body["provider"] not in {"openai", "anthropic", "gemini"}:
-            raise HTTPException(400, "provider must be openai, anthropic, or gemini")
+        if body["provider"] not in LLM_PROVIDER_KEYS:
+            raise HTTPException(400, LLM_PROVIDER_ERROR)
     engine = await _fetch_scoped_llm_engine(
         db,
         llm_id,

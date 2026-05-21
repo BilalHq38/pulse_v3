@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _DLQ_SCHEMA_READY = False
 _DLQ_SCHEMA_LOCK = None
 _SAFE_TASK_FUNCTION = "_run_safe_task"
+DEPLOYMENT_SCHEMA_MIGRATION = "backend/sql_migrations/011_deployment_runtime_schema_hardening.sql"
 
 
 async def _ensure_dead_letter_queue_table(db) -> None:
@@ -27,35 +28,31 @@ async def _ensure_dead_letter_queue_table(db) -> None:
     async with _DLQ_SCHEMA_LOCK:
         if _DLQ_SCHEMA_READY:
             return
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS dead_letter_queue ("
-            "id TEXT PRIMARY KEY,"
-            "task_name TEXT NOT NULL DEFAULT '',"
-            "event_id TEXT NOT NULL DEFAULT '',"
-            "trace_id TEXT NOT NULL DEFAULT '',"
-            "company_id TEXT NOT NULL DEFAULT '',"
-            "channel TEXT NOT NULL DEFAULT '',"
-            "source_queue TEXT NOT NULL DEFAULT '',"
-            "event_type TEXT NOT NULL DEFAULT '',"
-            "payload TEXT NOT NULL DEFAULT '',"
-            "error TEXT NOT NULL DEFAULT '',"
-            "error_message TEXT NOT NULL DEFAULT '',"
-            "retry_count INTEGER NOT NULL DEFAULT 0,"
-            "max_retries INTEGER NOT NULL DEFAULT 3,"
-            "status TEXT NOT NULL DEFAULT 'failed',"
-            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-            "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-            "resolved_at TIMESTAMPTZ"
-            ")"
-        )
-        await db.execute("ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS task_name TEXT NOT NULL DEFAULT ''")
-        await db.execute("ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''")
-        await db.execute("ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''")
-        await db.execute("ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''")
-        await db.execute("ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT ''")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_dlq_status ON dead_letter_queue(status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_dlq_company_id ON dead_letter_queue(company_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_dlq_created_at ON dead_letter_queue(created_at)")
+        required_columns = ("task_name", "event_id", "trace_id", "company_id", "channel", "source_queue", "error")
+        missing = []
+        relation_exists = bool(await db.fetchval("SELECT to_regclass($1) IS NOT NULL", "dead_letter_queue"))
+        if not relation_exists:
+            missing.append("relation:dead_letter_queue")
+        else:
+            for column in required_columns:
+                exists = bool(
+                    await db.fetchval(
+                        "SELECT EXISTS("
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name='dead_letter_queue' AND column_name=$1"
+                        ")",
+                        column,
+                    )
+                )
+                if not exists:
+                    missing.append(f"column:dead_letter_queue.{column}")
+        if missing:
+            logger.error(
+                "runtime_schema_migration_required area=dead_letter_queue migration=%s missing=%s",
+                DEPLOYMENT_SCHEMA_MIGRATION,
+                ",".join(missing),
+            )
+            raise RuntimeError(f"Dead letter queue schema is missing required objects. Run {DEPLOYMENT_SCHEMA_MIGRATION}.")
         _DLQ_SCHEMA_READY = True
 
 

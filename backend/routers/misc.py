@@ -19,6 +19,7 @@ from services.db_helpers import (
     create_notification,
     ensure_setup_reminder_notifications,
     get_average_response_minutes,
+    runtime_schema_ready,
     token_candidates,
 )
 
@@ -45,32 +46,26 @@ def _client_ip_hash(request: Request) -> str:
 
 
 async def _ensure_visitor_tracking_schema(db) -> None:
-    await db.execute(
-        "CREATE TABLE IF NOT EXISTS visitor_sessions ("
-        "id TEXT PRIMARY KEY, company_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', "
-        "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-        "page_url TEXT NOT NULL DEFAULT '', referrer TEXT NOT NULL DEFAULT '', landing_path TEXT NOT NULL DEFAULT '', "
-        "user_agent TEXT NOT NULL DEFAULT '', ip_hash TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
-        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-    )
-    await db.execute(
-        "CREATE TABLE IF NOT EXISTS visitor_events ("
-        "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES visitor_sessions(id) ON DELETE CASCADE, "
-        "company_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL DEFAULT 'page_view', "
-        "page_url TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', referrer TEXT NOT NULL DEFAULT '', "
-        "element TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
-        "occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-    )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_visitor_sessions_company_seen ON visitor_sessions(company_id, last_seen_at DESC)"
-    )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_visitor_events_company_time ON visitor_events(company_id, occurred_at DESC)"
+    await runtime_schema_ready(
+        db,
+        "visitor_tracking",
+        required_relations=("visitor_sessions", "visitor_events"),
+        required_columns=(
+            ("visitor_sessions", "id"),
+            ("visitor_sessions", "last_seen_at"),
+            ("visitor_sessions", "ip_hash"),
+            ("visitor_events", "session_id"),
+            ("visitor_events", "event_type"),
+        ),
+        required_indexes=("idx_visitor_sessions_company_seen", "idx_visitor_events_company_time"),
+        raise_on_missing=True,
     )
 
 
 @misc_router.post("/visitor/track")
 async def track_visitor(request: Request, response: Response):
+    if str(request.headers.get("dnt") or request.headers.get("DNT") or "").strip() == "1":
+        return {"ok": True, "skipped": True, "reason": "do_not_track"}
     db = _db(request)
     try:
         body = await request.json()
@@ -86,13 +81,21 @@ async def track_visitor(request: Request, response: Response):
     if not session_id:
         session_id = f"vis_{make_id()}"
     event_type = _text(body.get("event_type") or "page_view", 80) or "page_view"
+    if event_type not in {"page_view"}:
+        event_type = "page_view"
     page_url = _text(body.get("page_url"), 1500)
     path = _text(body.get("path"), 500)
     referrer = _text(body.get("referrer"), 1500)
-    company_id = _text(body.get("company_id"), 120)
-    user_id = _text(body.get("user_id"), 120)
-    element = _text(body.get("element"), 300)
-    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    auth_context = getattr(request.state, "auth_context", {}) or {}
+    company_id = _text(auth_context.get("company_id"), 120)
+    user_id = _text(auth_context.get("sub"), 120)
+    element = ""
+    raw_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    metadata = {
+        key: _text(raw_metadata.get(key), 200)
+        for key in ("title", "viewport", "timezone", "utm_source", "utm_medium", "utm_campaign", "browser", "os", "device")
+        if raw_metadata.get(key) is not None
+    }
     user_agent = _text(request.headers.get("user-agent"), 600)
     ip_hash = _client_ip_hash(request)
     await db.execute(
@@ -148,21 +151,37 @@ async def list_visitor_tracking(
 ):
     db = _db(request)
     cu = await get_current_user_flexible(request)
+    if cu.get("role") != "super_admin":
+        raise HTTPException(403, "Super admin role required")
     await _ensure_visitor_tracking_schema(db)
-    scoped_company_id = company_id if cu.get("role") == "super_admin" else cu.get("company_id", "")
+    scoped_company_id = company_id or ""
     args: list[Any] = []
     filters: list[str] = []
     if scoped_company_id:
         args.append(scoped_company_id)
-        filters.append(f"company_id=${len(args)}")
+        filters.append(f"vs.company_id=${len(args)}")
     if session_id:
         args.append(session_id)
-        filters.append(f"id=${len(args)}")
+        filters.append(f"vs.id=${len(args)}")
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     args.append(limit)
     sessions = rs(
         await db.fetch(
-            f"SELECT * FROM visitor_sessions {where} ORDER BY last_seen_at DESC LIMIT ${len(args)}",
+            f"""
+            SELECT
+                vs.*,
+                COALESCE(ev.visit_count, 0) AS visit_count,
+                COALESCE(ev.last_activity_at, vs.last_seen_at) AS last_activity
+            FROM visitor_sessions vs
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS visit_count, MAX(occurred_at) AS last_activity_at
+                FROM visitor_events
+                GROUP BY session_id
+            ) ev ON ev.session_id = vs.id
+            {where}
+            ORDER BY vs.last_seen_at DESC
+            LIMIT ${len(args)}
+            """,
             *args,
         )
     )

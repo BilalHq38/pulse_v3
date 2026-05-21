@@ -19,6 +19,7 @@ from shared.background_queue import (
 from shared.cache import close_cache_clients
 from core.socket import close_socket_resources, set_socket_db
 from shared.metrics import increment_counter, observe_histogram, snapshot_metrics
+from shared.provider_queues import provider_worker_labels_for_service
 from shared.auth.dependencies import (
     build_trusted_context_from_request,
     extract_bearer_token,
@@ -67,6 +68,22 @@ def _register_security_handlers(app: FastAPI) -> None:
         trace_id = trace.trace_id if trace else ""
         if exc.status_code in {401, 403}:
             err = "Authentication failed"
+            if isinstance(exc.detail, dict):
+                code = str(exc.detail.get("code") or "").strip()
+                message = str(exc.detail.get("message") or exc.detail.get("detail") or "").strip() or err
+                return _apply_security_headers(
+                    JSONResponse(
+                        status_code=exc.status_code,
+                        content={
+                            "success": False,
+                            "error": message,
+                            "detail": message,
+                            "code": code,
+                            "data": None,
+                            "trace_id": trace_id,
+                        },
+                    )
+                )
             if isinstance(exc.detail, str) and exc.detail in (
                 "EMAIL_VERIFICATION_REQUIRED",
                 "ENTERPRISE_INVITE_REQUIRED",
@@ -97,6 +114,22 @@ def _register_security_handlers(app: FastAPI) -> None:
                     content={"success": False, "error": detail, "detail": detail, "data": None, "trace_id": trace_id},
                 )
             )
+        if isinstance(exc.detail, dict):
+            detail_message = str(exc.detail.get("message") or exc.detail.get("detail") or "Request failed")
+            content = {
+                "success": False,
+                "error": detail_message,
+                "detail": detail_message,
+                "data": None,
+                "trace_id": trace_id,
+            }
+            code = str(exc.detail.get("code") or "").strip()
+            if code:
+                content["code"] = code
+            for key in ("status", "used", "limit"):
+                if key in exc.detail:
+                    content[key] = exc.detail[key]
+            return _apply_security_headers(JSONResponse(status_code=exc.status_code, content=content))
         detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
         return _apply_security_headers(
             JSONResponse(
@@ -277,15 +310,29 @@ def create_service_app(
         set_socket_db(db)
         for task in startup_tasks:
             await task(db)
+        app.state.background_queue_handles = []
         try:
-            app.state.background_queue_handle = await start_background_queue_worker(db, service_label=service_name)
+            primary_handle = await start_background_queue_worker(db, service_label=service_name)
+            if primary_handle is not None:
+                app.state.background_queue_handles.append(primary_handle)
+            for provider_label in provider_worker_labels_for_service(service_name):
+                provider_handle = await start_background_queue_worker(db, service_label=provider_label)
+                if provider_handle is not None:
+                    app.state.background_queue_handles.append(provider_handle)
+                    logger.info("Started provider-isolated background worker label=%s", provider_label)
+            app.state.background_queue_handle = primary_handle
         except Exception as exc:
             logger.warning("background queue startup skipped for %s: %s", service_name, exc)
             app.state.background_queue_handle = None
+            app.state.background_queue_handles = []
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
-        await stop_background_queue_worker(getattr(app.state, "background_queue_handle", None))
+        handles = list(getattr(app.state, "background_queue_handles", []) or [])
+        if not handles:
+            handles = [getattr(app.state, "background_queue_handle", None)]
+        for handle in handles:
+            await stop_background_queue_worker(handle)
         set_socket_db(None)
         await close_socket_resources()
         await close_cache_clients()

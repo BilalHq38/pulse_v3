@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import json
 import logging
-import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -45,6 +44,7 @@ from services.ai_service.memory_service import (
     update_customer_memory,
 )
 from services.ai_service.rag import build_ai_context
+from services.ai_service.response_safety import validate_ai_response_safety
 from services.ai_service.response_generator import (
     auto_score_and_nurture_lead,
     generate_combined_ai_analysis,
@@ -454,27 +454,9 @@ _VALIDATE_RESPONSE_MAX_CHARS = 16_000
 _MODEL_HEALTH_CACHE: dict = {}
 _MODEL_HEALTH_CACHE_TTL = max(5.0, float(os.getenv("AI_MODEL_HEALTH_CACHE_TTL_SECONDS", "30") or 30))
 
-_SAFETY_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in [
-        r"\b(kill|murder|suicide|self-harm)\b",
-        r"\b(bomb|weapon|exploit|hack)\s+(make|build|create)\b",
-        r"\b(credit card|ssn|social security)\s*\d",
-        r"(?:^|\s)(password|secret)\s*[:=]\s*\S+",
-    ]
-]
-
-
 def _validate_response_safety(text: str) -> dict:
     """Check AI response for unsafe content patterns."""
-    # Architectural gap: exposed as /ai/validate-response; grep shows no hot-path
-    # caller currently enforces this before outbound delivery.
-    issues: list[str] = []
-    for pattern in _SAFETY_PATTERNS:
-        if pattern.search(text or ""):
-            issues.append(f"Matched safety pattern: {pattern.pattern}")
-    is_safe = len(issues) == 0
-    return {"safe": is_safe, "issues": issues}
+    return validate_ai_response_safety(text)
 
 
 @router.get("/ai/model-health")

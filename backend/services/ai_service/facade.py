@@ -59,9 +59,7 @@ from services.ai_service.common import (
     LeadScoreResult,
     SentimentResult,
     _json_safe,
-    get_ai_reply_delay_seconds,
     utc_now_iso,
-    wait_for_ai_response_timing,
 )
 from services.ai_service.sentiment import (
     analyze_local_sentiment,
@@ -829,7 +827,6 @@ __all__ = [
     "generate_lead_score",
     "generate_nurture_message",
     "generate_product_description",
-    "get_ai_reply_delay_seconds",
     "get_active_llm_engine",
     "get_active_llm_engines",
     "get_company_knowledge",
@@ -843,5 +840,4 @@ __all__ = [
     "summarize_customer_interaction",
     "update_customer_memory",
     "validate_live_engine",
-    "wait_for_ai_response_timing",
 ]

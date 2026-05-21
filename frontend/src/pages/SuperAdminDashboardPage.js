@@ -36,6 +36,8 @@ export default function SuperAdminDashboardPage() {
   const [authLogs, setAuthLogs] = useState([]);
   const [loginSessions, setLoginSessions] = useState([]);
   const [loadingSecurity, setLoadingSecurity] = useState(false);
+  const [visitors, setVisitors] = useState([]);
+  const [loadingVisitors, setLoadingVisitors] = useState(false);
 
   const fetchData = useCallback(async () => {
     setLoading(true); setError('');
@@ -85,11 +87,24 @@ export default function SuperAdminDashboardPage() {
     }
   }, []);
 
+  const fetchVisitors = useCallback(async () => {
+    setLoadingVisitors(true);
+    try {
+      const r = await api.get('/visitor/tracking?limit=100');
+      setVisitors(r.data?.sessions || []);
+    } catch (e) {
+      setError(e.response?.data?.detail || 'Failed to load visitor tracking');
+    } finally {
+      setLoadingVisitors(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (activeTab === 'logs') fetchLogs();
     if (activeTab === 'security') fetchSecurity();
     if (activeTab === 'tenants') fetchTenants();
-  }, [activeTab, fetchLogs, fetchSecurity, fetchTenants]);
+    if (activeTab === 'visitors') fetchVisitors();
+  }, [activeTab, fetchLogs, fetchSecurity, fetchTenants, fetchVisitors]);
 
   const openPlanEdit = (t) => {
     setPlanEditTenant(t);
@@ -152,6 +167,15 @@ export default function SuperAdminDashboardPage() {
         message: getErrorMessage(err, 'We could not update that user status.'),
       });
     } finally { setActionLoading(''); }
+  };
+
+  const reviewUser = async (userId) => {
+    try {
+      await api.post(`/admin/users/${userId}/review`, {});
+    } catch {
+      // Review is informational; keep the detail panel usable if logging fails.
+    }
+    setExpandedUser(prev => prev === userId ? null : userId);
   };
 
   const deleteUser = async (userId, userName) => {
@@ -218,7 +242,9 @@ export default function SuperAdminDashboardPage() {
   const toggleTree = (id) => setExpandedTree(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   const statusCfg = {
+    pending_approval: { color: '#d97706', bg: '#fffbeb', border: '#fde68a', label: 'Pending Approval', icon: Clock },
     active:   { color: '#16a34a', bg: '#ecfdf5', border: '#bbf7d0', label: 'Active',   icon: CheckCircle },
+    rejected: { color: '#dc2626', bg: '#fef2f2', border: '#fecaca', label: 'Not Allowed', icon: XCircle },
     paused:   { color: '#d97706', bg: '#fffbeb', border: '#fde68a', label: 'Paused',   icon: Pause },
     blocked:  { color: '#dc2626', bg: '#fef2f2', border: '#fecaca', label: 'Blocked',  icon: Ban },
     inactive: { color: '#64748b', bg: '#f8fafc', border: '#e2e8f0', label: 'Inactive', icon: XCircle },
@@ -246,7 +272,8 @@ export default function SuperAdminDashboardPage() {
                                'bg-slate-100 text-slate-500 border border-slate-200';
 
   const getUserStats = (user) => [
-    { icon: MessageSquare, label: 'Conversations', value: user?.conversations_count ?? 0, color: '#7c3aed' },
+    { icon: MessageSquare, label: 'Conversations', value: `${Number(user?.conversations_used ?? user?.conversations_count ?? 0).toLocaleString()} / ${Number(user?.conversation_limit ?? 0).toLocaleString() || '0'}`, color: '#7c3aed' },
+    { icon: Users, label: 'Users', value: `${Number(user?.users_used ?? 0).toLocaleString()} / ${Number(user?.user_limit ?? 0).toLocaleString() || '0'}`, color: '#2563eb' },
     { icon: Target,        label: 'Leads',         value: user?.leads_count ?? 0,         color: '#0891b2' },
     { icon: UserCheck,     label: 'Customers',     value: user?.customers_count ?? 0,     color: '#059669' },
     { icon: Ticket,        label: 'Tickets',       value: user?.tickets_count ?? 0,       color: '#ea580c' },
@@ -260,6 +287,8 @@ export default function SuperAdminDashboardPage() {
     { label: 'Total Users',    value: overview.total_users,         icon: Users,          color: '#2563eb', bg: '#eff6ff' },
     { label: 'Total Agents',   value: overview.total_agents,        icon: Users,          color: '#0f766e', bg: '#ecfeff' },
     { label: 'Active',         value: overview.active_users,        icon: UserCheck,      color: '#16a34a', bg: '#ecfdf5' },
+    { label: 'Pending',        value: overview.pending_approval_users || 0, icon: Clock,   color: '#d97706', bg: '#fffbeb' },
+    { label: 'Not Allowed',    value: overview.rejected_users || 0,  icon: XCircle,       color: '#dc2626', bg: '#fef2f2' },
     { label: 'Paused',         value: overview.paused_users,        icon: Pause,          color: '#d97706', bg: '#fffbeb' },
     { label: 'Blocked',        value: overview.blocked_users,       icon: Ban,            color: '#dc2626', bg: '#fef2f2' },
     { label: 'Conversations',  value: overview.total_conversations, icon: MessageSquare,  color: '#7c3aed', bg: '#f5f3ff' },
@@ -320,6 +349,7 @@ export default function SuperAdminDashboardPage() {
         {[
           { id: 'users',    label: 'Users',        icon: Users    },
           { id: 'tenants',  label: 'Tenants',      icon: Building2 },
+          { id: 'visitors', label: 'Visitors',     icon: Globe },
           { id: 'logs',     label: 'System Logs',  icon: Activity },
           { id: 'security', label: 'Security',     icon: Shield   },
         ].map((tab, idx) => (
@@ -465,6 +495,53 @@ export default function SuperAdminDashboardPage() {
       )}
 
       {/* ═══ USERS TAB ═══ */}
+      {activeTab === 'visitors' && (
+        <div className="bg-white rounded-xl border border-slate-100 overflow-hidden shadow-sm">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 bg-slate-50/50">
+            <div>
+              <p className="text-sm font-semibold text-slate-800">Website visitors</p>
+              <p className="text-xs text-slate-500">Anonymous public-page sessions; sensitive form values, tokens, and app-page activity are not collected.</p>
+            </div>
+            <button type="button" onClick={fetchVisitors} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50">
+              <RefreshCw size={13} /> Refresh
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-slate-50/80 text-left text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  <th className="px-3 py-3 border-b border-slate-100">Visitor</th>
+                  <th className="px-3 py-3 border-b border-slate-100">First seen</th>
+                  <th className="px-3 py-3 border-b border-slate-100">Last activity</th>
+                  <th className="px-3 py-3 border-b border-slate-100">Page</th>
+                  <th className="px-3 py-3 border-b border-slate-100">Device</th>
+                  <th className="px-3 py-3 border-b border-slate-100">Visits</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loadingVisitors ? (
+                  <tr><td colSpan={6} className="px-4 py-10 text-center text-slate-400">Loading visitors...</td></tr>
+                ) : !(visitors || []).length ? (
+                  <tr><td colSpan={6} className="px-4 py-10 text-center text-slate-400">No visitor sessions found</td></tr>
+                ) : visitors.map((v) => {
+                  const meta = typeof v.metadata === 'object' && v.metadata ? v.metadata : {};
+                  return (
+                    <tr key={v.id} className="border-b border-slate-100 hover:bg-slate-50/50">
+                      <td className="px-3 py-2.5 font-mono text-xs text-slate-600">{String(v.id || '').slice(0, 28)}</td>
+                      <td className="px-3 py-2.5 text-slate-600">{v.first_seen_at ? new Date(v.first_seen_at).toLocaleString() : '-'}</td>
+                      <td className="px-3 py-2.5 text-slate-600">{(v.last_activity || v.last_seen_at) ? new Date(v.last_activity || v.last_seen_at).toLocaleString() : '-'}</td>
+                      <td className="px-3 py-2.5 text-slate-700 max-w-[280px] truncate" title={v.page_url || v.landing_path || ''}>{v.page_url || v.landing_path || '-'}</td>
+                      <td className="px-3 py-2.5 text-slate-600">{[meta.browser, meta.os, meta.device].filter(Boolean).join(' / ') || 'Unknown'}</td>
+                      <td className="px-3 py-2.5 text-slate-700">{Number(v.visit_count || 0).toLocaleString()}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {activeTab === 'users' && (
         <>
           {/* ─── Filters ─── */}
@@ -483,7 +560,9 @@ export default function SuperAdminDashboardPage() {
                 <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
                   className="text-sm border border-slate-200 rounded-lg px-3 py-2 outline-none bg-white text-slate-700 focus:border-blue-400">
                   <option value="all">All Status</option>
+                  <option value="pending_approval">Pending Approval</option>
                   <option value="active">Active</option>
+                  <option value="rejected">Not Allowed</option>
                   <option value="paused">Paused</option>
                   <option value="blocked">Blocked</option>
                   <option value="inactive">Inactive</option>
@@ -573,8 +652,8 @@ export default function SuperAdminDashboardPage() {
                                 {sa.created_at ? new Date(sa.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}
                               </td>
                               <td className="px-3 py-3">
-                                <button onClick={() => setExpandedUser(isDetailOpen ? null : sa.id)}
-                                  className="p-1.5 rounded-md hover:bg-slate-100 text-slate-500 transition-colors" title="View details">
+                                <button onClick={() => reviewUser(sa.id)}
+                                  className="p-1.5 rounded-md hover:bg-slate-100 text-slate-500 transition-colors" title="Review / Manage access">
                                   <Eye size={15} />
                                 </button>
                               </td>
@@ -630,6 +709,9 @@ export default function SuperAdminDashboardPage() {
                                       )}
                                     </div>
                                     <p className="text-xs text-slate-400 truncate">{admin.email}</p>
+                                    <p className="text-[11px] text-slate-400 truncate">
+                                      {(admin.subscription_plan || 'free')} | users {admin.users_used ?? 0}/{admin.user_limit ?? '-'} | conversations {admin.conversations_used ?? admin.conversations_count ?? 0}/{admin.conversation_limit ?? '-'}
+                                    </p>
                                   </div>
                                 </div>
                               </td>
@@ -660,14 +742,20 @@ export default function SuperAdminDashboardPage() {
                               </td>
                               <td className="px-3 py-3">
                                 <div className="flex items-center gap-1.5">
-                                  <button onClick={() => setExpandedUser(isDetailOpen ? null : admin.id)}
-                                    className="p-1.5 rounded-md hover:bg-slate-100 text-slate-500 transition-colors" title="View details">
+                                  <button onClick={() => reviewUser(admin.id)}
+                                    className="p-1.5 rounded-md hover:bg-slate-100 text-slate-500 transition-colors" title="Review / Manage access">
                                     <Eye size={15} />
                                   </button>
                                   {admin.status !== 'active' && (
                                     <button onClick={() => updateUserStatus(admin.id, 'active', admin.name)} disabled={!!actionLoading}
-                                      className="p-1.5 rounded-md hover:bg-emerald-50 text-emerald-600 transition-colors disabled:opacity-40" title="Activate">
+                                      className="p-1.5 rounded-md hover:bg-emerald-50 text-emerald-600 transition-colors disabled:opacity-40" title={['paused', 'blocked', 'inactive'].includes(admin.status) ? 'Resume' : 'Approve / Allow'}>
                                       {actionLoading === admin.id + 'active' ? <Loader size={14} className="animate-spin" /> : <CheckCircle size={15} />}
+                                    </button>
+                                  )}
+                                  {admin.status !== 'rejected' && (
+                                    <button onClick={() => updateUserStatus(admin.id, 'rejected', admin.name)} disabled={!!actionLoading}
+                                      className="p-1.5 rounded-md hover:bg-red-50 text-red-600 transition-colors disabled:opacity-40" title="Not Allowed / Reject">
+                                      {actionLoading === admin.id + 'rejected' ? <Loader size={14} className="animate-spin" /> : <XCircle size={15} />}
                                     </button>
                                   )}
                                   {admin.status !== 'paused' && admin.status !== 'blocked' && (
@@ -713,7 +801,7 @@ export default function SuperAdminDashboardPage() {
                                     <span className="inline-flex items-center gap-1"><Activity size={12} /> Auth: {admin.auth_provider || 'email'}</span>
                                   </div>
                                   <div className="mt-3 flex flex-wrap gap-2">
-                                    {['active', 'paused', 'blocked', 'inactive'].filter(s => s !== admin.status).map(st => {
+                                    {['active', 'rejected', 'paused', 'blocked', 'inactive'].filter(s => s !== admin.status).map(st => {
                                       const cfg = statusCfg[st];
                                       const Icon = cfg.icon;
                                       return (
@@ -759,6 +847,9 @@ export default function SuperAdminDashboardPage() {
                                             <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${roleBadgeCls('company_agent')}`}>{roleLabel('company_agent')}</span>
                                           </div>
                                           <p className="text-[11px] text-slate-400 truncate">{agent.email}</p>
+                                          <p className="text-[10px] text-slate-400 truncate">
+                                            {(agent.subscription_plan || 'free')} | users {agent.users_used ?? 0}/{agent.user_limit ?? '-'} | conversations {agent.conversations_used ?? agent.conversations_count ?? 0}/{agent.conversation_limit ?? '-'}
+                                          </p>
                                         </div>
                                       </div>
                                     </td>
@@ -789,14 +880,20 @@ export default function SuperAdminDashboardPage() {
                                     </td>
                                     <td className="px-3 py-2">
                                       <div className="flex items-center gap-1.5">
-                                        <button onClick={() => setExpandedUser(isAgentDetail ? null : agent.id)}
-                                          className="p-1 rounded-md hover:bg-slate-100 text-slate-400 transition-colors" title="View details">
+                                        <button onClick={() => reviewUser(agent.id)}
+                                          className="p-1 rounded-md hover:bg-slate-100 text-slate-400 transition-colors" title="Review / Manage access">
                                           <Eye size={13} />
                                         </button>
                                         {agent.status !== 'active' && (
                                           <button onClick={() => updateUserStatus(agent.id, 'active', agent.name)} disabled={!!actionLoading}
-                                            className="p-1 rounded-md hover:bg-emerald-50 text-emerald-600 transition-colors disabled:opacity-40" title="Activate">
+                                            className="p-1 rounded-md hover:bg-emerald-50 text-emerald-600 transition-colors disabled:opacity-40" title={['paused', 'blocked', 'inactive'].includes(agent.status) ? 'Resume' : 'Approve / Allow'}>
                                             {actionLoading === agent.id + 'active' ? <Loader size={12} className="animate-spin" /> : <CheckCircle size={13} />}
+                                          </button>
+                                        )}
+                                        {agent.status !== 'rejected' && (
+                                          <button onClick={() => updateUserStatus(agent.id, 'rejected', agent.name)} disabled={!!actionLoading}
+                                            className="p-1 rounded-md hover:bg-red-50 text-red-600 transition-colors disabled:opacity-40" title="Not Allowed / Reject">
+                                            {actionLoading === agent.id + 'rejected' ? <Loader size={12} className="animate-spin" /> : <XCircle size={13} />}
                                           </button>
                                         )}
                                         {agent.status !== 'paused' && agent.status !== 'blocked' && (
@@ -842,7 +939,7 @@ export default function SuperAdminDashboardPage() {
                                           <span className="inline-flex items-center gap-1">Role: {agent.role === 'company_agent' ? 'Company Agent' : (agent.role || 'Company Agent')}</span>
                                         </div>
                                         <div className="mt-3 flex flex-wrap gap-2">
-                                          {['active', 'paused', 'blocked', 'inactive'].filter(s => s !== agent.status).map(st => {
+                                          {['active', 'rejected', 'paused', 'blocked', 'inactive'].filter(s => s !== agent.status).map(st => {
                                             const cfg = statusCfg[st]; const Icon = cfg.icon;
                                             return (
                                               <button key={st} onClick={() => updateUserStatus(agent.id, st, agent.name)} disabled={!!actionLoading}
@@ -889,6 +986,9 @@ export default function SuperAdminDashboardPage() {
                                       <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-600 border border-amber-200">Unassigned</span>
                                     </div>
                                     <p className="text-[11px] text-slate-400 truncate">{agent.email}</p>
+                                    <p className="text-[10px] text-slate-400 truncate">
+                                      {(agent.subscription_plan || 'free')} | users {agent.users_used ?? 0}/{agent.user_limit ?? '-'} | conversations {agent.conversations_used ?? agent.conversations_count ?? 0}/{agent.conversation_limit ?? '-'}
+                                    </p>
                                   </div>
                                 </div>
                               </td>
@@ -913,13 +1013,17 @@ export default function SuperAdminDashboardPage() {
                               </td>
                               <td className="px-3 py-2">
                                 <div className="flex items-center gap-1.5">
-                                  <button onClick={() => setExpandedUser(isAgentDetail ? null : agent.id)}
-                                    className="p-1 rounded-md hover:bg-slate-100 text-slate-400 transition-colors" title="View details">
+                                  <button onClick={() => reviewUser(agent.id)}
+                                    className="p-1 rounded-md hover:bg-slate-100 text-slate-400 transition-colors" title="Review / Manage access">
                                     <Eye size={13} />
                                   </button>
                                   {agent.status !== 'active' && (
                                     <button onClick={() => updateUserStatus(agent.id, 'active', agent.name)} disabled={!!actionLoading}
-                                      className="p-1 rounded-md hover:bg-emerald-50 text-emerald-600 disabled:opacity-40"><CheckCircle size={13} /></button>
+                                      className="p-1 rounded-md hover:bg-emerald-50 text-emerald-600 disabled:opacity-40" title={['paused', 'blocked', 'inactive'].includes(agent.status) ? 'Resume' : 'Approve / Allow'}><CheckCircle size={13} /></button>
+                                  )}
+                                  {agent.status !== 'rejected' && (
+                                    <button onClick={() => updateUserStatus(agent.id, 'rejected', agent.name)} disabled={!!actionLoading}
+                                      className="p-1 rounded-md hover:bg-red-50 text-red-600 disabled:opacity-40" title="Not Allowed / Reject"><XCircle size={13} /></button>
                                   )}
                                   {agent.status !== 'paused' && agent.status !== 'blocked' && (
                                     <button onClick={() => updateUserStatus(agent.id, 'paused', agent.name)} disabled={!!actionLoading}
@@ -960,7 +1064,7 @@ export default function SuperAdminDashboardPage() {
                                     <span className="inline-flex items-center gap-1">Role: {agent.role === 'company_agent' ? 'Company Agent' : (agent.role || 'Company Agent')}</span>
                                   </div>
                                   <div className="mt-3 flex flex-wrap gap-2">
-                                    {['active', 'paused', 'blocked', 'inactive'].filter(s => s !== agent.status).map(st => {
+                                    {['active', 'rejected', 'paused', 'blocked', 'inactive'].filter(s => s !== agent.status).map(st => {
                                       const cfg = statusCfg[st];
                                       const Icon = cfg.icon;
                                       return (

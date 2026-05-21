@@ -38,6 +38,7 @@ const ProfilePage = lazy(() => import('@/pages/ProfilePage'));
 const OnboardingPage = lazy(() => import('@/pages/OnboardingPage'));
 const BillingPlanPage = lazy(() => import('@/pages/BillingPlanPage'));
 const WidgetDemoPage = lazy(() => import('@/pages/WidgetDemoPage'));
+const AccountStatusPage = lazy(() => import('@/pages/AccountStatusPage'));
 
 function defaultRouteForUser(user) {
   return postAuthDestination(user);
@@ -71,31 +72,74 @@ function visitorSessionId() {
   return generated;
 }
 
+function doNotTrackEnabled() {
+  return navigator.doNotTrack === '1' || window.doNotTrack === '1';
+}
+
+function isPublicTrackingPath(pathname) {
+  return ['/', '/pricing', '/contact', '/privacy', '/terms', '/signup', '/signin', '/admin/login', '/widget-demo'].includes(pathname);
+}
+
+function safeTrackingUrl() {
+  const url = new URL(window.location.href);
+  const safe = new URL(`${url.origin}${url.pathname}`);
+  ['utm_source', 'utm_medium', 'utm_campaign'].forEach((key) => {
+    const value = url.searchParams.get(key);
+    if (value) safe.searchParams.set(key, value.slice(0, 120));
+  });
+  return safe.toString();
+}
+
+function safeTrackingPath(pathname) {
+  const params = new URLSearchParams(window.location.search);
+  const safeParams = new URLSearchParams();
+  ['utm_source', 'utm_medium', 'utm_campaign'].forEach((key) => {
+    const value = params.get(key);
+    if (value) safeParams.set(key, value.slice(0, 120));
+  });
+  const query = safeParams.toString();
+  return query ? `${pathname}?${query}` : pathname;
+}
+
+function visitorMetadata() {
+  const ua = navigator.userAgent || '';
+  const browser = /Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Other';
+  const os = /Windows/i.test(ua) ? 'Windows' : /Mac OS/i.test(ua) ? 'macOS' : /Android/i.test(ua) ? 'Android' : /iPhone|iPad/i.test(ua) ? 'iOS' : /Linux/i.test(ua) ? 'Linux' : 'Other';
+  const device = /Mobi|Android|iPhone/i.test(ua) ? 'mobile' : /iPad|Tablet/i.test(ua) ? 'tablet' : 'desktop';
+  return {
+    title: document.title || '',
+    viewport: `${window.innerWidth}x${window.innerHeight}`,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+    browser,
+    os,
+    device,
+    utm_source: new URLSearchParams(window.location.search).get('utm_source') || '',
+    utm_medium: new URLSearchParams(window.location.search).get('utm_medium') || '',
+    utm_campaign: new URLSearchParams(window.location.search).get('utm_campaign') || '',
+  };
+}
+
 function VisitorTracker() {
   const location = useLocation();
   const { user } = useAuth();
   const sessionIdRef = useRef('');
-  const lastClickAtRef = useRef(0);
 
   useEffect(() => {
-    sessionIdRef.current = visitorSessionId();
-  }, []);
+    if (!user && !doNotTrackEnabled() && isPublicTrackingPath(location.pathname)) {
+      sessionIdRef.current = visitorSessionId();
+    }
+  }, [location.pathname, user]);
 
   useEffect(() => {
+    if (user || doNotTrackEnabled() || !isPublicTrackingPath(location.pathname)) return;
     if (!sessionIdRef.current) sessionIdRef.current = visitorSessionId();
     const payload = {
       session_id: sessionIdRef.current,
       event_type: 'page_view',
-      page_url: window.location.href,
-      path: `${location.pathname}${location.search || ''}`,
+      page_url: safeTrackingUrl(),
+      path: safeTrackingPath(location.pathname),
       referrer: document.referrer || '',
-      company_id: user?.company_id || '',
-      user_id: user?.id || '',
-      metadata: {
-        title: document.title || '',
-        viewport: `${window.innerWidth}x${window.innerHeight}`,
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-      },
+      metadata: visitorMetadata(),
     };
     fetch(`${API_BASE_URL}/visitor/track`, {
       method: 'POST',
@@ -104,44 +148,7 @@ function VisitorTracker() {
       keepalive: true,
       body: JSON.stringify(payload),
     }).catch(() => {});
-  }, [location.pathname, location.search, user?.company_id, user?.id]);
-
-  useEffect(() => {
-    const onClick = (event) => {
-      const now = Date.now();
-      if (now - lastClickAtRef.current < 1500) return;
-      lastClickAtRef.current = now;
-      const target = event.target?.closest?.('button,a,[role="button"],input[type="submit"]');
-      if (!target) return;
-      const label = (target.getAttribute('aria-label') || target.getAttribute('title') || target.textContent || '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 120);
-      fetch(`${API_BASE_URL}/visitor/track`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        keepalive: true,
-        body: JSON.stringify({
-          session_id: sessionIdRef.current || visitorSessionId(),
-          event_type: 'click',
-          page_url: window.location.href,
-          path: `${window.location.pathname}${window.location.search || ''}`,
-          referrer: document.referrer || '',
-          company_id: user?.company_id || '',
-          user_id: user?.id || '',
-          element: label,
-          metadata: {
-            tag: target.tagName?.toLowerCase?.() || '',
-            id: target.id || '',
-            testid: target.getAttribute('data-testid') || '',
-          },
-        }),
-      }).catch(() => {});
-    };
-    document.addEventListener('click', onClick, true);
-    return () => document.removeEventListener('click', onClick, true);
-  }, [user?.company_id, user?.id]);
+  }, [location.pathname, location.search, user]);
 
   return null;
 }
@@ -156,6 +163,8 @@ function ProtectedRoute({ children }) {
     && locationParams.get('onboarding') === '1';
   if (loading) return <Spinner />;
   if (!user) return <Navigate to="/signin" replace />;
+  const status = user.account_status || user.status || 'active';
+  if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return <Navigate to="/account-status" replace />;
   if (user.role !== 'super_admin' && user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return <Navigate to={`/verify-email${q}`} replace />;
@@ -169,6 +178,7 @@ function ProtectedRoute({ children }) {
   if (user.role !== 'super_admin' && user.plan_selected === false && !isOnboardingInviteRoute) {
     return <Navigate to="/billing" replace />;
   }
+  if (user.role !== 'super_admin' && status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout>{children}</Layout>;
 }
 
@@ -178,6 +188,8 @@ function RoleRoute({ children, allowedRoles }) {
   if (!user) return <Navigate to="/signin" replace />;
   if (!allowedRoles.includes(user.role)) return <Navigate to="/unauthorized" replace />;
   if (user.role === 'super_admin') return <Layout>{children}</Layout>;
+  const status = user.account_status || user.status || 'active';
+  if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return <Navigate to="/account-status" replace />;
   if (user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return <Navigate to={`/verify-email${q}`} replace />;
@@ -185,6 +197,7 @@ function RoleRoute({ children, allowedRoles }) {
   if (user.onboarding_completed === false) return <Navigate to="/onboarding" replace />;
   if (user.enterprise_invite_gate_pending) return <Navigate to="/onboarding" replace />;
   if (user.plan_selected === false) return <Navigate to="/billing" replace />;
+  if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout>{children}</Layout>;
 }
 
@@ -203,6 +216,8 @@ function DashboardWithAuthCheck() {
   if (loading) return <Spinner />;
   if (!user) return <Navigate to="/signin" replace />;
   if (user.role === 'super_admin') return <Navigate to="/super-admin" replace />;
+  const status = user.account_status || user.status || 'active';
+  if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return <Navigate to="/account-status" replace />;
   if (user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return <Navigate to={`/verify-email${q}`} replace />;
@@ -210,6 +225,7 @@ function DashboardWithAuthCheck() {
   if (user.onboarding_completed === false) return <Navigate to="/onboarding" replace />;
   if (user.enterprise_invite_gate_pending) return <Navigate to="/onboarding" replace />;
   if (user.plan_selected === false) return <Navigate to="/billing" replace />;
+  if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout><DashboardPage /></Layout>;
 }
 
@@ -232,6 +248,7 @@ function App() {
             <Route path="/auth/callback" element={<AuthCallback />} />
             <Route path="/onboarding" element={<OnboardingPage />} />
             <Route path="/billing" element={<BillingPlanPage />} />
+            <Route path="/account-status" element={<AccountStatusPage />} />
             <Route path="/widget-demo" element={<WidgetDemoPage />} />
             <Route path="/dashboard" element={<DashboardWithAuthCheck />} />
             <Route path="/inbox" element={<ProtectedRoute><InboxPage /></ProtectedRoute>} />

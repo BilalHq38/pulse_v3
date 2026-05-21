@@ -27,6 +27,7 @@ from shared.config import (
     background_queue_consumer_prefix,
     background_queue_job_timeout_seconds,
     background_queue_job_ttl_seconds,
+    background_queue_max_stream_length,
     background_queue_enabled,
     background_queue_max_retries,
     background_queue_stream_prefix,
@@ -194,6 +195,7 @@ class BackgroundQueue:
         self.max_retries = max(1, background_queue_max_retries())
         self.visibility_timeout_seconds = max(30, background_queue_visibility_timeout_seconds())
         self.job_timeout_seconds = max(60, background_queue_job_timeout_seconds())
+        self.max_stream_length = max(1000, int(background_queue_max_stream_length()))
         self.job_ttl_seconds = max(
             self.visibility_timeout_seconds * (self.max_retries + 2),
             int(background_queue_job_ttl_seconds()),
@@ -370,7 +372,7 @@ class BackgroundQueue:
             message_id = await self._redis.xadd(
                 self.stream_name,
                 {"payload": payload},
-                maxlen=10000,
+                maxlen=self.max_stream_length,
                 approximate=True,
             )
         except Exception:
@@ -582,7 +584,7 @@ class BackgroundQueue:
                 retry_message_id = await self._redis.xadd(
                     self.stream_name,
                     {"payload": json.dumps(retry_spec, ensure_ascii=True, separators=(",", ":"))},
-                    maxlen=10000,
+                    maxlen=self.max_stream_length,
                     approximate=True,
                 )
                 state_updated = await self._redis.set(
@@ -641,7 +643,7 @@ class BackgroundQueue:
                         "payload": json.dumps(spec, ensure_ascii=True, separators=(",", ":")),
                         "error": str(exc)[:1000],
                     },
-                    maxlen=10000,
+                    maxlen=self.max_stream_length,
                     approximate=True,
                 )
                 try:
@@ -746,6 +748,7 @@ async def collect_background_queue_snapshot() -> dict[str, Any]:
         "visibility_timeout_seconds": background_queue_visibility_timeout_seconds(),
         "job_timeout_seconds": background_queue_job_timeout_seconds(),
         "max_retries": background_queue_max_retries(),
+        "max_stream_length": background_queue_max_stream_length(),
         "streams": streams,
     }
 

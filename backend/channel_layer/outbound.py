@@ -24,6 +24,11 @@ from shared.metrics import increment_counter
 logger = logging.getLogger(__name__)
 
 
+def _attachment_raw_metadata(item: dict) -> dict:
+    raw_metadata = item.get("raw_metadata") or item.get("metadata") or {}
+    return dict(raw_metadata) if isinstance(raw_metadata, dict) else {"value": str(raw_metadata)}
+
+
 class OutboundRouter:
     """
     Routes outbound messages to the correct channel adapter.
@@ -151,6 +156,7 @@ class OutboundRouter:
                 name=str(item.get("name") or "").strip(),
                 mime_type=str(item.get("mime_type") or "").strip(),
                 size=int(item.get("size") or 0),
+                raw_metadata=_attachment_raw_metadata(item),
             )
             for item in (attachments or [])
             if isinstance(item, dict)

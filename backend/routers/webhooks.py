@@ -33,10 +33,7 @@ from channel_layer.schemas import (
 )
 from channel_layer.social_lead_detector import detect as detect_social_lead
 
-from services.ai_service.facade import (
-    build_sentiment_gate,
-    wait_for_ai_response_timing,
-)
+from services.ai_service.facade import build_sentiment_gate
 from services.ai_service.common import estimate_tokens
 from services.agent_orchestrator.facade import (
     orchestrate_lead_workflow,
@@ -64,6 +61,7 @@ from shared.config import (
     webhook_signature_max_skew_seconds,
 )
 from shared.tracing import current_trace_context
+from shared.provider_queues import provider_retry_queue_label, provider_webhook_queue_label
 from shared.webhook_task_runner import create_safe_detached_task
 from services.billing_helpers import relaxed_billing_env
 from shared.usage_guard import (
@@ -93,6 +91,7 @@ from services.db_helpers import (
     r,
     record_webhook_event,
     resolve_customer_by_contact,
+    runtime_schema_ready,
     save_message_attachments,
     save_message_reaction,
     upsert_customer_social_profile,
@@ -451,6 +450,14 @@ def _metadata_truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _whatsapp_provider_from_metadata(metadata_payload: dict | None) -> str:
+    payload = dict(metadata_payload or {})
+    source = str(payload.get("source") or payload.get("bridge_source") or "").strip().lower()
+    if source == "whatsapp_web_bridge" or str(payload.get("bridge_scope") or "").strip():
+        return "qr"
+    return "meta"
+
+
 def _is_whatsapp_group_metadata(metadata_payload: dict | None) -> bool:
     payload = dict(metadata_payload or {})
     group_id = str(payload.get("group_id") or payload.get("group_chat_id") or "").strip()
@@ -503,6 +510,48 @@ def _should_update_sender_name(channel: str, incoming_name: str, metadata_payloa
         return True
     generic_existing = not existing or existing.lower() in {"unknown", "unknown contact"} or existing.startswith("WhatsApp ")
     return generic_existing
+
+
+def _format_channel_title(channel: str) -> str:
+    return str(channel or "channel").replace("_", " ").strip().title()
+
+
+def _is_generic_conversation_subject(subject: str, channel: str) -> bool:
+    text = re.sub(r"\s+", " ", str(subject or "").strip()).lower()
+    if not text:
+        return True
+    normalized_channel = str(channel or "").strip().lower().replace("_", " ")
+    return text in {
+        f"new {normalized_channel} conversation",
+        f"new {_format_channel_title(channel).lower()} conversation",
+        "new conversation",
+        "unknown contact",
+    }
+
+
+def _conversation_subject_from_identity(
+    channel: str,
+    display_name: str,
+    metadata_payload: dict | None,
+    *,
+    is_group_message: bool = False,
+) -> str:
+    payload = dict(metadata_payload or {})
+    if is_group_message:
+        group_name = _clean_display_name(payload.get("group_name"))
+        if group_name:
+            return group_name
+    name = (
+        _clean_display_name(display_name)
+        or _clean_display_name(payload.get("profile_name"))
+        or _clean_display_name(payload.get("sender_name_saved"))
+        or _clean_display_name(payload.get("contact_name_saved"))
+        or _clean_display_name(payload.get("sender_pushname"))
+        or _clean_display_name(payload.get("group_sender_name"))
+    )
+    if name:
+        return name
+    return f"New {_format_channel_title(channel)} conversation"
 
 
 async def _get_or_create_whatsapp_group_customer(db, company_id: str, group_id: str, group_name: str = "") -> dict:
@@ -1330,31 +1379,12 @@ async def _ensure_unprocessed_events_table(db) -> None:
     async with _UNPROCESSED_SCHEMA_LOCK:
         if _UNPROCESSED_SCHEMA_READY:
             return
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS unprocessed_events ("
-            "id TEXT PRIMARY KEY,"
-            "channel TEXT NOT NULL,"
-            "event_id TEXT NOT NULL,"
-            "raw_payload TEXT NOT NULL DEFAULT '',"
-            "metadata TEXT NOT NULL DEFAULT '',"
-            "reason TEXT NOT NULL DEFAULT '',"
-            "status TEXT NOT NULL DEFAULT 'pending',"
-            "retry_count INTEGER NOT NULL DEFAULT 0,"
-            "next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-            "last_error TEXT NOT NULL DEFAULT '',"
-            "resolved_company_id TEXT NOT NULL DEFAULT '',"
-            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-            "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-            "resolved_at TIMESTAMPTZ"
-            ")"
-        )
-        await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_unprocessed_events_channel_event "
-            "ON unprocessed_events(channel, event_id)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_unprocessed_events_status_retry "
-            "ON unprocessed_events(status, next_retry_at)"
+        await runtime_schema_ready(
+            db,
+            "unprocessed_events",
+            required_relations=("unprocessed_events",),
+            required_indexes=("uq_unprocessed_events_channel_event", "idx_unprocessed_events_status_retry"),
+            raise_on_missing=True,
         )
         _UNPROCESSED_SCHEMA_READY = True
 
@@ -1512,6 +1542,7 @@ async def _retry_unprocessed_events(
     db,
     *,
     channel: str,
+    provider: str = "",
     limit: int = 20,
 ) -> None:
     await _ensure_unprocessed_events_table(db)
@@ -1530,7 +1561,7 @@ async def _retry_unprocessed_events(
         )
         if next_due_seconds is not None:
             delay_seconds = max(1.0, float(next_due_seconds) + 1.0)
-            _schedule_unprocessed_retry(db, channel, delay_seconds=delay_seconds)
+            _schedule_unprocessed_retry(db, channel, provider=provider, delay_seconds=delay_seconds)
         return
 
     for row in rows:
@@ -1553,11 +1584,13 @@ async def _retry_unprocessed_events(
             continue
         try:
             if channel == "whatsapp":
+                retry_is_bridge = provider == "qr" or _is_whatsapp_web_bridge_payload(payload)
                 resolved = await _handle_whatsapp_webhook_payload(
                     db,
                     payload,
                     event_id=event_id,
                     store_unresolved=False,
+                    allow_direct_company_id=retry_is_bridge,
                 )
             elif channel == "facebook":
                 resolved = await _handle_facebook_webhook_payload(
@@ -1620,44 +1653,47 @@ async def _retry_unprocessed_events(
             channel,
             event_id,
         )
-        _schedule_unprocessed_retry(db, channel, delay_seconds=delay_seconds + 1)
+        _schedule_unprocessed_retry(db, channel, provider=provider, delay_seconds=delay_seconds + 1)
 
 
 async def _retry_unprocessed_events_after_delay(
     db,
     *,
     channel: str,
+    provider: str = "",
     delay_seconds: float,
 ) -> None:
     delay = max(0.0, float(delay_seconds or 0.0))
     if delay > 0:
         await asyncio.sleep(delay)
-    await _retry_unprocessed_events(db, channel=channel)
+    await _retry_unprocessed_events(db, channel=channel, provider=provider)
 
 
 async def _enqueue_delayed_unprocessed_retry(
     db,
     *,
     channel: str,
+    provider: str = "",
     delay_seconds: float,
 ) -> None:
     delay = max(0.0, float(delay_seconds or 0.0))
     if delay <= 0:
-        await _retry_unprocessed_events(db, channel=channel)
+        await _retry_unprocessed_events(db, channel=channel, provider=provider)
         return
 
-    queue = get_background_queue()
+    queue = get_background_queue(service_label=provider_retry_queue_label(provider or channel))
     if queue is None or not queue.enabled:
         await _retry_unprocessed_events_after_delay(
             db,
             channel=channel,
+            provider=provider,
             delay_seconds=delay,
         )
         return
 
     retry_job_name = f"retry-unprocessed-{channel}"
     retry_job_id = f"{retry_job_name}:{make_id()}"
-    coro = _retry_unprocessed_events(db, channel=channel)
+    coro = _retry_unprocessed_events(db, channel=channel, provider=provider)
     try:
         spec = serialize_coroutine(
             coro,
@@ -1672,6 +1708,7 @@ async def _enqueue_delayed_unprocessed_retry(
         await _retry_unprocessed_events_after_delay(
             db,
             channel=channel,
+            provider=provider,
             delay_seconds=delay,
         )
         return
@@ -1691,6 +1728,7 @@ async def _enqueue_delayed_unprocessed_retry(
         await _retry_unprocessed_events_after_delay(
             db,
             channel=channel,
+            provider=provider,
             delay_seconds=delay,
         )
     finally:
@@ -1700,7 +1738,7 @@ async def _enqueue_delayed_unprocessed_retry(
             pass
 
 
-def _schedule_unprocessed_retry(db, channel: str, *, delay_seconds: float = 0.0) -> None:
+def _schedule_unprocessed_retry(db, channel: str, *, provider: str = "", delay_seconds: float = 0.0) -> None:
     retry_job_name = f"retry-unprocessed-{channel}"
     retry_job_id = f"{retry_job_name}:{make_id()}"
     timeout_seconds = None
@@ -1711,11 +1749,13 @@ def _schedule_unprocessed_retry(db, channel: str, *, delay_seconds: float = 0.0)
         _enqueue_delayed_unprocessed_retry(
             db,
             channel=channel,
+            provider=provider,
             delay_seconds=delay_seconds,
         ),
         name=retry_job_name,
         job_id=retry_job_id,
         timeout_seconds=timeout_seconds,
+        service_label=provider_retry_queue_label(provider or channel),
     )
 
 
@@ -1978,7 +2018,11 @@ async def _handle_whatsapp_webhook_payload(
                         unresolved_metadata,
                     )
                     if store_unresolved:
-                        _schedule_unprocessed_retry(db, "whatsapp")
+                        _schedule_unprocessed_retry(
+                            db,
+                            "whatsapp",
+                            provider="qr" if is_web_bridge else "meta",
+                        )
                     continue
                 tenant_resolved_any = True
                 await _ensure_whatsapp_identity_schema(db)
@@ -1997,6 +2041,7 @@ async def _handle_whatsapp_webhook_payload(
                     company_id=resolved_company_id,
                     channel="whatsapp",
                     event_id=event_id,
+                    service_label=provider_webhook_queue_label("qr" if is_web_bridge else "meta"),
                 )
 
                 if raw_statuses:
@@ -2012,6 +2057,7 @@ async def _handle_whatsapp_webhook_payload(
                         company_id=resolved_company_id,
                         channel="whatsapp",
                         event_id=event_id,
+                        service_label=provider_webhook_queue_label("qr" if is_web_bridge else "meta"),
                     )
                     processed_any = True
                     if not messages:
@@ -2329,7 +2375,11 @@ async def _handle_whatsapp_webhook_payload(
                     metadata=unresolved_metadata,
                     reason="tenant_unresolved",
                 )
-                _schedule_unprocessed_retry(db, "whatsapp")
+                _schedule_unprocessed_retry(
+                    db,
+                    "whatsapp",
+                    provider=_whatsapp_provider_from_metadata(unresolved_metadata),
+                )
             return {"processed": False, "status": status, "results": processed_results} if return_results else False
 
         if event_id and resolved_company_id:
@@ -2390,7 +2440,7 @@ async def _handle_facebook_webhook_payload(
                     page_id,
                 )
                 if store_unresolved:
-                    _schedule_unprocessed_retry(db, "facebook")
+                    _schedule_unprocessed_retry(db, "facebook", provider="meta")
                 return False
             entry_contexts.append((entry, page_id, company_id))
 
@@ -2514,7 +2564,7 @@ async def _handle_facebook_webhook_payload(
                 event_id=event_id,
                 company_id=entry_contexts[0][2],
             )
-        _schedule_unprocessed_retry(db, "facebook")
+        _schedule_unprocessed_retry(db, "facebook", provider="meta")
         return True
     except Exception as exc:
         logger.error("Facebook webhook error: %s", exc)
@@ -2559,7 +2609,7 @@ async def _handle_instagram_webhook_payload(
                     page_id,
                 )
                 if store_unresolved:
-                    _schedule_unprocessed_retry(db, "instagram")
+                    _schedule_unprocessed_retry(db, "instagram", provider="meta")
                 return False
             entry_contexts.append((entry, page_id, company_id))
 
@@ -2685,7 +2735,7 @@ async def _handle_instagram_webhook_payload(
                 event_id=event_id,
                 company_id=entry_contexts[0][2],
             )
-        _schedule_unprocessed_retry(db, "instagram")
+        _schedule_unprocessed_retry(db, "instagram", provider="meta")
         return True
     except Exception as exc:
         logger.error("Instagram webhook error: %s", exc)
@@ -2730,7 +2780,7 @@ async def _handle_lead_form_webhook_payload(
                     page_id,
                 )
                 if store_unresolved:
-                    _schedule_unprocessed_retry(db, "lead_form")
+                    _schedule_unprocessed_retry(db, "lead_form", provider="meta")
                 return False
             entry_contexts.append((entry, company_id))
 
@@ -2778,7 +2828,7 @@ async def _handle_lead_form_webhook_payload(
                 event_id=event_id,
                 company_id=entry_contexts[0][1],
             )
-        _schedule_unprocessed_retry(db, "lead_form")
+        _schedule_unprocessed_retry(db, "lead_form", provider="meta")
         return True
     except Exception as exc:
         logger.error("Lead form webhook error: %s", exc)
@@ -3653,15 +3703,14 @@ async def _ensure_messages_idempotency_schema(db) -> None:
     async with _MESSAGES_IDEMPOTENCY_SCHEMA_LOCK:
         if _MESSAGES_IDEMPOTENCY_SCHEMA_READY:
             return
-        try:
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT ''")
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_idempotency_key_nonempty "
-                "ON messages(company_id, idempotency_key) WHERE BTRIM(idempotency_key) <> ''"
-            )
-            _MESSAGES_IDEMPOTENCY_SCHEMA_READY = True
-        except Exception as exc:
-            logger.warning("Messages idempotency schema check failed: %s", exc)
+        await runtime_schema_ready(
+            db,
+            "messages_idempotency",
+            required_columns=(("messages", "idempotency_key"),),
+            required_indexes=("uq_messages_company_idempotency_key_nonempty",),
+            raise_on_missing=True,
+        )
+        _MESSAGES_IDEMPOTENCY_SCHEMA_READY = True
 
 
 async def _ensure_whatsapp_identity_schema(db) -> None:
@@ -3671,93 +3720,45 @@ async def _ensure_whatsapp_identity_schema(db) -> None:
     async with _WHATSAPP_IDENTITY_SCHEMA_LOCK:
         if _WHATSAPP_IDENTITY_SCHEMA_READY:
             return
-        try:
-            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_group BOOLEAN NOT NULL DEFAULT FALSE")
-            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS group_id TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS whatsapp_account_id TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS identity_key TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider_event_id TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_direction TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_identity_id TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_group_id TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_group_name TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_participant_id TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS whatsapp_participant_name TEXT NOT NULL DEFAULT ''")
-            await db.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS raw_metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_company_provider_event_nonempty "
-                "ON messages(company_id, provider_event_id) WHERE BTRIM(provider_event_id) <> ''"
-            )
-            await db.execute(
-                "CREATE TABLE IF NOT EXISTS whatsapp_identity_mappings ("
-                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'whatsapp', "
-                "account_id TEXT NOT NULL DEFAULT '', bridge_scope TEXT NOT NULL DEFAULT '', "
-                "identity_type TEXT NOT NULL DEFAULT '', identity_value TEXT NOT NULL DEFAULT '', "
-                "identity_value_normalized TEXT NOT NULL DEFAULT '', canonical_phone TEXT NOT NULL DEFAULT '', "
-                "remote_jid TEXT NOT NULL DEFAULT '', lid_jid TEXT NOT NULL DEFAULT '', chat_id TEXT NOT NULL DEFAULT '', "
-                "contact_id TEXT NOT NULL DEFAULT '', customer_id TEXT NOT NULL DEFAULT '', conversation_id TEXT NOT NULL DEFAULT '', "
-                "group_id TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL DEFAULT '', profile_picture_url TEXT NOT NULL DEFAULT '', "
-                "status TEXT NOT NULL DEFAULT 'resolved', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
-                "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-            )
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_identity_alias "
-                "ON whatsapp_identity_mappings(company_id,channel,account_id,identity_type,identity_value_normalized) "
-                "WHERE BTRIM(identity_value_normalized) <> ''"
-            )
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_customer ON whatsapp_identity_mappings(company_id,customer_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_conversation ON whatsapp_identity_mappings(company_id,conversation_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_lid ON whatsapp_identity_mappings(company_id,lid_jid)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_identity_phone ON whatsapp_identity_mappings(company_id,canonical_phone)")
-            await db.execute(
-                "CREATE TABLE IF NOT EXISTS whatsapp_event_dedup ("
-                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'whatsapp', "
-                "account_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL DEFAULT '', provider_event_id TEXT NOT NULL DEFAULT '', "
-                "idempotency_key TEXT NOT NULL DEFAULT '', payload_hash TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'seen', "
-                "attempts INTEGER NOT NULL DEFAULT 1, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
-                "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-            )
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_event_provider "
-                "ON whatsapp_event_dedup(company_id,channel,account_id,event_type,provider_event_id) "
-                "WHERE BTRIM(provider_event_id) <> ''"
-            )
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_event_idempotency "
-                "ON whatsapp_event_dedup(company_id,idempotency_key) WHERE BTRIM(idempotency_key) <> ''"
-            )
-            await db.execute(
-                "CREATE TABLE IF NOT EXISTS whatsapp_pending_messages ("
-                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'whatsapp', account_id TEXT NOT NULL DEFAULT '', "
-                "direction TEXT NOT NULL DEFAULT '', provider_event_id TEXT NOT NULL DEFAULT '', raw_identity TEXT NOT NULL DEFAULT '', "
-                "identity_type TEXT NOT NULL DEFAULT '', payload JSONB NOT NULL DEFAULT '{}'::jsonb, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
-                "status TEXT NOT NULL DEFAULT 'pending', customer_id TEXT NOT NULL DEFAULT '', conversation_id TEXT NOT NULL DEFAULT '', "
-                "message_id TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-                "last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-            )
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_pending_provider "
-                "ON whatsapp_pending_messages(company_id,channel,account_id,provider_event_id) WHERE BTRIM(provider_event_id) <> ''"
-            )
-            await db.execute(
-                "CREATE TABLE IF NOT EXISTS whatsapp_group_participants ("
-                "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', group_id TEXT NOT NULL DEFAULT '', "
-                "participant_jid TEXT NOT NULL DEFAULT '', participant_phone TEXT NOT NULL DEFAULT '', participant_customer_id TEXT NOT NULL DEFAULT '', "
-                "display_name TEXT NOT NULL DEFAULT '', profile_picture_url TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
-                "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-            )
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_group_participant "
-                "ON whatsapp_group_participants(company_id,account_id,group_id,participant_jid) "
-                "WHERE BTRIM(group_id) <> '' AND BTRIM(participant_jid) <> ''"
-            )
-            _WHATSAPP_IDENTITY_SCHEMA_READY = True
-        except Exception as exc:
-            logger.warning("WhatsApp identity schema check failed: %s", exc)
+        await runtime_schema_ready(
+            db,
+            "whatsapp_identity",
+            required_relations=(
+                "whatsapp_identity_mappings",
+                "whatsapp_event_dedup",
+                "whatsapp_pending_messages",
+                "whatsapp_group_participants",
+            ),
+            required_columns=(
+                ("conversations", "is_group"),
+                ("conversations", "group_id"),
+                ("conversations", "whatsapp_account_id"),
+                ("conversations", "identity_key"),
+                ("messages", "provider_event_id"),
+                ("messages", "message_direction"),
+                ("messages", "source"),
+                ("messages", "whatsapp_identity_id"),
+                ("messages", "whatsapp_group_id"),
+                ("messages", "whatsapp_group_name"),
+                ("messages", "whatsapp_participant_id"),
+                ("messages", "whatsapp_participant_name"),
+                ("messages", "raw_metadata"),
+            ),
+            required_indexes=(
+                "uq_messages_company_provider_event_nonempty",
+                "uq_whatsapp_identity_alias",
+                "idx_whatsapp_identity_customer",
+                "idx_whatsapp_identity_conversation",
+                "idx_whatsapp_identity_lid",
+                "idx_whatsapp_identity_phone",
+                "uq_whatsapp_event_provider",
+                "uq_whatsapp_event_idempotency",
+                "uq_whatsapp_pending_provider",
+                "uq_whatsapp_group_participant",
+            ),
+            raise_on_missing=True,
+        )
+        _WHATSAPP_IDENTITY_SCHEMA_READY = True
 
 
 async def _record_whatsapp_event_dedup(
@@ -5454,8 +5455,8 @@ async def _send_outbound_response_via_channel_layer(
     trace_id = str(message_metadata.get("trace_id") or "").strip() or _trace_id_from_context()
     message_metadata["trace_id"] = trace_id
 
-    single_dispatch_whatsapp_ai = channel_type == ChannelType.WHATSAPP and _is_whatsapp_ai_auto_response(message_metadata)
-    max_attempts = 1 if single_dispatch_whatsapp_ai else 3
+    single_dispatch_ai = _is_whatsapp_ai_auto_response(message_metadata)
+    max_attempts = 1 if single_dispatch_ai else 3
     base_delay = outbound_retry_base_delay_seconds()
     external_message_id = ""
     last_error = ""
@@ -5522,11 +5523,12 @@ async def _send_outbound_response_via_channel_layer(
         if attempt < max_attempts and not _is_non_retryable_outbound_error(last_error):
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
 
-    if single_dispatch_whatsapp_ai and last_error and not _is_non_retryable_outbound_error(last_error):
+    if single_dispatch_ai and last_error and not _is_non_retryable_outbound_error(last_error):
         logger.warning(
-            "WhatsApp AI auto-response retry suppressed to preserve idempotency company_id=%s conversation_id=%s message_id=%s idempotency_key=%s trace_id=%s error=%s",
+            "AI auto-response retry suppressed to preserve idempotency company_id=%s conversation_id=%s channel=%s message_id=%s idempotency_key=%s trace_id=%s error=%s",
             company_id,
             conversation_id,
+            channel,
             db_message_id,
             str(message_metadata.get("idempotency_key") or ""),
             trace_id,
@@ -5570,6 +5572,128 @@ async def _send_outbound_response_via_channel_layer(
         last_error or "unknown",
     )
     return False, last_error or "Outbound send failed"
+
+
+async def _retry_existing_ai_outbound_if_needed(
+    db,
+    *,
+    company_id: str,
+    channel: str,
+    conversation_id: str,
+    conversation: dict,
+    customer: dict,
+    sender_contact: str,
+    ai_message: dict,
+    idempotency_key: str,
+    trace_id: str,
+    metadata_payload: dict | None = None,
+) -> bool:
+    message_id = str((ai_message or {}).get("id") or "").strip()
+    delivery_status = str((ai_message or {}).get("delivery_status") or "").strip().lower()
+    if delivery_status in {"sent", "delivered", "read", "sending"}:
+        logger.info(
+            "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=already_%s",
+            company_id,
+            conversation_id,
+            channel,
+            channel,
+            f"webhook_{channel}",
+            message_id,
+            delivery_status or "processed",
+        )
+        return False
+    content = str((ai_message or {}).get("content") or "").strip()
+    if not message_id or not content:
+        logger.warning(
+            "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=missing_existing_message_content",
+            company_id,
+            conversation_id,
+            channel,
+            channel,
+            f"webhook_{channel}",
+            message_id,
+        )
+        return False
+    recipient_id = _resolve_outbound_recipient(channel, conversation, customer, sender_contact)
+    if not recipient_id:
+        await _persist_outbound_message_state(
+            db,
+            company_id=company_id,
+            db_message_id=message_id,
+            delivery_status="failed",
+        )
+        logger.warning(
+            "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=missing_outbound_recipient",
+            company_id,
+            conversation_id,
+            channel,
+            channel,
+            f"webhook_{channel}",
+            message_id,
+        )
+        return False
+    attachments = list((ai_message or {}).get("attachments") or [])
+    started_at = time.monotonic()
+    logger.info(
+        "ai_outbound_send_attempt company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s",
+        company_id,
+        conversation_id,
+        channel,
+        channel,
+        f"webhook_{channel}",
+        message_id,
+    )
+    sent, error = await _send_outbound_response_via_channel_layer(
+        db=db,
+        company_id=company_id,
+        channel=channel,
+        recipient_id=recipient_id,
+        content=content,
+        conversation_id=conversation_id,
+        attachments=attachments,
+        db_message_id=message_id,
+        metadata={
+            **dict(metadata_payload or {}),
+            "source": f"webhook_{channel}",
+            "trace_id": trace_id,
+            "customer_id": str((customer or {}).get("id") or ""),
+            "conversation_id": conversation_id,
+            "idempotency_key": idempotency_key,
+            "raw_sender_id": str(sender_contact or ""),
+            "normalized_sender_id": recipient_id,
+            "selected_outbound_recipient": recipient_id,
+        },
+    )
+    logger.info(
+        "ai_latency_stage stage=outbound_send duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+        _elapsed_ms(started_at),
+        conversation_id,
+        company_id,
+        "",
+        trace_id,
+    )
+    if sent:
+        logger.info(
+            "ai_outbound_send_success company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s",
+            company_id,
+            conversation_id,
+            channel,
+            channel,
+            f"webhook_{channel}",
+            message_id,
+        )
+        return True
+    logger.warning(
+        "ai_outbound_send_failed company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s error=%s",
+        company_id,
+        conversation_id,
+        channel,
+        channel,
+        f"webhook_{channel}",
+        message_id,
+        error,
+    )
+    return False
 
 
 async def _process_unified_outbound_bridge_message(
@@ -5751,17 +5875,23 @@ async def _process_unified_outbound_bridge_message(
             )
             if not convo:
                 convo_id = make_id()
+                conversation_subject = _conversation_subject_from_identity(
+                    channel,
+                    str(customer.get("name") or sender_name or ""),
+                    metadata_payload,
+                    is_group_message=is_group_message,
+                )
                 await conn.execute(
                     "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,agent_type,"
                     "channel_id,sentiment_score,sentiment_label,message_count,last_message,last_message_at,unread_count,session_id,page_url,created_at,updated_at) "
-                    "VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,FALSE,'generic',$10,$11::numeric,$12,0,'',$13,0,'','',NOW(),NOW())",
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,'open','medium',$8,$9,TRUE,'generic',$10,$11::numeric,$12,0,'',$13,0,'','',NOW(),NOW())",
                     convo_id,
                     company_id,
                     cid,
                     customer.get("name", sender_name or "WhatsApp Contact"),
                     customer.get("avatar", ""),
                     channel,
-                    str(metadata_payload.get("group_name") or "") if is_group_message else f"New {channel} conversation",
+                    conversation_subject,
                     "",
                     "",
                     channel_binding,
@@ -5814,12 +5944,22 @@ async def _process_unified_outbound_bridge_message(
                 },
             )
             await conn.execute(
-                "UPDATE conversations SET last_message=$1,last_message_at=$2,updated_at=NOW(),message_count=message_count+1,"
-                "ai_handled=FALSE WHERE id=$3 AND company_id=$4",
+                "UPDATE conversations SET last_message=$1,last_message_at=$2,updated_at=NOW(),message_count=message_count+1 "
+                "WHERE id=$3 AND company_id=$4",
                 preview,
                 created_at,
                 convo_id,
                 company_id,
+            )
+            logger.info(
+                "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=manual_message reason=manual_message_not_escalation actor_type=agent trigger_message_id=%s message_type=%s media_type=%s",
+                company_id,
+                convo_id,
+                msg_id,
+                "media" if saved_attachments else "text",
+                str((saved_attachments[0] or {}).get("file_type") or (saved_attachments[0] or {}).get("type") or "").strip()
+                if saved_attachments
+                else "",
             )
     except Exception:
         logger.exception(
@@ -6018,6 +6158,7 @@ async def _process_incoming_message(
     attachments: Optional[list] = None,
     metadata: dict = None,
 ):
+    request_started_at = time.monotonic()
     metadata_payload = dict(metadata or {})
     if sender_contact and not metadata_payload.get("sender_contact"):
         metadata_payload["sender_contact"] = sender_contact
@@ -6195,6 +6336,12 @@ async def _process_incoming_message(
             )
             if not convo:
                 convo_id = make_id()
+                conversation_subject = _conversation_subject_from_identity(
+                    channel,
+                    _clean_display_name(conversation_customer.get("name")) or message_sender_name,
+                    metadata_payload,
+                    is_group_message=is_group_message,
+                )
                 # Match db_helpers get_or_create_contact_conversation: list columns through agent_type, then NOT NULL sentiment fields as bound parameters.
                 await conn.execute(
                     "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,subject,status,priority,assigned_to,assigned_name,ai_handled,agent_type,"  # noqa: E501
@@ -6206,7 +6353,7 @@ async def _process_incoming_message(
                     _clean_display_name(conversation_customer.get("name")) or message_sender_name,
                     conversation_customer.get("avatar", ""),
                     channel,
-                    str(metadata_payload.get("group_name") or "") if is_group_message else f"New {channel} conversation",
+                    conversation_subject,
                     "",
                     "",
                     conversation_channel_binding,
@@ -6241,6 +6388,34 @@ async def _process_incoming_message(
                     company_id,
                 )
                 convo["customer_avatar"] = conversation_customer.get("avatar", "")
+            preferred_conversation_name = _clean_display_name(conversation_customer.get("name")) or message_sender_name
+            preferred_subject = _conversation_subject_from_identity(
+                channel,
+                preferred_conversation_name,
+                metadata_payload,
+                is_group_message=is_group_message,
+            )
+            if preferred_conversation_name and _should_update_sender_name(
+                channel,
+                preferred_conversation_name,
+                metadata_payload,
+                str(convo.get("customer_name") or ""),
+            ):
+                await conn.execute(
+                    "UPDATE conversations SET customer_name=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                    preferred_conversation_name,
+                    convo["id"],
+                    company_id,
+                )
+                convo["customer_name"] = preferred_conversation_name
+            if preferred_subject and _is_generic_conversation_subject(str(convo.get("subject") or ""), channel):
+                await conn.execute(
+                    "UPDATE conversations SET subject=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
+                    preferred_subject,
+                    convo["id"],
+                    company_id,
+                )
+                convo["subject"] = preferred_subject
 
             convo_id = str(convo["id"])
             history_message["conversation_id"] = convo_id
@@ -6309,6 +6484,16 @@ async def _process_incoming_message(
         metadata_payload.get("raw_sender_id", sender_contact),
         sender_contact,
         channel_binding,
+    )
+    logger.info(
+        "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=customer_message reason=normal_customer_message actor_type=customer trigger_message_id=%s message_type=%s media_type=%s",
+        company_id,
+        convo_id,
+        msg_id,
+        "media" if saved_attachments else "text",
+        str((saved_attachments[0] or {}).get("file_type") or (saved_attachments[0] or {}).get("type") or "").strip()
+        if saved_attachments
+        else "",
     )
     trace_id = _trace_id_from_context(str(metadata_payload.get("trace_id") or ""))
     if trace_id:
@@ -6441,10 +6626,11 @@ async def _process_incoming_message(
         }
 
     try:
+        context_started_at = time.monotonic()
         msgs_history = await fetch_messages_with_attachments(
             db,
             convo_id,
-            limit=max(webhook_message_history_fetch_limit(), 500),
+            limit=max(5, min(webhook_message_history_fetch_limit(), 20)),
             since_days=10,
             company_id=company_id,
             customer_id=cid,
@@ -6456,6 +6642,14 @@ async def _process_incoming_message(
             conversation_id=convo_id,
             channel=channel,
             trace_id=trace_id,
+        )
+        logger.info(
+            "ai_latency_stage stage=context_build duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+            _elapsed_ms(context_started_at),
+            convo_id,
+            company_id,
+            "",
+            trace_id,
         )
         ai_generation_started_at = time.monotonic()
         workflow = await orchestrate_message_workflow(
@@ -6498,6 +6692,14 @@ async def _process_incoming_message(
             msg_id,
             trace_id,
             _elapsed_ms(ai_generation_started_at),
+        )
+        logger.info(
+            "ai_latency_stage stage=ai_call duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+            _elapsed_ms(ai_generation_started_at),
+            convo_id,
+            company_id,
+            "",
+            trace_id,
         )
         capture, _, support_output, _ = _extract_workflow_outputs(
             workflow,
@@ -6601,6 +6803,14 @@ async def _process_incoming_message(
             recent_human_agent_message.get("id", ""),
             recent_human_agent_message.get("sender_name", ""),
         )
+        logger.info(
+            "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=recent_manual_message reason=manual_message_not_escalation actor_type=agent trigger_message_id=%s message_type=%s media_type=%s",
+            company_id,
+            convo_id,
+            recent_human_agent_message.get("id", ""),
+            str(recent_human_agent_message.get("message_type") or "text"),
+            str(recent_human_agent_message.get("media_type") or ""),
+        )
     elif (
         convo.get("ai_handled", True)
         and not conversation_ai_auto_paused(convo)
@@ -6703,17 +6913,14 @@ async def _process_incoming_message(
                     "sentiment_analysis": sentiment_gate,
                 }
             if support_result.get("deliver_response") and support_result.get("response"):
-                ai_started_at = time.monotonic()
-                if channel == "whatsapp":
-                    logger.info(
-                        "Skipping artificial AI response timing for WhatsApp company_id=%s conversation_id=%s message_id=%s trace_id=%s",
-                        company_id,
-                        convo_id,
-                        msg_id,
-                        trace_id,
-                    )
-                else:
-                    await wait_for_ai_response_timing(message_text, ai_started_at)
+                logger.info(
+                    "ai_response_generated company_id=%s conversation_id=%s channel=%s auto_send=true workflow_id=%s message_id=%s",
+                    company_id,
+                    convo_id,
+                    channel,
+                    f"webhook_{channel}",
+                    msg_id,
+                )
                 ai_id = make_id()
                 ai_idempotency_key = _build_ai_response_idempotency_key(
                     company_id=company_id,
@@ -6748,6 +6955,19 @@ async def _process_incoming_message(
                         trace_id=trace_id,
                     )
                     ai_message = existing_ai_message
+                    await _retry_existing_ai_outbound_if_needed(
+                        db,
+                        company_id=company_id,
+                        channel=channel,
+                        conversation_id=convo_id,
+                        conversation=convo,
+                        customer=customer,
+                        sender_contact=sender_contact,
+                        ai_message=ai_message,
+                        idempotency_key=ai_idempotency_key,
+                        trace_id=trace_id,
+                        metadata_payload=metadata_payload,
+                    )
                     return {
                         "conversation_id": convo_id,
                         "message_id": msg_id,
@@ -6758,10 +6978,19 @@ async def _process_incoming_message(
                         "sentiment_analysis": sentiment_gate,
                     }
                 await _ensure_messages_idempotency_schema(db)
+                persist_started_at = time.monotonic()
+                logger.info(
+                    "ai_response_persist_attempt company_id=%s conversation_id=%s channel=%s auto_send=true workflow_id=%s message_id=%s",
+                    company_id,
+                    convo_id,
+                    channel,
+                    f"webhook_{channel}",
+                    ai_id,
+                )
                 try:
                     await db.execute(
-                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,idempotency_key,read,created_at) "  # noqa: E501
-                        "VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,$6,FALSE,NOW())",
+                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,idempotency_key,delivery_status,read,created_at) "  # noqa: E501
+                        "VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,$6,'sending',FALSE,NOW())",
                         ai_id,
                         company_id,
                         convo_id,
@@ -6792,6 +7021,19 @@ async def _process_incoming_message(
                             trace_id=trace_id,
                         )
                         ai_message = existing_ai_message
+                        await _retry_existing_ai_outbound_if_needed(
+                            db,
+                            company_id=company_id,
+                            channel=channel,
+                            conversation_id=convo_id,
+                            conversation=convo,
+                            customer=customer,
+                            sender_contact=sender_contact,
+                            ai_message=ai_message,
+                            idempotency_key=ai_idempotency_key,
+                            trace_id=trace_id,
+                            metadata_payload=metadata_payload,
+                        )
                         return {
                             "conversation_id": convo_id,
                             "message_id": msg_id,
@@ -6854,6 +7096,22 @@ async def _process_incoming_message(
                     _message_preview(support_result["response"], ai_attachments, "ai"),
                     convo_id,
                 )
+                logger.info(
+                    "ai_response_persisted company_id=%s conversation_id=%s channel=%s auto_send=true workflow_id=%s message_id=%s",
+                    company_id,
+                    convo_id,
+                    channel,
+                    f"webhook_{channel}",
+                    ai_id,
+                )
+                logger.info(
+                    "ai_latency_stage stage=persistence duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                    _elapsed_ms(persist_started_at),
+                    convo_id,
+                    company_id,
+                    "",
+                    trace_id,
+                )
                 await auto_disable_ai_after_failure_fallback(
                     db,
                     company_id,
@@ -6893,6 +7151,15 @@ async def _process_incoming_message(
                 )
                 if recipient_id:
                     outbound_started_at = time.monotonic()
+                    logger.info(
+                        "ai_outbound_send_attempt company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s",
+                        company_id,
+                        convo_id,
+                        channel,
+                        channel,
+                        f"webhook_{channel}",
+                        ai_id,
+                    )
                     sent, error = await _send_outbound_response_via_channel_layer(
                         db=db,
                         company_id=company_id,
@@ -6933,10 +7200,24 @@ async def _process_incoming_message(
                     )
                     if not sent:
                         logger.warning(
-                            "Unified outbound send failed conversation=%s channel=%s error=%s",
+                            "ai_outbound_send_failed company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s error=%s",
+                            company_id,
                             convo_id,
                             channel,
+                            channel,
+                            f"webhook_{channel}",
+                            ai_id,
                             error,
+                        )
+                    else:
+                        logger.info(
+                            "ai_outbound_send_success company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s",
+                            company_id,
+                            convo_id,
+                            channel,
+                            channel,
+                            f"webhook_{channel}",
+                            ai_id,
                         )
                 else:
                     await _persist_outbound_message_state(
@@ -6955,10 +7236,13 @@ async def _process_incoming_message(
                         error="Missing outbound recipient",
                     )
                     logger.warning(
-                        "Unified outbound skipped due to missing recipient company_id=%s conversation_id=%s channel=%s trace_id=%s",
+                        "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=missing_outbound_recipient trace_id=%s",
                         company_id,
                         convo_id,
                         channel,
+                        channel,
+                        f"webhook_{channel}",
+                        ai_id,
                         trace_id,
                     )
                 ai_message = await _load_message_with_attachments(db, ai_id)
@@ -6977,6 +7261,24 @@ async def _process_incoming_message(
                     channel=channel,
                     trace_id=trace_id,
                     event_id=ai_id,
+                )
+                logger.info(
+                    "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=ai_success reason=ai_success actor_type=ai trigger_message_id=%s message_type=%s media_type=%s",
+                    company_id,
+                    convo_id,
+                    ai_id,
+                    "media" if ai_attachments else "text",
+                    str((ai_attachments[0] or {}).get("file_type") or (ai_attachments[0] or {}).get("type") or "").strip()
+                    if ai_attachments
+                    else "",
+                )
+                logger.info(
+                    "ai_latency_stage stage=total duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                    _elapsed_ms(request_started_at),
+                    convo_id,
+                    company_id,
+                    "",
+                    trace_id,
                 )
             else:
                 escalation = await escalate_conversation_to_human(
@@ -7093,6 +7395,7 @@ async def whatsapp_webhook(request: Request):
             channel="whatsapp",
             event_id=event_id,
             payload=payload,
+            service_label=provider_webhook_queue_label("qr"),
         )
         logger.info(
             "WhatsApp bridge webhook queued company_id=%s user_id=%s event_id=%s",
@@ -7113,6 +7416,7 @@ async def whatsapp_webhook(request: Request):
         channel="whatsapp",
         event_id=event_id,
         payload=payload,
+        service_label=provider_webhook_queue_label("meta"),
     )
     return {"status": "received"}
 
@@ -7148,6 +7452,7 @@ async def facebook_webhook(request: Request):
         channel="facebook",
         event_id=event_id,
         payload=payload,
+        service_label=provider_webhook_queue_label("meta"),
     )
     return {"status": "received"}
 
@@ -7182,6 +7487,7 @@ async def instagram_webhook(request: Request):
         channel="instagram",
         event_id=event_id,
         payload=payload,
+        service_label=provider_webhook_queue_label("meta"),
     )
     return {"status": "received"}
 
@@ -7189,6 +7495,7 @@ async def instagram_webhook(request: Request):
 @router.post("/webhooks/web-chat")
 async def web_chat_webhook(request: Request):
     db = _db(request)
+    request_started_at = time.monotonic()
     raw_body = await request.body()
     payload = _decode_webhook_json(raw_body)
     has_signed_headers = bool(request.headers.get("X-Webhook-Timestamp") or request.headers.get("X-Webhook-Signature"))
@@ -7457,10 +7764,11 @@ async def web_chat_webhook(request: Request):
                 "is_ai": False,
             }
         try:
+            context_started_at = time.monotonic()
             msgs_history = await fetch_messages_with_attachments(
                 db,
                 convo_id,
-                limit=max(webhook_message_history_fetch_limit(), 500),
+                limit=max(5, min(webhook_message_history_fetch_limit(), 20)),
                 since_days=10,
                 company_id=company_id,
                 customer_id=customer_id,
@@ -7473,6 +7781,15 @@ async def web_chat_webhook(request: Request):
                 channel="web_chat",
                 trace_id=trace_id,
             )
+            logger.info(
+                "ai_latency_stage stage=context_build duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                _elapsed_ms(context_started_at),
+                convo_id,
+                company_id,
+                "",
+                trace_id,
+            )
+            ai_generation_started_at = time.monotonic()
             workflow = await orchestrate_message_workflow(
                 MessageWorkflowRequest(
                     trace_id=trace_id,
@@ -7496,6 +7813,14 @@ async def web_chat_webhook(request: Request):
                     },
                 ),
                 db=db,
+            )
+            logger.info(
+                "ai_latency_stage stage=ai_call duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                _elapsed_ms(ai_generation_started_at),
+                convo_id,
+                company_id,
+                "",
+                trace_id,
             )
             capture, _, support_output, _ = _extract_workflow_outputs(
                 workflow,
@@ -7606,6 +7931,14 @@ async def web_chat_webhook(request: Request):
                 recent_human_agent_message.get("id", ""),
                 recent_human_agent_message.get("sender_name", ""),
             )
+            logger.info(
+                "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=recent_manual_message reason=manual_message_not_escalation actor_type=agent trigger_message_id=%s message_type=%s media_type=%s",
+                company_id,
+                convo_id,
+                recent_human_agent_message.get("id", ""),
+                str(recent_human_agent_message.get("message_type") or "text"),
+                str(recent_human_agent_message.get("media_type") or ""),
+            )
         elif (
             convo.get("ai_handled", True)
             and not conversation_ai_auto_paused(convo)
@@ -7706,11 +8039,22 @@ async def web_chat_webhook(request: Request):
                         "is_ai": False,
                     }
                 if support_result.get("deliver_response") and support_result.get("response"):
-                    ai_started_at = time.monotonic()
-                    await wait_for_ai_response_timing(content, ai_started_at)
+                    logger.info(
+                        "ai_response_generated company_id=%s conversation_id=%s channel=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
+                        company_id,
+                        convo_id,
+                        msg_id,
+                    )
                     ai_id = make_id()
+                    persist_started_at = time.monotonic()
+                    logger.info(
+                        "ai_response_persist_attempt company_id=%s conversation_id=%s channel=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
+                        company_id,
+                        convo_id,
+                        ai_id,
+                    )
                     await db.execute(
-                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,read,created_at) VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,FALSE,NOW())",  # noqa: E501
+                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,delivery_status,read,created_at) VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,'sending',FALSE,NOW())",  # noqa: E501
                         ai_id,
                         company_id,
                         convo_id,
@@ -7759,6 +8103,20 @@ async def web_chat_webhook(request: Request):
                         _message_preview(support_result["response"], ai_attachments, "ai"),
                         convo_id,
                     )
+                    logger.info(
+                        "ai_response_persisted company_id=%s conversation_id=%s channel=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
+                        company_id,
+                        convo_id,
+                        ai_id,
+                    )
+                    logger.info(
+                        "ai_latency_stage stage=persistence duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                        _elapsed_ms(persist_started_at),
+                        convo_id,
+                        company_id,
+                        "",
+                        trace_id,
+                    )
                     await auto_disable_ai_after_failure_fallback(
                         db,
                         company_id,
@@ -7791,6 +8149,13 @@ async def web_chat_webhook(request: Request):
                         event_id=ai_id,
                     )
                     ai_message = await _load_message_with_attachments(db, ai_id)
+                    outbound_started_at = time.monotonic()
+                    logger.info(
+                        "ai_outbound_send_attempt company_id=%s conversation_id=%s channel=web_chat provider=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
+                        company_id,
+                        convo_id,
+                        ai_id,
+                    )
                     sent, error = await _send_outbound_response_via_channel_layer(
                         db=db,
                         company_id=company_id,
@@ -7809,11 +8174,28 @@ async def web_chat_webhook(request: Request):
                     )
                     if not sent:
                         logger.warning(
-                            "Unified web chat outbound send failed conversation=%s error=%s",
+                            "ai_outbound_send_failed company_id=%s conversation_id=%s channel=web_chat provider=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s error=%s",
+                            company_id,
                             convo_id,
+                            ai_id,
                             error,
                         )
                         await emit_new_message(convo_id, ai_message)
+                    else:
+                        logger.info(
+                            "ai_outbound_send_success company_id=%s conversation_id=%s channel=web_chat provider=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
+                            company_id,
+                            convo_id,
+                            ai_id,
+                        )
+                    logger.info(
+                        "ai_latency_stage stage=outbound_send duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                        _elapsed_ms(outbound_started_at),
+                        convo_id,
+                        company_id,
+                        "",
+                        trace_id,
+                    )
                     ai_response_text = support_result["response"]
                     is_ai = True
                     create_safe_detached_task(
@@ -7830,6 +8212,24 @@ async def web_chat_webhook(request: Request):
                         channel="web_chat",
                         trace_id=trace_id,
                         event_id=ai_id,
+                    )
+                    logger.info(
+                        "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=ai_success reason=ai_success actor_type=ai trigger_message_id=%s message_type=%s media_type=%s",
+                        company_id,
+                        convo_id,
+                        ai_id,
+                        "media" if ai_attachments else "text",
+                        str((ai_attachments[0] or {}).get("file_type") or (ai_attachments[0] or {}).get("type") or "").strip()
+                        if ai_attachments
+                        else "",
+                    )
+                    logger.info(
+                        "ai_latency_stage stage=total duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                        _elapsed_ms(request_started_at),
+                        convo_id,
+                        company_id,
+                        "",
+                        trace_id,
                     )
                 else:
                     escalation = await escalate_conversation_to_human(
@@ -7890,6 +8290,7 @@ async def lead_form_webhook(request: Request):
         channel="lead_form",
         event_id=event_id,
         payload={"page_payload": payload},
+        service_label=provider_webhook_queue_label("meta"),
     )
     return {"status": "received"}
 

@@ -258,11 +258,20 @@ services:
       SERVICE_NAME: email-campaign-service
       PORT: 8013
       DB_SCHEMA: email_campaign_service
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
+      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
+      GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
       interval: 15s
@@ -281,11 +290,20 @@ services:
       SERVICE_NAME: ai-service
       PORT: 8005
       DB_SCHEMA: ai_service
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
+      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
+      GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
       interval: 15s
@@ -304,11 +322,20 @@ services:
       SERVICE_NAME: agent-orchestrator-service
       PORT: 8009
       DB_SCHEMA: agent_orchestrator
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
+      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
+      GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
       interval: 15s

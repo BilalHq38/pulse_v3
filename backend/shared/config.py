@@ -660,6 +660,13 @@ def background_queue_job_ttl_seconds(default: int = 86400) -> int:
         return default
 
 
+def background_queue_max_stream_length(default: int = 10000) -> int:
+    try:
+        return max(1000, int(os.environ.get("BACKGROUND_QUEUE_MAX_STREAM_LENGTH", str(default))))
+    except ValueError:
+        return default
+
+
 def background_queue_consumer_prefix(default: str = "worker") -> str:
     return (os.environ.get("BACKGROUND_QUEUE_CONSUMER_PREFIX", default) or default).strip()
 

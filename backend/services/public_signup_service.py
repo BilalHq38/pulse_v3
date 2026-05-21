@@ -29,6 +29,7 @@ from services.db_helpers import (
     r,
     record_auth_event,
     record_system_log,
+    runtime_schema_ready,
     send_email_verification_message,
     set_company_context,
     set_public_auth_context,
@@ -512,7 +513,7 @@ async def _complete_pending_signup_workspace(
     user_id = make_id()
     await db.execute(
         "INSERT INTO users(id,email,password_hash,name,role,role_id,sub_role,status,avatar,company_id,phone,onboarding_completed,plan_selected,billing_status,auth_provider,email_verified,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$2,$3,$4,'admin',$5,'','active','',$6,'',FALSE,FALSE,'active','email',FALSE,NOW(),NOW())",
+        "VALUES($1,$2,$3,$4,'admin',$5,'','pending_approval','',$6,'',FALSE,FALSE,'active','email',FALSE,NOW(),NOW())",
         user_id,
         (pending_signup["email"] or "").strip().lower(),
         pending_signup["password_hash"],
@@ -539,6 +540,15 @@ async def _complete_pending_signup_workspace(
             "email": pending_signup["email"],
             "plan_code": pending_signup.get("plan_code") or "pro",
         },
+    )
+    logger.info(
+        "user_pending_approval_created actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        user_id,
+        user_id,
+        company_id,
+        "",
+        "pending_approval",
+        "public_signup",
     )
 
     billing_customer = await update_billing_customer_status(

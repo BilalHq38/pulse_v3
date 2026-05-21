@@ -52,7 +52,7 @@ export default function AdminLoginPage() {
       }
       navigate('/super-admin', { replace: true });
     } catch (err) {
-      setError(err.response?.data?.detail || 'Admin authentication failed');
+      setError(err.response?.data?.message || err.response?.data?.detail || 'Admin authentication failed');
     } finally {
       setLoading(false);
     }

@@ -1,5 +1,7 @@
 import asyncio
+import inspect
 
+import routers.conversations as conversations
 import routers.webhooks as webhooks
 import services.messaging_service as messaging_service
 from channel_layer.adapters.whatsapp import WhatsAppAdapter
@@ -56,6 +58,99 @@ def test_whatsapp_adapter_marks_ai_auto_response_single_dispatch(monkeypatch):
 
 def test_send_whatsapp_single_dispatch_suppresses_bridge_fallback(monkeypatch):
     asyncio.run(_run_send_whatsapp_single_dispatch_fallback_case(monkeypatch))
+
+
+def test_send_whatsapp_meta_success_does_not_probe_bridge(monkeypatch):
+    asyncio.run(_run_send_whatsapp_meta_success_does_not_probe_bridge_case(monkeypatch))
+
+
+def test_whatsapp_product_media_caption_prefers_product_identity():
+    caption = messaging_service._whatsapp_send_text_for_attachments(
+        "Here is a longer conversational product explanation that should not become the media caption.",
+        [
+            {
+                "type": "image",
+                "url": "/api/products/media/company-1/solar.jpg",
+                "name": "solar.jpg",
+                "raw_metadata": {
+                    "product_name": "Solar Kit",
+                    "product_title": "SK-100",
+                    "product_category": "Energy",
+                },
+            }
+        ],
+    )
+
+    assert caption == "Product: Solar Kit (SK-100)\nCategory: Energy"
+    assert "longer conversational" not in caption
+
+
+def test_whatsapp_manual_media_caption_preserves_typed_text():
+    typed = "is pr click krny sy ho raha ha, lakin jab manual reply kro to ai off ho jata..."
+
+    caption = messaging_service._whatsapp_send_text_for_attachments(
+        typed,
+        [
+            {
+                "type": "image",
+                "url": "/api/conversations/attachments/media/company-1/ik.png",
+                "name": "Ik.PNG",
+                "raw_metadata": {"caption": "Product: Ik.PNG"},
+            }
+        ],
+        idempotency_key="api:company-1:msg:manual-1",
+    )
+
+    assert caption == typed
+
+
+def test_whatsapp_manual_media_without_caption_uses_filename_fallback():
+    caption = messaging_service._whatsapp_send_text_for_attachments(
+        "",
+        [
+            {
+                "type": "image",
+                "url": "/api/conversations/attachments/media/company-1/ik.png",
+                "name": "Ik.PNG",
+            }
+        ],
+        idempotency_key="api:company-1:msg:manual-1",
+    )
+
+    assert caption == "Ik.PNG"
+
+
+def test_whatsapp_ai_media_without_product_caption_can_use_product_filename_fallback():
+    caption = messaging_service._whatsapp_send_text_for_attachments(
+        "",
+        [
+            {
+                "type": "image",
+                "url": "/api/products/media/company-1/ik.png",
+                "name": "Ik.PNG",
+            }
+        ],
+        idempotency_key="ai:auto_response:company-1:conversation-1:whatsapp:abc",
+    )
+
+    assert caption == "Product: Ik.PNG"
+
+
+def test_manual_outbound_paths_do_not_disable_conversation_ai():
+    start_source = inspect.getsource(conversations.start_outbound_conversation)
+    bridge_source = inspect.getsource(webhooks._process_unified_outbound_bridge_message)
+
+    assert "ai_handled=FALSE" not in start_source
+    assert "ai_handled=FALSE" not in bridge_source
+
+
+def test_whatsapp_infers_image_type_from_api_product_media_url():
+    assert (
+        messaging_service._infer_media_type(
+            {"type": "image", "url": "/api/products/media/company-1/solar.jpg", "mime_type": ""}
+        )
+        == "image"
+    )
 
 
 async def _run_whatsapp_session_not_ready_case(monkeypatch):
@@ -228,6 +323,43 @@ async def _run_send_whatsapp_single_dispatch_fallback_case(monkeypatch):
     assert "Meta timeout" in error
     assert bridge_calls == []
     assert persisted[0]["delivery_status"] == "failed"
+
+
+async def _run_send_whatsapp_meta_success_does_not_probe_bridge_case(monkeypatch):
+    bridge_snapshot_calls = []
+    persisted = []
+
+    async def _tenant_meta(*_args, **_kwargs):
+        return True, "", "wamid.meta-1"
+
+    async def _snapshot(*_args, **_kwargs):
+        bridge_snapshot_calls.append(_kwargs)
+        return {"state": "ready", "status": "ready"}
+
+    async def _persist(*_args, **kwargs):
+        persisted.append(kwargs)
+
+    monkeypatch.setattr(messaging_service, "_send_via_tenant_meta", _tenant_meta)
+    monkeypatch.setattr(messaging_service, "_bridge_session_snapshot", _snapshot)
+    monkeypatch.setattr(messaging_service, "_persist_outbound_message_state", _persist)
+
+    sent, error = await messaging_service.send_whatsapp_message(
+        "+923001234567",
+        "Hello",
+        db=object(),
+        company_id="company-1",
+        db_message_id="ai-1",
+        conversation_id="conversation-1",
+        customer_id="customer-1",
+        idempotency_key="ai:auto_response:company-1:conversation-1:whatsapp:abc",
+        single_dispatch=True,
+    )
+
+    assert sent is True
+    assert error == ""
+    assert bridge_snapshot_calls == []
+    assert persisted[0]["delivery_status"] == "sent"
+    assert persisted[0]["external_message_id"] == "wamid.meta-1"
 
 
 class _UniqueViolation(Exception):

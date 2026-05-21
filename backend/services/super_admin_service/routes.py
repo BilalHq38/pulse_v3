@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.db_helpers import (
+    account_status_error_detail,
     build_auth_payload,
     bump_user_token_version,
     close_login_sessions,
@@ -23,6 +24,7 @@ from services.db_helpers import (
     r,
     set_public_auth_context,
 )
+from services.billing_helpers import assert_workspace_seat_available
 from shared.auth.jwt import REFRESH_TOKEN_EXPIRE_DAYS, verify_password
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,20 @@ _SUSPICIOUS_SECURITY_FILTER = """
     )
 )
 """
+_USER_ACCESS_STATUSES = {"pending_approval", "active", "rejected", "blocked", "paused", "inactive"}
+_NON_ACTIVE_STATUSES = _USER_ACCESS_STATUSES - {"active"}
+_STATUS_ACTION_LOG = {
+    "active": "super_admin_user_approved",
+    "rejected": "super_admin_user_rejected",
+    "blocked": "super_admin_user_blocked",
+    "paused": "super_admin_user_paused",
+    "inactive": "super_admin_user_paused",
+    "pending_approval": "super_admin_approval_requested",
+}
+
+
+def _normalize_user_status(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 def _db(request: Request):
@@ -119,7 +135,7 @@ def _blocked_account_response(status: str) -> JSONResponse:
     normalized = str(status or "inactive").strip().lower() or "inactive"
     return JSONResponse(
         status_code=403,
-        content={"detail": f"Your account is {normalized}. Please contact your administrator."},
+        content=account_status_error_detail(normalized),
     )
 
 
@@ -129,6 +145,45 @@ async def _revoke_user_access_after_status_change(db, user_id: str, status: str)
     await bump_user_token_version(db, user_id)
     await revoke_refresh_tokens_for_user(db, user_id, f"status_changed:{status}")
     await close_login_sessions(db, user_id)
+
+
+async def _log_super_admin_user_action(
+    db,
+    actor: dict[str, Any],
+    *,
+    action: str,
+    target: dict[str, Any],
+    previous_status: str,
+    new_status: str,
+    reason: str = "",
+) -> None:
+    actor_user_id = str(actor.get("sub") or actor.get("id") or "")
+    target_user_id = str(target.get("id") or "")
+    company_id = str(target.get("company_id") or "")
+    logger.info(
+        "%s actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        action,
+        actor_user_id,
+        target_user_id,
+        company_id,
+        previous_status,
+        new_status,
+        reason,
+    )
+    await record_system_log(
+        db,
+        actor,
+        action,
+        "user",
+        target_user_id,
+        {
+            "target_email": target.get("email", ""),
+            "company_id": company_id,
+            "previous_status": previous_status,
+            "new_status": new_status,
+            "reason": reason,
+        },
+    )
 
 
 def _normalize_record(record: Any) -> dict[str, Any]:
@@ -199,6 +254,8 @@ async def admin_overview(
             (SELECT COUNT(*) FROM users WHERE status = 'active') AS active_users,
             (SELECT COUNT(*) FROM users WHERE status = 'paused') AS paused_users,
             (SELECT COUNT(*) FROM users WHERE status = 'blocked') AS blocked_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'pending_approval') AS pending_approval_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'rejected') AS rejected_users,
             (SELECT COUNT(*) FROM users WHERE status = 'inactive') AS inactive_users,
             (SELECT COUNT(*) FROM leads) AS total_leads,
             (SELECT COUNT(*) FROM customers) AS total_customers,
@@ -290,6 +347,13 @@ async def admin_users(
             FROM leads
             GROUP BY company_id
         ),
+        user_totals AS (
+            SELECT
+                company_id,
+                COUNT(*) FILTER (WHERE status = 'active' AND role IN ('admin', 'company_agent')) AS users_used
+            FROM users
+            GROUP BY company_id
+        ),
         customer_totals AS (
             SELECT company_id, COUNT(*) AS total_customers
             FROM customers
@@ -309,10 +373,32 @@ async def admin_users(
             SELECT company_id, COUNT(*) AS total_products
             FROM company_products
             GROUP BY company_id
+        ),
+        conversation_month AS (
+            SELECT company_id, COALESCE(SUM(usage_units), 0) AS monthly_conversation_usage
+            FROM usage_ledger
+            WHERE occurred_at >= date_trunc('month', timezone('utc', now()))
+              AND usage_type = 'conversation_message'
+            GROUP BY company_id
         )
         SELECT
             u.*,
             COALESCE(c.name, '') AS company_name,
+            COALESCE(sub.plan_code, 'free') AS subscription_plan,
+            COALESCE(sub.status, 'inactive') AS subscription_status,
+            COALESCE(ut.users_used, 0) AS users_used,
+            CASE
+                WHEN COALESCE(sub.max_users, 0) > 0 THEN sub.max_users
+                WHEN COALESCE(sub.plan_code, 'free') = 'enterprise' THEN 3
+                ELSE 1
+            END AS user_limit,
+            COALESCE(cm.monthly_conversation_usage, 0) AS conversations_used,
+            CASE
+                WHEN COALESCE(sub.monthly_conversation_limit, 0) > 0 THEN sub.monthly_conversation_limit
+                WHEN COALESCE(sub.plan_code, 'free') = 'enterprise' THEN 10000
+                WHEN COALESCE(sub.plan_code, 'free') = 'pro' THEN 2500
+                ELSE 250
+            END AS conversation_limit,
             COALESCE(lt.total_leads, 0) AS leads_count,
             COALESCE(ct.total_customers, 0) AS customers_count,
             COALESCE(conv.total_conversations, 0) AS conversations_count,
@@ -320,11 +406,14 @@ async def admin_users(
             COALESCE(pt.total_products, 0) AS products_count
         FROM users u
         LEFT JOIN companies c ON c.id = u.company_id
+        LEFT JOIN subscriptions sub ON sub.company_id = u.company_id
+        LEFT JOIN user_totals ut ON ut.company_id = u.company_id
         LEFT JOIN lead_totals lt ON lt.company_id = u.company_id
         LEFT JOIN customer_totals ct ON ct.company_id = u.company_id
         LEFT JOIN conversation_totals conv ON conv.company_id = u.company_id
         LEFT JOIN ticket_totals tt ON tt.company_id = u.company_id
         LEFT JOIN product_totals pt ON pt.company_id = u.company_id
+        LEFT JOIN conversation_month cm ON cm.company_id = u.company_id
         ORDER BY u.created_at DESC
         LIMIT $1
         """,
@@ -340,7 +429,7 @@ async def admin_update_user_status(user_id: str, request: Request) -> dict[str, 
     db = _db(request)
     body = await _json_body(request)
     status = str(body.get("status") or "").strip().lower()
-    allowed = {"active", "paused", "blocked", "inactive"}
+    allowed = _USER_ACCESS_STATUSES
     if status not in allowed:
         raise HTTPException(400, f"Invalid status. Must be one of: {', '.join(sorted(allowed))}")
     if user_id == current_user.get("sub"):
@@ -349,22 +438,86 @@ async def admin_update_user_status(user_id: str, request: Request) -> dict[str, 
     target = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", user_id))
     if not target:
         raise HTTPException(404, "User not found")
-
-    await db.execute(
-        "UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2",
-        status,
+    previous_status = _normalize_user_status(target.get("status")) or "active"
+    reason = str(body.get("reason") or "").strip()[:512]
+    logger.info(
+        "super_admin_user_action_requested actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        current_user.get("sub", ""),
         user_id,
+        target.get("company_id", ""),
+        previous_status,
+        status,
+        reason,
     )
+    if target.get("role") == "super_admin" and previous_status == "active" and status != "active":
+        other_active_super_admins = int(
+            await db.fetchval(
+                "SELECT COUNT(*) FROM users WHERE role='super_admin' AND status='active' AND id<>$1",
+                user_id,
+            )
+            or 0
+        )
+        if other_active_super_admins < 1:
+            raise HTTPException(400, "Cannot disable the last active super admin")
+    if status == "active" and previous_status != "active" and target.get("role") in {"admin", "company_agent"}:
+        async with db.transaction() as conn:
+            await assert_workspace_seat_available(conn, str(target.get("company_id") or ""))
+            await conn.execute(
+                "UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2",
+                status,
+                user_id,
+            )
+    else:
+        await db.execute(
+            "UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2",
+            status,
+            user_id,
+        )
     await _revoke_user_access_after_status_change(db, user_id, status)
-    await record_system_log(
+    if status in _NON_ACTIVE_STATUSES:
+        logger.info(
+            "user_session_invalidated actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+            current_user.get("sub", ""),
+            user_id,
+            target.get("company_id", ""),
+            previous_status,
+            status,
+            reason or f"status_changed:{status}",
+        )
+    action = _STATUS_ACTION_LOG.get(status, "super_admin_user_action")
+    if previous_status in {"blocked", "paused", "inactive"} and status == "active":
+        action = "super_admin_user_resumed"
+    await _log_super_admin_user_action(
         db,
         current_user,
-        "admin_user_status_update",
-        "user",
-        user_id,
-        {"new_status": status, "target_email": target.get("email", "")},
+        action=action,
+        target=target,
+        previous_status=previous_status,
+        new_status=status,
+        reason=reason,
     )
     return {"status": "ok", "user_id": user_id, "new_status": status}
+
+
+@router.post("/admin/users/{user_id}/review")
+@router.post("/platform/super-admin/users/{user_id}/review")
+async def admin_review_user(user_id: str, request: Request) -> dict[str, Any]:
+    current_user = _require_super_admin(request)
+    db = _db(request)
+    target = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", user_id))
+    if not target:
+        raise HTTPException(404, "User not found")
+    status = _normalize_user_status(target.get("status")) or "active"
+    await _log_super_admin_user_action(
+        db,
+        current_user,
+        action="super_admin_user_reviewed",
+        target=target,
+        previous_status=status,
+        new_status=status,
+        reason="review",
+    )
+    return {"status": "ok", "user": _strip_password_hash(_normalize_record(target))}
 
 
 @router.delete("/admin/users/{user_id}")

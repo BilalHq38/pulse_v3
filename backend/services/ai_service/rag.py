@@ -13,6 +13,7 @@ from shared.cache import get_cache_client
 from shared.metrics import increment_counter, observe_histogram, timed_metric
 from services.ai_service.embedding_service import search_similar_embeddings, store_embedding
 from services.ai_service.llm_tracking import has_embedding_budget_remaining
+from services.ai_service.routing_guards import is_low_value_message
 
 _CATALOG_CACHE_TTL_SECONDS = max(
     30,
@@ -117,6 +118,8 @@ def _should_skip_rag_query(query: str, *, intent_name: str = "", has_history: bo
     normalized = _normalize_term(query)
     if not normalized:
         return True, "empty_query"
+    if is_low_value_message(normalized):
+        return True, "low_value_message"
     if intent_name == "follow_up_continue" or has_history:
         return False, ""
     if normalized in _RAG_SKIP_PHRASES:
@@ -336,6 +339,12 @@ def _build_product_attachment(product: dict, image_url: str, image_index: int) -
         return None
     name = str(product.get("name") or "").strip()
     title = str(product.get("product_title") or "").strip()
+    category = str(product.get("category") or "").strip()
+    label = f"{name} ({title})" if name and title and title.lower() != name.lower() else (name or title or "Product")
+    caption_lines = [f"Product: {label}"]
+    if category:
+        caption_lines.append(f"Category: {category}")
+    caption = "\n".join(caption_lines)
     return {
         "type": "image",
         "url": image_url,
@@ -344,8 +353,17 @@ def _build_product_attachment(product: dict, image_url: str, image_index: int) -
         "product_id": str(product.get("id") or "").strip(),
         "product_name": name,
         "product_title": title,
-        "product_category": str(product.get("category") or "").strip(),
+        "product_category": category,
         "image_index": image_index,
+        "caption": caption,
+        "raw_metadata": {
+            "product_id": str(product.get("id") or "").strip(),
+            "product_name": name,
+            "product_title": title,
+            "product_category": category,
+            "image_index": image_index,
+            "caption": caption,
+        },
     }
 
 
@@ -558,6 +576,7 @@ async def build_ai_context(
     conversation_id: str = "",
     intent_name: str = "",
     has_history: bool = False,
+    include_products: bool = True,
 ) -> dict:
     if not db:
         return {
@@ -630,7 +649,7 @@ async def build_ai_context(
             if intro:
                 chunks.append(" | ".join(intro))
 
-        if company_id and current_query:
+        if include_products and company_id and current_query:
             selected_products = await rank_products_for_query(
                 db,
                 company_id,
@@ -642,7 +661,7 @@ async def build_ai_context(
                 customer_id=customer_id,
                 conversation_id=conversation_id,
             )
-        elif company_id:
+        elif include_products and company_id:
             catalog = await _load_product_catalog(db, company_id, limit=max(max_products * 4, 12))
             selected_products = [
                 product for product in catalog if str(product.get("id") or "").strip() not in excluded_ids

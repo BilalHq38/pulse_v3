@@ -42,6 +42,7 @@ function clearCachedUser() {
   localStorage.removeItem('pe_user');
   localStorage.removeItem('pe_avatar');
   localStorage.removeItem('pe_company_name');
+  localStorage.removeItem('pe_account_status');
 }
 
 export function applyAuthResponse(data = {}) {
@@ -49,6 +50,7 @@ export function applyAuthResponse(data = {}) {
     setAccessToken(data.token);
   }
   if (data?.user) {
+    localStorage.removeItem('pe_account_status');
     localStorage.setItem('pe_user', JSON.stringify(data.user));
   }
   return data;
@@ -107,7 +109,31 @@ api.interceptors.response.use(
   (response) => response,
   async (error) => {
     const d = error.response?.data?.detail ?? error.response?.data?.error;
+    const code = error.response?.data?.code;
     if (error.response?.status === 403 && typeof d === 'string') {
+      if (
+        ['ACCOUNT_PENDING_APPROVAL', 'ACCOUNT_REJECTED', 'ACCOUNT_BLOCKED', 'ACCOUNT_PAUSED', 'ACCOUNT_INACTIVE'].includes(code)
+        || /account (is pending|request was not approved|has been blocked|has been paused|is inactive)/i.test(d)
+      ) {
+        const statusByCode = {
+          ACCOUNT_PENDING_APPROVAL: 'pending_approval',
+          ACCOUNT_REJECTED: 'rejected',
+          ACCOUNT_BLOCKED: 'blocked',
+          ACCOUNT_PAUSED: 'paused',
+          ACCOUNT_INACTIVE: 'inactive',
+        };
+        if (statusByCode[code]) {
+          try {
+            const cached = JSON.parse(localStorage.getItem('pe_user') || '{}');
+            localStorage.setItem('pe_user', JSON.stringify({ ...cached, status: statusByCode[code], account_status: statusByCode[code] }));
+            localStorage.setItem('pe_account_status', statusByCode[code]);
+          } catch {
+            // Ignore malformed local cache.
+          }
+        }
+        if (!window.location.pathname.startsWith('/account-status')) window.location.assign('/account-status');
+        return Promise.reject(error);
+      }
       if (d === 'EMAIL_VERIFICATION_REQUIRED' && !window.location.pathname.startsWith('/verify-email')) {
         window.location.assign('/verify-email');
         return Promise.reject(error);

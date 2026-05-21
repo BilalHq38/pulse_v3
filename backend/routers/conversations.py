@@ -19,11 +19,7 @@ from channel_layer.channel_identity import (
 from channel_layer.router import get_outbound_router
 from channel_layer.schemas import ChannelType
 
-from services.ai_service.facade import (
-    build_sentiment_gate,
-    summarize_conversation,
-    wait_for_ai_response_timing,
-)
+from services.ai_service.facade import build_sentiment_gate, summarize_conversation
 from services.agent_orchestrator.facade import orchestrate_message_workflow
 from core.socket import emit_message_deleted, emit_message_updated, emit_new_message
 from core.utils import make_id, now_ts
@@ -50,11 +46,12 @@ from services.db_helpers import (
     refresh_conversation_rollup,
     normalize_attachment_row,
     rs,
+    runtime_schema_ready,
     save_message_attachments,
 )
 from services.messaging_service import _persist_outbound_message_state
 from services.lead_stage_service import apply_message_stage_transition
-from services.media_storage import serve_stored_media
+from services.media_storage import safe_path_segment, serve_stored_media
 
 from shared.usage_guard import (
     conversation_limit_completed_message,
@@ -116,6 +113,10 @@ def _trace_id_from_context() -> str:
     except Exception:
         return ""
     return str(getattr(context, "trace_id", "") or "").strip()
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.monotonic() - started_at) * 1000, 2)
 
 
 def _channel_type_from_name(channel: str) -> Optional[ChannelType]:
@@ -319,20 +320,25 @@ async def _ensure_inbox_visibility_schema(db) -> None:
     global _INBOX_VISIBILITY_SCHEMA_READY
     if _INBOX_VISIBILITY_SCHEMA_READY:
         return
-    statements = (
-        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-        "ALTER TABLE customer_channels ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS is_visible BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-        "ALTER TABLE customer_social_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-        "CREATE INDEX IF NOT EXISTS idx_customer_channels_visible_channel ON customer_channels(channel, is_active, is_visible)",
-        "CREATE INDEX IF NOT EXISTS idx_customer_social_profiles_visible_platform ON customer_social_profiles(platform, is_active, is_visible)",
+    await runtime_schema_ready(
+        db,
+        "inbox_visibility",
+        required_columns=(
+            ("customer_channels", "is_active"),
+            ("customer_channels", "is_visible"),
+            ("customer_channels", "created_at"),
+            ("customer_channels", "updated_at"),
+            ("customer_social_profiles", "is_active"),
+            ("customer_social_profiles", "is_visible"),
+            ("customer_social_profiles", "created_at"),
+            ("customer_social_profiles", "updated_at"),
+        ),
+        required_indexes=(
+            "idx_customer_channels_visible_channel",
+            "idx_customer_social_profiles_visible_platform",
+        ),
+        raise_on_missing=True,
     )
-    for statement in statements:
-        await db.execute(statement)
     _INBOX_VISIBILITY_SCHEMA_READY = True
 
 
@@ -360,6 +366,9 @@ async def _ensure_visible_social_conversations(db, company_id: str) -> None:
         ["open", "pending", "escalated"],
     )
     for row in rows or []:
+        customer_name = str(row["customer_name"] or "").strip()
+        generic_subject = f"New {format_channel_name(row['channel'])} conversation"
+        subject = customer_name if customer_name and customer_name.lower() not in {"unknown", "unknown contact"} else generic_subject
         await db.execute(
             "INSERT INTO conversations(id,company_id,customer_id,customer_name,customer_avatar,channel,channel_id,"
             "subject,status,priority,assigned_to,assigned_name,ai_handled,sentiment_score,sentiment_label,"
@@ -369,11 +378,11 @@ async def _ensure_visible_social_conversations(db, company_id: str) -> None:
             make_id(),
             scoped_company_id,
             row["customer_id"],
-            row["customer_name"] or "Unknown Contact",
+            customer_name or "Unknown Contact",
             row["avatar"] or "",
             row["channel"],
             row["channel_id"] or "",
-            f"New {format_channel_name(row['channel'])} conversation",
+            subject,
         )
 
 
@@ -672,10 +681,16 @@ async def start_outbound_conversation(request: Request):
         subject=_email_sender_label(company_sender_name.replace("Message from ", "", 1)) if channel == "email" else "",
     )
     await db.execute(
-        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,ai_handled=FALSE "
+        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1 "
         "WHERE id=$2",
         initial_message[:100],
         convo["id"],
+    )
+    logger.info(
+        "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=manual_message reason=manual_message_not_escalation actor_type=agent trigger_message_id=%s message_type=text media_type=",
+        cid,
+        convo["id"],
+        msg_id,
     )
     await persist_chat_history(
         db,
@@ -873,8 +888,57 @@ async def get_messages(convo_id: str, request: Request):
     return await fetch_messages_with_attachments(db, convo_id, limit=500)
 
 
+def _safe_media_filename(filename: str) -> bool:
+    value = str(filename or "").strip()
+    return bool(value and value == safe_path_segment(value, "") and "/" not in value and "\\" not in value)
+
+
 @router.get("/conversations/attachments/media/{company_id}/{filename}")
-async def get_conversation_attachment_media(company_id: str, filename: str) -> FileResponse:
+async def get_conversation_attachment_media(company_id: str, filename: str, request: Request) -> FileResponse:
+    user_id = "-"
+    logger.info(
+        "media_access_attempt company_id=%s filename=%s user_id=%s",
+        company_id,
+        str(filename or "")[:120],
+        user_id,
+    )
+    try:
+        cu = await get_current_user_flexible(request)
+    except HTTPException as exc:
+        logger.warning(
+            "media_access_denied company_id=%s filename=%s user_id=%s reason=unauthenticated",
+            company_id,
+            str(filename or "")[:120],
+            user_id,
+        )
+        raise exc
+
+    user_id = str(cu.get("sub") or cu.get("id") or "-")
+    user_company_id = str(get_company_id(cu) or "")
+    if not user_company_id or user_company_id != str(company_id):
+        logger.warning(
+            "media_access_denied company_id=%s filename=%s user_id=%s reason=company_mismatch",
+            company_id,
+            str(filename or "")[:120],
+            user_id,
+        )
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not _safe_media_filename(filename):
+        logger.warning(
+            "media_access_denied company_id=%s filename=%s user_id=%s reason=invalid_filename",
+            company_id,
+            str(filename or "")[:120],
+            user_id,
+        )
+        raise HTTPException(status_code=404, detail="media not found")
+
+    logger.info(
+        "media_access_granted company_id=%s filename=%s user_id=%s",
+        company_id,
+        str(filename or "")[:120],
+        user_id,
+    )
     return serve_stored_media(category="message-attachments", company_id=company_id, filename=filename)
 
 
@@ -907,6 +971,14 @@ async def send_message(convo_id: str, request: Request):
     conversation_sentiment = {}
     sentiment_gate = build_sentiment_gate(content, sentiment)
     trace_id = _trace_id_from_context()
+    request_started_at = time.monotonic()
+    logger.info(
+        "ai_latency_stage stage=request_received duration_ms=0.0 conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+        convo_id,
+        company_id,
+        "",
+        trace_id,
+    )
     outbound_delivered = True
     outbound_error = ""
     outbound_channel_name = str(convo.get("channel") or "")
@@ -960,12 +1032,35 @@ async def send_message(convo_id: str, request: Request):
     )
     await db.execute(
         "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,"
-        "unread_count=unread_count+$2,ai_handled=CASE WHEN $4 THEN FALSE ELSE ai_handled END WHERE id=$3",
+        "unread_count=unread_count+$2 WHERE id=$3",
         preview,
         1 if sender_type == "customer" else 0,
         convo_id,
-        sender_type == "agent",
     )
+    message_type_for_log = "media" if saved_attachments else "text"
+    media_type_for_log = (
+        str((saved_attachments[0] or {}).get("file_type") or (saved_attachments[0] or {}).get("type") or "").strip()
+        if saved_attachments
+        else ""
+    )
+    if sender_type == "agent":
+        logger.info(
+            "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=manual_message reason=manual_message_not_escalation actor_type=agent trigger_message_id=%s message_type=%s media_type=%s",
+            company_id,
+            convo_id,
+            msg_id,
+            message_type_for_log,
+            media_type_for_log,
+        )
+    elif sender_type == "customer":
+        logger.info(
+            "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=customer_message reason=normal_customer_message actor_type=customer trigger_message_id=%s message_type=%s media_type=%s",
+            company_id,
+            convo_id,
+            msg_id,
+            message_type_for_log,
+            media_type_for_log,
+        )
     if sender_type == "customer":
         res = await reserve_conversation_usage(
             db,
@@ -1007,6 +1102,7 @@ async def send_message(convo_id: str, request: Request):
             }
         else:
             try:
+                context_started_at = time.monotonic()
                 cust_full = r(
                     await db.fetchrow(
                         "SELECT * FROM customers WHERE id=$1 LIMIT 1",
@@ -1016,12 +1112,21 @@ async def send_message(convo_id: str, request: Request):
                 msgs_history = await fetch_messages_with_attachments(
                     db,
                     convo_id,
-                    limit=500,
+                    limit=20,
                     since_days=10,
                     company_id=company_id,
                     customer_id=str(convo.get("customer_id") or ""),
                     include_linked_profiles=True,
                 )
+                logger.info(
+                    "ai_latency_stage stage=context_build duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                    _elapsed_ms(context_started_at),
+                    convo_id,
+                    company_id,
+                    "",
+                    trace_id,
+                )
+                ai_started_at = time.monotonic()
                 workflow = await orchestrate_message_workflow(
                     MessageWorkflowRequest(
                         trace_id=trace_id,
@@ -1041,6 +1146,14 @@ async def send_message(convo_id: str, request: Request):
                     ),
                     authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
                     db=db,
+                )
+                logger.info(
+                    "ai_latency_stage stage=ai_call duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                    _elapsed_ms(ai_started_at),
+                    convo_id,
+                    company_id,
+                    "",
+                    trace_id,
                 )
                 capture = workflow.agent_outputs.capture
                 support_plan = workflow.agent_outputs.support
@@ -1292,8 +1405,14 @@ async def send_message(convo_id: str, request: Request):
                 }
 
             if result.get("deliver_response") and result.get("response"):
-                ai_started_at = time.monotonic()
-                await wait_for_ai_response_timing(content, ai_started_at)
+                logger.info(
+                    "ai_response_generated company_id=%s conversation_id=%s channel=%s auto_send=true workflow_id=%s message_id=%s",
+                    company_id,
+                    convo_id,
+                    str(convo.get("channel") or ""),
+                    "send_message",
+                    msg_id,
+                )
                 ai_id = make_id()
                 ai_reservation = await reserve_conversation_usage(
                     db,
@@ -1326,6 +1445,15 @@ async def send_message(convo_id: str, request: Request):
                 outbound_channel = str(convo.get("channel") or "")
                 ai_sender_name = company_sender_name if outbound_channel == "email" else "AI Assistant"
                 ai_delivery_status = "sending" if outbound_channel in ("whatsapp", "facebook", "instagram", "email") else "pending"
+                persist_started_at = time.monotonic()
+                logger.info(
+                    "ai_response_persist_attempt company_id=%s conversation_id=%s channel=%s auto_send=true workflow_id=%s message_id=%s",
+                    company_id,
+                    convo_id,
+                    outbound_channel,
+                    "send_message",
+                    ai_id,
+                )
                 await db.execute(
                     "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,"
                     "ai_confidence,delivery_status,read,created_at) "
@@ -1386,6 +1514,22 @@ async def send_message(convo_id: str, request: Request):
                     _message_preview(result["response"], ai_attachments, "ai"),
                     convo_id,
                 )
+                logger.info(
+                    "ai_response_persisted company_id=%s conversation_id=%s channel=%s auto_send=true workflow_id=%s message_id=%s",
+                    company_id,
+                    convo_id,
+                    outbound_channel,
+                    "send_message",
+                    ai_id,
+                )
+                logger.info(
+                    "ai_latency_stage stage=persistence duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                    _elapsed_ms(persist_started_at),
+                    convo_id,
+                    company_id,
+                    "",
+                    trace_id,
+                )
                 await auto_disable_ai_after_failure_fallback(
                     db,
                     company_id,
@@ -1407,6 +1551,16 @@ async def send_message(convo_id: str, request: Request):
                         ai_subject = ""
                         if outbound_channel == "email":
                             ai_subject = _reply_email_subject(str(convo.get("subject") or ""), company_sender_name.replace("Message from ", "", 1))
+                        outbound_started_at = time.monotonic()
+                        logger.info(
+                            "ai_outbound_send_attempt company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s",
+                            company_id,
+                            convo_id,
+                            outbound_channel,
+                            outbound_channel,
+                            "send_message",
+                            ai_id,
+                        )
                         sent, error = await _send_outbound_via_channel_layer(
                             db=db,
                             company_id=company_id,
@@ -1430,18 +1584,59 @@ async def send_message(convo_id: str, request: Request):
                         )
                         if not sent:
                             logger.warning(
-                                "AI outbound send failed for conversation %s channel=%s: %s",
+                                "ai_outbound_send_failed company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s error=%s",
+                                company_id,
                                 convo_id,
                                 outbound_channel,
+                                outbound_channel,
+                                "send_message",
+                                ai_id,
                                 error,
                             )
+                        else:
+                            logger.info(
+                                "ai_outbound_send_success company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s",
+                                company_id,
+                                convo_id,
+                                outbound_channel,
+                                outbound_channel,
+                                "send_message",
+                                ai_id,
+                            )
+                        logger.info(
+                            "ai_latency_stage stage=outbound_send duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                            _elapsed_ms(outbound_started_at),
+                            convo_id,
+                            company_id,
+                            "",
+                            trace_id,
+                        )
                     else:
+                        logger.warning(
+                            "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=missing_outbound_recipient",
+                            company_id,
+                            convo_id,
+                            outbound_channel,
+                            outbound_channel,
+                            "send_message",
+                            ai_id,
+                        )
                         await _persist_outbound_message_state(
                             db,
                             company_id=company_id,
                             db_message_id=ai_id,
                             delivery_status="failed",
                         )
+                else:
+                    logger.info(
+                        "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=realtime_channel_emit",
+                        company_id,
+                        convo_id,
+                        outbound_channel or "web_chat",
+                        outbound_channel or "web_chat",
+                        "send_message",
+                        ai_id,
+                    )
                 lead_for_qualification = dict(capture.get("lead") or {})
                 if not lead_for_qualification and cust_full:
                     lead_for_qualification = {"id": str(cust_full.get("lead_id") or "")}
@@ -1459,6 +1654,24 @@ async def send_message(convo_id: str, request: Request):
                     channel=str(convo.get("channel") or ""),
                     trace_id=trace_id,
                     event_id=ai_id,
+                )
+                logger.info(
+                    "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=ai_success reason=ai_success actor_type=ai trigger_message_id=%s message_type=%s media_type=%s",
+                    company_id,
+                    convo_id,
+                    ai_id,
+                    "media" if ai_attachments else "text",
+                    str((ai_attachments[0] or {}).get("file_type") or (ai_attachments[0] or {}).get("type") or "").strip()
+                    if ai_attachments
+                    else "",
+                )
+                logger.info(
+                    "ai_latency_stage stage=total duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                    _elapsed_ms(request_started_at),
+                    convo_id,
+                    company_id,
+                    "",
+                    trace_id,
                 )
             else:
                 escalation = await escalate_conversation_to_human(
@@ -1743,6 +1956,15 @@ async def _run_manual_ai_response_workflow(
     company_id = cu.get("company_id", "") or convo.get("company_id", "")
     if conversation_ai_auto_paused(convo):
         if draft_only:
+            logger.info(
+                "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=false workflow_id=%s message_id=%s skip_reason=manual_draft_mode",
+                company_id,
+                convo_id,
+                str(convo.get("channel") or ""),
+                str(convo.get("channel") or ""),
+                "manual_ai_respond",
+                "",
+            )
             return _build_manual_ai_draft_payload(
                 {
                     "response": _manual_ai_safe_fallback_draft(),
@@ -1847,15 +2069,6 @@ async def _run_manual_ai_response_workflow(
         and (is_ai_api_exhaustion_payload(result) or not result.get("response"))
     ):
         sys_msg = AI_API_EXHAUSTED_MANUAL_MESSAGE
-        await disable_company_ai_after_api_exhaustion(
-            db,
-            company_id,
-            conversation_id=convo_id,
-            reason=str(result.get("error_reason") or result.get("error_type") or "AI service unavailable"),
-            error_type=str(result.get("error_type") or ""),
-            provider=str(result.get("provider") or ""),
-            model=str(result.get("model_name") or ""),
-        )
         if draft_only:
             result["response"] = str(result.get("response") or _manual_ai_safe_fallback_draft())
             result["requires_review"] = True
@@ -1876,7 +2089,31 @@ async def _run_manual_ai_response_workflow(
                 draft_payload.get("model_name", ""),
                 True,
             )
+            logger.info(
+                "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=false workflow_id=%s message_id=%s skip_reason=manual_draft_mode",
+                company_id,
+                convo_id,
+                str(convo.get("channel") or ""),
+                str(convo.get("channel") or ""),
+                "manual_ai_respond",
+                manual_idempotency_key,
+            )
+            logger.info(
+                "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=manual_draft reason=draft_only_not_static_fallback actor_type=agent trigger_message_id=%s message_type=text media_type=",
+                company_id,
+                convo_id,
+                manual_idempotency_key,
+            )
             return draft_payload
+        await disable_company_ai_after_api_exhaustion(
+            db,
+            company_id,
+            conversation_id=convo_id,
+            reason=str(result.get("error_reason") or result.get("error_type") or "AI service unavailable"),
+            error_type=str(result.get("error_type") or ""),
+            provider=str(result.get("provider") or ""),
+            model=str(result.get("model_name") or ""),
+        )
         sys_id = make_id()
         await db.execute(
             "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,is_alert,read,created_at) "
@@ -1896,15 +2133,21 @@ async def _run_manual_ai_response_workflow(
         await emit_new_message(convo_id, sys_message)
         return sys_message
     if draft_only:
-        await auto_disable_ai_after_failure_fallback(
-            db,
+        logger.info(
+            "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=false workflow_id=%s message_id=%s skip_reason=manual_draft_mode",
             company_id,
             convo_id,
-            result,
-            channel=str(convo.get("channel") or ""),
-            trace_id=trace_id,
+            str(convo.get("channel") or ""),
+            str(convo.get("channel") or ""),
+            "manual_ai_respond",
+            manual_idempotency_key,
         )
-    if draft_only:
+        logger.info(
+            "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=manual_draft reason=draft_only_not_escalation actor_type=agent trigger_message_id=%s message_type=text media_type=",
+            company_id,
+            convo_id,
+            manual_idempotency_key,
+        )
         draft_payload = _build_manual_ai_draft_payload(
             result,
             convo_id,

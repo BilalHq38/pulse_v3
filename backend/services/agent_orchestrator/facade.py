@@ -263,7 +263,6 @@ async def _message_workflow_fallback(
     escalate = bool(
         not sentiment_gate.get("ai_response_allowed", True)
         or should_auto_escalate(payload.message_text, sentiment=sentiment, intent=intent)
-        or confidence < threshold
     )
     support_payload = {
         "response": str(support.get("response") or ""),

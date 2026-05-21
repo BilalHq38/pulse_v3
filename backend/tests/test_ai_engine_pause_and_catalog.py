@@ -138,9 +138,14 @@ class FakePauseDb:
 class FakeSchemaDb:
     def __init__(self):
         self.executed = []
+        self.checked = []
 
     async def execute(self, sql, *args):
         self.executed.append(sql)
+
+    async def fetchval(self, sql, *args):
+        self.checked.append((sql, args))
+        return True
 
 
 class FakeGlobalEngineDb:
@@ -162,16 +167,17 @@ class FakeGlobalEngineDb:
 
 
 @pytest.mark.asyncio
-async def test_conversation_ai_pause_schema_bootstrap_adds_missing_columns(monkeypatch):
+async def test_conversation_ai_pause_schema_bootstrap_checks_required_columns_without_runtime_ddl(monkeypatch):
     monkeypatch.setattr(db_helpers, "_conversation_ai_pause_schema_ready", False)
     db = FakeSchemaDb()
 
     await ensure_conversation_ai_pause_schema(db)
 
-    joined = "\n".join(db.executed)
-    assert "ai_auto_paused" in joined
-    assert "ai_paused_reason" in joined
-    assert "ai_paused_scope" in joined
+    checked = "\n".join(str(args) for _sql, args in db.checked)
+    assert "ai_auto_paused" in checked
+    assert "ai_paused_reason" in checked
+    assert "ai_paused_scope" in checked
+    assert db.executed == []
 
 
 @pytest.mark.asyncio
@@ -208,6 +214,29 @@ def test_gemini_catalog_exposes_only_supported_generation_models():
     assert not is_supported_model("gemini", "gemini-" + "3-flash-preview")
     assert not is_supported_model("gemini", "gemma-" + "4-31b")
     assert model_capabilities("gemini", "gemini-2.5-flash")["supports_vision"] is True
+
+
+def test_vertex_ai_catalog_uses_supported_gemini_models():
+    catalog = supported_model_catalog("vertex_ai")
+    names_by_category = {(item["category"], item["model_name"]) for item in catalog}
+
+    assert ("text_generation", "gemini-2.5-flash-lite") in names_by_category
+    assert is_supported_model("vertex_ai", "gemini-2.5-flash-lite")
+    assert not is_supported_model("vertex_ai", "gemini-" + "3.1" + "-flash")
+    assert model_capabilities("vertex_ai", "gemini-2.5-flash-lite")["supports_text"] is True
+
+
+def test_provider_status_treats_vertex_ai_as_server_configured(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+    monkeypatch.delenv("VERTEX_AI_ENABLED", raising=False)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "pulse-engine7")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+    status, detail = db_helpers.provider_configuration_status("vertex_ai")
+
+    assert status == "configured"
+    assert detail == ""
 
 
 def test_unsupported_gemini_model_error_is_clean(monkeypatch):
@@ -300,6 +329,74 @@ async def test_static_fallback_auto_disables_conversation_ai():
 
 
 @pytest.mark.asyncio
+async def test_manual_image_send_does_not_auto_disable_ai():
+    db = FakePauseDb()
+
+    disabled = await auto_disable_ai_after_failure_fallback(
+        db,
+        "co-1",
+        "convo-1",
+        {
+            "sender_type": "agent",
+            "message_type": "media",
+            "media_type": "image",
+            "static_fallback_served": False,
+            "api_error": False,
+        },
+        channel="whatsapp",
+        trace_id="trace-media",
+    )
+
+    assert disabled is False
+    assert db.executed == []
+
+
+@pytest.mark.asyncio
+async def test_manual_text_send_does_not_auto_disable_ai():
+    db = FakePauseDb()
+
+    disabled = await auto_disable_ai_after_failure_fallback(
+        db,
+        "co-1",
+        "convo-1",
+        {
+            "sender_type": "agent",
+            "message_type": "text",
+            "static_fallback_served": False,
+            "api_error": False,
+        },
+        channel="web_chat",
+        trace_id="trace-text",
+    )
+
+    assert disabled is False
+    assert db.executed == []
+
+
+@pytest.mark.asyncio
+async def test_customer_media_does_not_auto_disable_ai():
+    db = FakePauseDb()
+
+    disabled = await auto_disable_ai_after_failure_fallback(
+        db,
+        "co-1",
+        "convo-1",
+        {
+            "sender_type": "customer",
+            "message_type": "media",
+            "media_type": "image",
+            "static_fallback_served": False,
+            "api_error": False,
+        },
+        channel="whatsapp",
+        trace_id="trace-customer-media",
+    )
+
+    assert disabled is False
+    assert db.executed == []
+
+
+@pytest.mark.asyncio
 async def test_escalation_pauses_ai_auto_response():
     db = FakePauseDb()
 
@@ -369,3 +466,50 @@ async def test_support_agent_provider_failure_returns_static_fallback(monkeypatc
     assert payload["provider"] == "static_fallback"
     assert payload["deliver_response"] is True
     assert "having trouble connecting" in payload["response"]
+
+
+@pytest.mark.asyncio
+async def test_support_agent_low_confidence_does_not_auto_escalate(monkeypatch):
+    async def threshold(*_args, **_kwargs):
+        return 0.8
+
+    monkeypatch.setattr(support_agent, "fetch_company_ai_threshold", threshold)
+
+    context = SimpleNamespace(
+        workflow_kind=WorkflowKind.MESSAGE,
+        workflow_id="wf-low-confidence",
+        company_id="co-1",
+        db=None,
+        request=SimpleNamespace(
+            message_text="Can you help me pick one?",
+            conversation_id="convo-1",
+            customer_id="cust-1",
+            message_id="msg-1",
+            conversation_context=[],
+            knowledge_context="",
+            channel="web_chat",
+        ),
+        global_memory=SimpleNamespace(conversation_history=[]),
+        agent_outputs=SimpleNamespace(
+            capture={
+                "customer": {"id": "cust-1", "name": "Customer"},
+                "sentiment": {"emotion": "neutral", "score": 0},
+                "intent": {"intent": "product_recommendation"},
+                "sentiment_gate": {"ai_response_allowed": True},
+                "prefetched_support_response": {
+                    "response": "I can help you compare the available options.",
+                    "confidence": 0.3,
+                    "api_error": False,
+                    "provider": "gemini",
+                    "model_name": "gemini-2.5-flash-lite",
+                },
+            },
+            qualification={},
+        ),
+    )
+
+    payload = (await SupportAgent().execute(context)).payload
+
+    assert payload["requires_review"] is True
+    assert payload["escalate"] is False
+    assert payload["deliver_response"] is True

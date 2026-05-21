@@ -10,7 +10,7 @@ from services.ai_service.facade import (
     get_provider_runtime_info,
     validate_live_engine,
 )
-from services.ai_service.model_catalog import validate_model_selection
+from services.ai_service.model_catalog import GEMINI_PROVIDER_KEYS, validate_model_selection
 from services.ai_service.response_generator import clear_engine_cache
 from core.utils import make_id, now_ts, normalize_reference_key
 from services.db_helpers import (
@@ -88,6 +88,8 @@ SOCIAL_POST_FIELDS = {
     "sentiment",
     "posted_at",
 }
+LLM_PROVIDER_KEYS = {*GEMINI_PROVIDER_KEYS, "openai", "anthropic"}
+LLM_PROVIDER_ERROR = "provider must be openai, anthropic, gemini, gemini_api, or vertex_ai"
 
 
 def _filter_update_fields(body: dict, allowed: set[str]) -> dict:
@@ -172,8 +174,8 @@ async def create_llm_engine(request: Request):
     provider = normalize_reference_key(body.get("provider", ""))
     if not model_name:
         raise HTTPException(400, "model_name is required")
-    if provider not in {"gemini", "openai", "anthropic"}:
-        raise HTTPException(400, "provider must be gemini, openai, or anthropic")
+    if provider not in LLM_PROVIDER_KEYS:
+        raise HTTPException(400, LLM_PROVIDER_ERROR)
     _validate_llm_model_or_400(provider, model_name)
     eid = make_id()
     await db.execute(
@@ -200,8 +202,8 @@ async def update_llm_engine(llm_id: str, request: Request):
     body.pop("_id", None)
     if "provider" in body:
         body["provider"] = normalize_reference_key(body["provider"])
-        if body["provider"] not in {"openai", "anthropic", "gemini"}:
-            raise HTTPException(400, "provider must be openai, anthropic, or gemini")
+        if body["provider"] not in LLM_PROVIDER_KEYS:
+            raise HTTPException(400, LLM_PROVIDER_ERROR)
     current = r(await db.fetchrow("SELECT provider,model_name,company_id FROM llm_engines WHERE id=$1 LIMIT 1", llm_id))
     if not current:
         raise HTTPException(404, "LLM engine not found")

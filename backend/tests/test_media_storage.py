@@ -1,5 +1,10 @@
 import base64
 
+import pytest
+from fastapi import HTTPException
+from fastapi.responses import PlainTextResponse
+
+from routers import conversations
 from services import media_storage
 from services.db_helpers import normalize_attachment_payload
 
@@ -82,3 +87,83 @@ def test_normalize_attachment_payload_detects_video_data_url():
     assert payload["type"] == "video"
     assert payload["url"].startswith("data:video/mp4")
     assert payload["mime_type"] == "video/mp4"
+
+
+class _DummyRequest:
+    pass
+
+
+_COMPANY_1 = "11111111-1111-1111-1111-111111111111"
+_COMPANY_2 = "22222222-2222-2222-2222-222222222222"
+
+
+@pytest.mark.asyncio
+async def test_conversation_media_route_denies_unauthenticated(monkeypatch):
+    async def deny_auth(_request):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    monkeypatch.setattr(conversations, "get_current_user_flexible", deny_auth)
+
+    with pytest.raises(HTTPException) as exc:
+        await conversations.get_conversation_attachment_media(_COMPANY_1, "photo.png", _DummyRequest())
+
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_conversation_media_route_denies_wrong_company(monkeypatch):
+    async def fake_auth(_request):
+        return {"id": "user-1", "company_id": _COMPANY_2}
+
+    monkeypatch.setattr(conversations, "get_current_user_flexible", fake_auth)
+
+    with pytest.raises(HTTPException) as exc:
+        await conversations.get_conversation_attachment_media(_COMPANY_1, "photo.png", _DummyRequest())
+
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_conversation_media_route_allows_same_company(monkeypatch):
+    captured = {}
+
+    async def fake_auth(_request):
+        return {"id": "user-1", "company_id": _COMPANY_1}
+
+    def fake_serve_stored_media(**kwargs):
+        captured.update(kwargs)
+        return PlainTextResponse("ok")
+
+    monkeypatch.setattr(conversations, "get_current_user_flexible", fake_auth)
+    monkeypatch.setattr(conversations, "serve_stored_media", fake_serve_stored_media)
+
+    response = await conversations.get_conversation_attachment_media(_COMPANY_1, "photo.png", _DummyRequest())
+
+    assert response.body == b"ok"
+    assert captured == {
+        "category": "message-attachments",
+        "company_id": _COMPANY_1,
+        "filename": "photo.png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_conversation_media_route_denies_path_traversal(monkeypatch):
+    called = False
+
+    async def fake_auth(_request):
+        return {"id": "user-1", "company_id": _COMPANY_1}
+
+    def fake_serve_stored_media(**_kwargs):
+        nonlocal called
+        called = True
+        return PlainTextResponse("ok")
+
+    monkeypatch.setattr(conversations, "get_current_user_flexible", fake_auth)
+    monkeypatch.setattr(conversations, "serve_stored_media", fake_serve_stored_media)
+
+    with pytest.raises(HTTPException) as exc:
+        await conversations.get_conversation_attachment_media(_COMPANY_1, "../secret.png", _DummyRequest())
+
+    assert exc.value.status_code == 404
+    assert called is False

@@ -595,9 +595,15 @@ async def _send_lead_nurture_message(
         },
     )
     await db.execute(
-        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1,ai_handled=FALSE WHERE id=$2",  # noqa: E501
+        "UPDATE conversations SET last_message=$1,last_message_at=NOW(),updated_at=NOW(),message_count=message_count+1 WHERE id=$2",  # noqa: E501
         content[:100],
         conversation["id"],
+    )
+    logger.info(
+        "ai_auto_disable_skipped company_id=%s conversation_id=%s trigger=manual_message reason=manual_message_not_escalation actor_type=agent trigger_message_id=%s message_type=text media_type=",
+        company_id,
+        conversation["id"],
+        msg_id,
     )
     await db.execute(
         "UPDATE lead_nurture_messages SET sent=TRUE WHERE id=$1 AND lead_id=$2",

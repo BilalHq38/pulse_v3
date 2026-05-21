@@ -26,6 +26,7 @@ MODEL_CATEGORIES = {
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_GEMINI_PRO_MODEL = "gemini-2.5-pro"
+GEMINI_PROVIDER_KEYS = {"gemini", "gemini_api", "vertex_ai"}
 
 _GEMINI_TEXT_MODELS = [
     ("gemini-2.5-flash", "Gemini 2.5 Flash (Default)", True),
@@ -88,19 +89,24 @@ def supported_model_catalog(provider: str = "") -> list[dict[str, Any]]:
         _catalog_item("anthropic", "claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet", "text_generation", recommended=True, supports_text=True, supports_vision=True),
         _catalog_item("anthropic", "claude-3-5-haiku-20241022", "Claude 3.5 Haiku", "text_generation", supports_text=True, supports_vision=True),
     ]
-    for model_name, label, recommended in _GEMINI_TEXT_MODELS:
-        items.append(
-            _catalog_item(
-                "gemini",
-                model_name,
-                label,
-                "text_generation",
-                recommended=recommended,
-                supports_text=True,
-                supports_vision=model_name in _GEMINI_VISION_MODEL_NAMES,
-                supports_audio=model_name in _GEMINI_AUDIO_MODEL_NAMES,
+    for provider_key, provider_label in (
+        ("gemini", "Gemini"),
+        ("gemini_api", "Gemini API"),
+        ("vertex_ai", "Vertex AI Gemini"),
+    ):
+        for model_name, label, recommended in _GEMINI_TEXT_MODELS:
+            items.append(
+                _catalog_item(
+                    provider_key,
+                    model_name,
+                    label if provider_key == "gemini" else f"{provider_label} {label.replace('Gemini ', '')}",
+                    "text_generation",
+                    recommended=recommended or (provider_key == "vertex_ai" and model_name == "gemini-2.5-flash-lite"),
+                    supports_text=True,
+                    supports_vision=model_name in _GEMINI_VISION_MODEL_NAMES,
+                    supports_audio=model_name in _GEMINI_AUDIO_MODEL_NAMES,
+                )
             )
-        )
     if provider:
         return [item for item in items if item["provider"] == provider]
     return items
@@ -122,7 +128,7 @@ def is_supported_model(provider: str, model_name: str) -> bool:
 def validate_model_selection(provider: str, model_name: str) -> None:
     provider_key = str(provider or "").strip().lower()
     model_key = str(model_name or "").strip()
-    if provider_key == "gemini" and not is_supported_model(provider_key, model_key):
+    if provider_key in GEMINI_PROVIDER_KEYS and not is_supported_model(provider_key, model_key):
         raise ValueError(f"Unsupported Gemini model: {model_key}. Please choose a supported Gemini model.")
 
 
@@ -139,7 +145,7 @@ def model_capabilities(provider: str, model_name: str) -> dict[str, bool]:
             for key in CAPABILITY_LABELS:
                 merged[key] = bool(merged[key] or item.get(key))
         return merged
-    if provider_key == "gemini":
+    if provider_key in GEMINI_PROVIDER_KEYS:
         if model_key.startswith("gemma-"):
             return _caps(supports_text=True)
         if model_key in _GEMINI_EMBEDDING_MODEL_NAMES or "embedding" in model_key:

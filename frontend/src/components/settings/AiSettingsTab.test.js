@@ -138,7 +138,7 @@ test('LLM Engines renders a single default Gemini 2.5 Flash engine with capabili
   await act(async () => root.unmount());
 });
 
-test('Add Engine dropdown exposes only supported Gemini models', async () => {
+test('Add Engine dropdown exposes Vertex AI and supported Gemini models', async () => {
   const StateHarness = () => {
     const [showAdd, setShowAdd] = React.useState(false);
     const [form, setForm] = React.useState({
@@ -194,9 +194,12 @@ test('Add Engine dropdown exposes only supported Gemini models', async () => {
   });
 
   const modelSelect = await waitForSelector('[data-testid="llm-add-model"]', container);
-  expect(modelSelect.textContent).toContain('Gemini 2.5 Flash (Default)');
-  expect(modelSelect.textContent).toContain('Gemini 2.5 Flash Lite (Recommended)');
-  expect(modelSelect.textContent).toContain('Gemini 2.5 Pro (Recommended)');
+  const providerSelect = await waitForSelector('[data-testid="llm-add-provider"]', container);
+  expect(providerSelect.textContent).toContain('Vertex AI Gemini');
+  expect(providerSelect.textContent).toContain('Gemini Developer API');
+  expect(modelSelect.textContent).toContain('Vertex AI Gemini 2.5 Flash Lite (Default)');
+  expect(modelSelect.textContent).toContain('Vertex AI Gemini 2.5 Flash');
+  expect(modelSelect.textContent).toContain('Vertex AI Gemini 2.5 Pro (Recommended)');
   expect(modelSelect.textContent).not.toContain('Gemini 3');
   expect(modelSelect.textContent).not.toContain('Gemma');
   expect(modelSelect.textContent).not.toContain('Gemini 1.5');

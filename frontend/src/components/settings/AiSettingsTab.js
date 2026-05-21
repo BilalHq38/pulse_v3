@@ -30,10 +30,27 @@ const LLM_MODEL_OPTIONS = {
     { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite', category: 'text_generation', caps: ['Text'], recommended: true },
     { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', category: 'text_generation', caps: ['Text', 'Vision'], recommended: true },
   ],
+  gemini_api: [
+    { id: 'gemini-2.5-flash-lite', label: 'Gemini API 2.5 Flash Lite', category: 'text_generation', caps: ['Text'], default: true, recommended: true },
+    { id: 'gemini-2.5-flash', label: 'Gemini API 2.5 Flash', category: 'text_generation', caps: ['Text', 'Vision', 'Audio'] },
+    { id: 'gemini-2.5-pro', label: 'Gemini API 2.5 Pro', category: 'text_generation', caps: ['Text', 'Vision'], recommended: true },
+  ],
+  vertex_ai: [
+    { id: 'gemini-2.5-flash-lite', label: 'Vertex AI Gemini 2.5 Flash Lite', category: 'text_generation', caps: ['Text'], default: true, recommended: true },
+    { id: 'gemini-2.5-flash', label: 'Vertex AI Gemini 2.5 Flash', category: 'text_generation', caps: ['Text', 'Vision', 'Audio'] },
+    { id: 'gemini-2.5-pro', label: 'Vertex AI Gemini 2.5 Pro', category: 'text_generation', caps: ['Text', 'Vision'], recommended: true },
+  ],
 };
-const DEFAULT_LLM_PROVIDER = 'gemini';
+const PROVIDER_OPTIONS = [
+  { value: 'vertex_ai', label: 'Vertex AI Gemini' },
+  { value: 'gemini_api', label: 'Gemini Developer API' },
+  { value: 'gemini', label: 'Gemini (auto)' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+];
+const DEFAULT_LLM_PROVIDER = 'vertex_ai';
 const DEFAULT_MODEL_CATEGORY = 'text_generation';
-const DEFAULT_LLM_MODEL = 'gemini-2.5-flash';
+const DEFAULT_LLM_MODEL = 'gemini-2.5-flash-lite';
 
 const MODEL_MAX_TOKENS = {
   'gpt-4o': 16384, 'gpt-4o-mini': 16384,
@@ -67,6 +84,11 @@ const AGENT_RUNTIME_PROFILES = {
   },
 };
 
+function providerLabel(provider) {
+  return PROVIDER_OPTIONS.find((option) => option.value === provider)?.label
+    || (provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'Provider');
+}
+
 function agentRuntimeProfile(type) {
   const key = String(type || 'generic').toLowerCase();
   return AGENT_RUNTIME_PROFILES[key] || AGENT_RUNTIME_PROFILES.generic;
@@ -83,7 +105,7 @@ function providerStatusMeta(engine) {
   if (status === 'unavailable') {
     return { label: 'Unavailable', className: 'bg-red-50 text-red-700' };
   }
-  return { label: 'Missing API key', className: 'bg-amber-50 text-amber-700' };
+  return { label: engine?.provider === 'vertex_ai' ? 'Missing Vertex config' : 'Missing API key', className: 'bg-amber-50 text-amber-700' };
 }
 
 function modelOptions(provider, category = '') {
@@ -225,7 +247,7 @@ export default function AiSettingsTab({
   const engineOptions = useMemo(
     () => llmEngines.map((engine) => ({
       id: engine.id,
-      label: `${engine.provider ? engine.provider.charAt(0).toUpperCase() + engine.provider.slice(1) : 'Provider'} - ${engine.model_name || 'model'}`,
+      label: `${providerLabel(engine.provider)} - ${engine.model_name || 'model'}`,
       ready: Boolean(engine.provider_ready),
     })),
     [llmEngines],
@@ -314,7 +336,7 @@ export default function AiSettingsTab({
         {selectedLlmEngine ? (
           <p className="pl-4">
             <span className="text-slate-600">└ </span>
-            <span className="text-amber-300">{selectedLlmEngine.provider ? selectedLlmEngine.provider.charAt(0).toUpperCase() + selectedLlmEngine.provider.slice(1) : '?'} — {selectedLlmEngine.model_name || 'unknown'}</span>
+            <span className="text-amber-300">{providerLabel(selectedLlmEngine.provider)} — {selectedLlmEngine.model_name || 'unknown'}</span>
             <span className="text-slate-600"> (temp: {selectedLlmEngine.temperature ?? 0.7}, max_tokens: {selectedLlmEngine.max_tokens ?? 2048})</span>
           </p>
         ) : (
@@ -480,7 +502,7 @@ export default function AiSettingsTab({
               <div key={e.id} className="border border-slate-200 rounded-lg overflow-hidden" data-testid="llm-engine-card">
                 <div className="flex items-center justify-between p-3 bg-slate-50">
                   <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium text-slate-700">{e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : '—'} — {e.model_name || 'No model'}</p>
+                    <p className="text-sm font-medium text-slate-700">{providerLabel(e.provider)} — {e.model_name || 'No model'}</p>
                     <p className="text-[10px] text-slate-400">Temp: {e.temperature ?? 0.7} | Max tokens: {e.max_tokens ?? 2048}</p>
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${e.is_selected ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{e.is_selected ? 'Live now' : 'Catalog only'}</span>
@@ -500,7 +522,7 @@ export default function AiSettingsTab({
                             showToast({
                               type: 'success',
                               title: 'Engine Selected',
-                              message: `${e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : 'The provider'} ${e.model_name || 'engine'} is now live.`,
+                              message: `${providerLabel(e.provider)} ${e.model_name || 'engine'} is now live.`,
                             });
                             return;
                           }
@@ -524,7 +546,7 @@ export default function AiSettingsTab({
                       <button onClick={() => {
                         requestConfirmation({
                           title: 'Delete LLM Engine',
-                          description: `Delete ${e.provider ? e.provider.charAt(0).toUpperCase() + e.provider.slice(1) : 'this'} ${e.model_name || 'engine'}. This removes it from the workspace catalog.`,
+                          description: `Delete ${providerLabel(e.provider)} ${e.model_name || 'engine'}. This removes it from the workspace catalog.`,
                           confirmLabel: 'Delete engine',
                           onConfirm: async () => {
                             try {
@@ -559,7 +581,7 @@ export default function AiSettingsTab({
                           data-testid="llm-edit-provider"
                           onChange={ev => { const first = firstModel(ev.target.value, DEFAULT_MODEL_CATEGORY); setLlmDraft(p => ({ ...p, provider: ev.target.value, model_category: DEFAULT_MODEL_CATEGORY, model_name: first.id, max_tokens: MODEL_MAX_TOKENS[first.id] || 2048 })); }}
                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm">
-                          <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option>
+                          {PROVIDER_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
                       </div>
                       <div>
@@ -624,7 +646,7 @@ export default function AiSettingsTab({
                   data-testid="llm-add-provider"
                   onChange={ev => { const first = firstModel(ev.target.value, DEFAULT_MODEL_CATEGORY); setAddLlmForm(p => ({ ...p, provider: ev.target.value, model_category: DEFAULT_MODEL_CATEGORY, model_name: first.id, max_tokens: MODEL_MAX_TOKENS[first.id] || 2048 })); }}
                   className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
-                  <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option>
+                  {PROVIDER_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </div>
               <div>
@@ -686,7 +708,7 @@ export default function AiSettingsTab({
                 <div className="flex items-center justify-between p-3 bg-slate-50">
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-slate-700 capitalize">{a.agent_type || 'support'} Agent</p>
-                    <p className="text-[10px] text-slate-400">Provider: {a.provider || '—'} | Model: {a.model_name || 'default'} | LLM: {a.llm_id?.substring(0, 8) || 'default'}…</p>
+                    <p className="text-[10px] text-slate-400">Provider: {providerLabel(a.provider)} | Model: {a.model_name || 'default'} | LLM: {a.llm_id?.substring(0, 8) || 'default'}…</p>
                   </div>
                   <div className="flex items-center gap-2 ml-3 flex-shrink-0">
                     <button onClick={async () => { const nextActive = !a.is_active; const r = await api.put(`/ai/agents/${a.id}`, { is_active: nextActive }).catch(() => null); if (r) { setAiAgents(prev => prev.map(x => x.id === a.id ? { ...x, is_active: nextActive } : x)); if (nextActive) setCompany(prev => ({ ...prev, ai_enabled: true })); } }}

@@ -20,6 +20,7 @@ from services.identity_service.app.services.observability import increment_count
 from services.identity_service.app.utils.utils import utcnow
 
 logger = logging.getLogger(__name__)
+IDENTITY_SCHEMA_MIGRATION = "backend/sql_migrations/012_identity_runtime_schema_hardening.sql"
 
 _EVENT_STREAM_NAME = (
     os.environ.get("IDENTITY_EVENT_STREAM_NAME", "identity.events") or "identity.events"
@@ -31,42 +32,31 @@ _EVENT_MAX_BACKOFF_SECONDS = max(10.0, float(os.environ.get("IDENTITY_EVENT_MAX_
 
 
 async def _ensure_dead_letter_queue_table(db) -> None:
-    await db.execute(
-        text(
-            """
-            CREATE TABLE IF NOT EXISTS dead_letter_queue (
-                id TEXT PRIMARY KEY,
-                task_name TEXT NOT NULL DEFAULT '',
-                event_id TEXT NOT NULL DEFAULT '',
-                trace_id TEXT NOT NULL DEFAULT '',
-                company_id TEXT NOT NULL DEFAULT '',
-                channel TEXT NOT NULL DEFAULT '',
-                source_queue TEXT NOT NULL DEFAULT '',
-                event_type TEXT NOT NULL DEFAULT '',
-                payload TEXT NOT NULL DEFAULT '',
-                error TEXT NOT NULL DEFAULT '',
-                error_message TEXT NOT NULL DEFAULT '',
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 3,
-                status TEXT NOT NULL DEFAULT 'failed',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                resolved_at TIMESTAMPTZ
+    required_columns = ("task_name", "event_id", "trace_id", "company_id", "channel", "source_queue", "error")
+    missing: list[str] = []
+    exists = await db.scalar(text("SELECT to_regclass('dead_letter_queue') IS NOT NULL"))
+    if not bool(exists):
+        missing.append("relation:dead_letter_queue")
+    else:
+        for column in required_columns:
+            column_exists = await db.scalar(
+                text(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name='dead_letter_queue' AND column_name=:column"
+                    ")"
+                ),
+                {"column": column},
             )
-            """
+            if not bool(column_exists):
+                missing.append(f"column:dead_letter_queue.{column}")
+    if missing:
+        logger.error(
+            "runtime_schema_migration_required area=identity_dead_letter_queue migration=%s missing=%s",
+            IDENTITY_SCHEMA_MIGRATION,
+            ",".join(missing),
         )
-    )
-    for ddl in (
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS task_name TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE IF EXISTS dead_letter_queue ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT ''",
-        "CREATE INDEX IF NOT EXISTS idx_dlq_status ON dead_letter_queue(status)",
-        "CREATE INDEX IF NOT EXISTS idx_dlq_company_id ON dead_letter_queue(company_id)",
-        "CREATE INDEX IF NOT EXISTS idx_dlq_created_at ON dead_letter_queue(created_at)",
-    ):
-        await db.execute(text(ddl))
+        raise RuntimeError(f"Identity dead letter schema is missing required objects. Run {IDENTITY_SCHEMA_MIGRATION}.")
 
 
 async def _write_dead_letter_record(

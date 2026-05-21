@@ -170,6 +170,12 @@ function mapTechnicalErrorMessage(text, fallback) {
   const normalized = String(text || "").trim()
   const lower = normalized.toLowerCase()
   if (!normalized) return fallback
+  if (lower.includes("user_limit_reached")) {
+    return "User limit reached. Please upgrade your package to add more users."
+  }
+  if (lower.includes("conversation_limit_reached")) {
+    return "Conversation limit reached. Please upgrade your package to continue this service."
+  }
   if (
     lower.includes("workspace user limit reached")
     || lower.includes("seat(s) on your plan")
@@ -241,6 +247,13 @@ function mapTechnicalErrorMessage(text, fallback) {
 function getErrorMessage(error, fallback = "We couldn't finish that action.") {
   const responseDetail = error?.response?.data?.detail
   const responseError = error?.response?.data?.error
+  const responseCode = error?.response?.data?.code
+  if (responseCode === "USER_LIMIT_REACHED") {
+    return "User limit reached. Please upgrade your package to add more users."
+  }
+  if (responseCode === "CONVERSATION_LIMIT_REACHED") {
+    return "Conversation limit reached. Please upgrade your package to continue this service."
+  }
   const raw = responseDetail ?? responseError ?? error?.message ?? ""
 
   if (Array.isArray(raw)) {

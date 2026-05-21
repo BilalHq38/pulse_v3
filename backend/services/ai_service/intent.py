@@ -5,6 +5,7 @@ import re
 
 from services.ai_service.common import IntentResult
 from services.ai_service.llm_client import _resolve_engine_for_request, call_model_json
+from services.ai_service.routing_guards import is_low_value_message, lightweight_route_message
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,11 @@ def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None
     normalized = " ".join("".join(ch if ch.isalnum() or ch.isspace() else " " for ch in lower).split())
     intent_name = previous_intent if previous_intent and previous_intent != "unknown" else "general_question"
     confidence = 0.15
-    if is_short_follow_up_message(text) or normalized in {"next", "yes", "yeah", "yep", "ok", "okay", "continue", "show", "send", "proceed", "go ahead", "tell me more", "more"}:
+    lightweight = lightweight_route_message(text, previous_intent=previous_intent)
+    if lightweight:
+        intent_name = str(lightweight.get("intent") or intent_name)
+        confidence = max(float(lightweight.get("confidence") or 0.0), 0.5 if is_low_value_message(text) else 0.35)
+    elif is_short_follow_up_message(text) or normalized in {"next", "continue", "show", "send", "proceed", "go ahead", "tell me more", "more"}:
         intent_name = "follow_up_continue"
         confidence = 0.5
     elif any(token in lower for token in ("image", "photo", "picture", "catalog", "show me")):
@@ -182,6 +187,19 @@ def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None
 async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) -> dict:
     history_context = _render_history_context(kwargs.get("conversation_context"))
     previous_intent = str(kwargs.get("previous_intent") or "").strip().lower()
+    lightweight = lightweight_route_message(
+        text,
+        previous_intent=previous_intent,
+        previous_ai_message=str(kwargs.get("previous_ai_message") or ""),
+    )
+    if lightweight:
+        logger.info(
+            "intent_llm_skipped company_id=%s reason=lightweight_route intent=%s confidence=%s",
+            company_id or "",
+            str(lightweight.get("intent") or ""),
+            lightweight.get("confidence"),
+        )
+        return _normalize_intent_payload(lightweight)
     prompt = (
         "Classify the latest CRM customer message.\n"
         "Return ONLY JSON: {\"intent\":\"snake_case_intent\",\"confidence\":0.0,\"entities\":{},\"urgency\":\"low|medium|high|critical\"}\n"

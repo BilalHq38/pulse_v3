@@ -23,7 +23,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from core.utils import make_id
-from services.db_helpers import get_ai_static_fallback_message
+from services.db_helpers import get_ai_static_fallback_message, runtime_schema_ready
 from services.ai_service.llm_client import call_model_json, get_active_llm_engine
 from services.email_service import send_tenant_email_async
 from shared.database import company_context
@@ -567,17 +567,15 @@ def _campaign_product_snapshot(product: dict | None) -> dict | None:
 
 
 async def bootstrap_email_campaign_schema(db) -> None:
-    await db.execute(
-        "ALTER TABLE IF EXISTS email_campaigns "
-        "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-    )
-    await db.execute(
-        "ALTER TABLE IF EXISTS email_campaigns "
-        "ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb"
-    )
-    await db.execute(
-        "ALTER TABLE IF EXISTS email_campaigns "
-        "ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
+    await runtime_schema_ready(
+        db,
+        "email_campaigns",
+        required_columns=(
+            ("email_campaigns", "updated_at"),
+            ("email_campaigns", "attachments"),
+            ("email_campaigns", "metadata"),
+        ),
+        raise_on_missing=True,
     )
 
 
