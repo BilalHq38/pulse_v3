@@ -59,6 +59,7 @@ from services.ai_service.routing_guards import (
     is_low_value_message,
     lightweight_route_message,
     normalize_message_text,
+    route_product_order_intent,
     should_fetch_knowledge_context,
     should_lightweight_bypass,
 )
@@ -77,6 +78,7 @@ from services.db_helpers import (
     is_data_url_image,
     resolve_active_ai_agent,
 )
+from services.order_service import handle_order_flow
 from core.utils import is_valid_image_url
 from shared.database import create_detached_task
 
@@ -97,6 +99,107 @@ _ENGINE_CACHE_TTL = 10.0  # seconds
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.monotonic() - started_at) * 1000, 2)
+
+
+def _combined_order_flow_result(
+    order_response: dict,
+    *,
+    source_text: str,
+    history: str,
+    history_lines: list[str],
+) -> dict:
+    sentiment = analyze_local_sentiment(source_text)
+    sentiment["scope"] = "message"
+    sentiment["source"] = "local_order_flow"
+    conversation_sentiment = analyze_local_sentiment(history or source_text)
+    conversation_sentiment["scope"] = "conversation"
+    conversation_sentiment["source"] = "local_order_flow"
+    conversation_sentiment["turns_analyzed"] = len(history_lines)
+    intent = {
+        "intent": "order_intent",
+        "confidence": 0.98,
+        "entities": {},
+        "urgency": "medium",
+        "source": "deterministic_order_flow",
+    }
+    ai_response = dict(order_response or {})
+    ai_response["conversation_sentiment"] = conversation_sentiment
+    return {
+        "sentiment": sentiment,
+        "conversation_sentiment": conversation_sentiment,
+        "intent": intent,
+        "ai_response": ai_response,
+        "qualification_hint": {
+            "missing_fields": [],
+            "completed_fields": [],
+            "ready_for_scoring": False,
+            "next_question": "",
+        },
+        "interaction_summary": {
+            "summary": "",
+            "total_messages": len(history_lines),
+            "avg_sentiment": float(conversation_sentiment.get("score") or 0.0),
+            "resolution_status": "in_progress",
+            "source": "local_order_flow",
+        },
+        "ai_response_error": "",
+        "ai_response_generated": bool(ai_response.get("response")),
+        "llm_budget_exhausted": False,
+    }
+
+
+def _customer_message_text(item: dict | None) -> str:
+    if not isinstance(item, dict):
+        return ""
+    sender = str(item.get("sender_type") or item.get("sender") or "").strip().lower()
+    if sender and sender not in {"customer", "user", "lead"}:
+        return ""
+    for key in ("content", "body", "message", "text"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+async def _select_router_customer_message(
+    *,
+    db,
+    company_id: str,
+    conversation_id: str,
+    message_id: str,
+    request_text: str,
+    conversation_context: list[dict],
+) -> tuple[str, str, str]:
+    request_text = str(request_text or "").strip()
+    if request_text and request_text != "[empty message]":
+        return request_text, "request_payload", message_id
+    for item in reversed(list(conversation_context or [])):
+        text = _customer_message_text(item)
+        if text:
+            return text, "latest_inbound", str((item or {}).get("id") or (item or {}).get("message_id") or message_id or "")
+    if db and company_id and conversation_id:
+        try:
+            row = await db.fetchrow(
+                "SELECT id,content,sender_type FROM messages "
+                "WHERE company_id=$1 AND conversation_id=$2 AND sender_type='customer' AND BTRIM(COALESCE(content,''))<>'' "
+                "ORDER BY created_at DESC LIMIT 1",
+                company_id,
+                conversation_id,
+            )
+            if row:
+                payload = dict(row)
+                text = str(payload.get("content") or "").strip()
+                if text:
+                    return text, "db_fallback", str(payload.get("id") or message_id or "")
+        except Exception as exc:
+            logger.warning(
+                "order_router_message_lookup_failed company_id=%s conversation_id=%s message_id=%s error=%s",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                exc,
+            )
+    return request_text, "empty", message_id
 
 
 def clear_engine_cache(company_id: str = "", *, reason: str = "", use_pro: bool | None = None) -> None:
@@ -330,7 +433,7 @@ def _derive_conversation_state(
         "explain what detail is needed to quote accurately."
     ),
     "availability_question": (
-        "Answer availability or stock status using available context. If unknown, ask for the specific product, variant, or quantity."
+        "Answer availability or stock status using available context. If unknown, ask for the specific product or quantity."
     ),
     "service_question": (
         "Answer the service question directly using business context, summarize the relevant services, "
@@ -515,7 +618,7 @@ def _normalize_ai_attachments(attachments: list[dict]) -> list[dict]:
             enriched
         )
         seen_urls.add(url)
-        if len(normalized) >= 3:
+        if len(normalized) >= 6:
             break
     return normalized
 
@@ -533,8 +636,15 @@ def _align_product_attachments(product_ids: list[str], attachments: list[dict]) 
             continue
         aligned.append(attachment)
         seen_products.add(product_id)
-        if len(aligned) >= 3:
+        if len(aligned) >= 6:
             break
+    logger.info(
+        "product_attachment_alignment_result requested_product_count=%s input_attachment_count=%s aligned_attachment_count=%s selected_product_ids=%s",
+        len(allowed),
+        len(attachments or []),
+        len(aligned),
+        ",".join(str(item) for item in list(allowed)[:6]),
+    )
     return aligned
 
 
@@ -674,6 +784,87 @@ def _is_short_follow_up(query: str) -> bool:
     return normalized in _SHORT_FOLLOW_UPS or is_short_follow_up_message(query)
 
 
+def _looks_like_more_products_request(query: str) -> bool:
+    normalized = normalize_message_text(query)
+    return normalized in {
+        "show more",
+        "more",
+        "more products",
+        "next",
+        "next products",
+        "more options",
+        "different products",
+        "aur dikhao",
+        "kuch aur dikhao",
+    } or any(phrase in normalized for phrase in ("show more", "more products", "more options", "aur dikhao"))
+
+
+def _is_product_more_products_request(query: str, *, has_product_history: bool) -> bool:
+    if not _looks_like_more_products_request(query):
+        return False
+    normalized = normalize_message_text(query)
+    if has_product_history:
+        return True
+    return bool(
+        any(term in normalized.split() for term in ("product", "products", "catalog", "options"))
+        or any(phrase in normalized for phrase in ("more products", "more options", "different products", "aur dikhao", "kuch aur dikhao"))
+    )
+
+
+def _product_selection_index(query: str) -> int | None:
+    normalized = normalize_message_text(query)
+    if not normalized:
+        return None
+    if re.fullmatch(r"\d{1,2}", normalized):
+        return int(normalized)
+    match = re.search(r"\b(?:number|option|product)\s+(\d{1,2})\b", normalized)
+    if match:
+        return int(match.group(1))
+    words = {
+        "first": 1,
+        "1st": 1,
+        "pehla": 1,
+        "second": 2,
+        "2nd": 2,
+        "doosra": 2,
+        "dusra": 2,
+        "third": 3,
+        "3rd": 3,
+        "teesra": 3,
+    }
+    for word, index in words.items():
+        if re.search(rf"\b{re.escape(word)}\b", normalized):
+            return index
+    return None
+
+
+async def _resolve_recent_product_selection(db, company_id: str, query: str, shown_product_ids: list[str]) -> dict | None:
+    if not (db and company_id and shown_product_ids):
+        return None
+    product_ids = [str(item).strip() for item in shown_product_ids[:50] if str(item).strip()]
+    if not product_ids:
+        return None
+    rows = await db.fetch(
+        "SELECT id, company_id, name, product_title, description, category, product_type, price, price_currency, status "
+        "FROM company_products WHERE company_id=$1 AND id = ANY($2::text[])",
+        company_id,
+        product_ids,
+    )
+    by_id = {str(row["id"]): dict(row) for row in rows}
+    products = [by_id[item] for item in product_ids if item in by_id]
+    if not products:
+        return None
+    selected_index = _product_selection_index(query)
+    if selected_index and 1 <= selected_index <= len(products):
+        return products[selected_index - 1]
+    normalized = normalize_message_text(query)
+    for product in products:
+        name = normalize_message_text(str(product.get("name") or product.get("product_title") or ""))
+        if name and (name in normalized or normalized in name):
+            return product
+    return None
+
+
 def _canonical_intent(intent_name: str) -> str:
     normalized = str(intent_name or "general_question").strip().lower() or "general_question"
     return _INTENT_ALIASES.get(normalized, normalized)
@@ -767,6 +958,10 @@ def _product_follow_up_context_allowed(query: str, *, intent_name: str, has_prod
 
 def _product_context_allowed(intent: dict | None, query: str, *, has_product_history: bool = False) -> bool:
     intent_name = _canonical_intent(str((intent or {}).get("intent") or ""))
+    if str((intent or {}).get("intent") or "").strip().lower() == "product_selection":
+        return True
+    if _is_product_more_products_request(query, has_product_history=has_product_history):
+        return True
     if is_high_confidence_product_intent(intent, query, has_product_history=has_product_history):
         return True
     return _product_follow_up_context_allowed(query, intent_name=intent_name, has_product_history=has_product_history)
@@ -796,7 +991,7 @@ def _ensure_product_names_in_response(response_text: str, attachments: list[dict
     missing = [label for label in labels if label.lower() not in lowered]
     if not missing:
         return text
-    prefix = f"Attached product image{'s' if len(labels) > 1 else ''}: {', '.join(labels[:3])}."
+    prefix = f"Attached product image{'s' if len(labels) > 1 else ''}: {', '.join(labels[:6])}."
     if not text:
         return prefix
     return f"{prefix} {text}"
@@ -1074,7 +1269,7 @@ def _channel_tone_note(channel: str) -> str:
 
 
 def build_pricing_response(query: str, *, ai_context: dict, intent_name: str = "") -> str:
-    products = list((ai_context or {}).get("products") or [])[:3]
+    products = list((ai_context or {}).get("products") or [])[:6]
     priced = [p for p in products if str(p.get("price") or "").strip()]
     if len(priced) == 1:
         product = priced[0]
@@ -1241,19 +1436,43 @@ def build_product_response(
     intent_payload: dict | None = None,
     conversation_context: list[dict] | None = None,
 ) -> dict:
-    products = list((ai_context or {}).get("products") or [])[:3]
+    products = list((ai_context or {}).get("products") or [])[:6]
     attachments = _normalize_ai_attachments(list((ai_context or {}).get("product_attachments") or []))
     if not products:
+        query_info = understand_product_query(query)
+        if (ai_context or {}).get("product_batch_exhausted"):
+            return {
+                "response": "These are the available products for now. I can help you choose from these or connect you with our team.",
+                "attachments": [],
+                "product_images": [],
+                "product_ids": [],
+            }
+        if query_info.get("specific"):
+            return {
+                "response": "I could not find that product in our catalog. Would you like to see available products?",
+                "attachments": [],
+                "product_images": [],
+                "product_ids": [],
+            }
+        if "service" in normalize_message_text(query) and "product" not in normalize_message_text(query):
+            return {
+                "response": "Services are not available in the catalog right now. Our team will contact you shortly.",
+                "attachments": [],
+                "product_images": [],
+                "product_ids": [],
+            }
         last_topic = _get_last_topic(intent_payload or {}, conversation_context or [])
+        if normalize_message_text(last_topic) in {"product", "products", "catalog", "catalogue", "service", "services"}:
+            last_topic = ""
         if last_topic:
             return {
-                "response": f"I do not see catalog details for {last_topic} in the available context. Do you want services, products, or pricing help?",
+                "response": f"I could not find {last_topic} in our catalog. Would you like to see available products?",
                 "attachments": [],
                 "product_images": [],
                 "product_ids": [],
             }
         return {
-            "response": "I do not see product details in the available catalog context. Do you want services, products, or pricing help?",
+            "response": "I do not see the catalog available right now. Our team will contact you shortly.",
             "attachments": [],
             "product_images": [],
             "product_ids": [],
@@ -1261,16 +1480,27 @@ def build_product_response(
     if len(products) == 1:
         product = products[0]
         name = str(product.get("name") or product.get("product_title") or "This option").strip()
-        reason = _product_reason(product)
-        response = f"I found {name}: {reason}."
-        if not str(product.get("price") or "").strip() and _canonical_intent(intent_name) == "pricing_question":
-            response += " The price is not listed for this option."
+        price = str(product.get("price") or "").strip()
+        currency = str(product.get("price_currency") or "").strip()
+        status = str(product.get("status") or "available").strip()
+        description = " ".join(str(product.get("description") or "").split()).strip()
+        features = [
+            str(item).strip()
+            for item in (product.get("features") or [])
+            if str(item).strip()
+        ][:4]
+        price_display = f"{price} {currency}".strip() if price else "Price on request"
+        response = f"{name}\nPrice: {price_display}\nAvailability: {status or 'available'}"
+        if description:
+            response += f"\nDetails: {description[:220]}"
+        if features:
+            response += f"\nFeatures: {', '.join(features)}"
         if image_request and attachments:
-            response += f" The attached image is for {name}."
+            response += f"\nThe attached image is for {name}."
         elif image_request:
-            response += " I do not see an image available for this product, but these are the details I found."
+            response += "\nI do not see an image available for this product, but these are the details I found."
         else:
-            response += " Do you want details, prices, or pictures for this option?"
+            response += "\nReply with order or buy if you want to place an order."
         website_url = str((ai_context or {}).get("public_company", {}).get("website_address") or "").strip()
         if share_website and website_url:
             response += f" You can place the order here: {website_url}"
@@ -1278,35 +1508,70 @@ def build_product_response(
             "response": response,
             "attachments": attachments,
             "product_images": attachments,
-            "product_ids": [str(item).strip() for item in (ai_context or {}).get("product_ids", []) if str(item).strip()][:3],
+            "product_ids": [str(item).strip() for item in (ai_context or {}).get("product_ids", []) if str(item).strip()][:1],
         }
-    lines = ["I found these product options:"]
-    for index, product in enumerate(products, start=1):
-        name = str(product.get("name") or product.get("product_title") or "Product").strip()
-        lines.append(f"{index}. {name} - {_product_reason(product)}.")
-        if not str(product.get("price") or "").strip() and _canonical_intent(intent_name) == "pricing_question":
-            lines.append("The price is not listed for this option.")
-    if image_request and attachments:
-        names_with_images = [
-            _product_identity_label(item) for item in attachments if str(item.get("product_id") or "").strip()
-        ]
-        if names_with_images:
-            lines.append(f"Attached images: {', '.join(names_with_images[:3])}.")
-        else:
-            lines.append("I attached the matching product images.")
-    elif image_request:
-        lines.append("I do not see an image available for this product, but these are the details I found.")
-    else:
-        lines.append("Do you want details, prices, or pictures for any option?")
-    website_url = str((ai_context or {}).get("public_company", {}).get("website_address") or "").strip()
-    if share_website and website_url:
-        lines.append(f"You can place the order here: {website_url}")
-    return {
-        "response": "\n".join(lines),
-        "attachments": attachments,
-        "product_images": attachments,
-        "product_ids": [str(item).strip() for item in (ai_context or {}).get("product_ids", []) if str(item).strip()][:3],
-    }
+    if len(products) > 1:
+        normalized_query = normalize_message_text(query)
+        service_signal = "service" in normalized_query or "services" in normalized_query
+        product_signal = any(term in normalized_query for term in ("product", "products", "catalog", "item", "items"))
+        if service_signal and product_signal:
+            product_items = [
+                product for product in products if str(product.get("product_type") or "").strip().lower() not in {"service", "services"}
+            ]
+            service_items = [
+                product for product in products if str(product.get("product_type") or "").strip().lower() in {"service", "services"}
+            ]
+            if product_items or service_items:
+                lines = []
+                if product_items:
+                    lines.extend(["Products:", ""])
+                    for index, product in enumerate(product_items, start=1):
+                        name = str(product.get("name") or product.get("product_title") or "Product").strip()
+                        price = str(product.get("price") or "").strip()
+                        currency = str(product.get("price_currency") or "").strip()
+                        price_display = f"{price} {currency}".strip() if price else "Price on request"
+                        lines.append(f"{index}. {name} — {price_display}")
+                    lines.append("")
+                if service_items:
+                    lines.extend(["Services:", ""])
+                    for index, product in enumerate(service_items, start=1):
+                        name = str(product.get("name") or product.get("product_title") or "Service").strip()
+                        price = str(product.get("price") or "").strip()
+                        currency = str(product.get("price_currency") or "").strip()
+                        price_display = f"{price} {currency}".strip() if price else "Price on request"
+                        lines.append(f"{index}. {name} — {price_display}")
+                    lines.append("")
+                lines.append("Reply with the product or service number/name to see details or continue.")
+                return {
+                    "response": "\n".join(lines),
+                    "attachments": attachments,
+                    "product_images": attachments,
+                    "product_ids": [
+                        str(p.get("id") or p.get("product_id") or "").strip()
+                        for p in products
+                        if str(p.get("id") or p.get("product_id") or "").strip()
+                    ][:6],
+                }
+        intro = "Here are some available products:"
+        lines = [intro, ""]
+        for index, product in enumerate(products, start=1):
+            name = str(product.get("name") or product.get("product_title") or "Product").strip()
+            price = str(product.get("price") or "").strip()
+            currency = str(product.get("price_currency") or "").strip()
+            price_display = f"{price} {currency}".strip() if price else "Price on request"
+            lines.append(f"{index}. {name} — {price_display}")
+        lines.append("")
+        lines.append("Reply with the product number or name to see details or place an order.")
+        return {
+            "response": "\n".join(lines),
+            "attachments": attachments,
+            "product_images": attachments,
+            "product_ids": [
+                str(p.get("id") or p.get("product_id") or "").strip()
+                for p in products
+                if str(p.get("id") or p.get("product_id") or "").strip()
+            ][:6],
+        }
 
 
 def build_follow_up_response(
@@ -1561,6 +1826,8 @@ def _catalog_flow_response(
         }
         and explicit_product_signal(query)
     )
+    if service_query and not (ai_context or {}).get("products") and str(knowledge_context or "").strip():
+        product_query = False
     if not product_query and not service_query:
         return None
 
@@ -1596,7 +1863,7 @@ def _catalog_flow_response(
         "confidence": 0.98,
         "attachments": attachments,
         "product_images": attachments,
-        "product_ids": product_ids[:3],
+        "product_ids": product_ids[:6],
         "llm_id": "",
         "provider": "catalog",
         "model_name": "deterministic-catalog",
@@ -1850,7 +2117,7 @@ def _compose_rule_based_response(
         is_simple_product_query = bool(query_info.get("general")) or len((query or "").split()) <= 8
         if intent_name in {"product_recommendation", "purchase_inquiry"} and not is_simple_product_query and not image_request:
             return None
-        products = list(ai_context.get("products") or [])[:3]
+        products = list(ai_context.get("products") or [])[:6]
         if service_question and public_context_text and not products:
             return {
                 "response": f"{direction_prefix}{continuation_prefix}{response_prefix}{build_service_response(query, knowledge_context=knowledge_context, ai_context=ai_context, previous_response=previous_response, include_products='product' in str(query or '').lower())}",
@@ -2577,6 +2844,53 @@ async def generate_ai_response(
                 "urgency": "low",
                 "source": "local_legacy_guard",
             }
+    product_order_route = route_product_order_intent(
+        query,
+        {"has_catalog_context": bool(conversation_context), "has_product_history": False},
+    )
+    skip_order_flow_for_product_discovery = bool(
+        product_order_route.get("route") == "mixed_product_order"
+        and not str(product_order_route.get("extracted_product_text") or "").strip()
+    )
+    if db and company_id and conversation_id and not skip_order_flow_for_product_discovery:
+        try:
+            order_response = await handle_order_flow(
+                db=db,
+                company_id=company_id,
+                conversation_id=conversation_id,
+                message_text=query,
+                customer_info=customer_info,
+                lead=dict(kwargs.get("lead") or {}),
+                conversation_context=conversation_context,
+                shown_product_ids=[],
+                last_response_context={},
+                previous_state={},
+                source_channel=channel_name or str(kwargs.get("channel") or ""),
+                source=str(kwargs.get("source") or ""),
+                actor_user_id=actor_user_id,
+                message_id=message_id,
+                metadata=dict(kwargs.get("metadata") or {}),
+            )
+        except Exception as exc:
+            order_response = None
+            logger.warning(
+                "order_flow_error company_id=%s conversation_id=%s message_id=%s stage=early error=%s",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                exc,
+            )
+        if order_response:
+            order_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
+            logger.info(
+                "ai_order_flow_response company_id=%s conversation_id=%s order_id=%s status=%s stage=early",
+                company_id or "",
+                conversation_id or "",
+                str(order_response.get("order_id") or ""),
+                str(order_response.get("order_status") or ""),
+            )
+            _record_outcome("success", "order_flow", "deterministic-order-flow")
+            return order_response
     if should_lightweight_bypass(query, previous_ai_message=previous_ai_for_route):
         low_value_payload = _build_low_value_ai_payload(
             query,
@@ -2698,6 +3012,43 @@ async def generate_ai_response(
         str(item).strip() for item in (last_response_context.get("product_ids") or []) if str(item).strip()
     ]
     shown_product_ids = list(dict.fromkeys([*shown_product_ids, *previous_product_ids]))
+    product_order_route = route_product_order_intent(
+        query,
+        {"has_catalog_context": bool(conversation_context), "has_product_history": bool(shown_product_ids)},
+    )
+    if product_order_route.get("route") == "product_selection":
+        try:
+            selected_product = await _resolve_recent_product_selection(db, company_id or "", query, shown_product_ids)
+        except Exception as exc:
+            selected_product = None
+            logger.warning(
+                "product_selection_resolve_failed company_id=%s conversation_id=%s message_id=%s error=%s",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                exc,
+            )
+        if selected_product:
+            product_id = str(selected_product.get("id") or "").strip()
+            payload = build_product_response(
+                query,
+                ai_context={
+                    "products": [selected_product],
+                    "product_ids": [product_id] if product_id else [],
+                    "product_attachments": [],
+                },
+                intent_name="product_catalog_question",
+            )
+            payload.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
+            logger.info(
+                "product_selection_resolved company_id=%s conversation_id=%s message_id=%s product_id=%s",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                product_id,
+            )
+            _record_outcome("success", "product_selection", "deterministic-product-router")
+            return payload
     recent_ai_replies = _recent_ai_messages(
         conversation_context,
         limit=ai_response_recent_ai_message_limit(),
@@ -2725,6 +3076,53 @@ async def generate_ai_response(
         previous_state=previous_state,
         last_response_context=last_response_context,
     )
+    product_order_route = route_product_order_intent(
+        query,
+        {"has_catalog_context": bool(conversation_context), "has_product_history": bool(shown_product_ids)},
+    )
+    skip_order_flow_for_product_discovery = bool(
+        product_order_route.get("route") == "mixed_product_order"
+        and not str(product_order_route.get("extracted_product_text") or "").strip()
+    )
+    if db and company_id and conversation_id and not skip_order_flow_for_product_discovery:
+        try:
+            order_response = await handle_order_flow(
+                db=db,
+                company_id=company_id,
+                conversation_id=conversation_id,
+                message_text=query,
+                customer_info=customer_info,
+                lead=dict(kwargs.get("lead") or {}),
+                conversation_context=conversation_context,
+                shown_product_ids=shown_product_ids,
+                last_response_context=last_response_context,
+                previous_state=previous_state,
+                source_channel=channel_name or str(kwargs.get("channel") or ""),
+                source=str(kwargs.get("source") or ""),
+                actor_user_id=actor_user_id,
+                message_id=message_id,
+                metadata=dict(kwargs.get("metadata") or {}),
+            )
+        except Exception as exc:
+            order_response = None
+            logger.warning(
+                "order_flow_error company_id=%s conversation_id=%s message_id=%s stage=memory error=%s",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                exc,
+            )
+        if order_response:
+            order_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
+            logger.info(
+                "ai_order_flow_response company_id=%s conversation_id=%s order_id=%s status=%s stage=memory",
+                company_id or "",
+                conversation_id or "",
+                str(order_response.get("order_id") or ""),
+                str(order_response.get("order_status") or ""),
+            )
+            _record_outcome("success", "order_flow", "deterministic-order-flow")
+            return order_response
     # Generic responses still go through the model; identity and catalog questions
     # can be answered deterministically from local business context.
     rule_recovery_enabled = False
@@ -2791,7 +3189,7 @@ async def generate_ai_response(
                 sentiment=observed_sentiment,
                 product_ids=[
                     str(item).strip() for item in quick_response.get("product_ids", []) if str(item).strip()
-                ][:3],
+                ][:6],
                 response_style=str(quick_response.get("provider") or "rule"),
                 channel=channel_name,
                 conversation_state=conversation_state,
@@ -2816,6 +3214,13 @@ async def generate_ai_response(
         query,
         has_product_history=has_product_history,
     )
+    route_allows_product_context = bool(
+        product_order_route.get("product_intent")
+        or product_order_route.get("route") in {"product_flow", "mixed_product_order", "product_selection"}
+        or product_order_route.get("image_request")
+        or product_order_route.get("price_request")
+    )
+    product_context_allowed = bool(product_context_allowed or route_allows_product_context)
     follow_up_topic = _infer_topic_from_text(previous_response)
     knowledge_context_needed = bool(
         should_fetch_knowledge_context(observed_intent, query)
@@ -2839,6 +3244,15 @@ async def generate_ai_response(
             intent_name or "unknown",
             len(query or ""),
         )
+    more_products_requested = _is_product_more_products_request(query, has_product_history=has_product_history)
+    if more_products_requested:
+        logger.info(
+            "more_products_requested company_id=%s conversation_id=%s message_id=%s recently_shown_product_ids=%s",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            ",".join(str(item) for item in shown_product_ids[:50]),
+        )
     if db and company_id and should_retrieve_context:
         try:
             retrieved_context = await build_ai_context(
@@ -2846,7 +3260,7 @@ async def generate_ai_response(
                 company_id=company_id,
                 current_query=query,
                 exclude_product_ids=shown_product_ids,
-                max_products=5,
+                max_products=6,
                 history_product_ids=shown_product_ids,
                 customer_id=memory_entity_id,
                 conversation_id=conversation_id,
@@ -2860,6 +3274,7 @@ async def generate_ai_response(
                 intent_name=intent_name,
                 has_history=bool(shown_product_ids),
                 include_products=product_context_allowed,
+                bypass_product_cache=True,
             )
             if knowledge_context:
                 retrieved_context["knowledge_text"] = (
@@ -2868,13 +3283,42 @@ async def generate_ai_response(
             ai_context = retrieved_context
         except Exception as exc:
             logger.error("RAG context build failed: %s", exc)
+    if ai_context.get("products") and not product_context_allowed:
+        logger.error(
+            "product_context_dropped_before_response company_id=%s conversation_id=%s message_id=%s route=%s retrieved_product_count=%s reason=product_context_guard_false",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            str(product_order_route.get("route") or ""),
+            len(ai_context.get("products") or []),
+        )
+        product_context_allowed = True
     if not product_context_allowed:
         ai_context["products"] = []
         ai_context["product_ids"] = []
         ai_context["product_attachments"] = []
+    if more_products_requested and product_context_allowed and not ai_context.get("products"):
+        ai_context["product_batch_exhausted"] = True
+        logger.info(
+            "product_batch_exhausted company_id=%s conversation_id=%s message_id=%s recently_shown_product_ids=%s",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            ",".join(str(item) for item in shown_product_ids[:50]),
+        )
+    elif more_products_requested and ai_context.get("products"):
+        logger.info(
+            "next_product_batch_selected company_id=%s conversation_id=%s message_id=%s product_count=%s selected_product_ids=%s recently_shown_product_ids=%s",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            len(ai_context.get("products") or []),
+            ",".join(str(item) for item in ai_context.get("product_ids", [])[:6]),
+            ",".join(str(item) for item in shown_product_ids[:50]),
+        )
 
     ai_context["product_ids"] = [str(item).strip() for item in ai_context.get("product_ids", []) if str(item).strip()][
-        :3
+        :6
     ]
     ai_context["product_attachments"] = _align_product_attachments(
         ai_context["product_ids"],
@@ -2920,6 +3364,15 @@ async def generate_ai_response(
         catalog_response.setdefault("agent_type", selected_agent_type)
         catalog_response.setdefault("conversation_sentiment", observed_conversation_sentiment or observed_sentiment)
         logger.info(
+            "product_flow_message_consumed company_id=%s conversation_id=%s message_id=%s route=%s product_count=%s attachment_count=%s",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            str(product_order_route.get("route") or ""),
+            len(ai_context.get("products") or []),
+            len(catalog_response.get("attachments") or catalog_response.get("product_images") or []),
+        )
+        logger.info(
             "ai_catalog_flow_response company_id=%s conversation_id=%s intent=%s channel=%s rag_called=%s product_count=%s",
             company_id or "",
             conversation_id or "",
@@ -2928,6 +3381,52 @@ async def generate_ai_response(
             bool(catalog_response.get("rag_called")),
             len(ai_context.get("products") or []),
         )
+        logger.info(
+            "product_flow_response_generated company_id=%s conversation_id=%s message_id=%s response_len=%s product_count=%s attachment_count=%s",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            len(str(catalog_response.get("response") or "")),
+            len(ai_context.get("products") or []),
+            len(catalog_response.get("attachments") or catalog_response.get("product_images") or []),
+        )
+        if catalog_response.get("attachments") or catalog_response.get("product_images"):
+            logger.info(
+                "product_images_allowed company_id=%s conversation_id=%s message_id=%s intent=%s image_count=%s reason=catalog_response_has_attachments",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                str(catalog_response.get("intent_name") or intent_name or ""),
+                len(catalog_response.get("attachments") or catalog_response.get("product_images") or []),
+            )
+            logger.info(
+                "product_images_sent company_id=%s conversation_id=%s message_id=%s intent=%s image_count=%s",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                str(catalog_response.get("intent_name") or intent_name or ""),
+                len(catalog_response.get("attachments") or catalog_response.get("product_images") or []),
+            )
+        else:
+            products_with_images = [
+                product for product in (ai_context.get("products") or []) if product.get("images")
+            ]
+            if products_with_images:
+                logger.error(
+                    "product_context_dropped_before_response company_id=%s conversation_id=%s message_id=%s route=%s retrieved_product_count=%s reason=products_have_images_but_no_attachments",
+                    company_id or "",
+                    conversation_id or "",
+                    message_id or "",
+                    str(product_order_route.get("route") or ""),
+                    len(products_with_images),
+                )
+            logger.info(
+                "product_images_skipped company_id=%s conversation_id=%s message_id=%s intent=%s reason=missing_or_invalid_media",
+                company_id or "",
+                conversation_id or "",
+                message_id or "",
+                str(catalog_response.get("intent_name") or intent_name or ""),
+            )
         create_detached_task(
             _persist_response_memory(
                 db=db,
@@ -2940,7 +3439,7 @@ async def generate_ai_response(
                 sentiment=observed_sentiment,
                 product_ids=[
                     str(item).strip() for item in catalog_response.get("product_ids", []) if str(item).strip()
-                ][:3],
+                ][:6],
                 response_style="catalog",
                 channel=channel_name,
                 conversation_state=conversation_state,
@@ -2991,7 +3490,7 @@ async def generate_ai_response(
             str(item).strip()
             for item in product_rule_response.get("product_ids", ai_context.get("product_ids", []))
             if str(item).strip()
-        ][:3]
+        ][:6]
         response_attachments = _align_product_attachments(
             response_product_ids,
             list(
@@ -3281,7 +3780,7 @@ async def generate_ai_response(
         if response_text != before_dedupe:
             increment_counter("ai.responses.deduped")
         response_product_ids = (
-            [str(item).strip() for item in ai_context.get("product_ids", []) if str(item).strip()][:3]
+            [str(item).strip() for item in ai_context.get("product_ids", []) if str(item).strip()][:6]
             if product_context_allowed
             else []
         )
@@ -3429,7 +3928,7 @@ async def generate_ai_response(
                 sentiment=observed_sentiment,
                 product_ids=[
                     str(item).strip() for item in fallback_response.get("product_ids", []) if str(item).strip()
-                ][:3],
+                ][:6],
                 response_style="fallback",
                 channel=channel_name,
                 conversation_state=conversation_state,
@@ -3484,11 +3983,30 @@ async def generate_combined_ai_analysis(
             context_budget.max_embedding_calls = 1
 
     context = list(conversation_context or [])
-    if customer_message and (not context or str(context[-1].get("content") or "").strip() != customer_message):
-        context.append({"sender_type": "customer", "content": customer_message})
+    conversation_id = str(kwargs.get("conversation_id") or "").strip()
+    message_id = str(kwargs.get("message_id") or "").strip()
+    source_text, selected_source, selected_message_id = await _select_router_customer_message(
+        db=db,
+        company_id=company_id or "",
+        conversation_id=conversation_id,
+        message_id=message_id,
+        request_text=(customer_message or "").strip(),
+        conversation_context=context,
+    )
+    if source_text and (not context or str(context[-1].get("content") or "").strip() != source_text):
+        context.append({"sender_type": "customer", "content": source_text, "id": selected_message_id})
     recent_context = context[-6:]
 
-    source_text = (customer_message or "").strip() or "[empty message]"
+    source_text = source_text or "[empty message]"
+    logger.info(
+        "order_router_message_selected company_id=%s conversation_id=%s message_id=%s sender_type=customer body_length=%s selected_source=%s body_preview=%s",
+        company_id or "",
+        conversation_id,
+        selected_message_id or message_id,
+        len(source_text or ""),
+        selected_source,
+        str(source_text or "")[:80].replace("\n", " "),
+    )
     history_lines: list[str] = []
     for item in recent_context:
         role = str((item or {}).get("sender_type") or "unknown").strip().lower()
@@ -3502,6 +4020,159 @@ async def generate_combined_ai_analysis(
         previous_intent=str(kwargs.get("previous_intent") or ""),
         previous_ai_message=previous_ai_message,
     )
+
+    customer = dict(customer_info or {})
+    memory_entity_id = str(
+        customer.get("id")
+        or customer.get("customer_id")
+        or kwargs.get("customer_id")
+        or kwargs.get("lead_id")
+        or conversation_id
+        or ""
+    ).strip()
+    shown_product_ids: list[str] = []
+    last_response_context: dict = {}
+    previous_state: dict = {}
+    if db and company_id and memory_entity_id:
+        try:
+            last_response_context = await get_last_ai_response_context(db, company_id or "", memory_entity_id, convo_id=conversation_id)
+        except Exception:
+            last_response_context = {}
+        try:
+            previous_state = await get_conversation_state_memory(db, company_id or "", memory_entity_id, convo_id=conversation_id)
+        except Exception:
+            previous_state = {}
+        try:
+            shown_product_ids = await get_last_shown_product_ids(db, company_id or "", memory_entity_id, convo_id=conversation_id)
+        except Exception:
+            shown_product_ids = []
+        shown_product_ids = list(
+            dict.fromkeys(
+                [
+                    *[str(item).strip() for item in shown_product_ids if str(item).strip()],
+                    *[
+                        str(item).strip()
+                        for item in (last_response_context.get("product_ids") or [])
+                        if str(item).strip()
+                    ],
+                ]
+            )
+        )
+    combined_product_order_route = route_product_order_intent(
+        source_text,
+        {"has_catalog_context": bool(context), "has_product_history": bool(shown_product_ids)},
+    )
+    skip_combined_order_flow_for_product_discovery = bool(
+        combined_product_order_route.get("route") == "mixed_product_order"
+        and not str(combined_product_order_route.get("extracted_product_text") or "").strip()
+    )
+    if combined_product_order_route.get("route") == "product_selection":
+        try:
+            selected_product = await _resolve_recent_product_selection(db, company_id or "", source_text, shown_product_ids)
+        except Exception as exc:
+            selected_product = None
+            logger.warning(
+                "product_selection_resolve_failed company_id=%s conversation_id=%s message_id=%s error=%s",
+                company_id or "",
+                conversation_id,
+                message_id,
+                exc,
+            )
+        if selected_product:
+            product_id = str(selected_product.get("id") or "").strip()
+            product_payload = build_product_response(
+                source_text,
+                ai_context={
+                    "products": [selected_product],
+                    "product_ids": [product_id] if product_id else [],
+                    "product_attachments": [],
+                },
+                intent_name="product_catalog_question",
+            )
+            sentiment = analyze_local_sentiment(source_text)
+            sentiment["scope"] = "message"
+            sentiment["source"] = "local_product_selection"
+            conversation_sentiment = analyze_local_sentiment(history or source_text)
+            conversation_sentiment["scope"] = "conversation"
+            conversation_sentiment["source"] = "local_product_selection"
+            intent = {
+                "intent": "product_selection",
+                "confidence": 0.96,
+                "entities": {"product_id": product_id},
+                "urgency": "medium",
+                "source": "deterministic_product_router",
+            }
+            logger.info(
+                "product_selection_resolved company_id=%s conversation_id=%s message_id=%s product_id=%s",
+                company_id or "",
+                conversation_id,
+                message_id,
+                product_id,
+            )
+            return {
+                "sentiment": sentiment,
+                "conversation_sentiment": conversation_sentiment,
+                "intent": intent,
+                "ai_response": product_payload,
+                "qualification_hint": {
+                    "missing_fields": [],
+                    "completed_fields": [],
+                    "ready_for_scoring": False,
+                    "next_question": "",
+                },
+                "interaction_summary": {
+                    "summary": "",
+                    "total_messages": len(history_lines),
+                    "avg_sentiment": float(conversation_sentiment.get("score") or 0.0),
+                    "resolution_status": "in_progress",
+                    "source": "local_product_selection",
+                },
+                "ai_response_error": "",
+                "ai_response_generated": bool(product_payload.get("response")),
+                "llm_budget_exhausted": False,
+            }
+    if db and company_id and conversation_id and not skip_combined_order_flow_for_product_discovery:
+        try:
+            order_response = await handle_order_flow(
+                db=db,
+                company_id=company_id or "",
+                conversation_id=conversation_id,
+                message_text=source_text,
+                customer_info=customer_info or {},
+                lead=dict(kwargs.get("lead") or {}),
+                conversation_context=context,
+                shown_product_ids=shown_product_ids,
+                last_response_context=last_response_context,
+                previous_state=previous_state,
+                source_channel=str(kwargs.get("channel") or ""),
+                source=str(kwargs.get("source") or ""),
+                actor_user_id=str(kwargs.get("actor_user_id") or ""),
+                message_id=message_id,
+                metadata=dict(kwargs.get("metadata") or {}),
+            )
+        except Exception as exc:
+            order_response = None
+            logger.warning(
+                "order_flow_error company_id=%s conversation_id=%s message_id=%s stage=combined_early error=%s",
+                company_id or "",
+                conversation_id,
+                message_id,
+                exc,
+            )
+        if order_response:
+            logger.info(
+                "combined_analysis_order_flow company_id=%s conversation_id=%s order_id=%s status=%s",
+                company_id or "",
+                conversation_id,
+                str(order_response.get("order_id") or ""),
+                str(order_response.get("order_status") or ""),
+            )
+            return _combined_order_flow_result(
+                order_response,
+                source_text=source_text,
+                history=history,
+                history_lines=history_lines,
+            )
 
     if should_lightweight_bypass(source_text, previous_ai_message=previous_ai_message):
         intent = dict(lightweight_intent or {})
@@ -3599,23 +4270,42 @@ async def generate_combined_ai_analysis(
         "rag_called": False,
     }
     pre_intent = dict(lightweight_intent or {})
-    product_context_allowed = _product_context_allowed(pre_intent, source_text)
+    product_context_allowed = _product_context_allowed(pre_intent, source_text, has_product_history=bool(shown_product_ids))
+    route_allows_product_context = bool(
+        combined_product_order_route.get("product_intent")
+        or combined_product_order_route.get("route") in {"product_flow", "mixed_product_order", "product_selection"}
+        or combined_product_order_route.get("image_request")
+        or combined_product_order_route.get("price_request")
+    )
+    product_context_allowed = bool(product_context_allowed or route_allows_product_context)
     knowledge_context_needed = bool(
         should_fetch_knowledge_context(pre_intent, source_text) or _looks_like_service_catalog_question(source_text)
     )
+    more_products_requested = _is_product_more_products_request(source_text, has_product_history=bool(shown_product_ids))
+    if more_products_requested:
+        logger.info(
+            "more_products_requested company_id=%s conversation_id=%s message_id=%s recently_shown_product_ids=%s",
+            company_id or "",
+            conversation_id or "",
+            message_id or "",
+            ",".join(str(item) for item in shown_product_ids[:50]),
+        )
     if db and company_id and source_text and (product_context_allowed or knowledge_context_needed):
         try:
             ai_context = await build_ai_context(
                 db,
                 company_id=company_id,
                 current_query=source_text,
-                max_products=3,
+                exclude_product_ids=shown_product_ids if _is_short_follow_up(source_text) or more_products_requested else [],
+                max_products=6,
+                history_product_ids=shown_product_ids,
                 history_text=history,
                 customer_id=str((customer_info or {}).get("id") or ""),
                 conversation_id=str(kwargs.get("conversation_id") or ""),
                 intent_name=str(pre_intent.get("intent") or ""),
-                has_history=False,
+                has_history=bool(shown_product_ids),
                 include_products=product_context_allowed,
+                bypass_product_cache=True,
             )
         except Exception as exc:
             logger.warning(
@@ -3624,10 +4314,39 @@ async def generate_combined_ai_analysis(
                 str(kwargs.get("conversation_id") or ""),
                 exc,
             )
+    if ai_context.get("products") and not product_context_allowed:
+        logger.error(
+            "product_context_dropped_before_response company_id=%s conversation_id=%s message_id=%s route=%s retrieved_product_count=%s reason=product_context_guard_false",
+            company_id or "",
+            conversation_id,
+            message_id,
+            str(combined_product_order_route.get("route") or ""),
+            len(ai_context.get("products") or []),
+        )
+        product_context_allowed = True
     if not product_context_allowed:
         ai_context["product_ids"] = []
         ai_context["product_attachments"] = []
         ai_context["products"] = []
+    if more_products_requested and product_context_allowed and not ai_context.get("products"):
+        ai_context["product_batch_exhausted"] = True
+        logger.info(
+            "product_batch_exhausted company_id=%s conversation_id=%s message_id=%s recently_shown_product_ids=%s",
+            company_id or "",
+            conversation_id,
+            message_id,
+            ",".join(str(item) for item in shown_product_ids[:50]),
+        )
+    elif more_products_requested and ai_context.get("products"):
+        logger.info(
+            "next_product_batch_selected company_id=%s conversation_id=%s message_id=%s product_count=%s selected_product_ids=%s recently_shown_product_ids=%s",
+            company_id or "",
+            conversation_id,
+            message_id,
+            len((ai_context or {}).get("products") or []),
+            ",".join(str(item) for item in (ai_context or {}).get("product_ids", [])[:6]),
+            ",".join(str(item) for item in shown_product_ids[:50]),
+        )
 
     merged_knowledge = "\n\n".join(
         dict.fromkeys(
@@ -3692,6 +4411,14 @@ async def generate_combined_ai_analysis(
         }
 
     deterministic_intent = dict(pre_intent or {})
+    if not deterministic_intent and product_context_allowed:
+        deterministic_intent = {
+            "intent": "product_catalog_question",
+            "confidence": 0.9,
+            "entities": {"route_selected": str(combined_product_order_route.get("route") or "")},
+            "urgency": "medium",
+            "source": "deterministic_product_router",
+        }
     if not deterministic_intent and _looks_like_service_catalog_question(source_text):
         deterministic_intent = {
             "intent": "service_question",
@@ -3730,6 +4457,15 @@ async def generate_combined_ai_analysis(
         }
         deterministic_catalog["conversation_sentiment"] = conversation_sentiment
         logger.info(
+            "product_flow_message_consumed company_id=%s conversation_id=%s message_id=%s route=%s product_count=%s attachment_count=%s",
+            company_id or "",
+            conversation_id,
+            str(kwargs.get("message_id") or ""),
+            str(combined_product_order_route.get("route") or ""),
+            len((ai_context or {}).get("products") or []),
+            len(deterministic_catalog.get("attachments") or deterministic_catalog.get("product_images") or []),
+        )
+        logger.info(
             "combined_analysis_catalog_flow company_id=%s conversation_id=%s intent=%s rag_called=%s product_count=%s",
             company_id or "",
             str(kwargs.get("conversation_id") or ""),
@@ -3737,6 +4473,75 @@ async def generate_combined_ai_analysis(
             bool(deterministic_catalog.get("rag_called")),
             len((ai_context or {}).get("products") or []),
         )
+        logger.info(
+            "product_flow_response_generated company_id=%s conversation_id=%s message_id=%s response_len=%s product_count=%s attachment_count=%s",
+            company_id or "",
+            conversation_id or "",
+            str(kwargs.get("message_id") or ""),
+            len(str(deterministic_catalog.get("response") or "")),
+            len((ai_context or {}).get("products") or []),
+            len(deterministic_catalog.get("attachments") or deterministic_catalog.get("product_images") or []),
+        )
+        if deterministic_catalog.get("attachments") or deterministic_catalog.get("product_images"):
+            logger.info(
+                "product_images_allowed company_id=%s conversation_id=%s message_id=%s intent=%s image_count=%s reason=catalog_response_has_attachments",
+                company_id or "",
+                conversation_id or "",
+                str(kwargs.get("message_id") or ""),
+                str(intent.get("intent") or ""),
+                len(deterministic_catalog.get("attachments") or deterministic_catalog.get("product_images") or []),
+            )
+            logger.info(
+                "product_images_sent company_id=%s conversation_id=%s message_id=%s intent=%s image_count=%s",
+                company_id or "",
+                conversation_id or "",
+                str(kwargs.get("message_id") or ""),
+                str(intent.get("intent") or ""),
+                len(deterministic_catalog.get("attachments") or deterministic_catalog.get("product_images") or []),
+            )
+        else:
+            products_with_images = [
+                product for product in ((ai_context or {}).get("products") or []) if product.get("images")
+            ]
+            if products_with_images:
+                logger.error(
+                    "product_context_dropped_before_response company_id=%s conversation_id=%s message_id=%s route=%s retrieved_product_count=%s reason=products_have_images_but_no_attachments",
+                    company_id or "",
+                    conversation_id,
+                    str(kwargs.get("message_id") or ""),
+                    str(combined_product_order_route.get("route") or ""),
+                    len(products_with_images),
+                )
+            logger.info(
+                "product_images_skipped company_id=%s conversation_id=%s message_id=%s intent=%s reason=missing_or_invalid_media",
+                company_id or "",
+                conversation_id or "",
+                str(kwargs.get("message_id") or ""),
+                str(intent.get("intent") or ""),
+            )
+        if memory_entity_id and deterministic_catalog.get("response"):
+            create_detached_task(
+                _persist_response_memory(
+                    db=db,
+                    company_id=company_id or "",
+                    memory_entity_id=memory_entity_id,
+                    convo_id=conversation_id,
+                    prompt=source_text,
+                    response=str(deterministic_catalog.get("response") or ""),
+                    intent=intent,
+                    sentiment=sentiment,
+                    product_ids=[
+                        str(item).strip()
+                        for item in deterministic_catalog.get("product_ids", [])
+                        if str(item).strip()
+                    ][:6],
+                    response_style="catalog",
+                    channel=str(kwargs.get("channel") or ""),
+                    conversation_state={"intent": deterministic_intent_name, "stage": "catalog_shown"},
+                    message_id=message_id,
+                ),
+                name=f"persist-combined-response-memory-{message_id or conversation_id or 'catalog'}",
+            )
         return {
             "sentiment": sentiment,
             "conversation_sentiment": conversation_sentiment,
@@ -3824,7 +4629,7 @@ async def generate_combined_ai_analysis(
     ai_response["response"] = response_text
     ai_response["attachments"] = response_attachments
     ai_response["product_images"] = response_attachments
-    ai_response["product_ids"] = response_product_ids[:3]
+    ai_response["product_ids"] = response_product_ids[:6]
     ai_response["provider"] = str((engine or {}).get("provider") or ai_response.get("provider") or "")
     ai_response["model_name"] = str((engine or {}).get("model_name") or ai_response.get("model_name") or "")
     ai_response["llm_id"] = str((engine or {}).get("id") or ai_response.get("llm_id") or "")

@@ -22,6 +22,7 @@ from routers.customers import router as customers_router
 from routers.leads import router as leads_router
 from routers.meta import router as meta_router
 from routers.misc import misc_router, notifications_router, security_router
+from routers.orders import router as orders_router
 from routers.products import router as products_router
 from routers.settings import router as settings_router
 from routers.tickets import router as tickets_router
@@ -190,6 +191,7 @@ app = create_service_app(
         tickets_router,
         leads_router,
         settings_router,
+        orders_router,
         products_router,
         billing_router,
         analytics_router,

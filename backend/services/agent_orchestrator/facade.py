@@ -233,8 +233,11 @@ async def _message_workflow_fallback(
         db=db,
         knowledge_context=payload.knowledge_context,
         conversation_id=payload.conversation_id,
+        message_id=payload.message_id,
         actor_user_id=payload.actor_user_id,
         channel=payload.channel,
+        source=payload.source,
+        metadata=payload.metadata,
         lead=payload.lead,
     )
     sentiment = dict(combined.get("sentiment") or {})

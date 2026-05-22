@@ -138,6 +138,9 @@ class CaptureAgent(BaseAgent):
             conversation_id=getattr(request, "conversation_id", ""),
             message_id=getattr(request, "message_id", ""),
             actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
+            channel=str(getattr(request, "channel", "") or ""),
+            source=str(getattr(request, "source", "") or ""),
+            metadata=dict(getattr(request, "metadata", {}) or {}),
             lead=lead,
         )
         sentiment = dict(combined.get("sentiment") or {})

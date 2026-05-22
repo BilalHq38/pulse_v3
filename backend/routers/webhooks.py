@@ -7281,6 +7281,23 @@ async def _process_incoming_message(
                     trace_id,
                 )
             else:
+                skip_reason = (
+                    "no_response_text"
+                    if not str(support_result.get("response") or "").strip()
+                    else "ai_disabled"
+                    if support_result.get("escalate")
+                    else "outbound_disabled"
+                )
+                logger.warning(
+                    "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=%s provider=%s auto_send=true workflow_id=%s message_id=%s skip_reason=%s",
+                    company_id,
+                    convo_id,
+                    channel,
+                    channel,
+                    f"webhook_{channel}",
+                    msg_id,
+                    skip_reason,
+                )
                 escalation = await escalate_conversation_to_human(
                     db,
                     convo_id,
@@ -8232,6 +8249,20 @@ async def web_chat_webhook(request: Request):
                         trace_id,
                     )
                 else:
+                    skip_reason = (
+                        "no_response_text"
+                        if not str(support_result.get("response") or "").strip()
+                        else "ai_disabled"
+                        if support_result.get("escalate")
+                        else "outbound_disabled"
+                    )
+                    logger.warning(
+                        "ai_outbound_send_skipped company_id=%s conversation_id=%s channel=web_chat provider=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s skip_reason=%s",
+                        company_id,
+                        convo_id,
+                        msg_id,
+                        skip_reason,
+                    )
                     escalation = await escalate_conversation_to_human(
                         db,
                         convo_id,

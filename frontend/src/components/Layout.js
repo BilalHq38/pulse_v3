@@ -8,7 +8,7 @@ import PlatformLogo from '@/components/PlatformLogo';
 import {
   LayoutDashboard, MessageSquare, Users, Target, BarChart3,
   Ticket, BookOpen, Settings, LogOut, X, Bell, Search, Package,
-  Link2, Mail,
+  ClipboardList, Link2, Mail,
   ChevronDown, ChevronRight, UserCircle, Filter, Save, Check, Plus, Menu
 } from 'lucide-react';
 
@@ -52,6 +52,7 @@ const navItems = [
     roles: ['admin', 'company_agent'],
   },
   { path: '/products', label: 'Products', icon: Package, roles: ['admin', 'company_agent'] },
+  { path: '/orders', label: 'Orders', icon: ClipboardList, roles: ['admin', 'company_agent'] },
   { path: '/analytics', label: 'Analytics', icon: BarChart3, roles: ['admin', 'company_agent'] },
   {
     path: '/knowledge-base',

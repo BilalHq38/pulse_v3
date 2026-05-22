@@ -28,6 +28,7 @@ const {
   stringifyIdentityValue,
 } = require("./inbound_identity");
 const {
+  envBoolean,
   guardMessageReplay,
   markSessionReadyBaseline,
 } = require("./replay_guard");
@@ -159,6 +160,7 @@ const MOBILE_OUTBOUND_BACKFILL_LOOKBACK_MS = readEnvInt("WHATSAPP_MOBILE_OUTBOUN
 const MOBILE_OUTBOUND_BACKFILL_CHAT_LIMIT = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_BACKFILL_CHAT_LIMIT", 30);
 const MOBILE_OUTBOUND_BACKFILL_MESSAGE_LIMIT = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_MESSAGE_LIMIT", 20);
 const MOBILE_OUTBOUND_FORWARD_CACHE_TTL_MS = readEnvInt("WHATSAPP_MOBILE_OUTBOUND_FORWARD_CACHE_TTL_MS", 60 * 60 * 1000);
+const WHATSAPP_ENABLE_MOBILE_OUTBOUND_BACKFILL = envBoolean(process.env.WHATSAPP_ENABLE_MOBILE_OUTBOUND_BACKFILL, false);
 const BRIDGE_WEBHOOK_MIN_INTERVAL_MS = readEnvInt("BRIDGE_WEBHOOK_MIN_INTERVAL_MS", 150);
 const BRIDGE_WEBHOOK_RETRY_ATTEMPTS = readEnvInt("BRIDGE_WEBHOOK_RETRY_ATTEMPTS", 4);
 const BRIDGE_WEBHOOK_RETRY_BASE_DELAY_MS = readEnvInt("BRIDGE_WEBHOOK_RETRY_BASE_DELAY_MS", 1000);
@@ -295,9 +297,12 @@ function sessionSnapshot(session) {
       scope: "",
       company_id: "",
       user_id: "",
+      qr_present: false,
+      qr_data_url_present: false,
     };
   }
   const state = isSessionReady(session) ? SESSION_STATES.READY : session.state || SESSION_STATES.IDLE;
+  const qrPresent = state === SESSION_STATES.QR_REQUIRED && Boolean(session.lastQrString);
   return {
     connected: connectedForState(state),
     state,
@@ -306,13 +311,15 @@ function sessionSnapshot(session) {
     progress: progressForState(state),
     message: messageForState(state, { retrying: session.retrying }),
     phone: state === SESSION_STATES.READY ? session.phone || "" : "",
-    qr: state === SESSION_STATES.QR_REQUIRED ? session.lastQrString || "" : "",
+    qr: qrPresent ? session.lastQrString || "" : "",
     retrying: Boolean(session.retrying),
     last_error: session.lastInitError || "",
     updated_at: new Date(session.updatedAt || Date.now()).toISOString(),
     scope: session.scopeKey,
     company_id: session.companyId || "",
     user_id: session.userId || "",
+    qr_present: qrPresent,
+    qr_data_url_present: false,
     bridgeSecretConfigured: Boolean(BRIDGE_SECRET),
   };
 }
@@ -932,10 +939,8 @@ function guardLiveMessage(session, msg, { direction = "inbound", source = "messa
   });
   if (!decision.ignored) return { ignored: false, decision, messageId, messageTimestamp };
 
-  const event = decision.reason === "duplicate_message_id"
-    ? `${eventPrefix}.duplicate_ignored`
-    : "whatsapp.backfill.ignored";
-  logBridgeEvent("info", event, {
+  const duplicate = decision.reason === "duplicate_message_id";
+  const logPayload = {
     scope: session.scopeKey,
     company_id: session.companyId || "",
     user_id: session.userId || "",
@@ -945,7 +950,11 @@ function guardLiveMessage(session, msg, { direction = "inbound", source = "messa
     direction,
     source,
     reason: decision.reason,
-  });
+  };
+  logBridgeEvent("info", duplicate ? `${eventPrefix}.duplicate_ignored` : `${eventPrefix}.backfill_ignored`, logPayload);
+  if (!duplicate && ["history_sync", "mobile_backfill", "timer", "ready", "message_ack", "chat_update"].includes(source)) {
+    logBridgeEvent("info", "whatsapp.backfill.ignored", logPayload);
+  }
   return { ignored: true, decision, messageId, messageTimestamp };
 }
 
@@ -2041,8 +2050,51 @@ async function forwardOutboundMessage(session, msg, options = {}) {
   }
 }
 
+function logMobileOutboundBackfillDisabled(session, source = "event") {
+  if (!session) return;
+  if (!session.mobileOutboundBackfillDisabledLogged) session.mobileOutboundBackfillDisabledLogged = new Set();
+  const key = String(source || "event");
+  if (session.mobileOutboundBackfillDisabledLogged.has(key)) return;
+  session.mobileOutboundBackfillDisabledLogged.add(key);
+  logBridgeEvent("info", "whatsapp.outbound.mobile_backfill_disabled", {
+    scope: session.scopeKey,
+    company_id: session.companyId || "",
+    user_id: session.userId || "",
+    state: session.state || SESSION_STATES.IDLE,
+    source: key,
+    ready_baseline: session.readyBaselineSeconds || 0,
+    reason: "WHATSAPP_ENABLE_MOBILE_OUTBOUND_BACKFILL=false",
+  });
+}
+
+function logMobileOutboundBackfillEnabled(session, source = "event") {
+  if (!session) return;
+  if (!session.mobileOutboundBackfillEnabledLogged) session.mobileOutboundBackfillEnabledLogged = new Set();
+  const key = String(source || "event");
+  if (session.mobileOutboundBackfillEnabledLogged.has(key)) return;
+  session.mobileOutboundBackfillEnabledLogged.add(key);
+  logBridgeEvent("info", "whatsapp.outbound.mobile_backfill_enabled", {
+    scope: session.scopeKey,
+    company_id: session.companyId || "",
+    user_id: session.userId || "",
+    state: session.state || SESSION_STATES.IDLE,
+    source: key,
+    ready_baseline: session.readyBaselineSeconds || 0,
+  });
+}
+
+function mobileOutboundBackfillEnabled(session, source = "event") {
+  if (WHATSAPP_ENABLE_MOBILE_OUTBOUND_BACKFILL) {
+    logMobileOutboundBackfillEnabled(session, source);
+    return true;
+  }
+  logMobileOutboundBackfillDisabled(session, source);
+  return false;
+}
+
 async function syncRecentMobileOutboundMessages(session, options = {}) {
   if (!session || !session.isReady || !session.client || session.mobileOutboundBackfillRunning) return;
+  if (!mobileOutboundBackfillEnabled(session, options.source || "mobile_backfill")) return;
   session.mobileOutboundBackfillRunning = true;
   const sinceMs = Date.now() - MOBILE_OUTBOUND_BACKFILL_LOOKBACK_MS;
   let checked = 0;
@@ -2113,6 +2165,7 @@ async function syncRecentMobileOutboundMessages(session, options = {}) {
 
 function scheduleMobileOutboundBackfill(session, source = "event", chat = null) {
   if (!session || !session.isReady) return;
+  if (!mobileOutboundBackfillEnabled(session, source)) return;
   if (session.mobileOutboundBackfillTimeout) return;
   session.mobileOutboundBackfillTimeout = setTimeout(() => {
     session.mobileOutboundBackfillTimeout = null;
@@ -2125,6 +2178,7 @@ function scheduleMobileOutboundBackfill(session, source = "event", chat = null) 
 
 function startMobileOutboundBackfill(session) {
   if (!session || session.mobileOutboundBackfillTimer) return;
+  if (!mobileOutboundBackfillEnabled(session, "timer")) return;
   session.mobileOutboundBackfillTimer = setInterval(() => {
     syncRecentMobileOutboundMessages(session, { source: "timer" }).catch(() => {});
   }, MOBILE_OUTBOUND_BACKFILL_INTERVAL_MS);
@@ -2141,16 +2195,76 @@ function stopMobileOutboundBackfill(session) {
   session.mobileOutboundBackfillTimeout = null;
 }
 
+function reactionTimestampSeconds(reaction) {
+  const raw = Number(
+    (reaction && reaction.timestamp) ||
+    (reaction && reaction._data && (reaction._data.timestamp || reaction._data.t)) ||
+    0,
+  );
+  if (Number.isFinite(raw) && raw > 0) {
+    return raw > 10_000_000_000 ? Math.floor(raw / 1000) : Math.floor(raw);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+function reactionActionForEmoji(reaction, emoji) {
+  const rawAction = String((reaction && reaction.action) || (reaction && reaction._data && reaction._data.action) || "").trim().toLowerCase();
+  if (rawAction) return rawAction;
+  return emoji ? "added" : "removed";
+}
+
+function reactionTargetMessageId(reaction) {
+  return stringifyIdentityValue(
+    reaction && (
+      reaction.msgId ||
+      reaction.messageId ||
+      reaction.parentMsgId ||
+      (reaction._data && (reaction._data.msgId || reaction._data.messageId || reaction._data.parentMsgId)) ||
+      (reaction.id && reaction.id.remote) ||
+      reaction.id
+    ),
+  );
+}
+
+function reactionSenderId(reaction) {
+  return stringifyIdentityValue(
+    reaction && (
+      reaction.senderId ||
+      reaction.author ||
+      reaction.from ||
+      (reaction._data && (reaction._data.senderId || reaction._data.author || reaction._data.from)) ||
+      (reaction.id && reaction.id.participant)
+    ),
+  );
+}
+
+function buildReactionReplayId({ reaction, targetMessageId, rawSender, emoji, action }) {
+  const rawReactionId = stringifyIdentityValue(
+    reaction && (
+      reaction.reactionId ||
+      reaction.id ||
+      (reaction._data && (reaction._data.reactionId || reaction._data.id))
+    ),
+  );
+  const keyParts = [
+    rawReactionId,
+    targetMessageId,
+    rawSender,
+    emoji,
+    action,
+  ].map((item) => String(item || "").trim());
+  const replayKey = keyParts.join("|");
+  if (!replayKey.replace(/\|/g, "")) return "";
+  return `reaction:${crypto.createHash("sha256").update(replayKey).digest("hex")}`;
+}
+
 async function forwardInboundReaction(session, reaction) {
-  const rawSender = stringifyIdentityValue(
-    reaction && (reaction.senderId || reaction.author || reaction.from || (reaction.id && reaction.id.participant)),
-  );
-  const targetMessageId = stringifyIdentityValue(
-    reaction && (reaction.msgId || reaction.messageId || reaction.parentMsgId || reaction.id),
-  );
-  const providerReactionId = stringifyIdentityValue(reaction && reaction.id ? reaction.id : "")
-    || `${targetMessageId}:${rawSender}:${reaction && reaction.timestamp ? reaction.timestamp : Date.now()}`;
+  const rawSender = reactionSenderId(reaction);
+  const targetMessageId = reactionTargetMessageId(reaction);
   const emoji = String((reaction && (reaction.reaction || reaction.emoji)) || "").trim();
+  const action = reactionActionForEmoji(reaction, emoji);
+  const reactionTimestamp = reactionTimestampSeconds(reaction);
+  const providerReactionId = buildReactionReplayId({ reaction, targetMessageId, rawSender, emoji, action });
   const senderPhone = normalizePhoneNumber(rawSender);
   const actorIdentity = senderPhone || rawSender;
   if (!targetMessageId) {
@@ -2160,6 +2274,25 @@ async function forwardInboundReaction(session, reaction) {
       user_id: session.userId || "",
       raw_sender: rawSender,
       target_message_id: targetMessageId,
+    });
+    return;
+  }
+  const replayDecision = guardMessageReplay(session, reaction, {
+    messageId: providerReactionId,
+    timestampSeconds: reactionTimestamp,
+  });
+  if (replayDecision.ignored) {
+    logBridgeEvent("info", replayDecision.reason === "duplicate_message_id"
+      ? "whatsapp.reaction.duplicate_ignored"
+      : "whatsapp.reaction.backfill_ignored", {
+      scope: session.scopeKey,
+      company_id: session.companyId || "",
+      user_id: session.userId || "",
+      reaction_id: providerReactionId,
+      target_message_id: targetMessageId,
+      message_timestamp: reactionTimestamp,
+      ready_baseline: replayDecision.readyBaseline || session.readyBaselineSeconds || 0,
+      reason: replayDecision.reason,
     });
     return;
   }
@@ -2179,14 +2312,14 @@ async function forwardInboundReaction(session, reaction) {
     const messagePayload = {
       from: actorIdentity,
       type: "reaction",
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: reactionTimestamp,
       id: providerReactionId,
       provider_event_id: providerReactionId,
       idempotency_key: providerReactionId ? `whatsapp:${session.companyId || DEFAULT_BRIDGE_COMPANY_ID || ""}:reaction:${providerReactionId}` : "",
       reaction: {
         message_id: targetMessageId,
         emoji,
-        action: emoji ? "added" : "removed",
+        action,
       },
       web_bridge: {
         source: "whatsapp_web_bridge",
@@ -2220,12 +2353,15 @@ async function forwardInboundReaction(session, reaction) {
       }],
     };
     const response = await postWebhookPayload(session, payload, { returnResults: true });
-    logBridgeEvent("info", "whatsapp.incoming.reaction_forwarded", {
+    logBridgeEvent("info", "whatsapp.reaction.forwarded", {
       scope: session.scopeKey,
       company_id: session.companyId || "",
       user_id: session.userId || "",
-      message_id: providerReactionId,
+      reaction_id: providerReactionId,
       target_message_id: targetMessageId,
+      message_timestamp: reactionTimestamp,
+      ready_baseline: session.readyBaselineSeconds || 0,
+      reason: "live_reaction",
       backend_status: response.status,
     });
   } catch (err) {
@@ -2309,6 +2445,11 @@ function attachClientHandlers(session) {
     session.lastInitError = "";
     session.retrying = false;
     setSessionState(session, SESSION_STATES.QR_REQUIRED);
+    logBridgeEvent("info", "whatsapp.qr.generated", {
+      ...sessionLogContext(session),
+      qr_present: Boolean(session.lastQrString),
+      qr_data_url_present: false,
+    });
     logBridgeEvent("info", "whatsapp.session.qr_required", {
       ...sessionLogContext(session),
     });
@@ -2355,6 +2496,7 @@ function attachClientHandlers(session) {
     session.isReady = true;
     session.isAuthenticated = true;
     session.lastReadyAt = Date.now();
+    const hadReadyBaseline = Boolean(session.readyBaselineSeconds);
     markSessionReadyBaseline(session, session.lastReadyAt);
     session.lastInitError = "";
     session.lastQrString = "";
@@ -2371,6 +2513,13 @@ function attachClientHandlers(session) {
       phone: maskPhone(session.phone),
       ready_baseline: session.readyBaselineSeconds || 0,
     });
+    if (hadReadyBaseline) {
+      logBridgeEvent("info", "whatsapp.session.reconnect_baseline_set", {
+        ...sessionLogContext(session),
+        ready_baseline: session.readyBaselineSeconds || 0,
+        reason: "ready_event",
+      });
+    }
     console.log(
       `[${session.scopeKey}] READY company=${session.companyId || "-"} user=${session.userId || "-"} phone=${session.phone || "-"}`,
     );
@@ -2462,6 +2611,8 @@ function createSession(scopeInput) {
     mobileOutboundBackfillTimer: null,
     mobileOutboundBackfillTimeout: null,
     mobileOutboundBackfillRunning: false,
+    mobileOutboundBackfillDisabledLogged: new Set(),
+    mobileOutboundBackfillEnabledLogged: new Set(),
   };
   session.client = buildClient(session);
   attachClientHandlers(session);
@@ -2897,12 +3048,30 @@ app.get("/qr", async (req, res) => {
   session.traceId = bridgeTraceId(req);
   ensureSessionInitialized(session).catch(() => {});
   const snapshot = sessionSnapshot(session);
+  logBridgeEvent("info", "whatsapp.qr.status_requested", {
+    ...sessionLogContext(session),
+    state: snapshot.state,
+    qr_present: Boolean(session.lastQrString),
+    qr_data_url_present: Boolean(!session.isReady && session.lastQrString),
+  });
 
   if (session.isReady) {
-    return res.json({ ...snapshot, qr_data_url: "", qr_png_base64: "" });
+    return res.json({
+      ...snapshot,
+      qr_data_url: "",
+      qr_png_base64: "",
+      qr_data_url_present: false,
+      detail: "",
+    });
   }
   if (!session.lastQrString) {
-    return res.json({ ...snapshot, qr_data_url: "", qr_png_base64: "" });
+    return res.json({
+      ...snapshot,
+      qr_data_url: "",
+      qr_png_base64: "",
+      qr_data_url_present: false,
+      detail: snapshot.last_error || "WhatsApp QR is not ready yet; the session is still initializing.",
+    });
   }
 
   QRImage.toDataURL(session.lastQrString, { errorCorrectionLevel: "M", width: 280 }, (err, dataUrl) => {
@@ -2910,7 +3079,33 @@ app.get("/qr", async (req, res) => {
       console.error(`[${session.scopeKey}] QR PNG error: ${err.message}`);
       return res.status(500).json({ error: err.message });
     }
-    res.json({ ...sessionSnapshot(session), qr_data_url: dataUrl, qr_png_base64: "" });
+    if (session.isReady || !session.lastQrString) {
+      return res.json({
+        ...sessionSnapshot(session),
+        qr_data_url: "",
+        qr_png_base64: "",
+        qr_data_url_present: false,
+        detail: "",
+      });
+    }
+    const safeDataUrl = String(dataUrl || "");
+    if (!safeDataUrl.startsWith("data:image/")) {
+      return res.status(500).json({ error: "QR image generation returned invalid data URL" });
+    }
+    const responseSnapshot = sessionSnapshot(session);
+    logBridgeEvent("info", "whatsapp.qr.status_response", {
+      ...sessionLogContext(session),
+      state: responseSnapshot.state,
+      qr_present: Boolean(session.lastQrString),
+      qr_data_url_present: true,
+    });
+    res.json({
+      ...responseSnapshot,
+      qr_data_url: safeDataUrl,
+      qr_png_base64: "",
+      qr_data_url_present: true,
+      detail: "",
+    });
   });
 });
 

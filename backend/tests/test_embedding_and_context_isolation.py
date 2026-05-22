@@ -4,7 +4,7 @@ import pytest
 
 from memory_engine.semantic import SemanticMemory
 from memory_engine.short_term import ShortTermMemory
-from services.ai_service import embedding_service, memory_service
+from services.ai_service import embedding_service, memory_service, rag
 from services.ai_service.rag import _should_skip_rag_query
 from shared.config import normalize_gemini_embedding_model_name
 
@@ -33,6 +33,17 @@ class FakeGeminiModels:
     async def embed_content(self, **_kwargs):
         self.calls += 1
         raise self.exc
+
+
+class FakeGeminiSuccessModels:
+    def __init__(self):
+        self.calls = 0
+        self.kwargs = []
+
+    async def embed_content(self, **kwargs):
+        self.calls += 1
+        self.kwargs.append(kwargs)
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.4, 0.5, 0.6])])
 
 
 class FakeOpenAIEmbeddings:
@@ -114,6 +125,29 @@ async def test_embedding_falls_back_to_openai_after_gemini_unsupported(monkeypat
     assert values == [0.1, 0.2, 0.3]
     assert fake_models.calls == 1
     assert fake_openai_embeddings.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vertex_embedding_provider_uses_vertex_gemini_client(monkeypatch):
+    llm_client, _ = _install_embedding_fakes(monkeypatch, ready_providers={"vertex_ai"})
+    fake_models = FakeGeminiSuccessModels()
+    captured = {}
+
+    def fake_gemini_client_for_model(model, provider="gemini"):
+        captured["model"] = model
+        captured["provider"] = provider
+        return SimpleNamespace(aio=SimpleNamespace(models=fake_models))
+
+    monkeypatch.setattr(llm_client, "_gemini_client", None)
+    monkeypatch.setattr(llm_client, "_gemini_client_for_model", fake_gemini_client_for_model)
+    monkeypatch.setattr(llm_client, "_openai_client", None)
+    monkeypatch.setattr(embedding_service, "_EMBEDDING_PROVIDER_FALLBACK", False)
+
+    values = await embedding_service.generate_embedding("customer asked about a product catalog", {"provider": "vertex_ai"})
+
+    assert values == [0.4, 0.5, 0.6]
+    assert captured["provider"] == "vertex_ai"
+    assert fake_models.calls == 1
 
 
 @pytest.mark.asyncio
@@ -201,3 +235,60 @@ async def test_search_similar_embeddings_query_filters_by_company(monkeypatch):
     assert captured_queries
     assert "WHERE company_id=$2" in captured_queries[0][0]
     assert captured_queries[0][1][1] == "co_a"
+
+
+@pytest.mark.asyncio
+async def test_catalog_keyword_fallback_returns_products_without_embeddings(monkeypatch):
+    class FakeCatalogDb:
+        async def fetch(self, query, *args):
+            if "information_schema.columns" in query:
+                return [
+                    {"column_name": "id"},
+                    {"column_name": "company_id"},
+                    {"column_name": "name"},
+                    {"column_name": "product_title"},
+                    {"column_name": "description"},
+                    {"column_name": "category"},
+                    {"column_name": "product_type"},
+                    {"column_name": "price"},
+                    {"column_name": "price_currency"},
+                    {"column_name": "status"},
+                    {"column_name": "created_at"},
+                    {"column_name": "updated_at"},
+                ]
+            if "FROM company_products" in query:
+                return [
+                    {
+                        "id": "prod-1",
+                        "company_id": "co-1",
+                        "name": "Black Shirt",
+                        "product_title": "",
+                        "description": "Cotton shirt",
+                        "category": "shirts",
+                        "product_type": "standard",
+                        "price": "25",
+                        "price_currency": "USD",
+                        "status": "active",
+                        "created_at": "",
+                        "updated_at": "",
+                    }
+                ]
+            return []
+
+    async def empty_vector_search(*_args, **_kwargs):
+        return []
+
+    async def skip_seed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rag, "_CATALOG_CACHE", FakeCache())
+    monkeypatch.setattr(rag, "_RANKING_CACHE", FakeCache())
+    monkeypatch.setattr(rag, "_COMPANY_PRODUCTS_COLUMNS", None)
+    monkeypatch.setattr(rag, "search_similar_embeddings", empty_vector_search)
+    monkeypatch.setattr(rag, "_ensure_product_embeddings", skip_seed)
+    monkeypatch.setattr(rag, "has_embedding_budget_remaining", lambda: True)
+
+    products = await rag.rank_products_for_query(FakeCatalogDb(), "co-1", "black shirt", limit=1)
+
+    assert products
+    assert products[0]["name"] == "Black Shirt"

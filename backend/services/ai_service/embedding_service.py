@@ -18,6 +18,7 @@ from services.ai_service.llm_client import (
     _engine_for_provider,
     get_provider_runtime_info,
 )
+from services.ai_service.model_catalog import GEMINI_PROVIDER_KEYS
 from services.ai_service.llm_tracking import get_llm_context, reserve_embedding_call
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,11 @@ _EMBEDDING_PROVIDER_FALLBACK = os.getenv("AI_ENABLE_EMBEDDING_PROVIDER_FALLBACK"
 }
 _UNSUPPORTED_MODEL_COOLDOWNS: dict[str, float] = {}
 _UNSUPPORTED_MODEL_LOGGED_UNTIL: dict[str, float] = {}
+_EMBEDDING_UNAVAILABLE_LOGGED_UNTIL: dict[str, float] = {}
+# Shared Redis cache key prefix for cross-worker embedding unavailability.
+_EMBED_UNAVAILABLE_CACHE_KEY_PREFIX = "ai:embed:unavailable:"
+# Minimum cooldown even if config returns 0.
+_EMBED_MIN_COOLDOWN_SECONDS = 300  # 5 minutes
 
 
 def _normalize_embedding_text(text: str) -> str:
@@ -46,7 +52,7 @@ def _embedding_cache_key(text: str, *, provider: str = "", model: str = "", comp
 
 
 def _embedding_model_for_provider(provider: str) -> str:
-    if provider == "gemini":
+    if provider in GEMINI_PROVIDER_KEYS:
         return GEMINI_EMBEDDING_MODEL
     if provider == "openai":
         return OPENAI_EMBEDDING_MODEL
@@ -59,13 +65,15 @@ def _embedding_provider_signature(provider: str) -> str:
 
 def _classify_embedding_error(exc: Exception) -> str:
     message = str(exc or "").lower()
+    # A bare 404 from an embedding endpoint means the model is unavailable on this provider,
+    # regardless of whether "embed"/"model" appear in the error string.
+    if "404" in message or "not found" in message:
+        return "unsupported_embedding_model"
     if (
-        "not found" in message
-        or "not_supported" in message
+        "not_supported" in message
         or "not supported" in message
         or "unsupported" in message
-        or "404" in message
-    ) and ("embed" in message or "embedding" in message or "model" in message):
+    ):
         return "unsupported_embedding_model"
     if "quota" in message or "rate limit" in message or "resource_exhausted" in message:
         return "quota_exhausted"
@@ -88,15 +96,71 @@ def _is_embedding_model_in_cooldown(provider: str, model: str, error_type: str =
     return True
 
 
+def _is_embedding_provider_in_any_cooldown(provider: str, model: str) -> bool:
+    return any(
+        _is_embedding_model_in_cooldown(provider, model, error_type)
+        for error_type in ("unsupported_embedding_model", "provider_not_configured", "quota_exhausted", "provider_error")
+    )
+
+
+async def _maybe_sync_embedding_cooldown_from_cache(provider: str, model: str) -> None:
+    """Seed this worker's cooldown dict from the shared cache when available."""
+    for error_type in ("unsupported_embedding_model", "provider_not_configured", "quota_exhausted", "provider_error"):
+        key = _cooldown_key(provider, model, error_type)
+        if _is_embedding_model_in_cooldown(provider, model, error_type):
+            return
+        try:
+            cache_key = f"{_EMBED_UNAVAILABLE_CACHE_KEY_PREFIX}{key}"
+            result = await _EMBEDDING_CACHE.get_json(cache_key)
+            if isinstance(result, dict) and result.get("unavailable"):
+                # Keep the local seed short so the worker periodically re-checks the shared TTL.
+                _UNSUPPORTED_MODEL_COOLDOWNS[key] = time.monotonic() + 60
+                logger.info(
+                    "embedding_cooldown_seeded_from_cache provider=%s model=%s error_type=%s",
+                    provider,
+                    model,
+                    error_type,
+                )
+                return
+        except Exception:
+            pass
+
+
+def _should_log_embedding_unavailable(signature: str) -> bool:
+    cooldown_seconds = max(60, ai_embedding_unsupported_cooldown_seconds())
+    now = time.monotonic()
+    expires_at = float(_EMBEDDING_UNAVAILABLE_LOGGED_UNTIL.get(signature) or 0)
+    if expires_at > now:
+        return False
+    _EMBEDDING_UNAVAILABLE_LOGGED_UNTIL[signature] = now + cooldown_seconds
+    return True
+
+
 def _mark_embedding_model_cooldown(provider: str, model: str, error_type: str, exc: Exception) -> None:
-    if error_type != "unsupported_embedding_model":
-        return
-    cooldown_seconds = ai_embedding_unsupported_cooldown_seconds()
-    if cooldown_seconds <= 0:
-        return
+    # All embedding errors get a cooldown to avoid hammering a broken endpoint.
+    if error_type in {"unsupported_embedding_model", "provider_not_configured"}:
+        cooldown_seconds = max(_EMBED_MIN_COOLDOWN_SECONDS, ai_embedding_unsupported_cooldown_seconds())
+    elif error_type == "quota_exhausted":
+        cooldown_seconds = 60
+    else:
+        cooldown_seconds = 120
     key = _cooldown_key(provider, model, error_type)
     expires_at = time.monotonic() + cooldown_seconds
     _UNSUPPORTED_MODEL_COOLDOWNS[key] = expires_at
+    # Write to shared cache so all workers can respect the cooldown without each making a failing call.
+    try:
+        cache_key = f"{_EMBED_UNAVAILABLE_CACHE_KEY_PREFIX}{key}"
+        loop = asyncio.get_running_loop()
+        if not loop.is_closed():
+            loop.create_task(
+                _EMBEDDING_CACHE.set_json(
+                    cache_key,
+                    {"unavailable": True, "error_type": error_type},
+                    ttl_seconds=int(cooldown_seconds),
+                )
+            )
+    except Exception:
+        pass
     if float(_UNSUPPORTED_MODEL_LOGGED_UNTIL.get(key) or 0) <= time.monotonic():
         _UNSUPPORTED_MODEL_LOGGED_UNTIL[key] = expires_at
         logger.warning(
@@ -178,7 +242,7 @@ def _embedding_candidate_engines(engine: dict | None = None) -> list[dict]:
         "gemini",
     ]
     for provider in providers:
-        if provider not in {"openai", "gemini"}:
+        if provider not in {"openai", *GEMINI_PROVIDER_KEYS}:
             continue
         ready, _ = get_provider_runtime_info(provider)
         if not ready:
@@ -206,9 +270,10 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
         model = _embedding_model_for_provider(provider)
         if not model:
             continue
-        if _is_embedding_model_in_cooldown(provider, model):
+        await _maybe_sync_embedding_cooldown_from_cache(provider, model)
+        if _is_embedding_provider_in_any_cooldown(provider, model):
             logger.debug(
-                "embedding_provider_skipped_cooldown provider=%s model=%s error_type=unsupported_embedding_model",
+                "embedding_provider_skipped_cooldown provider=%s model=%s",
                 provider,
                 model,
             )
@@ -233,8 +298,12 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
         )
         started = time.perf_counter()
         try:
-            gemini_client = (_gemini_client or _gemini_client_for_model(model)) if provider == "gemini" else None
-            if provider == "gemini" and gemini_client:
+            gemini_client = (
+                (_gemini_client if provider == "gemini" else None) or _gemini_client_for_model(model, provider)
+                if provider in GEMINI_PROVIDER_KEYS
+                else None
+            )
+            if provider in GEMINI_PROVIDER_KEYS and gemini_client:
                 try:
                     reserve_embedding_call(
                         function_name="generate_embedding",
@@ -323,7 +392,21 @@ async def generate_embedding(text: str, engine: dict | None = None, *, company_i
                 error=exc,
             )
             continue
-    logger.warning("Embedding generation unavailable for current runtime")
+    unavailable_signature = ",".join(
+        _embedding_provider_signature(str(item.get("provider") or "").lower()) for item in candidates
+    ) or "-"
+    if _should_log_embedding_unavailable(unavailable_signature):
+        logger.warning(
+            "embedding_generation_unavailable company_id=%s candidates=%s",
+            company_id or "",
+            unavailable_signature,
+        )
+    else:
+        logger.debug(
+            "embedding_generation_unavailable_suppressed company_id=%s candidates=%s",
+            company_id or "",
+            unavailable_signature,
+        )
     return None
 
 

@@ -1,5 +1,13 @@
 const DEFAULT_SEEN_TTL_MS = 6 * 60 * 60 * 1000;
 
+function envBoolean(value, defaultValue = false) {
+  const raw = String(value === undefined || value === null ? "" : value).trim().toLowerCase();
+  if (!raw) return Boolean(defaultValue);
+  if (["1", "true", "yes", "y", "on", "enabled"].includes(raw)) return true;
+  if (["0", "false", "no", "n", "off", "disabled"].includes(raw)) return false;
+  return Boolean(defaultValue);
+}
+
 function ensureSeenCache(session) {
   if (!session.seenMessageIds) session.seenMessageIds = new Map();
   return session.seenMessageIds;
@@ -64,6 +72,7 @@ function guardMessageReplay(session, message, options = {}) {
 
 module.exports = {
   DEFAULT_SEEN_TTL_MS,
+  envBoolean,
   guardMessageReplay,
   markSessionReadyBaseline,
   pruneSeenMessageIds,

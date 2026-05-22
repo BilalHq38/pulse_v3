@@ -29,13 +29,24 @@ _COMPANY_PRODUCTS_COLUMNS: set[str] | None = None
 GENERAL_PRODUCT_PATTERNS = (
     "what do you sell",
     "what do you have",
+    "what do you offer",
+    "what are you offering",
+    "what you are offering",
+    "what products do you provide",
     "show me products",
     "show products",
+    "tell me about products",
     "show your catalog",
     "catalog",
     "collection",
     "inventory",
     "available products",
+    "available options",
+    "options dikhao",
+    "products kya hain",
+    "kya available hai",
+    "what services do you offer",
+    "show services",
 )
 
 STOPWORDS = {
@@ -62,6 +73,57 @@ STOPWORDS = {
     "what",
     "you",
     "your",
+    # Added: generic intent and query words that are not product names
+    "know",
+    "about",
+    "tell",
+    "us",
+    "do",
+    "does",
+    "offering",
+    "offer",
+    "buy",
+    "purchase",
+    "order",
+    "get",
+    "any",
+    "some",
+    "all",
+    "available",
+    "more",
+    "options",
+    "option",
+    "how",
+    "with",
+    "list",
+    "catalog",
+    "our",
+    "this",
+    "that",
+    "just",
+    "also",
+    "item",
+    "items",
+    "see",
+    "would",
+    "like",
+    "from",
+    "by",
+    "on",
+    "at",
+    "been",
+    "we",
+    "provide",
+    "providing",
+    "product",
+    "products",
+    "catalog",
+    "catalogue",
+    "service",
+    "services",
+    "option",
+    "options",
+    "available",
 }
 
 _RAG_SKIP_PHRASES = {
@@ -200,6 +262,11 @@ def understand_product_query(
             "services",
             "solution",
             "solutions",
+            "offer",
+            "offering",
+            "option",
+            "options",
+            "available",
         )
     )
     is_general_phrase = any(pattern in lowered for pattern in GENERAL_PRODUCT_PATTERNS)
@@ -214,15 +281,35 @@ def understand_product_query(
     }
 
 
-async def _load_product_catalog(db, company_id: str, limit: int = 120) -> list[dict]:
+def _catalog_kind_for_query(query: str) -> str:
+    normalized = _normalize_term(query)
+    service_signal = any(term in normalized for term in ("service", "services", "solution", "solutions"))
+    product_signal = any(term in normalized for term in ("product", "products", "catalog", "item", "items", "collection", "inventory"))
+    if service_signal and not product_signal:
+        return "service"
+    if product_signal and not service_signal:
+        return "product"
+    return ""
+
+
+async def _load_product_catalog(
+    db,
+    company_id: str,
+    limit: int = 120,
+    *,
+    bypass_cache: bool = False,
+    catalog_kind: str = "",
+) -> list[dict]:
     if not db or not company_id:
         return []
 
-    cache_key = f"catalog:{company_id}:{max(1, int(limit))}"
-    cached = await _CATALOG_CACHE.get_json(cache_key)
-    if isinstance(cached, list):
-        increment_counter("ai.cache.catalog.hit")
-        return [dict(item) for item in cached if isinstance(item, dict)]
+    catalog_kind = str(catalog_kind or "").strip().lower()
+    cache_key = f"catalog:{company_id}:{max(1, int(limit))}:{catalog_kind}"
+    if not bypass_cache:
+        cached = await _CATALOG_CACHE.get_json(cache_key)
+        if isinstance(cached, list):
+            increment_counter("ai.cache.catalog.hit")
+            return [dict(item) for item in cached if isinstance(item, dict)]
 
     increment_counter("ai.cache.catalog.miss")
     started = time.perf_counter()
@@ -235,9 +322,12 @@ async def _load_product_catalog(db, company_id: str, limit: int = 120) -> list[d
         f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, created_at, updated_at "
         "FROM company_products "
         "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
-        "ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT $2",
+        "  AND ($3='' OR ($3='service' AND LOWER(COALESCE(product_type,'')) IN ('service','services')) "
+        "       OR ($3='product' AND LOWER(COALESCE(product_type,'')) NOT IN ('service','services'))) "
+        "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, name ASC LIMIT $2",
         company_id,
         limit,
+        catalog_kind,
     )
     products = [dict(row) for row in rows]
     if not products:
@@ -285,7 +375,8 @@ async def _load_product_catalog(db, company_id: str, limit: int = 120) -> list[d
         product["normalized_tags"] = sorted({_normalize_term(item) for item in raw_tags if _normalize_term(item)})
 
     observe_histogram("ai.catalog.load_ms", (time.perf_counter() - started) * 1000.0)
-    await _CATALOG_CACHE.set_json(cache_key, products, ttl_seconds=_CATALOG_CACHE_TTL_SECONDS)
+    if not bypass_cache:
+        await _CATALOG_CACHE.set_json(cache_key, products, ttl_seconds=_CATALOG_CACHE_TTL_SECONDS)
     return products
 
 
@@ -327,15 +418,22 @@ def _token_set(text: str) -> set[str]:
     return set(_tokenize(text or ""))
 
 
+def _is_acceptable_product_image_url(image_url: str) -> bool:
+    image_url = str(image_url or "").strip()
+    if image_url.startswith("/api/") or image_url.startswith("/media/"):
+        return True
+    return is_valid_image_url(image_url)
+
+
 def _pick_product_image_url(product: dict) -> str:
     for image_url in normalize_product_images(product.get("images") or [], limit=3):
-        if is_valid_image_url(image_url):
+        if _is_acceptable_product_image_url(image_url):
             return image_url
     return ""
 
 
 def _build_product_attachment(product: dict, image_url: str, image_index: int) -> dict | None:
-    if not image_url or not is_valid_image_url(image_url):
+    if not image_url or not _is_acceptable_product_image_url(image_url):
         return None
     name = str(product.get("name") or "").strip()
     title = str(product.get("product_title") or "").strip()
@@ -440,12 +538,13 @@ async def rank_products_for_query(
     company_id: str,
     query: str,
     *,
-    limit: int = 3,
+    limit: int = 6,
     exclude_ids: list[str] | None = None,
     history_text: str = "",
     history_product_ids: list[str] | None = None,
     customer_id: str = "",
     conversation_id: str = "",
+    bypass_product_cache: bool = False,
 ) -> list[dict]:
     excluded = {str(item).strip() for item in [*(exclude_ids or []), *(history_product_ids or [])] if str(item).strip()}
     history_affects_ranking = bool(str(history_text or "").strip() or excluded)
@@ -465,19 +564,42 @@ async def rank_products_for_query(
     )
     ranking_key = f"rank:{hashlib.sha256(cache_material.encode('utf-8')).hexdigest()}"
 
-    cached_ranked = await _RANKING_CACHE.get_json(ranking_key)
-    if isinstance(cached_ranked, list):
-        increment_counter("ai.cache.ranking.hit")
-        return [dict(item) for item in cached_ranked if isinstance(item, dict)][: max(1, int(limit))]
+    if not bypass_product_cache:
+        cached_ranked = await _RANKING_CACHE.get_json(ranking_key)
+        if isinstance(cached_ranked, list):
+            increment_counter("ai.cache.ranking.hit")
+            return [dict(item) for item in cached_ranked if isinstance(item, dict)][: max(1, int(limit))]
 
     increment_counter("ai.cache.ranking.miss")
-    products = await _load_product_catalog(db, company_id)
+    catalog_kind = _catalog_kind_for_query(query)
+    products = await _load_product_catalog(
+        db,
+        company_id,
+        limit=max(3, min(max(1, int(limit or 3)) * 4, 50)),
+        bypass_cache=bypass_product_cache,
+        catalog_kind=catalog_kind,
+    )
     if not products:
         return []
     query_info = understand_product_query(
         query,
         catalog_categories=[str(product.get("category") or "") for product in products],
     )
+    if query_info.get("general") and not query_info.get("specific"):
+        selected = [
+            product
+            for product in products
+            if str(product.get("id") or "").strip() not in excluded
+        ][: max(1, int(limit or 3))]
+        logger.info(
+            "top_products_selected company_id=%s conversation_id=%s batch_limit=%s selected_product_ids=%s recently_shown_product_ids=%s reason=generic_product_query",
+            company_id,
+            conversation_id or "",
+            max(1, int(limit or 3)),
+            ",".join(str(product.get("id") or "") for product in selected),
+            ",".join(sorted(excluded)),
+        )
+        return selected
 
     with timed_metric("ai.ranking.total_ms"):
         history_terms = _token_set(history_text)
@@ -503,6 +625,15 @@ async def rank_products_for_query(
                     source_type="company_product",
                     top_k=max(limit * 4, 12),
                 )
+        if not vector_rows:
+            logger.info(
+                "embedding_fallback_catalog_keyword_match_used company_id=%s conversation_id=%s query_specific=%s query_general=%s product_count=%s",
+                company_id,
+                conversation_id or "",
+                bool(query_info.get("specific")),
+                bool(query_info.get("general")),
+                len(products),
+            )
         vector_scores = {
             str(row.get("source_id") or ""): float(row.get("similarity") or 0)
             for row in vector_rows
@@ -533,7 +664,10 @@ async def rank_products_for_query(
 
         selected: list[dict] = []
         seen_ids: set[str] = set()
-        for _, product in ranked:
+        min_specific_score = 0.45 if query_info.get("specific") and not query_info.get("general") else 0.0
+        for score, product in ranked:
+            if min_specific_score and score < min_specific_score:
+                continue
             product_id = str(product.get("id") or "").strip()
             if not product_id or product_id in excluded or product_id in seen_ids:
                 continue
@@ -542,7 +676,8 @@ async def rank_products_for_query(
             if len(selected) >= limit:
                 break
 
-    await _RANKING_CACHE.set_json(ranking_key, selected, ttl_seconds=30)
+    if not bypass_product_cache:
+        await _RANKING_CACHE.set_json(ranking_key, selected, ttl_seconds=30)
     return selected
 
 
@@ -569,7 +704,7 @@ async def build_ai_context(
     current_query: str = "",
     *,
     exclude_product_ids: list[str] | None = None,
-    max_products: int = 3,
+    max_products: int = 6,
     history_text: str = "",
     history_product_ids: list[str] | None = None,
     customer_id: str = "",
@@ -577,6 +712,7 @@ async def build_ai_context(
     intent_name: str = "",
     has_history: bool = False,
     include_products: bool = True,
+    bypass_product_cache: bool = False,
 ) -> dict:
     if not db:
         return {
@@ -660,9 +796,16 @@ async def build_ai_context(
                 history_product_ids=history_product_ids,
                 customer_id=customer_id,
                 conversation_id=conversation_id,
+                bypass_product_cache=bypass_product_cache,
             )
         elif include_products and company_id:
-            catalog = await _load_product_catalog(db, company_id, limit=max(max_products * 4, 12))
+            catalog = await _load_product_catalog(
+                db,
+                company_id,
+                limit=max(max_products * 4, 12),
+                bypass_cache=bypass_product_cache,
+                catalog_kind=_catalog_kind_for_query(current_query),
+            )
             selected_products = [
                 product for product in catalog if str(product.get("id") or "").strip() not in excluded_ids
             ][:max_products]

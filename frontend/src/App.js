@@ -24,6 +24,7 @@ const KnowledgeBasePage = lazy(() => import('@/pages/KnowledgeBasePage'));
 const SettingsPage = lazy(() => import('@/pages/SettingsPage'));
 const UnificationPage = lazy(() => import('@/pages/UnificationPage'));
 const ProductsPage = lazy(() => import('@/pages/ProductsPage'));
+const OrdersPage = lazy(() => import('@/pages/OrdersPage'));
 const PrivacyPage = lazy(() => import('@/pages/PrivacyPage'));
 const TermsPage = lazy(() => import('@/pages/TermsPage'));
 const ContactPage = lazy(() => import('@/pages/ContactPage'));
@@ -259,6 +260,7 @@ function App() {
             <Route path="/tickets" element={<ProtectedRoute><TicketsPage /></ProtectedRoute>} />
             <Route path="/knowledge-base" element={<ProtectedRoute><KnowledgeBasePage /></ProtectedRoute>} />
             <Route path="/products" element={<ProtectedRoute><ProductsPage /></ProtectedRoute>} />
+            <Route path="/orders" element={<ProtectedRoute><OrdersPage /></ProtectedRoute>} />
             <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
             <Route path="/unification" element={<RoleRoute allowedRoles={['admin']}><UnificationPage /></RoleRoute>} />
             <Route path="/profile" element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />

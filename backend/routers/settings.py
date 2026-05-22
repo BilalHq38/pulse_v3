@@ -682,6 +682,8 @@ async def get_whatsapp_bridge_qr(request: Request):
     cu = await get_current_user_flexible(request)
     bridge_url = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3001").rstrip("/")
     secret = (os.environ.get("WHATSAPP_BRIDGE_SECRET") or os.environ.get("BRIDGE_SECRET") or "").strip()
+    company_id = (get_company_id(cu) or "").strip()
+    user_id = str(cu.get("sub") or "").strip()
     if not secret:
         return {
             "bridge_status": "not_configured",
@@ -691,9 +693,15 @@ async def get_whatsapp_bridge_qr(request: Request):
         }
     headers = {
         "X-Bridge-Secret": secret,
-        "X-Bridge-Company-Id": (get_company_id(cu) or "").strip(),
-        "X-Bridge-User-Id": str(cu.get("sub") or "").strip(),
+        "X-Bridge-Company-Id": company_id,
+        "X-Bridge-User-Id": user_id,
     }
+    logger.info(
+        "whatsapp.qr.status_requested company_id=%s user_id=%s bridge_url=%s",
+        company_id,
+        user_id,
+        bridge_url,
+    )
     timeout = httpx.Timeout(12.0, connect=3.0)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -730,11 +738,15 @@ async def get_whatsapp_bridge_qr(request: Request):
             "detail": str(detail or "Bridge /qr error"),
         }
 
-    bridge_status = ""
+    session_state = ""
     if isinstance(session_data, dict):
-        bridge_status = str(session_data.get("state") or session_data.get("status") or "").strip()
-    if isinstance(qr_data, dict) and not bridge_status:
-        bridge_status = str(qr_data.get("state") or qr_data.get("bridge_status") or "").strip()
+        session_state = str(session_data.get("state") or session_data.get("status") or "").strip()
+    qr_state = ""
+    qr_has_image = False
+    if isinstance(qr_data, dict):
+        qr_state = str(qr_data.get("state") or qr_data.get("bridge_status") or qr_data.get("status") or "").strip()
+        qr_has_image = bool(qr_data.get("qr_data_url") or qr_data.get("qr_png_base64"))
+    bridge_status = qr_state if (qr_has_image or qr_state) else session_state
     legacy_progress = {
         "idle": 0,
         "qr_required": 20,
@@ -748,6 +760,15 @@ async def get_whatsapp_bridge_qr(request: Request):
         "disconnected": 0,
     }
     status_source = qr_data if isinstance(qr_data, dict) and qr_data else session_data if isinstance(session_data, dict) else {}
+    logger.info(
+        "whatsapp.qr.proxy_response company_id=%s user_id=%s scope=%s state=%s qr_present=%s qr_data_url_present=%s",
+        company_id,
+        user_id,
+        str(status_source.get("scope") or ""),
+        bridge_status,
+        bool(status_source.get("qr_present") or status_source.get("qr")),
+        bool(isinstance(qr_data, dict) and qr_data.get("qr_data_url")),
+    )
     out: dict = {
         "bridge_status": bridge_status,
         "status": bridge_status,
@@ -759,15 +780,29 @@ async def get_whatsapp_bridge_qr(request: Request):
         "qr": str(status_source.get("qr") or ""),
         "retrying": bool(status_source.get("retrying")),
         "last_error": str(status_source.get("last_error") or ""),
+        "detail": str(status_source.get("detail") or ""),
         "updated_at": str(status_source.get("updated_at") or ""),
+        "scope": str(status_source.get("scope") or ""),
+        "company_id": str(status_source.get("company_id") or company_id),
+        "user_id": str(status_source.get("user_id") or user_id),
         "qr_data_url": "",
         "qr_png_base64": "",
     }
     if isinstance(qr_data, dict):
-        if qr_data.get("qr_data_url"):
-            out["qr_data_url"] = str(qr_data["qr_data_url"])
+        qr_data_url = str(qr_data.get("qr_data_url") or "")
+        if qr_data_url.startswith("data:image/"):
+            out["qr_data_url"] = qr_data_url
         elif qr_data.get("qr_png_base64"):
             out["qr_png_base64"] = str(qr_data["qr_png_base64"])
+    logger.info(
+        "whatsapp.qr.frontend_payload_ready company_id=%s user_id=%s scope=%s state=%s qr_present=%s qr_data_url_present=%s",
+        company_id,
+        user_id,
+        out.get("scope", ""),
+        out.get("state", ""),
+        bool(out.get("qr") or out.get("qr_data_url") or out.get("qr_png_base64")),
+        bool(out.get("qr_data_url")),
+    )
     return out
 
 
