@@ -51,6 +51,11 @@ import {
   UserCircle,
   Wand2,
   QrCode,
+  Smile,
+  TrendingUp,
+  HeadphonesIcon,
+  Sparkles,
+  Zap,
 } from 'lucide-react';
 
 const CHANNEL_CONFIG = {
@@ -192,6 +197,295 @@ function validatePassword(password) {
   return { isValid: errors.length === 0, errors };
 }
 
+const _TEMPLATE_META = {
+  Friendly:        { icon: Smile,          color: 'amber',   preview: 'Hi there! Happy to help you find exactly what you need. Here\'s what I found…' },
+  Professional:    { icon: Briefcase,      color: 'slate',   preview: 'Thank you for your inquiry. The following information addresses your question…' },
+  'Sales-Oriented':{ icon: TrendingUp,     color: 'blue',    preview: 'Great news — this is exactly what you\'re looking for. Here\'s why it fits your needs…' },
+  'Support-Focused':{ icon: HeadphonesIcon,color: 'violet',  preview: 'I completely understand. Let me walk you through the solution step by step…' },
+};
+const _COLOR_CLASSES = {
+  amber:  { ring: 'border-amber-300  bg-amber-50/50',  icon: 'bg-amber-100  text-amber-600',  badge: 'bg-amber-100  text-amber-700  border-amber-200' },
+  slate:  { ring: 'border-slate-300  bg-slate-50/50',  icon: 'bg-slate-100  text-slate-600',  badge: 'bg-slate-100  text-slate-700  border-slate-200' },
+  blue:   { ring: 'border-blue-300   bg-blue-50/50',   icon: 'bg-blue-100   text-blue-600',   badge: 'bg-blue-100   text-blue-700   border-blue-200' },
+  violet: { ring: 'border-violet-300 bg-violet-50/50', icon: 'bg-violet-100 text-violet-600', badge: 'bg-violet-100 text-violet-700 border-violet-200' },
+};
+
+const _PREBUILT_TEMPLATES = [
+  { name: 'Friendly',        icon: Smile,          color: 'amber',  style_prompt: 'Adopt a warm, conversational tone. Use second-person (\'you\'), greet the customer, and offer to help further at the end of each answer. Keep replies short — two to four sentences for simple questions.' },
+  { name: 'Professional',    icon: Briefcase,      color: 'slate',  style_prompt: 'Adopt a clear, neutral, business-formal tone. Avoid contractions and slang. Lead each answer with the factual answer first, then add one sentence of context.' },
+  { name: 'Sales-Oriented',  icon: TrendingUp,     color: 'blue',   style_prompt: 'Adopt a confident, helpful tone focused on resolving the customer\'s purchase intent. When the question is about a product, surface the key value proposition and the next step (price, availability, link) without exaggerating or inventing details. Do not pressure the customer.' },
+  { name: 'Support-Focused', icon: HeadphonesIcon, color: 'violet', style_prompt: 'Adopt a patient, empathetic problem-solving tone. Acknowledge the customer\'s situation, restate the problem in one sentence so they know you understood, then give the next concrete step. Escalate to a human teammate when the context doesn\'t have a clear resolution.' },
+];
+
+function AiResponseTemplatesSection({ isAdmin }) {
+  const [templates, setTemplates] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [busyId, setBusyId] = useState('');
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [addTab, setAddTab] = useState('prebuilt'); // 'prebuilt' | 'custom'
+  const [customName, setCustomName] = useState('');
+  const [customPrompt, setCustomPrompt] = useState('');
+  const [adding, setAdding] = useState('');
+
+  const loadTemplates = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await api.get('/ai/templates');
+      setTemplates(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      setError(getErrorMessage(err, 'We could not load response templates.'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadTemplates(); }, [loadTemplates]);
+
+  const setDefault = useCallback(async (id) => {
+    setBusyId(id);
+    try {
+      await api.post(`/ai/templates/${id}/set-default`);
+      await loadTemplates();
+      showToast({ type: 'success', title: 'Active template updated', message: 'New conversations will use this style.' });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Could not update', message: getErrorMessage(err, 'Failed to change the active template.') });
+    } finally {
+      setBusyId('');
+    }
+  }, [loadTemplates]);
+
+  const deleteTemplate = useCallback(async (id) => {
+    setBusyId(id);
+    try {
+      await api.delete(`/ai/templates/${id}`);
+      await loadTemplates();
+      showToast({ type: 'success', title: 'Template deleted' });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Could not delete', message: getErrorMessage(err, 'Failed to delete template.') });
+    } finally {
+      setBusyId('');
+    }
+  }, [loadTemplates]);
+
+  const addPrebuilt = useCallback(async (prebuilt) => {
+    setAdding(prebuilt.name);
+    try {
+      await api.post('/ai/templates', { name: prebuilt.name, style_prompt: prebuilt.style_prompt });
+      await loadTemplates();
+      setShowAddModal(false);
+      showToast({ type: 'success', title: `"${prebuilt.name}" style added` });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Could not add', message: getErrorMessage(err, 'Template may already exist.') });
+    } finally {
+      setAdding('');
+    }
+  }, [loadTemplates]);
+
+  const addCustom = useCallback(async () => {
+    if (!customName.trim() || !customPrompt.trim()) return;
+    setAdding('custom');
+    try {
+      await api.post('/ai/templates', { name: customName.trim(), style_prompt: customPrompt.trim() });
+      await loadTemplates();
+      setShowAddModal(false);
+      setCustomName('');
+      setCustomPrompt('');
+      showToast({ type: 'success', title: `"${customName.trim()}" style added` });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Could not add', message: getErrorMessage(err, 'Template name may already be taken.') });
+    } finally {
+      setAdding('');
+    }
+  }, [customName, customPrompt, loadTemplates]);
+
+  const existingNames = new Set(templates.map((t) => t.name));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <div className="p-1.5 rounded-lg bg-blue-100"><Sparkles size={14} className="text-blue-600" /></div>
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">AI Response Style</h3>
+            <p className="text-xs text-slate-500">Controls the tone and style of every AI reply. Set one as the default for this workspace.</p>
+          </div>
+        </div>
+        {isAdmin && (
+          <button
+            type="button"
+            onClick={() => { setShowAddModal(true); setAddTab('prebuilt'); }}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-600 hover:bg-slate-50 hover:border-slate-300 transition-colors shadow-sm"
+          >
+            <Plus size={12} /> Add style
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="text-xs text-slate-400 py-3">Loading styles…</div>
+      ) : error ? (
+        <div className="space-y-2">
+          <div className="text-xs text-red-500 py-2">{error}</div>
+          {isAdmin && (
+            <p className="text-xs text-slate-400">Use the <strong>Add style</strong> button above to add your first response style.</p>
+          )}
+        </div>
+      ) : templates.length === 0 ? (
+        <div className="space-y-2">
+          <div className="text-xs text-slate-400 py-3">No response styles added yet.</div>
+          {isAdmin && (
+            <p className="text-xs text-slate-400">Click <strong>Add style</strong> to pick from 4 built-in styles or create your own.</p>
+          )}
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {templates.map((tmpl) => {
+            const meta = _TEMPLATE_META[tmpl.name] || { icon: Zap, color: 'slate', preview: (tmpl.style_prompt || '').slice(0, 80) + '…' };
+            const colors = _COLOR_CLASSES[meta.color] || _COLOR_CLASSES.slate;
+            const Icon = meta.icon;
+            const isActive = tmpl.is_default;
+            const isBuiltin = Boolean(_TEMPLATE_META[tmpl.name]);
+            return (
+              <div
+                key={tmpl.id}
+                data-testid={`response-template-${tmpl.id}`}
+                className={`rounded-xl border-2 p-4 transition-all ${isActive ? colors.ring + ' shadow-sm' : 'border-slate-100 bg-white hover:border-slate-200'}`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2.5">
+                    <div className={`p-1.5 rounded-lg ${colors.icon}`}><Icon size={14} /></div>
+                    <span className="text-sm font-semibold text-slate-900">{tmpl.name}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {isActive ? (
+                      <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${colors.badge}`}>
+                        <Check size={9} /> Active
+                      </span>
+                    ) : isAdmin ? (
+                      <button
+                        type="button"
+                        disabled={busyId === tmpl.id}
+                        onClick={() => setDefault(tmpl.id)}
+                        className="rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-500 hover:bg-slate-50 hover:border-slate-300 disabled:opacity-40 transition-colors"
+                      >
+                        {busyId === tmpl.id ? 'Saving…' : 'Set active'}
+                      </button>
+                    ) : null}
+                    {isAdmin && !isActive && !isBuiltin && (
+                      <button
+                        type="button"
+                        disabled={busyId === tmpl.id}
+                        onClick={() => deleteTemplate(tmpl.id)}
+                        className="rounded-lg border border-red-100 px-1.5 py-1 text-[11px] text-red-400 hover:bg-red-50 hover:border-red-200 disabled:opacity-40 transition-colors"
+                        title="Delete template"
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <p className="mt-2.5 text-[11px] leading-relaxed text-slate-500 italic border-l-2 border-slate-200 pl-2.5">
+                  "{meta.preview}"
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showAddModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg">
+            <div className="flex items-center justify-between px-5 pt-5 pb-3 border-b border-slate-100">
+              <h4 className="text-sm font-semibold text-slate-900">Add Response Style</h4>
+              <button type="button" onClick={() => setShowAddModal(false)} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
+            </div>
+            <div className="flex gap-1 px-5 pt-4">
+              {['prebuilt', 'custom'].map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setAddTab(tab)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${addTab === tab ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                >
+                  {tab === 'prebuilt' ? 'Choose prebuilt' : 'Create custom'}
+                </button>
+              ))}
+            </div>
+            <div className="p-5">
+              {addTab === 'prebuilt' ? (
+                <div className="grid gap-3">
+                  {_PREBUILT_TEMPLATES.map((pb) => {
+                    const colors = _COLOR_CLASSES[pb.color] || _COLOR_CLASSES.slate;
+                    const Icon = pb.icon;
+                    const alreadyAdded = existingNames.has(pb.name);
+                    return (
+                      <div key={pb.name} className={`flex items-center justify-between rounded-xl border p-3 ${alreadyAdded ? 'opacity-50 bg-slate-50' : 'bg-white hover:border-slate-300'}`}>
+                        <div className="flex items-center gap-2.5">
+                          <div className={`p-1.5 rounded-lg ${colors.icon}`}><Icon size={13} /></div>
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">{pb.name}</p>
+                            <p className="text-[10px] text-slate-400 mt-0.5 max-w-xs truncate">{pb.style_prompt.slice(0, 70)}…</p>
+                          </div>
+                        </div>
+                        {alreadyAdded ? (
+                          <span className="text-[10px] text-slate-400 font-medium">Added</span>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={adding === pb.name}
+                            onClick={() => addPrebuilt(pb)}
+                            className="rounded-lg bg-blue-600 text-white px-3 py-1 text-xs font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                          >
+                            {adding === pb.name ? 'Adding…' : 'Add'}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Style name</label>
+                    <input
+                      type="text"
+                      value={customName}
+                      onChange={(e) => setCustomName(e.target.value)}
+                      placeholder="e.g. Casual & Brief"
+                      className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Style instruction for the AI</label>
+                    <textarea
+                      value={customPrompt}
+                      onChange={(e) => setCustomPrompt(e.target.value)}
+                      rows={4}
+                      placeholder="Describe how the AI should respond — tone, length, what to emphasise…"
+                      className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!customName.trim() || !customPrompt.trim() || adding === 'custom'}
+                    onClick={addCustom}
+                    className="w-full rounded-lg bg-blue-600 text-white py-2 text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                  >
+                    {adding === 'custom' ? 'Adding…' : 'Add custom style'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const { user, logout, refreshUser } = useAuth();
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
@@ -210,11 +504,8 @@ export default function SettingsPage() {
   const [company, setCompany] = useState(null);
   const [companyValidationErrors, setCompanyValidationErrors] = useState({});
   const [users, setUsers] = useState([]);
-  const [templates, setTemplates] = useState([]);
   const [showKeyMap, setShowKeyMap] = useState({});
   const [saving, setSaving] = useState('');
-  const [showTemplateForm, setShowTemplateForm] = useState(false);
-  const [templateForm, setTemplateForm] = useState({ name: '', content: '', category: 'general', channel: 'all' });
   const [products, setProducts] = useState([]);
   const [faqs, setFaqs] = useState([]);
   const [personalSettings, setPersonalSettings] = useState(null);
@@ -552,7 +843,6 @@ export default function SettingsPage() {
           last_login: user.last_login || null,
           auth_provider: user.auth_provider || 'email',
         }] : []);
-        setTemplates([]);
         setProducts([]);
         setFaqs([]);
 
@@ -579,12 +869,11 @@ export default function SettingsPage() {
       const shouldLoadUsers = activeTab === 'users';
       const shouldLoadKnowledge = activeTab === 'templates';
 
-      const [co, personal, ch, us, tm, pr, fq] = await Promise.all([
+      const [co, personal, ch, us, pr, fq] = await Promise.all([
         api.get('/settings/company').catch(() => ({ data: null })),
         api.get('/settings/personal').catch(() => ({ data: null })),
         shouldLoadChannels ? api.get('/settings/channels').catch(() => ({ data: [] })) : Promise.resolve(null),
         shouldLoadUsers ? api.get('/users').catch(() => ({ data: [] })) : Promise.resolve(null),
-        shouldLoadKnowledge ? api.get('/settings/templates').catch(() => ({ data: [] })) : Promise.resolve(null),
         shouldLoadKnowledge ? api.get('/company-data/products').catch(() => ({ data: [] })) : Promise.resolve(null),
         shouldLoadKnowledge ? api.get('/company-data/faqs').catch(() => ({ data: [] })) : Promise.resolve(null),
       ]);
@@ -592,7 +881,6 @@ export default function SettingsPage() {
       setCompany(co.data || null);
       if (ch) setChannels(normalizeChannelsResponse(ch.data));
       if (us) setUsers(us.data || []);
-      if (tm) setTemplates(tm.data || []);
       if (pr) setProducts(pr.data || []);
       if (fq) setFaqs(fq.data || []);
 
@@ -1046,47 +1334,6 @@ export default function SettingsPage() {
     }
   };
 
-  const createTemplate = async () => {
-    try {
-      await api.post('/settings/templates', templateForm);
-      setShowTemplateForm(false);
-      setTemplateForm({ name: '', content: '', category: 'general', channel: 'all' });
-      const res = await api.get('/settings/templates');
-      setTemplates(res.data);
-      showToast({
-        type: 'success',
-        title: 'Template Saved',
-        message: `${templateForm.name || 'The template'} is ready to use.`,
-      });
-    } catch (err) {
-      console.error(err);
-      showToast({
-        type: 'error',
-        title: 'Save Failed',
-        message: getErrorMessage(err, 'We could not save that template.'),
-      });
-    }
-  };
-
-  const deleteTemplate = async (id) => {
-    const template = templates.find((item) => item.id === id);
-    try {
-      await api.delete(`/settings/templates/${id}`);
-      setTemplates(prev => prev.filter(t => t.id !== id));
-      showToast({
-        type: 'success',
-        title: 'Template Deleted',
-        message: `${template?.name || 'The template'} was removed.`,
-      });
-    } catch (err) {
-      console.error(err);
-      showToast({
-        type: 'error',
-        title: 'Delete Failed',
-        message: getErrorMessage(err, 'We could not delete that template.'),
-      });
-    }
-  };
 
   const openPasswordModal = (u) => { setPasswordModal(u); setNewPassword(''); setConfirmPassword(''); setShowPassword(false); setPasswordError(''); setPasswordSuccess(''); };
   const closePasswordModal = () => { setPasswordModal(null); setNewPassword(''); setConfirmPassword(''); setPasswordError(''); setPasswordSuccess(''); };
@@ -1724,7 +1971,7 @@ export default function SettingsPage() {
     { id: 'company',       label: 'Company',        icon: Globe },
     { id: 'channels',      label: 'Channels',       icon: MessageSquare },
     { id: 'ai',            label: 'AI Config',      icon: Bot },
-    { id: 'templates',     label: 'Templates',      icon: MessageSquare },
+    { id: 'templates',     label: 'Templates & FAQs', icon: MessageSquare },
     { id: 'users',         label: 'Teams',          icon: Users },
     { id: 'notifications', label: 'Notifications',  icon: Bell },
     { id: 'webhooks',      label: 'Webhooks',       icon: Link2 },
@@ -2457,14 +2704,15 @@ export default function SettingsPage() {
               isAdmin={isAdmin}
             />
           )}
-
-
-          {/* === TEMPLATES === */}
+          {/* === TEMPLATES & FAQs === */}
           {activeTab === 'templates' && (
             <div className="space-y-6">
-              <div className="flex items-center justify-between"><h2 className="text-lg font-semibold text-slate-900">Response Templates</h2><button onClick={() => setShowTemplateForm(true)} className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-500"><Plus size={14} /> New Template</button></div>
-              <div className="space-y-3">{templates.map(tmpl => (<div key={tmpl.id} className="bg-white border border-slate-100 rounded-xl p-4 flex items-start justify-between"><div><h4 className="text-sm font-medium text-slate-700">{tmpl.name}</h4><p className="text-xs text-slate-400 mt-1">{tmpl.content}</p><div className="flex gap-2 mt-2"><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-400">{tmpl.category}</span><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-400">{tmpl.channel}</span></div></div><button onClick={() => deleteTemplate(tmpl.id)} className="text-slate-400 hover:text-red-500 p-1"><Trash2 size={14} /></button></div>))}{templates.length === 0 && <p className="text-center text-slate-400 text-sm py-8">No templates yet</p>}</div>
-              {showTemplateForm && (<div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-4"><div className="bg-white rounded-2xl w-full max-w-lg p-6"><div className="flex items-center justify-between mb-6"><h3 className="text-lg font-bold text-slate-900">New Template</h3><button onClick={() => setShowTemplateForm(false)} className="text-slate-400"><X size={20} /></button></div><div className="space-y-4"><input value={templateForm.name} onChange={(e) => setTemplateForm({...templateForm, name: e.target.value})} placeholder="Template Name" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm" /><textarea value={templateForm.content} onChange={(e) => setTemplateForm({...templateForm, content: e.target.value})} placeholder="Template content..." rows={4} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm resize-none" /><button onClick={createTemplate} className="w-full py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium">Create Template</button></div></div></div>)}
+              <h2 className="text-lg font-semibold text-slate-900">Templates &amp; FAQs</h2>
+
+              {/* AI Response Style */}
+              <div className="bg-white border border-slate-100 rounded-xl p-5">
+                <AiResponseTemplatesSection isAdmin={isAdmin} />
+              </div>
 
               {/* === FAQs === */}
               <div className="bg-white border border-slate-100 rounded-xl p-6">

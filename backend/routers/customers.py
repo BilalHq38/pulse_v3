@@ -154,7 +154,7 @@ async def _fetch_customers(
         "SELECT c.*, "
         "ARRAY(SELECT tag FROM customer_tags WHERE customer_id=c.id) AS tags, "
         "ARRAY(SELECT channel FROM customer_channels WHERE customer_id=c.id) AS channels "
-        "FROM customers c WHERE c.company_id=$1 AND c.lifecycle_stage!='lead'"
+        "FROM customers c WHERE c.company_id=$1 AND c.lifecycle_stage != 'lead'"
     )
     args = [company_id]
     if segment:

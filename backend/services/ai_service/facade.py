@@ -45,7 +45,6 @@ from services.ai_service.response_generator import (
     build_safe_lead_ai_context,
     build_system_prompt,
     calculate_churn_risk,
-    generate_ai_response as _local_generate_ai_response,
     generate_combined_ai_analysis as _local_generate_combined_ai_analysis,
     generate_lead_score as _local_generate_lead_score,
     generate_nurture_message as _local_generate_nurture_message,
@@ -185,7 +184,7 @@ def _safe_ai_reply_default(message_text: str, customer_info: dict | None = None)
             "I can help with product details, support issues, and next steps. "
             "Tell me the key outcome you want and I will take it from there."
         )
-    return "Thanks for reaching out. I am here to help with support, products, and next steps."
+    return "Thanks for reaching out. What can I help you with?"
 
 
 def _safe_lead_score_default(lead_data: dict) -> dict:
@@ -340,87 +339,6 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
             **kwargs,
         )
 
-
-async def generate_ai_response(
-    conversation_context: list,
-    customer_info: dict | None = None,
-    knowledge_context: str = "",
-    company_id: str | None = None,
-    db=None,
-    long_term_summary: str = "",
-    historical_sentiment: str = "",
-    actor_user_id: str = "",
-    **kwargs,
-):
-    if _prefer_local_impl():
-        return await _local_generate_ai_response(
-            conversation_context,
-            customer_info=customer_info,
-            knowledge_context=knowledge_context,
-            company_id=company_id,
-            db=db,
-            long_term_summary=long_term_summary,
-            historical_sentiment=historical_sentiment,
-            actor_user_id=actor_user_id,
-            **kwargs,
-        )
-    try:
-        latest_message = kwargs.get("message") or latest_customer_message(conversation_context)
-        response = await _call_remote_ai(
-            "POST",
-            "/api/ai/respond",
-            company_id=company_id or (customer_info or {}).get("company_id", ""),
-            user_id=actor_user_id,
-            json_body={
-                "message": latest_message,
-                "company_id": company_id or (customer_info or {}).get("company_id", ""),
-                "conversation_context": conversation_context,
-                "customer": customer_info or {},
-                "knowledge_context": knowledge_context,
-                "long_term_summary": long_term_summary,
-                "historical_sentiment": historical_sentiment,
-                "actor_user_id": actor_user_id,
-                "conversation_id": kwargs.get("conversation_id", ""),
-                "channel": kwargs.get("channel", "web_chat"),
-                "system_prompt": kwargs.get("system_prompt", ""),
-                "extra_context": kwargs.get("extra_context", ""),
-                "company_info": kwargs.get("company_info") or {},
-                "context_package": kwargs.get("context_package") or {},
-            },
-        )
-        return {
-            "response": response.get("reply", ""),
-            "attachments": response.get("attachments", []),
-            "product_images": response.get("product_images", []),
-            "product_ids": response.get("product_ids", []),
-            "provider": response.get("engine", "").split(":", 1)[0] if response.get("engine") else "",
-            "model_name": response.get("engine", "").split(":", 1)[1] if ":" in response.get("engine", "") else "",
-            "confidence": float(response.get("confidence", 0.9) or 0.0),
-            "llm_id": str(response.get("llm_id", "") or ""),
-            "agent_id": str(response.get("agent_id", "") or ""),
-            "agent_type": str(response.get("agent_type", "") or ""),
-            "conversation_stage": str(response.get("conversation_stage", "") or ""),
-            "next_action": str(response.get("next_action", "") or ""),
-            "intent_shift": bool(response.get("intent_shift")),
-            "conversation_sentiment": dict(response.get("conversation_sentiment") or {}),
-        }
-    except Exception as exc:
-        logger.warning(
-            "ai_service response remote failed company_id=%s error=%s",
-            company_id or (customer_info or {}).get("company_id", ""),
-            exc.__class__.__name__,
-        )
-        return await _local_generate_ai_response(
-            conversation_context,
-            customer_info=customer_info,
-            knowledge_context=knowledge_context,
-            company_id=company_id,
-            db=db,
-            long_term_summary=long_term_summary,
-            historical_sentiment=historical_sentiment,
-            actor_user_id=actor_user_id,
-            **kwargs,
-        )
 
 
 async def generate_combined_ai_analysis(
@@ -820,7 +738,6 @@ __all__ = [
     "call_with_engines",
     "classify_intent",
     "engine_supports_vision",
-    "generate_ai_response",
     "generate_combined_ai_analysis",
     "generate_daily_ai_summary",
     "generate_embedding",

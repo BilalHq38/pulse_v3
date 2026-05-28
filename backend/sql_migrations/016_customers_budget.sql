@@ -1,0 +1,3 @@
+-- Add budget fields to customers
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS total_spent NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS order_count INTEGER NOT NULL DEFAULT 0;

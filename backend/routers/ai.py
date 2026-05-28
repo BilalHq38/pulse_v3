@@ -1,8 +1,10 @@
 """routers/ai.py — AI, MCP, Social endpoints using PostgreSQL."""
 
+import json
 import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from services.ai_service.facade import (
     analyze_sentiment,
     build_sentiment_gate,
@@ -12,6 +14,7 @@ from services.ai_service.facade import (
 )
 from services.ai_service.model_catalog import GEMINI_PROVIDER_KEYS, validate_model_selection
 from services.ai_service.response_generator import clear_engine_cache
+from services.conversation_engine import TurnRequest, run_turn as engine_run_turn
 from core.utils import make_id, now_ts, normalize_reference_key
 from services.db_helpers import (
     enrich_llm_engine,
@@ -946,3 +949,137 @@ async def delete_webhook_handler(handler_id: str, request: Request):
     if res == "DELETE 0":
         raise HTTPException(404, "Webhook handler not found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Wave 3 — conversation engine endpoints.
+# ---------------------------------------------------------------------------
+
+
+class AiChatRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=120)
+    user_message: str = Field(..., min_length=1, max_length=4000)
+    customer_id: str = Field(default="", max_length=120)
+    mode: str = Field(default="reactive", pattern=r"^(reactive|proactive)$")
+
+
+@router.post("/ai/chat")
+async def ai_chat(payload: AiChatRequest, request: Request):
+    """Primary entry point for the new conversation engine."""
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    turn_request = TurnRequest(
+        session_id=payload.session_id,
+        company_id=company_id,
+        user_message=payload.user_message,
+        customer_id=payload.customer_id,
+        mode=payload.mode,  # type: ignore[arg-type]
+    )
+    result = await engine_run_turn(db, turn_request)
+    return {
+        "answer": result.answer,
+        "session_id": result.session_id,
+        "turn_id": result.turn_id,
+        "sources_used": list(result.sources_used),
+        "product_links": [{"product_id": pl.product_id, "url": pl.url} for pl in result.product_links],
+        "tokens_used": {
+            "prompt": result.tokens_used.prompt,
+            "completion": result.tokens_used.completion,
+            "total": result.tokens_used.total,
+        },
+        "active_template": result.active_template,
+        "confidence": result.confidence,
+        "error": result.error or None,
+    }
+
+
+@router.get("/ai/sessions/{session_id}/turns")
+async def list_ai_turns(session_id: str, request: Request, limit: int = Query(default=50, ge=1, le=200)):
+    """Inbox / debug view of the conversation engine turn log for a session."""
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    rows = await db.fetch(
+        "SELECT id, turn_index, user_message, ai_response, sources_used, product_links, "
+        " confidence, active_template, token_usage, mode, created_at "
+        "FROM ai_conversation_turns WHERE company_id = $1 AND session_id = $2 "
+        "ORDER BY turn_index ASC LIMIT $3",
+        company_id,
+        session_id,
+        limit,
+    )
+    out: list[dict] = []
+    for row in rows or []:
+        record = dict(row)
+        # JSONB columns come back as strings or dicts depending on the driver
+        # config; normalise to Python objects for the API response.
+        for jsonb_field in ("sources_used", "product_links", "token_usage"):
+            value = record.get(jsonb_field)
+            if isinstance(value, str):
+                try:
+                    record[jsonb_field] = json.loads(value)
+                except json.JSONDecodeError:
+                    record[jsonb_field] = []
+        out.append(record)
+    return rs(out)
+
+
+@router.get("/ai/templates")
+async def list_response_templates(request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    # Self-heal: companies that pre-date the conversation engine, or that were
+    # created between startups, won't have the default templates yet. Seed them
+    # idempotently before returning the list so the Response Style page never
+    # renders empty on first hit.
+    from services.conversation_engine_bootstrap import ensure_company_response_templates
+
+    try:
+        await ensure_company_response_templates(db, company_id)
+    except Exception:
+        pass  # Seeding failure must never block the list response
+    return rs(
+        await db.fetch(
+            "SELECT id, name, style_prompt, is_default, created_at, updated_at "
+            "FROM response_templates WHERE company_id = $1 ORDER BY is_default DESC, name ASC",
+            company_id,
+        )
+    )
+
+
+@router.post("/ai/templates/{template_id}/set-default")
+async def set_default_response_template(template_id: str, request: Request):
+    db = _db(request)
+    cu = await require_roles(request, ["admin", "super_admin"])
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    target = await db.fetchrow(
+        "SELECT id FROM response_templates WHERE id = $1 AND company_id = $2",
+        template_id,
+        company_id,
+    )
+    if not target:
+        raise HTTPException(404, "template_not_found")
+    # Flip the default in a single transaction so the uq_response_templates_one_default
+    # partial index is never violated mid-update.
+    async with db.transaction():
+        await db.execute(
+            "UPDATE response_templates SET is_default = FALSE, updated_at = NOW() "
+            "WHERE company_id = $1 AND id <> $2 AND is_default = TRUE",
+            company_id,
+            template_id,
+        )
+        await db.execute(
+            "UPDATE response_templates SET is_default = TRUE, updated_at = NOW() WHERE id = $1",
+            template_id,
+        )
+    return {"ok": True, "id": template_id}

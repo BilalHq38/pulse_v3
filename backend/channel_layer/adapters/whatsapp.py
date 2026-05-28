@@ -162,6 +162,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
         ).strip()
         attachments = [
             {
+                "type": att.type,
                 "url": att.url,
                 "data_url": att.data_url,
                 "mime_type": att.mime_type,

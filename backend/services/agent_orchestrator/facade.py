@@ -24,11 +24,12 @@ from shared.config import (
 from shared.service_client import ServiceClient, build_internal_headers
 from services.ai_service.facade import (
     build_sentiment_gate,
-    generate_combined_ai_analysis,
     generate_lead_score,
     get_company_knowledge,
     should_auto_escalate,
 )
+from services.ai_service.routing_guards import lightweight_route_message
+from services.ai_service.sentiment import analyze_local_sentiment
 from agent_orchestrator.repository import fetch_company_ai_threshold
 
 logger = logging.getLogger(__name__)
@@ -225,27 +226,30 @@ async def _message_workflow_fallback(
     *,
     db,
 ) -> WorkflowResponse:
-    combined = await generate_combined_ai_analysis(
-        customer_message=payload.message_text,
-        conversation_context=payload.conversation_context,
-        customer_info=payload.customer,
-        company_id=payload.company_id,
-        db=db,
-        knowledge_context=payload.knowledge_context,
-        conversation_id=payload.conversation_id,
-        message_id=payload.message_id,
-        actor_user_id=payload.actor_user_id,
-        channel=payload.channel,
-        source=payload.source,
-        metadata=payload.metadata,
-        lead=payload.lead,
-    )
-    sentiment = dict(combined.get("sentiment") or {})
-    conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
-    intent = dict(combined.get("intent") or {})
+    # Rule-based classifiers only — no LLM call, no budget consumed.
+    # The Conversation Engine provides the customer-facing reply.
+    sentiment = analyze_local_sentiment(payload.message_text)
+    conversation_sentiment = dict(sentiment)
+    lightweight = lightweight_route_message(payload.message_text)
+    if lightweight:
+        intent = {
+            "intent": str(lightweight.get("intent") or "general_question"),
+            "confidence": float(lightweight.get("confidence") or 0.35),
+            "entities": {},
+            "urgency": "low",
+            "source": "rule",
+        }
+    else:
+        intent = {
+            "intent": "general_question",
+            "confidence": 0.35,
+            "entities": {},
+            "urgency": "low",
+            "source": "rule",
+        }
     sentiment_gate = build_sentiment_gate(payload.message_text, sentiment)
     threshold = await fetch_company_ai_threshold(db, payload.company_id)
-    support = dict(combined.get("ai_response") or {})
+    support = {}
     lead_candidate = {
         "company_id": payload.company_id,
         "name": str((payload.customer or {}).get("name") or payload.sender_name or ""),
@@ -308,8 +312,8 @@ async def _message_workflow_fallback(
                 "conversation_sentiment": conversation_sentiment,
                 "intent": intent,
                 "sentiment_gate": sentiment_gate,
-                "qualification_hint": dict(combined.get("qualification_hint") or {}),
-                "interaction_summary": dict(combined.get("interaction_summary") or {}),
+                "qualification_hint": {},
+                "interaction_summary": {},
             },
             qualification={
                 "score": int(qualification.get("score", 0) or 0),

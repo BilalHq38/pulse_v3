@@ -1,12 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { MessageCircle, X, Send, Loader2 } from 'lucide-react';
-import { BACKEND_BASE_URL } from '@/lib/backend-url';
+import { BACKEND_BASE_URL, resolveMediaUrl } from '@/lib/backend-url';
 import './ChatWidget.css';
 
 const STORAGE_KEY = 'pulse_widget_session';
 const HISTORY_KEY = 'pulse_widget_history';
 const MAX_HISTORY = 50;
+
+const WELCOME_MESSAGES = [
+  (name) => `Hi${name ? ` ${name}` : ''}! Welcome — feel free to ask me anything.`,
+  (name) => `Hello${name ? ` ${name}` : ''}! What can I help you with today?`,
+  (name) => `Hey${name ? ` ${name}` : ''}! Great to have you here. What brings you in?`,
+  (name) => `Hi${name ? ` ${name}` : ''}! Ask me anything about our products or services.`,
+  (name) => `Welcome${name ? `, ${name}` : ''}! Let me know what you're looking for.`,
+  (name) => `Hello${name ? ` ${name}` : ''}! I'm here if you have any questions.`,
+];
+
+function pickWelcomeMessage(senderName) {
+  const first = senderName ? senderName.split(' ')[0] : '';
+  const idx = Math.floor(Math.random() * WELCOME_MESSAGES.length);
+  return WELCOME_MESSAGES[idx](first);
+}
 
 function loadSession() {
   try {
@@ -39,6 +54,14 @@ function loadHistory() {
       .map((m) => ({ ...m, ts: m.ts ? new Date(m.ts) : new Date() }));
   } catch {
     return [];
+  }
+}
+
+function safeParseJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
   }
 }
 
@@ -111,7 +134,7 @@ export default function ChatWidget({
         {
           id: genId(),
           role: 'assistant',
-          text: `Hi ${senderName ? senderName.split(' ')[0] : 'there'}! How can we help today?`,
+          text: pickWelcomeMessage(senderName),
           ts: new Date(),
         },
       ]);
@@ -161,10 +184,56 @@ export default function ChatWidget({
           data.message ||
           (Array.isArray(data.messages) ? data.messages.find((m) => m.sender_type === 'ai')?.content : '');
 
+        // The engine path exposes product_links on the ai_message metadata or
+        // at the top level of the webhook response (legacy path leaves both
+        // empty). We surface them as small "View product" cards under the
+        // bubble so customers can jump straight to the product page.
+        const aiMessage = data.ai_message || {};
+        const rawMetadata = aiMessage.raw_metadata
+          ? (typeof aiMessage.raw_metadata === 'string'
+              ? safeParseJson(aiMessage.raw_metadata)
+              : aiMessage.raw_metadata)
+          : {};
+        const productLinks = Array.isArray(data.product_links)
+          ? data.product_links
+          : (Array.isArray(rawMetadata?.product_links) ? rawMetadata.product_links : []);
+        const companyLink = String(data.company_link || '').trim();
+        const productImageUrls = Array.isArray(data.product_image_urls) ? data.product_image_urls : (
+          // Fallback: extract image_url from product_links if product_image_urls is absent
+          Array.isArray(data.product_links)
+            ? data.product_links.map((pl) => pl.image_url).filter(Boolean)
+            : []
+        );
+
+        // Add image messages FIRST, then the text message.
+        if (productImageUrls.length > 0) {
+          const imgProductLinks = Array.isArray(data.product_links) ? data.product_links : [];
+          setMessages((prev) => [
+            ...prev,
+            ...productImageUrls.map((url, idx) => {
+              const name = (imgProductLinks[idx] || {}).name || '';
+              return {
+                id: genId(),
+                role: 'assistant',
+                imageUrl: String(url),
+                imageCaption: name ? `Here's an image of ${name}:` : 'Here\'s the product image:',
+                ts: new Date(),
+              };
+            }),
+          ]);
+        }
+
         if (aiReply) {
           setMessages((prev) => [
             ...prev,
-            { id: genId(), role: 'assistant', text: String(aiReply), ts: new Date() },
+            {
+              id: genId(),
+              role: 'assistant',
+              text: String(aiReply),
+              productLinks,
+              companyLink,
+              ts: new Date(),
+            },
           ]);
         } else if (data?.status === 'received' || data?.status === 'ok') {
           setMessages((prev) => [
@@ -230,7 +299,71 @@ export default function ChatWidget({
           <div className="pulse-widget-messages" ref={listRef}>
             {messages.map((m) => (
               <div key={m.id} className={`pulse-widget-msg pulse-widget-msg-${m.role}`}>
-                <div className="pulse-widget-bubble">{m.text}</div>
+                {m.role === 'assistant' && m.imageUrl ? (
+                  <div className="pulse-widget-image-block">
+                    {m.imageCaption ? (
+                      <div className="pulse-widget-bubble pulse-widget-image-caption">{m.imageCaption}</div>
+                    ) : null}
+                    <img
+                      src={resolveMediaUrl(m.imageUrl)}
+                      alt="Product"
+                      className="pulse-widget-chat-image"
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                        const fb = e.currentTarget.nextSibling;
+                        if (fb) fb.style.display = 'block';
+                      }}
+                    />
+                    <div className="pulse-widget-bubble" style={{ display: 'none', marginTop: '4px' }}>
+                      {m.imageCaption || 'Product image'}
+                    </div>
+                  </div>
+                ) : null}
+                {m.role === 'assistant' && !m.imageUrl && Array.isArray(m.productLinks) && m.productLinks.length > 0 ? (
+                  <div className="pulse-widget-product-cards" data-testid="widget-product-links">
+                    {m.productLinks.map((link, idx) => {
+                      const imgSrc = link.image_url ? resolveMediaUrl(link.image_url) : '';
+                      // Resolve relative paths (e.g. /c/company/product/slug) to
+                      // absolute using the current page origin so the link always works.
+                      let href = String(link.url || '').trim();
+                      if (href && href.startsWith('/')) {
+                        href = `${window.location.origin}${href}`;
+                      }
+                      const CardTag = href ? 'a' : 'div';
+                      const cardProps = href
+                        ? { href, target: '_blank', rel: 'noopener noreferrer' }
+                        : {};
+                      return (
+                        <CardTag
+                          key={`${link.product_id || idx}-${idx}`}
+                          {...cardProps}
+                          className="pulse-widget-product-card"
+                        >
+                          {imgSrc ? (
+                            <img
+                              src={imgSrc}
+                              alt={link.name || 'Product'}
+                              className="pulse-widget-product-card-img"
+                            />
+                          ) : (
+                            <div className="pulse-widget-product-card-img pulse-widget-product-card-img-placeholder" />
+                          )}
+                          <span className="pulse-widget-product-card-name">
+                            {link.name || 'View product'}
+                          </span>
+                        </CardTag>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {!m.imageUrl ? <div className="pulse-widget-bubble">{m.text}</div> : null}
+                {!m.imageUrl && m.role === 'assistant' && m.companyLink ? (
+                  <div className="pulse-widget-company-link">
+                    <a href={m.companyLink} target="_blank" rel="noopener noreferrer">
+                      Explore more on our website
+                    </a>
+                  </div>
+                ) : null}
                 <div className="pulse-widget-ts">{formatTime(m.ts)}</div>
               </div>
             ))}

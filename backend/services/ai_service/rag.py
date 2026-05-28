@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -317,9 +318,12 @@ async def _load_product_catalog(
     tags_select = "tags" if "tags" in product_columns else "NULL::jsonb AS tags"
     sku_select = "sku" if "sku" in product_columns else "''::text AS sku"
     stock_select = "stock_quantity" if "stock_quantity" in product_columns else "0::integer AS stock_quantity"
+    slug_select = "slug" if "slug" in product_columns else "''::text AS slug"
+    links_select = "links" if "links" in product_columns else "''::text AS links"
     rows = await db.fetch(
         "SELECT id, company_id, name, product_title, description, category, product_type, "
-        f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, created_at, updated_at "
+        f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, "
+        f"       {slug_select}, {links_select}, created_at, updated_at "
         "FROM company_products "
         "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
         "  AND ($3='' OR ($3='service' AND LOWER(COALESCE(product_type,'')) IN ('service','services')) "
@@ -617,14 +621,29 @@ async def rank_products_for_query(
         if not vector_rows and query_info["specific"]:
             increment_counter("ai.ranking.embedding_seeded")
             if has_embedding_budget_remaining():
-                await _ensure_product_embeddings(db, company_id, products)
-                vector_rows = await search_similar_embeddings(
-                    db,
-                    company_id,
-                    query,
-                    source_type="company_product",
-                    top_k=max(limit * 4, 12),
-                )
+                try:
+                    # Cap embedding seeding so a slow/unavailable embedding API
+                    # does not block the keyword-fallback scoring path.
+                    await asyncio.wait_for(
+                        _ensure_product_embeddings(db, company_id, products),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "embedding_seed_timeout company_id=%s reason=exceeded_1s_budget", company_id
+                    )
+                except Exception as _seed_exc:
+                    logger.debug("embedding_seed_error company_id=%s error=%s", company_id, _seed_exc)
+                try:
+                    vector_rows = await search_similar_embeddings(
+                        db,
+                        company_id,
+                        query,
+                        source_type="company_product",
+                        top_k=max(limit * 4, 12),
+                    )
+                except Exception:
+                    vector_rows = []
         if not vector_rows:
             logger.info(
                 "embedding_fallback_catalog_keyword_match_used company_id=%s conversation_id=%s query_specific=%s query_general=%s product_count=%s",

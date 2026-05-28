@@ -13,8 +13,8 @@ from agent_orchestrator.repository import (
 from agent_orchestrator.schemas import AgentName, AgentRunResult, WorkflowKind
 from services.ai_service.facade import (
     build_sentiment_gate,
-    generate_combined_ai_analysis,
 )
+from services.ai_service.routing_guards import is_low_value_message, lightweight_route_message
 from services.ai_service.sentiment import analyze_local_sentiment
 
 logger = logging.getLogger(__name__)
@@ -128,50 +128,65 @@ class CaptureAgent(BaseAgent):
                 },
             )
 
-        combined = await generate_combined_ai_analysis(
-            customer_message=message_text,
-            conversation_context=conversation_history,
-            customer_info=customer,
-            company_id=context.company_id,
-            db=context.db,
-            knowledge_context=str(getattr(request, "knowledge_context", "") or ""),
-            conversation_id=getattr(request, "conversation_id", ""),
-            message_id=getattr(request, "message_id", ""),
-            actor_user_id=str(getattr(request, "actor_user_id", "") or ""),
-            channel=str(getattr(request, "channel", "") or ""),
-            source=str(getattr(request, "source", "") or ""),
-            metadata=dict(getattr(request, "metadata", {}) or {}),
-            lead=lead,
-        )
-        sentiment = dict(combined.get("sentiment") or {})
-        intent = dict(combined.get("intent") or {})
-        conversation_sentiment = dict(combined.get("conversation_sentiment") or {})
-        qualification_hint = dict(combined.get("qualification_hint") or {})
+        # Pure rule-based classifiers — zero LLM calls, zero budget consumed.
+        # The Conversation Engine generates all customer-facing replies;
+        # intent here is only metadata for qualification/analytics.
+        sentiment = analyze_local_sentiment(message_text)
+        lightweight = lightweight_route_message(message_text)
+        if lightweight:
+            intent = {
+                "intent": str(lightweight.get("intent") or "general_question"),
+                "confidence": float(lightweight.get("confidence") or 0.35),
+                "entities": {},
+                "urgency": "high" if any(t in message_text.lower() for t in ("urgent", "asap", "legal")) else "low",
+                "source": "rule",
+            }
+        else:
+            lower = message_text.lower()
+            if any(t in lower for t in ("hi", "hello", "hey", "salam")):
+                intent_name, confidence = "greeting", 0.7
+            elif any(t in lower for t in ("price", "cost", "how much")):
+                intent_name, confidence = "pricing_question", 0.6
+            elif any(t in lower for t in ("buy", "purchase", "order")):
+                intent_name, confidence = "buying_intent", 0.6
+            elif any(t in lower for t in ("return", "refund", "cancel")):
+                intent_name, confidence = "refund", 0.6
+            elif any(t in lower for t in ("product", "available", "stock")):
+                intent_name, confidence = "product_catalog_question", 0.5
+            elif is_low_value_message(message_text):
+                intent_name, confidence = "general_question", 0.3
+            else:
+                intent_name, confidence = "general_question", 0.35
+            intent = {
+                "intent": intent_name,
+                "confidence": confidence,
+                "entities": {},
+                "urgency": "high" if any(t in lower for t in ("urgent", "asap", "legal")) else "low",
+                "source": "rule",
+            }
+        conversation_sentiment = dict(sentiment)
         sentiment_gate = build_sentiment_gate(message_text, sentiment)
         context.global_memory.shared_context["latest_intent"] = str(intent.get("intent") or "")
-        prefetched_support_response = dict(combined.get("ai_response") or {})
-        if prefetched_support_response.get("response"):
-            logger.info(
-                "capture_prefetched_response_available workflow_id=%s message_id=%s conversation_id=%s company_id=%s provider=%s model=%s",
-                context.workflow_id,
-                str(getattr(request, "message_id", "") or ""),
-                str(getattr(request, "conversation_id", "") or ""),
-                context.company_id,
-                str(prefetched_support_response.get("provider") or ""),
-                str(prefetched_support_response.get("model_name") or ""),
-            )
+        logger.info(
+            "capture_local_classify workflow_id=%s message_id=%s conversation_id=%s company_id=%s intent=%s",
+            context.workflow_id,
+            str(getattr(request, "message_id", "") or ""),
+            str(getattr(request, "conversation_id", "") or ""),
+            context.company_id,
+            intent.get("intent", ""),
+        )
         payload = {
             "structured_event": structured_event,
             "sentiment": sentiment,
             "conversation_sentiment": conversation_sentiment,
             "intent": intent,
             "sentiment_gate": sentiment_gate,
-            "prefetched_support_response": prefetched_support_response,
+            "prefetched_support_response": {},
             "customer": customer,
             "lead": lead,
-            "qualification_hint": qualification_hint,
-            "interaction_summary": dict(combined.get("interaction_summary") or {}),
-            "rag_called": bool(prefetched_support_response.get("rag_called")),
+            "qualification_hint": {},
+            "interaction_summary": {},
+            "rag_called": False,
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
 

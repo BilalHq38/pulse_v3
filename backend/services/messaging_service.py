@@ -133,6 +133,10 @@ def _outbound_media_caption_selection(
     manual_text = str(message_text or "").strip()
     if manual_text and context_source == "manual":
         return manual_text[:900].strip(), "manual"
+    # For AI-generated responses the assistant's own reply is more informative than
+    # a bare product-catalog label, so prefer it as the WhatsApp caption.
+    if manual_text and context_source == "ai":
+        return manual_text[:900].strip(), "ai"
     explicit_caption = str(metadata.get("caption") or "").strip()
     if explicit_caption:
         selected_source = "ai" if context_source == "ai" else "product" if context_source == "product" else context_source
@@ -548,20 +552,27 @@ async def _send_via_bridge(
         return False, error, ""
     try:
         first_attachment = attachments[0] if attachments and isinstance(attachments[0], dict) else {}
-        outbound_text = _whatsapp_send_text_for_attachments(
-            message_text,
-            attachments,
-            idempotency_key=idempotency_key,
-            conversation_id=conversation_id,
-            db_message_id=db_message_id,
-            channel_provider="qr",
-            log_selection=True,
-        )
-        _, outbound_caption_source = _outbound_media_caption_selection(
-            message_text,
-            first_attachment,
-            idempotency_key=idempotency_key,
-        )
+        is_ai_response = str(idempotency_key or "").startswith("ai:")
+        if attachments and is_ai_response and str(message_text or "").strip():
+            # For AI-generated responses with images, send the AI text as the WhatsApp
+            # caption so the customer reads the full AI reply, not just the product name.
+            outbound_text = str(message_text).strip()
+            outbound_caption_source = "manual"
+        else:
+            outbound_text = _whatsapp_send_text_for_attachments(
+                message_text,
+                attachments,
+                idempotency_key=idempotency_key,
+                conversation_id=conversation_id,
+                db_message_id=db_message_id,
+                channel_provider="qr",
+                log_selection=True,
+            )
+            _, outbound_caption_source = _outbound_media_caption_selection(
+                message_text,
+                first_attachment,
+                idempotency_key=idempotency_key,
+            )
         resp = await _HTTP_CLIENT.post(
             f"{_BRIDGE_URL}/send",
             json={
@@ -575,6 +586,29 @@ async def _send_via_bridge(
             headers=_bridge_headers(company_id=company_id, user_id=user_id),
             timeout=whatsapp_bridge_send_timeout_seconds(),
         )
+        # If the bridge rejected the attachment (e.g. could not fetch/convert the
+        # image), fall back to sending the text alone so the customer at least
+        # receives the AI's reply.
+        if resp.status_code == 400 and attachments:
+            logger.warning(
+                "whatsapp_bridge_attachment_rejected_text_fallback company_id=%s conversation_id=%s message_id=%s",
+                company_id,
+                conversation_id,
+                db_message_id,
+            )
+            fallback_text = str(message_text or outbound_text or "").strip()
+            resp = await _HTTP_CLIENT.post(
+                f"{_BRIDGE_URL}/send",
+                json={
+                    "to": phone,
+                    "message": fallback_text,
+                    "attachments": [],
+                    "conversation_id": conversation_id,
+                    "message_id": db_message_id,
+                },
+                headers=_bridge_headers(company_id=company_id, user_id=user_id),
+                timeout=whatsapp_bridge_send_timeout_seconds(),
+            )
         data = {}
         if resp.content:
             try:
@@ -803,7 +837,10 @@ async def _send_via_meta(
         attachment = attachments[0] or {}
         link = str(attachment.get("url") or attachment.get("data_url") or "").strip()
         media_type = _infer_media_type(attachment)
-        if link and media_type == "image":
+        # Meta Cloud API requires a publicly accessible URL; skip image sending for
+        # relative/local paths which Meta's servers cannot reach.
+        is_public_url = link.startswith(("http://", "https://"))
+        if link and media_type == "image" and is_public_url:
             caption = _product_media_caption(
                 message_text,
                 attachment,
@@ -919,7 +956,12 @@ async def _send_via_tenant_meta(
                     return False, "Meta media upload failed", ""
                 media_ref = {"id": media_id}
             elif attachment.get("url"):
-                media_ref = {"link": str(attachment["url"]).strip()}
+                raw_url = str(attachment["url"]).strip()
+                # Meta's servers must be able to download the URL; skip local/relative paths.
+                if raw_url.startswith(("http://", "https://")):
+                    media_ref = {"link": raw_url}
+                else:
+                    media_ref = {}
             else:
                 media_ref = {}
             if media_ref:

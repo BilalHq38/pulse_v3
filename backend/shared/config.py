@@ -61,6 +61,7 @@ PUBLIC_GATEWAY_PREFIXES = (
     "/api/webhook/meta/",
     "/api/webhooks/web-chat",
     "/api/webhooks/external/purchases",
+    "/api/public/companies/",
     "/api/products/media/",
     "/api/company-data/products/media/",
     "/api/settings/company/logo/media/",
@@ -673,6 +674,16 @@ def background_queue_consumer_prefix(default: str = "worker") -> str:
 
 def internal_service_secret() -> str:
     return os.environ.get("INTERNAL_SERVICE_SECRET", "").strip()
+
+
+def backend_public_url() -> str:
+    """Public-facing base URL of the API gateway.
+
+    Used to build absolute media URLs that external services (WhatsApp, Meta)
+    can download.  In production set BACKEND_PUBLIC_URL to the real domain.
+    Defaults to http://localhost:8000 for local development.
+    """
+    return os.environ.get("BACKEND_PUBLIC_URL", "http://localhost:8000").rstrip("/")
 
 
 def frontend_url() -> str:

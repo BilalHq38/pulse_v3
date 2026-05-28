@@ -5,6 +5,10 @@ x-common-env: &common-env
   PGSSLMODE: ${POSTGRES_SSLMODE:-disable}
   # Browser URL for Stripe return URLs and OAuth redirects when Origin is missing (e.g. GET callbacks).
   FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+  # Public-facing API gateway URL — used to build absolute product image URLs
+  # for outbound channels (WhatsApp/Meta require a publicly accessible URL).
+  # Change to your real domain in production.
+  BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL:-http://localhost:8000}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   CACHE_REDIS_URL: ${CACHE_REDIS_URL:-redis://redis:6379/1}
   RATE_LIMIT_REDIS_URL: ${RATE_LIMIT_REDIS_URL:-redis://redis:6379/2}
@@ -208,6 +212,13 @@ services:
       SERVICE_NAME: customer-service
       PORT: 8003
       DB_SCHEMA: customer_service
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
+      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
+      GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
       postgres:
         condition: service_healthy
@@ -224,6 +235,7 @@ services:
       - "8003"
     volumes:
       - uploads-data:/app/uploads
+      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
 
   lead:
     <<: *service-defaults
@@ -497,6 +509,13 @@ services:
       PORT: 8000
       GATEWAY_RATE_LIMIT_REQUESTS: ${GATEWAY_RATE_LIMIT_REQUESTS:-120}
       GATEWAY_RATE_LIMIT_WINDOW_SECONDS: ${GATEWAY_RATE_LIMIT_WINDOW_SECONDS:-60}
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
+      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
+      GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
       auth:
         condition: service_healthy
@@ -524,6 +543,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).read()\""]
       interval: 15s

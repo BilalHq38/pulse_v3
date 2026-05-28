@@ -36,23 +36,10 @@ def _sentiment_label(score: float | int | None) -> str:
 
 def _summary_dedupe_key(item: dict) -> tuple[str, ...]:
     entity_type = str(item.get("entity_type") or "").strip().lower()
-    date = str(item.get("date") or item.get("summary_date") or "")[:10].strip()
     if entity_type == "customer":
-        return (
-            "customer",
-            str(item.get("customer_id") or "").strip(),
-            str(item.get("conversation_id") or "").strip(),
-            date,
-        )
+        return ("customer", str(item.get("customer_id") or "").strip())
     if entity_type == "lead":
-        return (
-            "lead",
-            str(item.get("lead_id") or "").strip(),
-            date,
-            str(item.get("activity_type") or item.get("type") or "").strip().lower(),
-            str(item.get("stage") or item.get("status") or "").strip().lower(),
-            str(item.get("content") or item.get("summary_text") or "").strip(),
-        )
+        return ("lead", str(item.get("lead_id") or "").strip())
     return (str(item.get("id") or ""),)
 
 
@@ -85,11 +72,16 @@ async def analytics_overview(request: Request):
         _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
     )
     open_conversations = await db.fetchval("SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND status='open'", cid)
-    total_leads = await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1", cid)
-    hot_leads = await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot'", cid)
-    total_customers = await db.fetchval(
-        "SELECT COUNT(*) FROM customers WHERE company_id=$1 AND lifecycle_stage='customer'", cid
+    # Only count active (unconverted) leads — converted leads are now customers.
+    total_leads = await db.fetchval(
+        "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND status != 'converted'", cid
     )
+    hot_leads = await db.fetchval(
+        "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot' AND status != 'converted'", cid
+    )
+    # Count all customers — lifecycle_stage='customer' was unreliable for web_chat
+    # visitors so the old filter caused severe under-counting.
+    total_customers = await db.fetchval("SELECT COUNT(*) FROM customers WHERE company_id=$1", cid)
     total_products = await db.fetchval("SELECT COUNT(*) FROM company_products WHERE company_id=$1", cid)
     total_tickets = await db.fetchval("SELECT COUNT(*) FROM tickets WHERE company_id=$1", cid)
     open_tickets = await db.fetchval("SELECT COUNT(*) FROM tickets WHERE company_id=$1 AND status='open'", cid)
@@ -300,17 +292,13 @@ async def analytics_customer_summaries(
         customer_rows = rs(
             await db.fetch(
                 """
-                SELECT *
-                FROM (
-                  SELECT DISTINCT ON (cis.customer_id, cis.conversation_id, cis.summary_date) cis.*
-                  FROM customer_interaction_summaries cis
-                  JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
-                  WHERE cis.company_id=$1
-                    AND cis.summary_date=$2
-                    AND c.lifecycle_stage='customer'
-                  ORDER BY cis.customer_id, cis.conversation_id, cis.summary_date, cis.created_at DESC
-                ) deduped
-                ORDER BY created_at DESC
+                SELECT DISTINCT ON (cis.customer_id) cis.*
+                FROM customer_interaction_summaries cis
+                JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
+                WHERE cis.company_id=$1
+                  AND cis.summary_date=$2
+                  AND c.lifecycle_stage='customer'
+                ORDER BY cis.customer_id, cis.created_at DESC
                 LIMIT $3
                 """,
                 cid,
@@ -321,38 +309,29 @@ async def analytics_customer_summaries(
         lead_rows = rs(
             await db.fetch(
                 """
-                SELECT *
-                FROM (
-                  SELECT DISTINCT ON (la.lead_id, la.type, la.stage, la.content, la.created_at::date)
-                    la.id,
-                    la.company_id,
-                    la.lead_id,
-                    l.name AS lead_name,
-                    la.created_at::date AS summary_date,
-                    la.created_at,
-                    la.content,
-                    la.type,
-                    la.stage,
-                    l.status,
-                    l.grade,
-                    l.score
-                  FROM lead_activities la
-                  JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
-                  WHERE la.company_id=$1 AND la.created_at::date=$2
-                    AND NOT EXISTS (
-                      SELECT 1
-                      FROM customers c2
-                      JOIN customer_interaction_summaries cis2
-                        ON cis2.company_id=c2.company_id
-                       AND cis2.customer_id=c2.id
-                       AND cis2.summary_date=la.created_at::date
-                      WHERE c2.company_id=l.company_id
-                        AND c2.lead_id=l.id
-                        AND c2.lifecycle_stage='customer'
-                    )
-                  ORDER BY la.lead_id, la.type, la.stage, la.content, la.created_at::date, la.created_at DESC
-                ) deduped
-                ORDER BY created_at DESC
+                SELECT DISTINCT ON (la.lead_id)
+                  la.id,
+                  la.company_id,
+                  la.lead_id,
+                  l.name AS lead_name,
+                  la.created_at::date AS summary_date,
+                  la.created_at,
+                  la.content,
+                  la.type,
+                  la.stage,
+                  l.status,
+                  l.grade,
+                  l.score
+                FROM lead_activities la
+                JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
+                WHERE la.company_id=$1 AND la.created_at::date=$2
+                  AND NOT EXISTS (
+                    SELECT 1 FROM customers c2
+                    WHERE c2.company_id=l.company_id
+                      AND c2.lead_id=l.id
+                      AND c2.lifecycle_stage='customer'
+                  )
+                ORDER BY la.lead_id, la.created_at DESC
                 LIMIT $3
                 """,
                 cid,
@@ -364,16 +343,12 @@ async def analytics_customer_summaries(
         customer_rows = rs(
             await db.fetch(
                 """
-                SELECT *
-                FROM (
-                  SELECT DISTINCT ON (cis.customer_id, cis.conversation_id, cis.summary_date) cis.*
-                  FROM customer_interaction_summaries cis
-                  JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
-                  WHERE cis.company_id=$1
-                    AND c.lifecycle_stage='customer'
-                  ORDER BY cis.customer_id, cis.conversation_id, cis.summary_date, cis.created_at DESC
-                ) deduped
-                ORDER BY created_at DESC
+                SELECT DISTINCT ON (cis.customer_id) cis.*
+                FROM customer_interaction_summaries cis
+                JOIN customers c ON c.id=cis.customer_id AND c.company_id=cis.company_id
+                WHERE cis.company_id=$1
+                  AND c.lifecycle_stage='customer'
+                ORDER BY cis.customer_id, cis.created_at DESC
                 LIMIT $2
                 """,
                 cid,
@@ -383,38 +358,29 @@ async def analytics_customer_summaries(
         lead_rows = rs(
             await db.fetch(
                 """
-                SELECT *
-                FROM (
-                  SELECT DISTINCT ON (la.lead_id, la.type, la.stage, la.content, la.created_at::date)
-                    la.id,
-                    la.company_id,
-                    la.lead_id,
-                    l.name AS lead_name,
-                    la.created_at::date AS summary_date,
-                    la.created_at,
-                    la.content,
-                    la.type,
-                    la.stage,
-                    l.status,
-                    l.grade,
-                    l.score
-                  FROM lead_activities la
-                  JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
-                  WHERE la.company_id=$1
-                    AND NOT EXISTS (
-                      SELECT 1
-                      FROM customers c2
-                      JOIN customer_interaction_summaries cis2
-                        ON cis2.company_id=c2.company_id
-                       AND cis2.customer_id=c2.id
-                       AND cis2.summary_date=la.created_at::date
-                      WHERE c2.company_id=l.company_id
-                        AND c2.lead_id=l.id
-                        AND c2.lifecycle_stage='customer'
-                    )
-                  ORDER BY la.lead_id, la.type, la.stage, la.content, la.created_at::date, la.created_at DESC
-                ) deduped
-                ORDER BY created_at DESC
+                SELECT DISTINCT ON (la.lead_id)
+                  la.id,
+                  la.company_id,
+                  la.lead_id,
+                  l.name AS lead_name,
+                  la.created_at::date AS summary_date,
+                  la.created_at,
+                  la.content,
+                  la.type,
+                  la.stage,
+                  l.status,
+                  l.grade,
+                  l.score
+                FROM lead_activities la
+                JOIN leads l ON l.id=la.lead_id AND l.company_id=la.company_id
+                WHERE la.company_id=$1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM customers c2
+                    WHERE c2.company_id=l.company_id
+                      AND c2.lead_id=l.id
+                      AND c2.lifecycle_stage='customer'
+                  )
+                ORDER BY la.lead_id, la.created_at DESC
                 LIMIT $2
                 """,
                 cid,

@@ -20,14 +20,15 @@ import {
   LayoutGrid,
   List,
   Eye,
+  ExternalLink,
 } from 'lucide-react';
 
 const PRODUCT_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const MAX_PRODUCT_IMAGES = 3;
 const MAX_PRODUCT_IMAGE_SIZE_MB = 5;
 const DEFAULT_CATEGORIES = ['general','software','service','hardware','subscription','consulting','support','training','integration'];
-const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type', 'image_url'];
-const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard', 'https://example.com/product.jpg'];
+const PRODUCT_BULK_TEMPLATE_HEADERS = ['name', 'product_title', 'description', 'price', 'price_currency', 'category', 'product_type', 'links', 'stock_quantity', 'image_url'];
+const PRODUCT_BULK_TEMPLATE_SAMPLE = ['Starter Plan', 'starter-plan-2026', 'Entry-level package for new teams', '29', 'USD', 'subscription', 'standard', '', '50', 'https://example.com/product.jpg'];
 const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'name', help: 'Required product name.' },
   { column: 'product_title', help: 'Optional SKU, short code, or public title.' },
@@ -36,12 +37,14 @@ const PRODUCT_BULK_GUIDE_ROWS = [
   { column: 'price_currency', help: 'Optional currency code such as USD, EUR, or GBP. Defaults to USD.' },
   { column: 'category', help: 'Optional category such as software, service, subscription, or support.' },
   { column: 'product_type', help: 'Optional type or variant. Defaults to standard.' },
+  { column: 'links', help: 'Optional canonical product URL (http or https). Leave blank to use the auto-generated public product page.' },
+  { column: 'stock_quantity', help: 'Optional integer stock count. Leave blank if the product does not track inventory.' },
   { column: 'image_url', help: 'Optional public image URL (JPG, PNG, WEBP, GIF). Up to 3 URLs separated by |, use columns image_url_1, image_url_2, image_url_3, or embed images in XLSX rows.' },
 ];
 
 const EMPTY_FORM = {
   name: '', product_title: '', description: '', price: '', price_currency: 'USD',
-  category: 'general', product_type: '', images: [],
+  category: 'general', product_type: '', stock_quantity: '', links: '', images: [],
 };
 
 function ImageGrid({ images, onClickImage }) {
@@ -182,6 +185,8 @@ export default function ProductsPage() {
       price_currency: product.price_currency || 'USD',
       category: product.category || 'general',
       product_type: product.product_type || '',
+      stock_quantity: product.stock_quantity != null ? String(product.stock_quantity) : '',
+      links: product.link_source === 'manual' ? (product.links || '') : '',
       images: Array.isArray(product.images)
         ? product.images.slice(0, MAX_PRODUCT_IMAGES).map((url, idx) => ({
             id: `${product.id}-e${idx}`, name: `img-${idx + 1}`,
@@ -258,6 +263,8 @@ export default function ProductsPage() {
         price: (form.price || ''),
         price_currency: form.price_currency || 'USD',
         category: form.category || 'general',
+        stock_quantity: form.stock_quantity !== '' ? parseInt(form.stock_quantity, 10) : null,
+        links: (form.links || '').trim(),
         images: (form.images || []).map(img => img.dataUrl).slice(0, MAX_PRODUCT_IMAGES),
         features: [],
       };
@@ -517,6 +524,13 @@ export default function ProductsPage() {
                           className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors" title="View">
                           <Eye size={14} />
                         </button>
+                        {p.public_url && (
+                          <a href={p.public_url} target="_blank" rel="noopener noreferrer"
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 transition-colors" title="View public page"
+                            onClick={(e) => e.stopPropagation()}>
+                            <ExternalLink size={14} />
+                          </a>
+                        )}
                         <button onClick={(e) => openEdit(p, e)}
                           className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors" title="Edit">
                           <Edit size={14} />
@@ -602,6 +616,17 @@ export default function ProductsPage() {
                   {p.product_type && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200">{p.product_type}</span>}
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">{p.category}</span>
                 </div>
+                {p.public_url && (
+                  <a
+                    href={p.public_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-2 inline-flex items-center gap-1 text-[10px] text-blue-500 hover:text-blue-700 hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <ExternalLink size={9} /> View public page
+                  </a>
+                )}
               </div>
             </div>
           ))}
@@ -689,7 +714,23 @@ export default function ProductsPage() {
                       </ul>
                     </div>
                   )}
+                  {selectedProduct.stock_quantity != null && (
+                    <div className="bg-slate-50 border border-slate-100 rounded-xl p-3">
+                      <p className="text-[10px] text-slate-400 font-medium mb-0.5">Stock</p>
+                      <p className="text-sm font-semibold text-slate-700">{selectedProduct.stock_quantity} units</p>
+                    </div>
+                  )}
                 </div>
+                {selectedProduct.public_url && (
+                  <a
+                    href={selectedProduct.public_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-1 flex items-center gap-1.5 text-sm text-emerald-600 hover:text-emerald-800 font-medium"
+                  >
+                    <ExternalLink size={14} /> View Public Product Page
+                  </a>
+                )}
                 <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
                   <button
                     onClick={(e) => deleteProduct(selectedProduct, e)}
@@ -749,11 +790,23 @@ export default function ProductsPage() {
               <h3 className="text-lg font-bold text-slate-900">{editingProduct ? 'Edit Product' : 'Add Product'}</h3>
               <button onClick={resetForm} className="text-slate-400 hover:text-slate-600"><X size={20} /></button>
             </div>
-            <div className="p-6 space-y-3">
-              <input value={form.name} onChange={(e) => setForm(prev => ({ ...prev, name: e.target.value }))} placeholder="Product Name *" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
-              <input value={form.product_title} onChange={(e) => setForm(prev => ({ ...prev, product_title: e.target.value }))} placeholder="Product Code" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
-              <input value={form.product_type} onChange={(e) => setForm(prev => ({ ...prev, product_type: e.target.value }))} placeholder="Type / Variety" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
-              <textarea value={form.description} onChange={(e) => setForm(prev => ({ ...prev, description: e.target.value }))} placeholder="Describe this product — or let AI write it for you." rows={3} className="w-full px-3 py-2.5 pb-10 bg-white border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
+            <div className="p-6 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Product Name <span className="text-red-400">*</span></label>
+                <input value={form.name} onChange={(e) => setForm(prev => ({ ...prev, name: e.target.value }))} placeholder="e.g. Starter Plan" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Product Code <span className="text-slate-300">/ SKU</span></label>
+                <input value={form.product_title} onChange={(e) => setForm(prev => ({ ...prev, product_title: e.target.value }))} placeholder="e.g. SKU-001" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Type / Variant</label>
+                <input value={form.product_type} onChange={(e) => setForm(prev => ({ ...prev, product_type: e.target.value }))} placeholder="e.g. Standard, Premium, Lite" className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Description</label>
+                <textarea value={form.description} onChange={(e) => setForm(prev => ({ ...prev, description: e.target.value }))} placeholder="Describe this product — or let AI write it for you." rows={3} className="w-full px-3 py-2.5 pb-10 bg-white border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-1 focus:ring-blue-500/30" />
+              </div>
 
               {/* AI button wrapper — positioned over textarea bottom-right */}
               <div className="relative -mt-[38px] mb-[6px] flex justify-end pr-2.5 pointer-events-none">
@@ -842,62 +895,103 @@ export default function ProductsPage() {
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <div className="flex rounded-lg border border-slate-200 overflow-hidden bg-white">
-                  <input
-                    value={form.price}
-                    onChange={(e) => setForm(prev => ({ ...prev, price: e.target.value }))}
-                    placeholder="Price"
-                    className="w-[75%] px-3 py-2.5 text-sm bg-white focus:outline-none"
-                  />
-                  <div className="w-px bg-slate-200 flex-shrink-0" />
-                  <select
-                    value={form.price_currency}
-                    onChange={(e) => setForm(prev => ({ ...prev, price_currency: e.target.value }))}
-                    className="w-[25%] px-1 py-2.5 text-xs bg-slate-50 text-slate-600 focus:outline-none cursor-pointer"
-                  >
-                    {['USD','EUR','GBP','INR','JPY','CAD','AUD','AED','SGD','CHF'].map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Price</label>
+                  <div className="flex rounded-lg border border-slate-200 overflow-hidden bg-white">
+                    <input
+                      value={form.price}
+                      onChange={(e) => setForm(prev => ({ ...prev, price: e.target.value }))}
+                      placeholder="0.00"
+                      className="w-[75%] px-3 py-2.5 text-sm bg-white focus:outline-none"
+                    />
+                    <div className="w-px bg-slate-200 flex-shrink-0" />
+                    <select
+                      value={form.price_currency}
+                      onChange={(e) => setForm(prev => ({ ...prev, price_currency: e.target.value }))}
+                      className="w-[25%] px-1 py-2.5 text-xs bg-slate-50 text-slate-600 focus:outline-none cursor-pointer"
+                    >
+                      {['USD','EUR','GBP','INR','JPY','CAD','AUD','AED','SGD','CHF'].map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
                 </div>
-                <div className="space-y-1.5">
-                  <select
-                    value={allCategories.includes(form.category) ? form.category : (customCategories.includes(form.category) ? form.category : '__custom_active__')}
-                    onChange={(e) => {
-                      if (e.target.value === '__custom__') {
-                        setShowCustomCategoryInput(true);
-                      } else {
-                        setShowCustomCategoryInput(false);
-                        setForm(prev => ({ ...prev, category: e.target.value }));
-                      }
-                    }}
-                    className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none"
-                  >
-                    {DEFAULT_CATEGORIES.map(c => (
-                      <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>
-                    ))}
-                    {customCategories.map(c => (
-                      <option key={`custom-${c}`} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)} ★</option>
-                    ))}
-                    <option value="__custom__">+ Custom category...</option>
-                  </select>
-                  {showCustomCategoryInput && (
-                    <div className="flex gap-1.5">
-                      <input
-                        value={customCategoryInput}
-                        onChange={(e) => setCustomCategoryInput(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') addCustomCategory(customCategoryInput); }}
-                        placeholder="Enter category name"
-                        autoFocus
-                        className="flex-1 px-3 py-1.5 bg-white border border-blue-300 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-blue-500/30"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => addCustomCategory(customCategoryInput)}
-                        className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700"
-                      >Add &amp; Lock</button>
-                      <button type="button" onClick={() => { setShowCustomCategoryInput(false); setCustomCategoryInput(''); }} className="px-2 py-1.5 text-slate-400 hover:text-slate-600 text-xs">✕</button>
-                    </div>
-                  )}
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Category</label>
+                  <div className="space-y-1.5">
+                    <select
+                      value={allCategories.includes(form.category) ? form.category : (customCategories.includes(form.category) ? form.category : '__custom_active__')}
+                      onChange={(e) => {
+                        if (e.target.value === '__custom__') {
+                          setShowCustomCategoryInput(true);
+                        } else {
+                          setShowCustomCategoryInput(false);
+                          setForm(prev => ({ ...prev, category: e.target.value }));
+                        }
+                      }}
+                      className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none"
+                    >
+                      {DEFAULT_CATEGORIES.map(c => (
+                        <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>
+                      ))}
+                      {customCategories.map(c => (
+                        <option key={`custom-${c}`} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)} ★</option>
+                      ))}
+                      <option value="__custom__">+ Custom category...</option>
+                    </select>
+                    {showCustomCategoryInput && (
+                      <div className="flex gap-1.5">
+                        <input
+                          value={customCategoryInput}
+                          onChange={(e) => setCustomCategoryInput(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') addCustomCategory(customCategoryInput); }}
+                          placeholder="Enter category name"
+                          autoFocus
+                          className="flex-1 px-3 py-1.5 bg-white border border-blue-300 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-blue-500/30"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => addCustomCategory(customCategoryInput)}
+                          className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium hover:bg-blue-700"
+                        >Add &amp; Lock</button>
+                        <button type="button" onClick={() => { setShowCustomCategoryInput(false); setCustomCategoryInput(''); }} className="px-2 py-1.5 text-slate-400 hover:text-slate-600 text-xs">✕</button>
+                      </div>
+                    )}
+                  </div>
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Stock Quantity <span className="text-slate-300">(optional)</span></label>
+                <input
+                  value={form.stock_quantity}
+                  onChange={(e) => setForm(prev => ({ ...prev, stock_quantity: e.target.value.replace(/\D/g, '') }))}
+                  placeholder="Leave blank if not tracking inventory"
+                  className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30"
+                  inputMode="numeric"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">
+                  Custom Link <span className="text-slate-300">(optional)</span>
+                </label>
+                <input
+                  value={form.links || ''}
+                  onChange={(e) => setForm(prev => ({ ...prev, links: e.target.value }))}
+                  placeholder="https://yoursite.com/product — leave blank to auto-generate"
+                  className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/30"
+                  type="url"
+                />
+                <p className="mt-1 text-[11px] text-slate-400">
+                  If left blank, an auto-generated link is created from the product name.
+                </p>
+                {editingProduct && editingProduct.public_url && !form.links ? (
+                  <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-emerald-700">
+                    <span className="px-1 py-0.5 rounded bg-emerald-100 text-[10px] uppercase tracking-wide">Auto</span>
+                    <a href={editingProduct.public_url} target="_blank" rel="noopener noreferrer" className="hover:underline truncate">
+                      {editingProduct.public_url}
+                    </a>
+                  </div>
+                ) : null}
               </div>
 
               {/* Image upload */}

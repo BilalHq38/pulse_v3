@@ -1428,3 +1428,99 @@ async def delete_webhook_handler(handler_id: str, request: Request):
     if res == "DELETE 0":
         raise HTTPException(404, "Webhook handler not found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Response Style Templates
+# ---------------------------------------------------------------------------
+
+@router.get("/ai/templates")
+async def list_response_templates(request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    from services.conversation_engine_bootstrap import ensure_company_response_templates
+    try:
+        await ensure_company_response_templates(db, company_id)
+    except Exception:
+        pass
+    return rs(
+        await db.fetch(
+            "SELECT id, name, style_prompt, is_default, created_at, updated_at "
+            "FROM response_templates WHERE company_id = $1 ORDER BY is_default DESC, name ASC",
+            company_id,
+        )
+    )
+
+
+@router.post("/ai/templates")
+async def create_response_template(request: Request):
+    db = _db(request)
+    cu = await require_roles(request, ["admin", "super_admin"])
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    style_prompt = (body.get("style_prompt") or "").strip()
+    if not name:
+        raise HTTPException(422, "name_required")
+    if not style_prompt:
+        raise HTTPException(422, "style_prompt_required")
+    existing = await db.fetchrow(
+        "SELECT id FROM response_templates WHERE company_id=$1 AND name=$2", company_id, name
+    )
+    if existing:
+        raise HTTPException(409, "template_name_already_exists")
+    tid = f"rt_{make_id()}"
+    await db.execute(
+        "INSERT INTO response_templates(id,company_id,name,style_prompt,is_default,created_at,updated_at) "
+        "VALUES($1,$2,$3,$4,FALSE,NOW(),NOW())",
+        tid, company_id, name, style_prompt,
+    )
+    return r(await db.fetchrow("SELECT * FROM response_templates WHERE id=$1", tid))
+
+
+@router.post("/ai/templates/{template_id}/set-default")
+async def set_default_response_template(template_id: str, request: Request):
+    db = _db(request)
+    cu = await require_roles(request, ["admin", "super_admin"])
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    target = await db.fetchrow(
+        "SELECT id FROM response_templates WHERE id=$1 AND company_id=$2", template_id, company_id
+    )
+    if not target:
+        raise HTTPException(404, "template_not_found")
+    async with db.transaction():
+        await db.execute(
+            "UPDATE response_templates SET is_default=FALSE, updated_at=NOW() "
+            "WHERE company_id=$1 AND id<>$2 AND is_default=TRUE",
+            company_id, template_id,
+        )
+        await db.execute(
+            "UPDATE response_templates SET is_default=TRUE, updated_at=NOW() WHERE id=$1", template_id
+        )
+    return {"ok": True, "id": template_id}
+
+
+@router.delete("/ai/templates/{template_id}")
+async def delete_response_template(template_id: str, request: Request):
+    db = _db(request)
+    cu = await require_roles(request, ["admin", "super_admin"])
+    company_id = (cu.get("company_id") or "").strip()
+    if not company_id:
+        raise HTTPException(400, "company_id_required")
+    row = await db.fetchrow(
+        "SELECT id, is_default FROM response_templates WHERE id=$1 AND company_id=$2",
+        template_id, company_id,
+    )
+    if not row:
+        raise HTTPException(404, "template_not_found")
+    if row["is_default"]:
+        raise HTTPException(400, "cannot_delete_active_template")
+    await db.execute("DELETE FROM response_templates WHERE id=$1 AND company_id=$2", template_id, company_id)
+    return {"ok": True}

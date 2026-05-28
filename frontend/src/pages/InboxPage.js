@@ -120,6 +120,61 @@ function normalizeAttachments(attachments) {
     .filter((attachment) => attachment && attachment.url);
 }
 
+// Wave 5: small footer that surfaces conversation-engine metadata
+// (sources_used and any product link cards) on AI message bubbles. The
+// metadata is stashed on `messages.raw_metadata` when the engine produced
+// the response; legacy AI replies still render without the footer.
+const SOURCE_LABELS = {
+  company_data: 'Company',
+  product: 'Product',
+  template: 'Template',
+  faq: 'FAQ',
+  knowledge_base: 'Knowledge Base',
+};
+
+function AiEngineFooter({ metadata }) {
+  let parsed = metadata;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch { return null; }
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const sources = Array.isArray(parsed.sources_used) ? parsed.sources_used : [];
+  const productLinks = Array.isArray(parsed.product_links) ? parsed.product_links : [];
+  if (sources.length === 0 && productLinks.length === 0) return null;
+  return (
+    <div className="mt-2 space-y-1.5">
+      {sources.length > 0 && (
+        <div className="flex flex-wrap gap-1" data-testid="ai-sources-footer">
+          <span className="text-[10px] text-slate-500 font-medium">Sources:</span>
+          {sources.map((src) => (
+            <span
+              key={src}
+              className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border border-purple-200 bg-purple-50 text-purple-700"
+            >
+              {SOURCE_LABELS[src] || src}
+            </span>
+          ))}
+        </div>
+      )}
+      {productLinks.length > 0 && (
+        <div className="flex flex-wrap gap-1.5" data-testid="ai-product-links">
+          {productLinks.map((link, idx) => (
+            <a
+              key={`${link.product_id || idx}-${idx}`}
+              href={link.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-emerald-200 bg-white text-emerald-700 hover:bg-emerald-50"
+            >
+              View product
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function normalizeReactions(reactions) {
   if (!Array.isArray(reactions)) return [];
   const latest = new Map();
@@ -1366,30 +1421,17 @@ export default function InboxPage() {
   return (
     <>
     <div className="flex h-[calc(100vh-3.5rem)]" data-testid="inbox-page">
-      {(platformView || inboxFilterMeta) && (
+      {inboxFilterMeta && (
         <div className="absolute top-2 right-4 z-20 flex max-w-[calc(100%-2rem)] flex-wrap items-center gap-2 bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
-          {platformView && (
-            <span>
-              Viewing: {CHANNELS.find((c) => c.key === platformView)?.label}
-              <button
-                onClick={clearPlatformView}
-                className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
-              >
-                Show all
-              </button>
-            </span>
-          )}
-          {inboxFilterMeta && (
-            <span>
-              Filter: {inboxFilterMeta.label}
-              <button
-                onClick={clearInboxFilter}
-                className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
-              >
-                Clear
-              </button>
-            </span>
-          )}
+          <span>
+            Filter: {inboxFilterMeta.label}
+            <button
+              onClick={clearInboxFilter}
+              className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
+            >
+              Clear
+            </button>
+          </span>
         </div>
       )}
       {/* Mobile: Channel Tabs + Conversation List */}
@@ -2033,6 +2075,9 @@ export default function InboxPage() {
                               {messageContent}
                             </>
                           )}
+                          {isAI && msg.raw_metadata ? (
+                            <AiEngineFooter metadata={msg.raw_metadata} />
+                          ) : null}
                         </div>
                       </div>
                       {messageSentiment && (

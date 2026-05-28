@@ -257,7 +257,7 @@ async def admin_overview(
             (SELECT COUNT(*) FROM users WHERE status = 'pending_approval') AS pending_approval_users,
             (SELECT COUNT(*) FROM users WHERE status = 'rejected') AS rejected_users,
             (SELECT COUNT(*) FROM users WHERE status = 'inactive') AS inactive_users,
-            (SELECT COUNT(*) FROM leads) AS total_leads,
+            (SELECT COUNT(*) FROM leads WHERE status != 'converted') AS total_leads,
             (SELECT COUNT(*) FROM customers) AS total_customers,
             (SELECT COUNT(*) FROM conversations) AS total_conversations,
             (SELECT COUNT(*) FROM tickets) AS total_tickets,
@@ -345,6 +345,7 @@ async def admin_users(
         WITH lead_totals AS (
             SELECT company_id, COUNT(*) AS total_leads
             FROM leads
+            WHERE status != 'converted'
             GROUP BY company_id
         ),
         user_totals AS (

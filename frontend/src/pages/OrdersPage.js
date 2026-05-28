@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
@@ -11,6 +11,7 @@ import {
   X,
   MessageSquare,
   Package,
+  Truck,
 } from 'lucide-react';
 
 const STATUS_OPTIONS = [
@@ -19,7 +20,10 @@ const STATUS_OPTIONS = [
   { value: 'awaiting_confirmation', label: 'Awaiting confirmation' },
   { value: 'admin_review', label: 'Admin review' },
   { value: 'placed', label: 'Placed' },
+  { value: 'pending', label: 'Pending' },
   { value: 'confirmed', label: 'Confirmed' },
+  { value: 'shipped', label: 'Shipped' },
+  { value: 'delivered', label: 'Delivered' },
   { value: 'completed', label: 'Completed' },
   { value: 'cancelled', label: 'Cancelled' },
 ];
@@ -45,13 +49,27 @@ function customerLabel(order) {
 }
 
 function StatusBadge({ status }) {
-  const tone = status === 'cancelled'
-    ? 'bg-red-50 text-red-700 border-red-100'
-    : status === 'completed'
-      ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
-      : status === 'confirmed'
-        ? 'bg-blue-50 text-blue-700 border-blue-100'
-        : 'bg-amber-50 text-amber-700 border-amber-100';
+  let tone;
+  switch (status) {
+    case 'cancelled':
+      tone = 'bg-red-50 text-red-700 border-red-100';
+      break;
+    case 'completed':
+    case 'delivered':
+      tone = 'bg-emerald-50 text-emerald-700 border-emerald-100';
+      break;
+    case 'shipped':
+      tone = 'bg-indigo-50 text-indigo-700 border-indigo-100';
+      break;
+    case 'confirmed':
+      tone = 'bg-blue-50 text-blue-700 border-blue-100';
+      break;
+    case 'pending':
+      tone = 'bg-slate-100 text-slate-700 border-slate-200';
+      break;
+    default:
+      tone = 'bg-amber-50 text-amber-700 border-amber-100';
+  }
   return (
     <span className={`inline-flex items-center rounded-full border px-2 py-1 text-xs font-medium ${tone}`}>
       {formatStatus(status)}
@@ -70,6 +88,7 @@ export default function OrdersPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState('');
   const selectedOrderId = searchParams.get('order') || '';
+  const loadedForIdRef = useRef('');
 
   const loadOrders = useCallback(async (options = {}) => {
     const silent = Boolean(options?.silent);
@@ -136,10 +155,22 @@ export default function OrdersPage() {
   }, [loadOrders]);
 
   useEffect(() => {
-    if (selectedOrderId && !selected) {
+    if (selectedOrderId && loadedForIdRef.current !== selectedOrderId) {
+      loadedForIdRef.current = selectedOrderId;
       loadOrderDetail(selectedOrderId);
     }
-  }, [loadOrderDetail, selected, selectedOrderId]);
+    if (!selectedOrderId) {
+      loadedForIdRef.current = '';
+    }
+  }, [loadOrderDetail, selectedOrderId]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape' && selected) closeDetail();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
 
   const closeDetail = () => {
     setSelected(null);
@@ -281,6 +312,28 @@ export default function OrdersPage() {
                           <button
                             type="button"
                             disabled={Boolean(actionLoading)}
+                            onClick={() => updateStatus(order.id, 'shipped')}
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-indigo-200 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                            aria-label="Mark shipped"
+                          >
+                            <Truck size={16} />
+                          </button>
+                        ) : null}
+                        {order.status === 'shipped' ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(actionLoading)}
+                            onClick={() => updateStatus(order.id, 'delivered')}
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                            aria-label="Mark delivered"
+                          >
+                            <Package size={16} />
+                          </button>
+                        ) : null}
+                        {order.status === 'delivered' ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(actionLoading)}
                             onClick={() => updateStatus(order.id, 'completed')}
                             className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50 disabled:opacity-50"
                             aria-label="Mark completed"
@@ -363,6 +416,28 @@ export default function OrdersPage() {
                   </button>
                 ) : null}
                 {selected.status === 'confirmed' ? (
+                  <button
+                    type="button"
+                    disabled={Boolean(actionLoading)}
+                    onClick={() => updateStatus(selected.id, 'shipped')}
+                    className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    <Truck size={16} />
+                    Mark shipped
+                  </button>
+                ) : null}
+                {selected.status === 'shipped' ? (
+                  <button
+                    type="button"
+                    disabled={Boolean(actionLoading)}
+                    onClick={() => updateStatus(selected.id, 'delivered')}
+                    className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    <Package size={16} />
+                    Mark delivered
+                  </button>
+                ) : null}
+                {selected.status === 'delivered' ? (
                   <button
                     type="button"
                     disabled={Boolean(actionLoading)}

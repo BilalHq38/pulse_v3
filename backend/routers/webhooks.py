@@ -39,6 +39,11 @@ from services.agent_orchestrator.facade import (
     orchestrate_lead_workflow,
     orchestrate_message_workflow,
 )
+from services.conversation_engine import TurnRequest, run_turn as engine_run_turn
+from services.conversation_engine_webchat import (
+    apply_engine_response_to_support_plan,
+)
+from services.followup_scheduler.webhook_glue import maybe_handle_followup_reply
 from core.socket import emit_message_reaction_updated, emit_new_message
 from core.utils import make_id, now_ts
 from shared.background_queue import get_background_queue, serialize_coroutine
@@ -246,6 +251,209 @@ async def _store_and_emit_message_reaction(
 
 def _db(req):
     return req.app.state.db
+
+
+_IMAGE_REQUEST_KEYWORDS = frozenset([
+    # English – explicit image/photo requests
+    "image", "images", "photo", "photos", "picture", "pictures",
+    "pic", "pics", "show me", "show it", "show the",
+    "what does it look like", "how does it look",
+    "see it", "see the", "can i see", "let me see", "i want to see",
+    "could i see", "would like to see", "i'd like to see",
+    "send me", "send the", "send a photo", "send an image",
+    "visual", "look like", "looks like",
+    "view it", "view the", "show a photo", "share a photo",
+    "share an image", "share the image",
+    # Urdu / Roman Urdu
+    "tasveer", "photo bhejo", "image bhejo", "dikha", "dikhao",
+    "dekha", "dekhao", "tasver", "pic bhejo",
+])
+
+# Phrases that appear in AI responses when the engine decided to share an image.
+# If the AI says something like "image is on its way", we treat it as an image
+# send even if the user message alone didn't contain an image keyword.
+_AI_IMAGE_SEND_PHRASES = (
+    "image is on its way",
+    "image on its way",
+    "sharing an image",
+    "sending an image",
+    "sending the image",
+    "image being shared",
+    "image will be sent",
+    "here is an image",
+    "here's an image",
+    "here is the image",
+    "here's the image",
+    "attached the image",
+    "product image",
+)
+
+
+def _is_image_request(text: str, ai_response: str = "") -> bool:
+    """Return True when the user asked to see images OR the AI response indicates it is sending one."""
+    lower = str(text or "").lower()
+    if any(kw in lower for kw in _IMAGE_REQUEST_KEYWORDS):
+        return True
+    if ai_response:
+        ai_lower = str(ai_response).lower()
+        if any(phrase in ai_lower for phrase in _AI_IMAGE_SEND_PHRASES):
+            return True
+    return False
+
+
+def _make_absolute_image_url(image_url: str) -> str:
+    """Convert a relative /api/products/media/... path to an absolute URL."""
+    from shared.config import backend_public_url
+    url = str(image_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith(("http://", "https://")):
+        return url
+    return f"{backend_public_url()}{url}"
+
+
+async def _send_product_images(
+    db,
+    *,
+    company_id: str,
+    conversation_id: str,
+    channel: str,
+    recipient_id: str,
+    product_links: list[dict],
+    user_message: str,
+    outbound_metadata: dict,
+    ai_response: str = "",
+) -> list[str]:
+    """Send product images as individual messages before the text response.
+
+    One DB row + one socket emit per image for ALL channels.
+    For outbound channels (WhatsApp / Facebook / Instagram / Email) the same
+    message ID is reused for the channel-layer send so there is no duplicate
+    row in the messages table.
+
+    Returns the list of absolute image URLs (used by web_chat to include them
+    in the HTTP response so the ChatWidget can render them).
+    Fires when the user asked for images OR the AI response indicates it is sending one.
+    """
+    if not _is_image_request(user_message, ai_response=ai_response):
+        return []
+
+    from services.db_helpers import save_message_attachments
+
+    # If product_links is empty (legacy agent path uses product_images, not product_links),
+    # do a quick catalog lookup for the product mentioned in the user message so we can
+    # find its image_url and send it.
+    effective_links: list[dict] = list(product_links or [])
+    if not effective_links:
+        try:
+            from services.conversation_engine.retrieval.products import ProductRetriever
+            _retriever = ProductRetriever()
+            _chunks = await _retriever.fetch(
+                db, company_id=company_id,
+                query=str(user_message or ai_response or ""),
+                top_k=2,
+            )
+            for _chunk in _chunks:
+                _meta = _chunk.metadata or {}
+                _img = str(_meta.get("image_url") or "")
+                _url = str(_meta.get("public_url") or "")
+                if _img:
+                    effective_links.append({
+                        "product_id": _chunk.source_id,
+                        "name": _chunk.title or "",
+                        "image_url": _img,
+                        "url": _url,
+                    })
+        except Exception as _lookup_exc:
+            logger.debug("image_product_lookup_failed error=%s", _lookup_exc)
+
+    sent_urls: list[str] = []
+    for pl in effective_links[:3]:
+        raw_url = str(pl.get("image_url") or "").strip()
+        if not raw_url:
+            continue
+        # Keep relative /api/... paths as-is: the bridge resolves them against
+        # PYTHON_BACKEND (http://gateway:8000) internally, so converting them to
+        # http://localhost:8000/... would cause ECONNREFUSED inside Docker.
+        # Only convert to absolute if the URL is already an HTTP(S) URL.
+        abs_url = raw_url if raw_url.startswith(("/", "http://", "https://")) else _make_absolute_image_url(raw_url)
+        product_name = str(pl.get("name") or "Product")
+        attachment_name = product_name
+
+        img_msg_id = make_id()
+        # For outbound channels set status to 'sending' so the channel layer
+        # can update it to 'sent'/'failed'; web_chat is delivered via socket
+        # so it's already 'sent' immediately.
+        delivery_status = "sending" if channel != "web_chat" else "sent"
+        img_caption = f"Here's an image of {product_name}:"
+        await db.execute(
+            "INSERT INTO messages("
+            "id, company_id, conversation_id, content, sender_type, sender_id, "
+            "sender_name, ai_confidence, delivery_status, read, created_at"
+            ") VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',1.0,$5,FALSE,NOW())",
+            img_msg_id, company_id, conversation_id, img_caption, delivery_status,
+        )
+        await save_message_attachments(
+            db,
+            img_msg_id,
+            [{"type": "image", "url": abs_url, "name": attachment_name, "mime_type": "image/jpeg"}],
+        )
+        await db.execute(
+            "UPDATE conversations SET last_message='[Product image]',"
+            "last_message_at=NOW(),message_count=message_count+1 WHERE id=$1",
+            conversation_id,
+        )
+        img_msg = await _load_message_with_attachments(db, img_msg_id)
+        await emit_new_message(conversation_id, img_msg)
+
+        if channel != "web_chat":
+            # Ensure actor_user_id is set so the outbound router can resolve the
+            # correct per-user bridge scope (bridge sessions are user-scoped, not
+            # company-scoped; without this the scope resolves to company-level which
+            # may have no active session).
+            bridge_actor = str(
+                outbound_metadata.get("actor_user_id")
+                or outbound_metadata.get("bridge_user_id")
+                or outbound_metadata.get("user_id")
+                or ""
+            ).strip()
+            await _send_outbound_response_via_channel_layer(
+                db=db,
+                company_id=company_id,
+                channel=channel,
+                recipient_id=recipient_id,
+                content="",
+                conversation_id=conversation_id,
+                attachments=[{"type": "image", "url": abs_url, "name": attachment_name, "mime_type": "image/jpeg"}],
+                db_message_id=img_msg_id,
+                metadata={
+                    **outbound_metadata,
+                    "image_send": "product_image",
+                    "actor_user_id": bridge_actor,
+                },
+            )
+
+        sent_urls.append(abs_url)
+    return sent_urls
+
+
+def _format_msgs_as_dialogue(msgs: list[dict], max_pairs: int = 12) -> list[str]:
+    """Convert raw message dicts into ["User: X", "Assistant: Y"] dialogue lines
+    for the conversation engine's extra_history field."""
+    lines: list[str] = []
+    for msg in (msgs or []):
+        sender = str(msg.get("sender_type") or "")
+        text = str(msg.get("content") or "").strip()
+        if not text:
+            continue
+        if sender == "customer":
+            lines.append(f"User: {text}")
+        elif sender == "ai":
+            lines.append(f"Assistant: {text}")
+        elif sender == "agent":
+            lines.append(f"Agent: {text}")
+    # Keep only the last max_pairs*2 lines to avoid bloating the context.
+    return lines[-(max_pairs * 2):]
 
 
 def _float_or_none(value):
@@ -6630,8 +6838,8 @@ async def _process_incoming_message(
         msgs_history = await fetch_messages_with_attachments(
             db,
             convo_id,
-            limit=max(5, min(webhook_message_history_fetch_limit(), 20)),
-            since_days=10,
+            limit=max(5, min(webhook_message_history_fetch_limit(), 12)),
+            since_days=3,
             company_id=company_id,
             customer_id=cid,
             include_linked_profiles=True,
@@ -6652,7 +6860,8 @@ async def _process_incoming_message(
             trace_id,
         )
         ai_generation_started_at = time.monotonic()
-        workflow = await orchestrate_message_workflow(
+        import asyncio as _asyncio
+        _workflow_coro_in = orchestrate_message_workflow(
             MessageWorkflowRequest(
                 trace_id=trace_id,
                 company_id=company_id,
@@ -6681,28 +6890,31 @@ async def _process_incoming_message(
                     "provider_event_id": inbound_external_message_id,
                     "idempotency_key": usage_idempotency_key,
                 },
+                suppress_response_generation=True,
             ),
             db=db,
         )
-        logger.info(
-            "AI workflow generated company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s elapsed_ms=%s",
-            company_id,
-            convo_id,
-            channel,
-            msg_id,
-            trace_id,
-            _elapsed_ms(ai_generation_started_at),
+        _engine_coro_in = engine_run_turn(
+            db,
+            TurnRequest(
+                session_id=convo_id,
+                company_id=company_id,
+                user_message=message_text,
+                customer_id=cid,
+                mode="reactive",
+                extra_history=_format_msgs_as_dialogue(msgs_history),
+            ),
         )
+        _par = await _asyncio.gather(_workflow_coro_in, _engine_coro_in, return_exceptions=True)
+        workflow = _par[0] if not isinstance(_par[0], BaseException) else None
+        _engine_exc_in = _par[1] if isinstance(_par[1], BaseException) else None
+        engine_result_in = _par[1] if not isinstance(_par[1], BaseException) else None
         logger.info(
-            "ai_latency_stage stage=ai_call duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
-            _elapsed_ms(ai_generation_started_at),
-            convo_id,
-            company_id,
-            "",
-            trace_id,
+            "ai_latency_stage stage=parallel_ai_call duration_ms=%s conversation_id=%s company_id=%s channel=%s trace_id=%s",
+            _elapsed_ms(ai_generation_started_at), convo_id, company_id, channel, trace_id,
         )
         capture, _, support_output, _ = _extract_workflow_outputs(
-            workflow,
+            workflow or type("_W", (), {"agent_outputs": type("_O", (), {"capture": {}, "support": {}, "qualification": {}, "analytics": {}})()})(),
             context_label="process_incoming_message",
             company_id=company_id,
             conversation_id=convo_id,
@@ -6710,6 +6922,27 @@ async def _process_incoming_message(
             trace_id=trace_id,
         )
         support_plan = dict(support_output or {})
+        try:
+            if _engine_exc_in is not None:
+                raise _engine_exc_in
+            engine_result = engine_result_in
+            support_plan = apply_engine_response_to_support_plan(
+                support_plan=support_plan,
+                capture=capture,
+                engine_answer=engine_result.answer,
+                engine_confidence=engine_result.confidence,
+                engine_turn_id=engine_result.turn_id,
+                engine_product_links=engine_result.product_links,
+                engine_sources_used=engine_result.sources_used,
+            )
+        except Exception as engine_exc:
+            logger.warning(
+                "conversation_engine_failed company_id=%s conversation_id=%s "
+                "channel=%s trace_id=%s error=%s",
+                company_id, convo_id, channel, trace_id, engine_exc,
+            )
+            support_plan["api_error"] = True
+            support_plan["error_reason"] = "conversation_engine_exception"
         sentiment = _coerce_workflow_dict(
             capture.get("sentiment"),
             field_name="capture.sentiment",
@@ -6977,6 +7210,26 @@ async def _process_incoming_message(
                         "ai_message": ai_message,
                         "sentiment_analysis": sentiment_gate,
                     }
+                # Send product images FIRST (before the text) when the user
+                # explicitly asked to see images OR the AI response indicates
+                # it is sending one. For outbound channels the image is sent
+                # via the channel layer so WhatsApp/FB/IG delivers it natively.
+                await _send_product_images(
+                    db,
+                    company_id=company_id,
+                    conversation_id=convo_id,
+                    channel=channel,
+                    recipient_id=sender_contact,
+                    product_links=list(support_result.get("product_links") or []),
+                    user_message=message_text,
+                    ai_response=str(support_result.get("response") or ""),
+                    outbound_metadata={
+                        **metadata_payload,
+                        "source": f"webhook_{channel}_image",
+                        "trace_id": trace_id,
+                        "customer_id": str(cid or ""),
+                    },
+                )
                 await _ensure_messages_idempotency_schema(db)
                 persist_started_at = time.monotonic()
                 logger.info(
@@ -7785,8 +8038,8 @@ async def web_chat_webhook(request: Request):
             msgs_history = await fetch_messages_with_attachments(
                 db,
                 convo_id,
-                limit=max(5, min(webhook_message_history_fetch_limit(), 20)),
-                since_days=10,
+                limit=max(5, min(webhook_message_history_fetch_limit(), 12)),
+                since_days=3,
                 company_id=company_id,
                 customer_id=customer_id,
                 include_linked_profiles=True,
@@ -7807,40 +8060,86 @@ async def web_chat_webhook(request: Request):
                 trace_id,
             )
             ai_generation_started_at = time.monotonic()
-            workflow = await orchestrate_message_workflow(
-                MessageWorkflowRequest(
-                    trace_id=trace_id,
-                    company_id=company_id,
-                    conversation_id=convo_id,
-                    customer_id=customer_id,
-                    lead_id=str((lead_capture or {}).get("lead_id") or ""),
-                    message_id=msg_id,
-                    channel="web_chat",
-                    source="web_chat",
-                    message_text=content,
-                    sender_name=customer.get("name", customer_name),
-                    sender_contact=customer_email,
-                    conversation_context=msgs_history,
-                    customer=customer or {},
-                    lead=lead,
-                    metadata={
-                        "source": "webhook_web_chat",
-                        "page_url": page_url,
-                        "trace_id": trace_id,
-                    },
-                ),
-                db=db,
+            # ── FAST PATH ─────────────────────────────────────────────────────
+            # Run the conversation engine FIRST (blocks until the AI reply is
+            # ready), then fire the legacy orchestrator as a background task so
+            # sentiment/intent metadata is captured without blocking the response.
+            # This cuts the critical path to ~engine time only (~1-1.5 s on
+            # gemini-2.5-flash-lite) instead of max(orchestrator, engine).
+            import asyncio as _asyncio
+
+            async def _fire_orchestrator_background():
+                """Run sentiment/intent capture asynchronously after reply is sent."""
+                try:
+                    await _asyncio.wait_for(
+                        orchestrate_message_workflow(
+                            MessageWorkflowRequest(
+                                trace_id=trace_id,
+                                company_id=company_id,
+                                conversation_id=convo_id,
+                                customer_id=customer_id,
+                                lead_id=str((lead_capture or {}).get("lead_id") or ""),
+                                message_id=msg_id,
+                                channel="web_chat",
+                                source="web_chat",
+                                message_text=content,
+                                sender_name=customer.get("name", customer_name),
+                                sender_contact=customer_email,
+                                conversation_context=msgs_history,
+                                customer=customer or {},
+                                lead=lead,
+                                metadata={
+                                    "source": "webhook_web_chat",
+                                    "page_url": page_url,
+                                    "trace_id": trace_id,
+                                },
+                                suppress_response_generation=True,
+                            ),
+                            db=db,
+                        ),
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
+
+            # Immediately start the engine — the AI reply is ready when this awaits
+            engine_result = None
+            _engine_exc = None
+            try:
+                engine_result = await engine_run_turn(
+                    db,
+                    TurnRequest(
+                        session_id=convo_id,
+                        company_id=company_id,
+                        user_message=content,
+                        customer_id=customer_id,
+                        mode="reactive",
+                        extra_history=_format_msgs_as_dialogue(msgs_history),
+                    ),
+                )
+            except Exception as _exc:
+                _engine_exc = _exc
+
+            # Fire orchestrator in the background — does not block the response
+            workflow = None
+            create_safe_detached_task(
+                db,
+                _fire_orchestrator_background(),
+                name=f"orchestrator-bg-{convo_id}",
+                company_id=company_id,
+                channel="web_chat",
+                trace_id=trace_id,
+                event_id=msg_id,
             )
             logger.info(
-                "ai_latency_stage stage=ai_call duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
+                "ai_latency_stage stage=engine_only duration_ms=%s conversation_id=%s company_id=%s trace_id=%s",
                 _elapsed_ms(ai_generation_started_at),
                 convo_id,
                 company_id,
-                "",
                 trace_id,
             )
             capture, _, support_output, _ = _extract_workflow_outputs(
-                workflow,
+                workflow or type("_W", (), {"agent_outputs": type("_O", (), {"capture": {}, "support": {}, "qualification": {}, "analytics": {}})()})(),
                 context_label="web_chat_webhook",
                 company_id=company_id,
                 conversation_id=convo_id,
@@ -7848,6 +8147,59 @@ async def web_chat_webhook(request: Request):
                 trace_id=trace_id,
             )
             support_plan = dict(support_output or {})
+            try:
+                if _engine_exc is not None:
+                    raise _engine_exc
+                support_plan = apply_engine_response_to_support_plan(
+                    support_plan=support_plan,
+                    capture=capture,
+                    engine_answer=engine_result.answer,
+                    engine_confidence=engine_result.confidence,
+                    engine_turn_id=engine_result.turn_id,
+                    engine_product_links=engine_result.product_links,
+                    engine_sources_used=engine_result.sources_used,
+                )
+                logger.info(
+                    "ENGINE_RESPONSE company_id=%s conversation_id=%s turn_id=%s "
+                    "confidence=%.2f answer_len=%d sources=%s product_links=%d trace_id=%s",
+                    company_id,
+                    convo_id,
+                    engine_result.turn_id,
+                    engine_result.confidence,
+                    len(engine_result.answer or ""),
+                    list(engine_result.sources_used or []),
+                    len(list(engine_result.product_links or [])),
+                    trace_id,
+                )
+                logger.info(
+                    "SUPPORT_PLAN_PRODUCTS company_id=%s conversation_id=%s "
+                    "deliver=%s product_links=%s trace_id=%s",
+                    company_id,
+                    convo_id,
+                    support_plan.get("deliver_response"),
+                    support_plan.get("product_links"),
+                    trace_id,
+                )
+                logger.info(
+                    "ai_latency_stage stage=engine_call duration_ms=%s conversation_id=%s "
+                    "company_id=%s turn_id=%s trace_id=%s",
+                    _elapsed_ms(ai_generation_started_at),
+                    convo_id,
+                    company_id,
+                    engine_result.turn_id,
+                    trace_id,
+                )
+            except Exception as engine_exc:
+                # Engine failure should never silently drop the reply. Mark
+                # the support_plan as an API error so the existing fallback
+                # path (api_error -> escalate, AI shutdown) takes over.
+                logger.warning(
+                    "conversation_engine_failed company_id=%s conversation_id=%s "
+                    "trace_id=%s error=%s",
+                    company_id, convo_id, trace_id, engine_exc,
+                )
+                support_plan["api_error"] = True
+                support_plan["error_reason"] = "conversation_engine_exception"
             sentiment = _coerce_workflow_dict(
                 capture.get("sentiment"),
                 field_name="capture.sentiment",
@@ -7933,6 +8285,48 @@ async def web_chat_webhook(request: Request):
         ai_response_text = None
         ai_message = None
         is_ai = False
+        sent_image_urls: list[str] = []
+
+        # If this session has a proactive follow-up in flight, route the reply
+        # through on_customer_reply. The handler persists feedback / opt-out /
+        # upsell scheduling and we send back a short canned ack instead of
+        # invoking the full AI generation path.
+        followup_outcome = await maybe_handle_followup_reply(
+            db, company_id=company_id, session_id=session_id, text=content
+        )
+        if followup_outcome is not None:
+            ack_text = str(followup_outcome.get("ack_message") or "")
+            ai_id = make_id()
+            await db.execute(
+                "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,delivery_status,read,created_at) "  # noqa: E501
+                "VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,'sent',FALSE,NOW())",
+                ai_id, company_id, convo_id, ack_text, 1.0,
+            )
+            await db.execute(
+                "UPDATE conversations SET last_message=$1,last_message_at=NOW(),message_count=message_count+1 WHERE id=$2",  # noqa: E501
+                _message_preview(ack_text, [], "ai"),
+                convo_id,
+            )
+            ai_message = await _load_message_with_attachments(db, ai_id)
+            await emit_new_message(convo_id, ai_message)
+            logger.info(
+                "followup_reply_handled company_id=%s session_id=%s followup_id=%s action=%s sentiment=%s schedule_upsell=%s",
+                company_id, session_id,
+                followup_outcome.get("followup_id", ""),
+                followup_outcome.get("action", ""),
+                followup_outcome.get("sentiment", ""),
+                followup_outcome.get("schedule_upsell", False),
+            )
+            return {
+                "status": "ok",
+                "conversation_id": convo_id,
+                "customer_message": customer_message,
+                "ai_message": ai_message,
+                "response": ack_text,
+                "is_ai": True,
+                "followup_action": followup_outcome.get("action"),
+            }
+
         recent_human_agent_message = await _recent_human_agent_message_within_cooldown(
             db,
             company_id=company_id,
@@ -8056,6 +8450,30 @@ async def web_chat_webhook(request: Request):
                         "is_ai": False,
                     }
                 if support_result.get("deliver_response") and support_result.get("response"):
+                    # Send product images FIRST (before the text response) when
+                    # the user asked for images OR the AI response says so.
+                    sent_image_urls = await _send_product_images(
+                        db,
+                        company_id=company_id,
+                        conversation_id=convo_id,
+                        channel="web_chat",
+                        recipient_id="",  # web_chat has no external recipient_id
+                        product_links=list(support_result.get("product_links") or []),
+                        user_message=content,
+                        ai_response=str(support_result.get("response") or ""),
+                        outbound_metadata={"trace_id": trace_id},
+                    )
+                    logger.info(
+                        "OUTBOUND_RENDER company_id=%s conversation_id=%s channel=web_chat "
+                        "response_source=%s response_len=%d product_links=%d image_sends=%d trace_id=%s",
+                        company_id,
+                        convo_id,
+                        "conversation_engine" if support_result.get("engine_turn_id") else "legacy",
+                        len(str(support_result.get("response") or "")),
+                        len(list(support_result.get("product_links") or [])),
+                        len(sent_image_urls),
+                        trace_id,
+                    )
                     logger.info(
                         "ai_response_generated company_id=%s conversation_id=%s channel=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
                         company_id,
@@ -8070,13 +8488,24 @@ async def web_chat_webhook(request: Request):
                         convo_id,
                         ai_id,
                     )
+                    # When the engine produced the response, surface its
+                    # sources / turn_id / product_links into raw_metadata so
+                    # the InboxPage can render a "sources used" footer
+                    # without joining ai_conversation_turns at read time.
+                    engine_metadata = {
+                        "engine_turn_id": str(support_result.get("engine_turn_id") or ""),
+                        "sources_used": list(support_result.get("sources_used") or []),
+                        "product_links": list(support_result.get("product_links") or []),
+                    } if support_result.get("engine_turn_id") else {}
                     await db.execute(
-                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,delivery_status,read,created_at) VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,'sending',FALSE,NOW())",  # noqa: E501
+                        "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,ai_confidence,delivery_status,read,raw_metadata,created_at) "  # noqa: E501
+                        "VALUES($1,$2,$3,$4,'ai','ai-assistant','AI Assistant',$5,'sending',FALSE,$6::jsonb,NOW())",
                         ai_id,
                         company_id,
                         convo_id,
                         support_result["response"],
                         float(support_result.get("confidence", 0.0) or 0.0),
+                        json.dumps(engine_metadata) if engine_metadata else "{}",
                     )
                     ai_attachments = await save_message_attachments(
                         db,
@@ -8167,6 +8596,20 @@ async def web_chat_webhook(request: Request):
                     )
                     ai_message = await _load_message_with_attachments(db, ai_id)
                     outbound_started_at = time.monotonic()
+                    logger.info(
+                        "FINAL_SEND_PAYLOAD company_id=%s conversation_id=%s message_id=%s "
+                        "sender_type=%s content_len=%d attachments=%d "
+                        "engine_turn_id=%s product_links=%d trace_id=%s",
+                        company_id,
+                        convo_id,
+                        ai_id,
+                        (ai_message or {}).get("sender_type", "ai"),
+                        len(str((ai_message or {}).get("content") or "")),
+                        len(list((ai_message or {}).get("attachments") or [])),
+                        support_result.get("engine_turn_id", ""),
+                        len(list(support_result.get("product_links") or [])),
+                        trace_id,
+                    )
                     logger.info(
                         "ai_outbound_send_attempt company_id=%s conversation_id=%s channel=web_chat provider=web_chat auto_send=true workflow_id=webhook_web_chat message_id=%s",
                         company_id,
@@ -8295,6 +8738,16 @@ async def web_chat_webhook(request: Request):
                     )
             except Exception as e:
                 logger.error(f"Web chat AI failed: {e}")
+        company_link = ""
+        try:
+            cs_row = await db.fetchrow(
+                "SELECT website_address FROM company_settings WHERE company_id=$1 LIMIT 1",
+                company_id,
+            )
+            if cs_row:
+                company_link = str((dict(cs_row) if cs_row else {}).get("website_address") or "").strip()
+        except Exception:
+            pass
         return {
             "status": "ok",
             "conversation_id": convo_id,
@@ -8302,6 +8755,11 @@ async def web_chat_webhook(request: Request):
             "ai_message": ai_message,
             "response": ai_response_text or "Thanks for your message! A team member will respond shortly.",
             "is_ai": is_ai,
+            "product_links": list(support_plan.get("product_links") or []),
+            "company_link": company_link,
+            # Absolute URLs of product images sent as individual messages before
+            # the text response. The ChatWidget uses these to render image bubbles.
+            "product_image_urls": sent_image_urls,
         }
     except Exception as e:
         logger.error(f"Web chat webhook error: {e}")

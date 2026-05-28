@@ -79,6 +79,11 @@ def _normalize_trusted_headers(request: Request) -> dict[str, Any] | None:
     role = str(request.headers.get("X-User-Role", "")).strip()
     if not user_id and not company_id and not role:
         return None
+    # Gateway infers company_id from the request body for unauthenticated public
+    # webhook requests (e.g. web-chat). In that case user_id and role are empty —
+    # return a minimal company-only context rather than raising.
+    if not user_id and not role and company_id:
+        return {"company_id": company_id, "cid": company_id}
     if not user_id or not role or not ROLE_RE.fullmatch(role):
         raise unauthorized_exception()
     if role.lower() != "super_admin" and not is_valid_company_id(company_id):
