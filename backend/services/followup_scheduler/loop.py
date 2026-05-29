@@ -47,7 +47,7 @@ async def _lookup_conversation(db, *, company_id: str, session_id: str) -> dict 
         return None
     try:
         row = await db.fetchrow(
-            "SELECT id, company_id, customer_id FROM conversations "
+            "SELECT id, company_id, customer_id, channel, channel_id FROM conversations "
             "WHERE company_id = $1 AND session_id = $2 LIMIT 1",
             company_id,
             session_id,
@@ -123,6 +123,77 @@ async def _emit_socket_message(conversation_id: str, message_id: str) -> None:
         logger.debug("followup_loop_emit_failed conversation_id=%s error=%s", conversation_id, exc)
 
 
+async def _dispatch_via_channel(
+    db,
+    *,
+    company_id: str,
+    customer_id: str,
+    conversation_id: str,
+    channel: str,
+    channel_recipient: str,
+    message_text: str,
+    message_id: str,
+) -> None:
+    """Best-effort dispatch via the customer's actual channel (WhatsApp/email/etc.).
+
+    The socket broadcast in _emit_socket_message only reaches the web UI.
+    This function ensures customers receive the message on their real channel.
+    Never raises — a failed dispatch is logged but must not crash the loop.
+    """
+    if not channel or channel == "web_chat":
+        # web_chat is socket-only; no external channel to dispatch to.
+        return
+
+    if not channel_recipient:
+        logger.debug(
+            "followup_channel_dispatch_skipped company_id=%s channel=%s conversation_id=%s reason=no_recipient",
+            company_id, channel, conversation_id,
+        )
+        return
+
+    try:
+        if channel == "whatsapp":
+            from services.messaging_service import send_whatsapp_message
+            await send_whatsapp_message(
+                channel_recipient,
+                message_text,
+                db=db,
+                company_id=company_id,
+                db_message_id=message_id,
+                conversation_id=conversation_id,
+                customer_id=customer_id,
+            )
+        elif channel in ("facebook", "instagram"):
+            from services.messaging_service import send_meta_channel_message
+            await send_meta_channel_message(
+                db,
+                channel,
+                channel_recipient,
+                message_text,
+                current_user={"company_id": company_id},
+                db_message_id=message_id,
+            )
+        elif channel == "email":
+            from services.email_service import send_tenant_email_async
+            await send_tenant_email_async(
+                db,
+                company_id,
+                to_email=channel_recipient,
+                subject="A message for you",
+                body=message_text,
+                raise_on_failure=False,
+            )
+        logger.info(
+            "followup_channel_dispatch_sent company_id=%s channel=%s conversation_id=%s message_id=%s",
+            company_id, channel, conversation_id, message_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "followup_channel_dispatch_failed company_id=%s channel=%s conversation_id=%s error=%s",
+            company_id, channel, conversation_id, exc,
+        )
+
+
 async def dispatch_one_followup(db, claimed: dict) -> dict[str, Any]:
     """Run the engine for one claimed follow-up row and persist the result.
 
@@ -190,6 +261,16 @@ async def dispatch_one_followup(db, claimed: dict) -> dict[str, Any]:
         confidence=result.confidence,
     )
     await _emit_socket_message(convo_id, message_id)
+    await _dispatch_via_channel(
+        db,
+        company_id=company_id,
+        customer_id=customer_id,
+        conversation_id=convo_id,
+        channel=str(convo.get("channel") or ""),
+        channel_recipient=str(convo.get("channel_id") or ""),
+        message_text=answer,
+        message_id=message_id,
+    )
 
     duration_ms = int((time.monotonic() - started_at) * 1000)
     await _log_automation(

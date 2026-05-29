@@ -118,6 +118,14 @@ class Orchestrator:
                 "purchased. Only mention products that appear in the retrieved "
                 "context. Do not pressure the customer. One short paragraph."
             )
+        elif workflow_kind == "order_confirmed":
+            directive = (
+                "The customer's order has just been confirmed. Compose a brief, "
+                "warm message acknowledging this and letting them know what to "
+                "expect next. If the retrieved context contains a highly relevant "
+                "complementary product, mention it gently — but only if it adds "
+                "clear value. Be non-aggressive. One short paragraph."
+            )
         else:
             directive = "Compose a brief follow-up message."
         request = TurnRequest(
@@ -272,18 +280,20 @@ class Orchestrator:
         )
 
     def _retriever_for(self, source: SourceType, request: TurnRequest) -> SourceRetriever | None:
-        # Proactive upsell turns get a different product retriever: instead of
-        # an open-ended catalog search, pull only products linked to the
-        # purchased item via product_relationships. Falls back to the default
-        # retriever when no order is anchored (so the engine still has *some*
-        # product context to ground its suggestion on).
-        if (
-            source == "product"
-            and request.mode == "proactive"
-            and request.workflow_kind == "upsell"
-            and request.order_id
-        ):
-            return OrderRelatedProductRetriever(order_id=request.order_id)
+        # Product retrievers are created per-request so they carry the correct
+        # customer_id and session_id for signed ref-token URLs. This ensures
+        # order tracking links back to the customer without exposing internal IDs.
+        if source == "product":
+            if (
+                request.mode == "proactive"
+                and request.workflow_kind == "upsell"
+                and request.order_id
+            ):
+                return OrderRelatedProductRetriever(order_id=request.order_id)
+            return ProductRetriever(
+                customer_id=request.customer_id,
+                session_id=request.session_id,
+            )
         return self._retrievers.get(source)
 
     async def _retrieve(
@@ -450,7 +460,12 @@ def _extract_product_links(answer: str, chunks: list[ContextChunk]) -> list[Prod
                     or (slug and f"/{slug}" in cleaned)
                 )
                 if hit:
-                    links.append(ProductLink(product_id=chunk.source_id, url=cleaned))
+                    links.append(ProductLink(
+                        product_id=chunk.source_id,
+                        url=cleaned,
+                        name=str(meta.get("name") or chunk.title or ""),
+                        image_url=str(meta.get("image_url") or ""),
+                    ))
                     break
     if links:
         return links
@@ -461,7 +476,12 @@ def _extract_product_links(answer: str, chunks: list[ContextChunk]) -> list[Prod
         meta = chunk.metadata or {}
         url = str(meta.get("public_url") or meta.get("links") or "")
         if url:
-            links.append(ProductLink(product_id=chunk.source_id, url=url))
+            links.append(ProductLink(
+                product_id=chunk.source_id,
+                url=url,
+                name=str(meta.get("name") or chunk.title or ""),
+                image_url=str(meta.get("image_url") or ""),
+            ))
             break
     return links
 

@@ -837,8 +837,13 @@ async def _send_via_meta(
         attachment = attachments[0] or {}
         link = str(attachment.get("url") or attachment.get("data_url") or "").strip()
         media_type = _infer_media_type(attachment)
-        # Meta Cloud API requires a publicly accessible URL; skip image sending for
-        # relative/local paths which Meta's servers cannot reach.
+        # Convert relative paths to absolute using the configured public backend URL
+        # so Meta's servers can download the image. If BACKEND_PUBLIC_URL is not set
+        # to a real public domain the image will still fail, but silently dropping it
+        # is worse than trying.
+        if link.startswith("/"):
+            from shared.config import backend_public_url as _bpu
+            link = f"{_bpu()}{link}"
         is_public_url = link.startswith(("http://", "https://"))
         if link and media_type == "image" and is_public_url:
             caption = _product_media_caption(
