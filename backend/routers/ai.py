@@ -984,7 +984,10 @@ async def ai_chat(payload: AiChatRequest, request: Request):
         "session_id": result.session_id,
         "turn_id": result.turn_id,
         "sources_used": list(result.sources_used),
-        "product_links": [{"product_id": pl.product_id, "url": pl.url} for pl in result.product_links],
+        "product_links": [
+            {"product_id": pl.product_id, "url": pl.url, "name": pl.name, "image_url": pl.image_url}
+            for pl in result.product_links
+        ],
         "tokens_used": {
             "prompt": result.tokens_used.prompt,
             "completion": result.tokens_used.completion,

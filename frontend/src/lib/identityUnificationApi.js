@@ -236,7 +236,19 @@ export const identityUnificationApi = {
     return normalizeSuggestion(asObject(response.data));
   },
 
+  async syncCustomersToIdentity() {
+    try {
+      const response = await api.post('/customers/batch-sync-identity', {});
+      return asObject(response.data);
+    } catch (_err) {
+      // Sync failure is non-fatal; auto-detect still runs against whatever is already synced
+      return { synced: 0, skipped: 0, failed: 0, error: String(_err?.message || '') };
+    }
+  },
+
   async autoDetect() {
+    // Ensure all company customers are registered in the identity service before detection
+    await identityUnificationApi.syncCustomersToIdentity();
     const response = await api.post('/identity/auto-detect', {});
     return asObject(response.data);
   },

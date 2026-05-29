@@ -1,8 +1,10 @@
 """routers/customers.py - PostgreSQL version."""
 
+import asyncio
 import logging
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
 from channel_layer.channel_identity import company_default_phone_region
@@ -154,7 +156,7 @@ async def _fetch_customers(
         "SELECT c.*, "
         "ARRAY(SELECT tag FROM customer_tags WHERE customer_id=c.id) AS tags, "
         "ARRAY(SELECT channel FROM customer_channels WHERE customer_id=c.id) AS channels "
-        "FROM customers c WHERE c.company_id=$1 AND c.lifecycle_stage != 'lead'"
+        "FROM customers c WHERE c.company_id=$1"
     )
     args = [company_id]
     if segment:
@@ -636,3 +638,78 @@ async def create_purchase(request: Request):
         event_id=purchase_id,
     )
     return r(await db.fetchrow("SELECT * FROM purchases WHERE id=$1", purchase_id))
+
+
+@router.post("/customers/batch-sync-identity")
+async def batch_sync_customers_to_identity(request: Request):
+    """Sync all company customers into the identity service so auto-detect can find duplicates.
+
+    Calls POST /api/identity/resolve for each customer that has an email or phone.
+    Returns a summary of how many were synced and how many failed.
+    """
+    from shared.config import identity_tenant_api_keys, service_urls
+
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+
+    tenant_keys = identity_tenant_api_keys()
+    tenant_api_key = tenant_keys.get(cid or "")
+    if not tenant_api_key:
+        # Identity service not configured for this tenant — return gracefully
+        return {"synced": 0, "skipped": 0, "failed": 0, "reason": "identity_not_configured"}
+
+    identity_base = service_urls().identity.rstrip("/")
+    customers = rs(
+        await db.fetch(
+            "SELECT id, name, email, phone FROM customers WHERE company_id=$1 AND (email != '' OR phone != '') LIMIT 500",
+            cid,
+        )
+    )
+
+    synced = 0
+    skipped = 0
+    failed = 0
+
+    async def _resolve_one(customer: dict) -> None:
+        nonlocal synced, skipped, failed
+        platform_user_id = str(customer.get("id") or "").strip()
+        phone = str(customer.get("phone") or "").strip() or None
+        email = str(customer.get("email") or "").strip() or None
+        name = str(customer.get("name") or "").strip() or None
+        if not platform_user_id or (not phone and not email):
+            skipped += 1
+            return
+        payload = {
+            "platform": "pulse_customer",
+            "platform_user_id": platform_user_id,
+            "phone_number": phone,
+            "email_address": email,
+            "full_name": name,
+            "username": name,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(
+                    f"{identity_base}/api/identity/resolve",
+                    headers={
+                        "X-Tenant-ID": cid,
+                        "X-API-Key": tenant_api_key,
+                        "X-User-Role": "admin",
+                    },
+                    json=payload,
+                )
+            if resp.status_code < 400:
+                synced += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    # Process in small concurrent batches to avoid overwhelming the identity service
+    batch_size = 10
+    for i in range(0, len(customers), batch_size):
+        batch = customers[i : i + batch_size]
+        await asyncio.gather(*[_resolve_one(c) for c in batch])
+
+    return {"synced": synced, "skipped": skipped, "failed": failed}
