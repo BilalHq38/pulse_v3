@@ -273,6 +273,11 @@ async def check_user_status_active(request: Request) -> None:
     reads the DB instead of Redis so status changes take effect immediately.
     """
     auth = _get_auth_context(request)
+    # Internal service-to-service calls use a synthetic user ID ("ai-service-internal"
+    # etc.) that does not exist in the users table. Skip the user status check entirely
+    # for these calls — the service secret already authenticates them.
+    if auth.get("is_internal_service"):
+        return
     user_id = _user_id(auth)
     if not user_id:
         return

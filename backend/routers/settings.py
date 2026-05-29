@@ -858,6 +858,28 @@ async def update_channel_settings(channel: str, body: ChannelSettingsUpdate, req
             payload["verify_token"] = await _ensure_meta_verify_tokens(db, cid)
     payload["updated_at"] = now_ts()
 
+    # Auto-enable channel when sufficient credentials are supplied.
+    if "enabled" not in payload:
+        _api_key = str(payload.get("api_key") or "").strip()
+        _email_address = str(payload.get("email_address") or "").strip()
+        _smtp_host = str(payload.get("smtp_host") or "").strip()
+        _access_token = str(payload.get("access_token") or "").strip()
+        _page_id = str(payload.get("page_id") or "").strip()
+        _phone_number_id = str(payload.get("phone_number_id") or "").strip()
+        _email_provider = str(payload.get("email_provider") or "").strip().lower()
+
+        if channel_key == "email":
+            if _email_provider == "brevo" and _api_key and _email_address:
+                payload["enabled"] = True
+            elif _smtp_host and _email_address:
+                payload["enabled"] = True
+        elif channel_key in ("facebook", "instagram"):
+            if _access_token and _page_id:
+                payload["enabled"] = True
+        elif channel_key == "whatsapp":
+            if _access_token and _phone_number_id:
+                payload["enabled"] = True
+
     safe = _safe_fields(payload, ALLOWED_CHANNEL_FIELDS)
     if not safe:
         raise HTTPException(400, "No valid channel settings fields provided")

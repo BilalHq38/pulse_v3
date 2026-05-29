@@ -361,6 +361,87 @@ async def send_campaign(campaign_id: str, request: Request):
     return {"id": campaign_id, "status": "queued"}
 
 
+@router.post("/campaigns/{campaign_id}/pause")
+async def pause_campaign(campaign_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+    async with company_context(db, cid) as conn:
+        campaign = r(await conn.fetchrow(
+            "SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2",
+            campaign_id, cid,
+        ))
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        if campaign.get("status") not in {"queued", "sending"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot pause a campaign with status '{campaign.get('status')}'. Only queued or sending campaigns can be paused.",
+            )
+        # Atomic update: only succeeds if status is still queued/sending
+        result = await conn.execute(
+            "UPDATE email_campaigns SET status='paused' "
+            "WHERE id=$1 AND company_id=$2 AND status IN ('queued','sending')",
+            campaign_id, cid,
+        )
+    if result == "UPDATE 0":
+        raise HTTPException(status_code=409, detail="Campaign status changed before pause could be applied. Please refresh and try again.")
+    return {"id": campaign_id, "status": "paused"}
+
+
+@router.post("/campaigns/{campaign_id}/resume")
+async def resume_campaign(campaign_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+    campaign = r(await db.fetchrow("SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2", campaign_id, cid))
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("status") != "paused":
+        raise HTTPException(status_code=400, detail="Only paused campaigns can be resumed")
+    if not int(campaign.get("total_recipients") or 0):
+        raise HTTPException(status_code=400, detail="Campaign has no recipients")
+    async with company_context(db, cid) as conn:
+        await conn.execute(
+            "UPDATE email_campaigns SET status='queued' WHERE id=$1 AND company_id=$2 AND status='paused'",
+            campaign_id, cid,
+        )
+    schedule_campaign_send(request.app, campaign_id, cid)
+    return {"id": campaign_id, "status": "queued"}
+
+
+@router.post("/campaigns/{campaign_id}/restart")
+async def restart_campaign(campaign_id: str, request: Request):
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+    campaign = r(await db.fetchrow("SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2", campaign_id, cid))
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("status") == "sending":
+        raise HTTPException(status_code=400, detail="Campaign is currently sending. Pause it first to restart.")
+    # Reset all recipients to pending and campaign stats
+    await db.execute(
+        "UPDATE email_campaign_recipients SET status='pending',sent_at=NULL,error='' WHERE campaign_id=$1 AND company_id=$2",
+        campaign_id,
+        cid,
+    )
+    await db.execute(
+        "UPDATE email_campaigns SET status='queued',sent_count=0,failed_count=0,started_at=NULL,completed_at=NULL,"
+        "last_error='',updated_at=NOW() WHERE id=$1 AND company_id=$2",
+        campaign_id,
+        cid,
+    )
+    schedule_campaign_send(request.app, campaign_id, cid)
+    return {"id": campaign_id, "status": "queued"}
+
+
 @router.delete("/campaigns/{campaign_id}")
 async def delete_campaign(campaign_id: str, request: Request):
     db = _db(request)

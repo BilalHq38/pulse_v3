@@ -446,6 +446,7 @@ async def generate_nurture_message(
     company_context: str = "",
     db=None,
     company_id: str = "",
+    conversation_history: str = "",
 ) -> dict:
     safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=True)
     if _prefer_local_impl():
@@ -455,6 +456,7 @@ async def generate_nurture_message(
             company_context=company_context,
             db=db,
             company_id=company_id,
+            conversation_history=conversation_history,
         )
     try:
         return await _call_remote_ai(
@@ -466,6 +468,7 @@ async def generate_nurture_message(
                 "stage": stage,
                 "company_id": company_id or lead_data.get("company_id", ""),
                 "company_context": company_context,
+                "conversation_history": conversation_history,
             },
         )
     except Exception as exc:
@@ -481,6 +484,7 @@ async def generate_nurture_message(
                 company_context=company_context,
                 db=db,
                 company_id=company_id,
+                conversation_history=conversation_history,
             )
         return _safe_nurture_default(safe_lead, stage)
 

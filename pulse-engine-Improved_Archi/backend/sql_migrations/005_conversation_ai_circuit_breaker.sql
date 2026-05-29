@@ -1,3 +1,0 @@
-ALTER TABLE conversations 
-ADD COLUMN IF NOT EXISTS ai_disabled_until TIMESTAMPTZ,
-ADD COLUMN IF NOT EXISTS ai_failure_count INT DEFAULT 0;

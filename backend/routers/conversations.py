@@ -1143,10 +1143,6 @@ async def send_message(convo_id: str, request: Request):
                         conversation_context=msgs_history,
                         customer=cust_full or {},
                         metadata={"source": "send_message", "trace_id": trace_id},
-                        # Always suppress legacy SupportAgent catalog generation here.
-                        # web_chat responses are owned by webhooks.py (conversation engine);
-                        # all other channels that reach this path only need sentiment/intent metadata.
-                        suppress_response_generation=True,
                     ),
                     authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
                     db=db,
@@ -1314,13 +1310,9 @@ async def send_message(convo_id: str, request: Request):
 
     ai_response = None
     cust_full = None
-    # web_chat AI responses are owned exclusively by webhooks.py (conversation engine path).
-    # Skip the legacy auto-respond block here to prevent duplicate catalog responses.
-    _is_web_chat = str(convo.get("channel") or "").strip() == "web_chat"
     if (
         sender_type == "customer"
         and not outbound_limit_exhausted
-        and not _is_web_chat
         and convo.get("ai_handled", True)
         and not conversation_ai_auto_paused(convo)
         and await is_company_ai_enabled(db, company_id)

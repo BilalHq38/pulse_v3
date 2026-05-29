@@ -121,6 +121,7 @@ def extract_company_id_from_request(request: Request) -> str | None:
     if _internal_secret_valid(request):
         trusted = _normalize_trusted_headers(request)
         if trusted:
+            trusted["is_internal_service"] = True
             request.state.auth_context = trusted
             return trusted.get("company_id") or None
         return None
@@ -154,6 +155,8 @@ def build_trusted_context_from_request(request: Request) -> dict[str, Any] | Non
     if _internal_secret_valid(request):
         trusted = _normalize_trusted_headers(request)
         if trusted:
+            # Mark as an internal service call so billing guards skip user DB lookup
+            trusted["is_internal_service"] = True
             request.state.auth_context = trusted
             return trusted
     return _validate_jwt_request_context(request)

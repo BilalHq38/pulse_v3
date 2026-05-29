@@ -4122,3 +4122,46 @@ WITH CHECK (
     company_id = current_setting('app.current_company', true)
     OR current_setting('app.platform_admin_mode', true) = 'on'
 );
+
+-- ============================================================================
+-- Wave 3 — orders total_price + link click tracking (migration 018).
+-- ============================================================================
+
+-- Add total_price column to orders (was missing, causing order_creation_failed)
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_price NUMERIC(18,4);
+
+-- Link click tracking: records when a customer clicks a product purchase link
+CREATE TABLE IF NOT EXISTS link_clicks (
+    id              TEXT PRIMARY KEY,
+    company_id      TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    customer_id     TEXT NOT NULL DEFAULT '',
+    product_id      TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    order_id        TEXT NOT NULL DEFAULT '',
+    ref_token       TEXT NOT NULL DEFAULT '',
+    ip_address      TEXT NOT NULL DEFAULT '',
+    user_agent      TEXT NOT NULL DEFAULT '',
+    clicked_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_link_clicks_company_product ON link_clicks(company_id, product_id, clicked_at);
+CREATE INDEX IF NOT EXISTS idx_link_clicks_customer ON link_clicks(company_id, customer_id, clicked_at);
+CREATE INDEX IF NOT EXISTS idx_link_clicks_order ON link_clicks(company_id, order_id);
+
+ALTER TABLE link_clicks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE link_clicks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_link_clicks_tenant ON link_clicks;
+CREATE POLICY p_link_clicks_tenant ON link_clicks
+USING (
+    company_id = current_setting('app.current_company', true)
+    OR current_setting('app.platform_admin_mode', true) = 'on'
+)
+WITH CHECK (
+    company_id = current_setting('app.current_company', true)
+    OR current_setting('app.platform_admin_mode', true) = 'on'
+);
+
+-- Add paused status to campaign status enum (for Task 15 lifecycle controls)
+ALTER TABLE email_campaigns DROP CONSTRAINT IF EXISTS chk_email_campaigns_status;
+ALTER TABLE email_campaigns ADD CONSTRAINT chk_email_campaigns_status
+    CHECK (status IN ('draft','queued','sending','paused','completed','failed','cancelled'));

@@ -842,7 +842,7 @@ async def dashboard_live_summary(request: Request):
         )
         or 0
     )
-    ai_success_rate = round((ai_messages_today / customer_messages_today) * 100, 1) if customer_messages_today else 0
+    ai_success_rate = min(100.0, round((ai_messages_today / customer_messages_today) * 100, 1)) if customer_messages_today else 0
     blocked_flagged = (
         await db.fetchval(
             "SELECT COUNT(DISTINCT c.id) FROM conversations c "

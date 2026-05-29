@@ -24,13 +24,13 @@ MODEL_CATEGORIES = {
     "embeddings": "Embeddings",
 }
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_GEMINI_PRO_MODEL = "gemini-2.5-pro"
 GEMINI_PROVIDER_KEYS = {"gemini", "gemini_api", "vertex_ai"}
 
 _GEMINI_TEXT_MODELS = [
-    ("gemini-2.5-flash", "Gemini 2.5 Flash (Default)", True),
-    ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite", True),
+    ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite (Default)", True),
+    ("gemini-2.5-flash", "Gemini 2.5 Flash", True),
     ("gemini-2.5-pro", "Gemini 2.5 Pro", True),
 ]
 

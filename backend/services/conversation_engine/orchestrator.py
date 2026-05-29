@@ -50,70 +50,13 @@ from services.conversation_engine.schemas import (
 
 logger = logging.getLogger(__name__)
 
-_PURCHASE_INTENT_RE = re.compile(
-    r"\b(buy|purchase|order|price|cost|how much|available|in stock|want|need|looking for|"
-    r"recommend|suggest|show me|do you have|do you sell|catalog|what products|affordable|budget|cheap|best|"
-    r"can i see|view|see this|see the|details|more about|tell me more|this ring|that ring|"
-    r"this product|that product|the ring|the product|proceed|confirm|place an order|checkout)\b",
-    re.IGNORECASE,
-)
-
-# Strip source labels the LLM occasionally leaks despite prompt instructions.
-_SOURCE_LABEL_RE = re.compile(
-    r"\s*\(Source:\s*(?:Company Data|Product Database|FAQs?|Knowledge Base|Response Style)\)",
-    re.IGNORECASE,
-)
-_SECTION_HEADER_RE = re.compile(
-    r"#{1,3}\s*(?:Source\s*:\s*)?(?:Company Data|Product Database|FAQs?|Knowledge Base)[^\n]*\n?",
-    re.IGNORECASE,
-)
-
-
-def _strip_source_labels(text: str) -> str:
-    """Remove any internal source labels the LLM leaked into the customer response."""
-    text = _SOURCE_LABEL_RE.sub("", text)
-    text = _SECTION_HEADER_RE.sub("", text)
-    return re.sub(r" {2,}", " ", text).strip()
-
-
-# Positional image-location phrases the LLM sometimes writes despite prompt
-# instructions (e.g. "see the image below", "as shown above"). They are wrong
-# because product images are sent as a *separate earlier* message, so the AI
-# text response must not reference their screen position.
-_POSITIONAL_IMAGE_RE = re.compile(
-    r"[\(\[]?"
-    r"(?:you can |please )?"
-    r"(?:see|view|find|check out|have a look at|look at|refer to)?\s*"
-    r"(?:the\s+)?(?:product\s+)?(?:image|photo|picture|pic)\s*"
-    r"(?:is\s+)?(?:shown\s+)?(?:displayed\s+)?"
-    r"(?:right\s+)?(?:just\s+)?"
-    r"(?:above|below|down below|underneath|up above|right above|right below|attached above|attached below)"
-    r"[\)\]]?"
-    r"[.,!]?",
-    re.IGNORECASE,
-)
-# Also strip standalone positional references like "(see below)", "as shown above"
-_POSITIONAL_REF_RE = re.compile(
-    r"\(?(?:see|as shown|as seen|shown|displayed|found|available|pictured|enclosed)\s+"
-    r"(?:above|below|down below|right below|right above|here above|here below)\)?"
-    r"[.,!]?",
-    re.IGNORECASE,
-)
-
-
-def _strip_positional_image_refs(text: str) -> str:
-    """Remove spatial image-location phrases that are wrong when images are sent first."""
-    text = _POSITIONAL_IMAGE_RE.sub("", text)
-    text = _POSITIONAL_REF_RE.sub("", text)
-    return re.sub(r"  +", " ", text).strip()
-
 
 _PER_SOURCE_TIMEOUTS: dict[SourceType, float] = {
-    "company_data": 1.0,
-    "product": 1.5,
-    "template": 0.4,
-    "faq": 0.4,
-    "knowledge_base": 1.0,
+    "company_data": 0.5,
+    "product": 0.35,
+    "template": 0.1,
+    "faq": 0.1,
+    "knowledge_base": 0.4,
 }
 _VALIDATION_RETRY_DIRECTIVE_TEMPLATE = (
     "\n\nYour previous draft mentioned: {offences}. "
@@ -241,7 +184,7 @@ class Orchestrator:
             )
 
         result = await self._gateway.generate(prompt)
-        answer = _strip_positional_image_refs(_strip_source_labels((result.text or "").strip()))
+        answer = (result.text or "").strip()
         product_links = _extract_product_links(answer, trimmed_chunks)
 
         report = validator.validate(
@@ -255,7 +198,7 @@ class Orchestrator:
                 offences=", ".join(report.offences[:5])
             )
             retry_result = await self._gateway.generate(retry_prompt)
-            retry_answer = _strip_positional_image_refs(_strip_source_labels((retry_result.text or "").strip()))
+            retry_answer = (retry_result.text or "").strip()
             retry_links = _extract_product_links(retry_answer, trimmed_chunks)
             retry_report = validator.validate(
                 answer=retry_answer,
@@ -272,29 +215,11 @@ class Orchestrator:
                     request.company_id,
                     report.offences[:5] + retry_report.offences[:5],
                 )
-                # Graceful degrade: if the first answer is non-empty and all
-                # offences are benign (grounding / price — not secrets,
-                # profanity, or empty), return it rather than the useless
-                # static fallback. Strip product links so we don't surface
-                # cards for products that weren't retrieved this turn.
-                _fatal_prefixes = ("secret_leak:", "profanity:", "shouting", "empty_answer")
-                first_is_fatal = any(o.startswith(_fatal_prefixes) for o in report.offences)
-                if not answer or first_is_fatal:
-                    return await self._fallback_turn(
-                        db, request, sources_used=[r.source_type for r in retrieval_results if r.chunks],
-                        active_template=active_template, confidence=confidence,
-                        reason="validation_failed",
-                    )
-                logger.info(
-                    "validation_graceful_degrade company_id=%s using_first_attempt offences=%s",
-                    request.company_id, report.offences[:5],
+                return await self._fallback_turn(
+                    db, request, sources_used=[r.source_type for r in retrieval_results if r.chunks],
+                    active_template=active_template, confidence=confidence,
+                    reason="validation_failed",
                 )
-                # Only strip product links if the offence is specifically about the
-                # link itself being malformed or pointing to an unretrieved product.
-                # Grounding failures in the answer text don't invalidate a valid link.
-                _link_offence_prefixes = ("link_to_unretrieved_product:", "link_malformed:")
-                if any(o.startswith(_link_offence_prefixes) for o in report.offences):
-                    product_links = []
 
         sources_used: list[SourceType] = [r.source_type for r in retrieval_results if r.chunks]
         tokens = TokenUsage(
@@ -347,20 +272,18 @@ class Orchestrator:
         )
 
     def _retriever_for(self, source: SourceType, request: TurnRequest) -> SourceRetriever | None:
-        if source == "product":
-            # Proactive upsell: pull products related to the purchased item.
-            if (
-                request.mode == "proactive"
-                and request.workflow_kind == "upsell"
-                and request.order_id
-            ):
-                return OrderRelatedProductRetriever(order_id=request.order_id)
-            # Reactive: create a fresh retriever per request so it carries the
-            # customer_id and session_id used to build tracked product URLs.
-            return ProductRetriever(
-                customer_id=request.customer_id,
-                session_id=request.session_id,
-            )
+        # Proactive upsell turns get a different product retriever: instead of
+        # an open-ended catalog search, pull only products linked to the
+        # purchased item via product_relationships. Falls back to the default
+        # retriever when no order is anchored (so the engine still has *some*
+        # product context to ground its suggestion on).
+        if (
+            source == "product"
+            and request.mode == "proactive"
+            and request.workflow_kind == "upsell"
+            and request.order_id
+        ):
+            return OrderRelatedProductRetriever(order_id=request.order_id)
         return self._retrievers.get(source)
 
     async def _retrieve(
@@ -402,13 +325,6 @@ class Orchestrator:
             and "product" not in effective_sources
         ):
             effective_sources.append("product")
-        # Purchase intent — always consult the product catalog so the LLM can
-        # surface a link or availability without being asked to route there first.
-        if (
-            "product" not in effective_sources
-            and _PURCHASE_INTENT_RE.search(request.user_message or "")
-        ):
-            effective_sources.append("product")
 
         results = await asyncio.gather(*[_run(s) for s in effective_sources], return_exceptions=False)
         return list(results)
@@ -423,13 +339,7 @@ class Orchestrator:
         lines: list[str] = []
         if rolling:
             lines.append(f"[summary of earlier conversation] {rolling}")
-        if turns:
-            lines.extend(memory_module.history_as_dialogue(turns))
-        elif request.extra_history:
-            # ai_conversation_turns returned nothing (RLS not yet configured or
-            # first turn). Fall back to the formatted messages the webhook pulled
-            # directly from the messages table — these are always authoritative.
-            lines.extend(request.extra_history)
+        lines.extend(memory_module.history_as_dialogue(turns))
         return lines
 
     async def _refresh_rolling_summary(self, db, request: TurnRequest, turn_index: int) -> None:
@@ -540,22 +450,18 @@ def _extract_product_links(answer: str, chunks: list[ContextChunk]) -> list[Prod
                     or (slug and f"/{slug}" in cleaned)
                 )
                 if hit:
-                    name = str((chunk.metadata or {}).get("name") or chunk.title or "")
-                    image_url = str((chunk.metadata or {}).get("image_url") or "")
-                    links.append(ProductLink(product_id=chunk.source_id, url=cleaned, name=name, image_url=image_url))
+                    links.append(ProductLink(product_id=chunk.source_id, url=cleaned))
                     break
     if links:
         return links
     # Fallback: pick the top-relevance product chunk that has a resolvable
-    # public URL. This is what powers the product card in the chat widget when
-    # the LLM declined to write the URL inline.
+    # public URL. This is what powers the "View product" card in the chat
+    # widget when the LLM declined to write the URL inline.
     for chunk in sorted(product_chunks, key=lambda c: c.relevance_score, reverse=True):
         meta = chunk.metadata or {}
         url = str(meta.get("public_url") or meta.get("links") or "")
         if url:
-            name = str(meta.get("name") or chunk.title or "")
-            image_url = str(meta.get("image_url") or "")
-            links.append(ProductLink(product_id=chunk.source_id, url=url, name=name, image_url=image_url))
+            links.append(ProductLink(product_id=chunk.source_id, url=url))
             break
     return links
 

@@ -343,7 +343,9 @@ async def admin_users(
     rows = await db.fetch(
         """
         WITH lead_totals AS (
-            SELECT company_id, COUNT(*) AS total_leads
+            -- COUNT(DISTINCT id) avoids double-counting if joins are added later;
+            -- status != 'converted' matches the overview endpoint filter.
+            SELECT company_id, COUNT(DISTINCT id) AS total_leads
             FROM leads
             WHERE status != 'converted'
             GROUP BY company_id
@@ -356,7 +358,8 @@ async def admin_users(
             GROUP BY company_id
         ),
         customer_totals AS (
-            SELECT company_id, COUNT(*) AS total_customers
+            -- COUNT(DISTINCT id) avoids double-counting if a customer has multiple records.
+            SELECT company_id, COUNT(DISTINCT id) AS total_customers
             FROM customers
             GROUP BY company_id
         ),

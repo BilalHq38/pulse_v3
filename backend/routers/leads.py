@@ -539,11 +539,6 @@ async def _send_lead_nurture_message(
         company_id,
         channel=channel,
         idempotency_key=f"out:{company_id}:{channel}:lead_nurture:{msg_id}",
-        metadata={
-            "source": "lead_nurture",
-            "lead_id": lead.get("id", ""),
-            "nurture_message_id": nurture_message.get("id", ""),
-        },
     )
     if reservation == "denied":
         raise_conversation_limit_completed(await conversation_limit_status(db, company_id))
@@ -581,7 +576,13 @@ async def _send_lead_nurture_message(
                 msg_id,
                 company_id,
             )
-            raise HTTPException(502, error or f"Failed to send {channel} message")
+            err_detail = str(error or f"Failed to send {channel} message")
+            # Map common WHATSAPP_SESSION_NOT_READY errors to user-friendly messages
+            if "WHATSAPP_SESSION_NOT_READY" in err_detail:
+                err_detail = "WhatsApp is not connected. Please scan the QR code in Settings → Channels → WhatsApp to connect."
+            elif "not_configured" in err_detail.lower() or "not configured" in err_detail.lower():
+                err_detail = f"{channel.capitalize()} channel is not configured. Go to Settings → Channels to set it up."
+            raise HTTPException(400, err_detail)
     await persist_chat_history(
         db,
         conversation,
@@ -1136,6 +1137,66 @@ async def bulk_upload_leads(request: Request, file: UploadFile = File(...)):
     return summary
 
 
+async def _fetch_lead_conversation_context(db, lead_id: str, cid: str) -> dict:
+    """Return conversation_history string and last_message for a lead. Used to enrich scoring."""
+    result: dict = {"conversation_history": "", "last_message": ""}
+    try:
+        customer = r(
+            await db.fetchrow(
+                "SELECT id FROM customers WHERE lead_id=$1 AND company_id=$2 LIMIT 1",
+                lead_id, cid,
+            )
+        )
+        if not customer:
+            return result
+        conv = r(
+            await db.fetchrow(
+                "SELECT id, channel FROM conversations "
+                "WHERE customer_id=$1 AND company_id=$2 ORDER BY last_message_at DESC LIMIT 1",
+                customer["id"], cid,
+            )
+        )
+        if not conv:
+            return result
+        messages = rs(
+            await db.fetch(
+                "SELECT content, sender_type FROM messages "
+                "WHERE conversation_id=$1 AND company_id=$2 "
+                "AND COALESCE(TRIM(content), '') != '' "
+                "ORDER BY created_at DESC LIMIT 15",
+                conv["id"], cid,
+            )
+        )
+        if not messages:
+            return result
+        lines: list[str] = [f"Channel: {conv.get('channel', 'chat')}"]
+        last_customer_msg = ""
+        for msg in reversed(messages):
+            role = "Customer" if msg["sender_type"] == "customer" else "Agent"
+            content = str(msg["content"] or "").strip()[:300]
+            lines.append(f"{role}: {content}")
+            if msg["sender_type"] == "customer" and not last_customer_msg:
+                last_customer_msg = content
+        result["conversation_history"] = "\n".join(lines)
+        result["last_message"] = last_customer_msg
+
+        # MiniLM buying signal + lead quality from conversation content
+        if result["conversation_history"]:
+            try:
+                from services.ai_service.local_ml import classify_buying_signal, classify_lead_quality  # noqa: PLC0415
+                buying = classify_buying_signal(result["conversation_history"])
+                quality = classify_lead_quality(result["conversation_history"])
+                result["buying_signal"] = buying.get("signal", "")
+                result["buying_score"] = buying.get("buying_score", 0.5)
+                result["lead_quality_signal"] = quality.get("quality", "")
+                result["lead_quality_score"] = quality.get("quality_score", 0.3)
+            except Exception as exc:
+                logger.debug("MiniLM buying/quality signal failed lead_id=%s: %s", lead_id, exc)
+    except Exception as exc:
+        logger.debug("Could not fetch lead conversation for scoring lead_id=%s: %s", lead_id, exc)
+    return result
+
+
 @router.post("/leads/{lead_id}/score")
 async def score_lead(lead_id: str, request: Request):
     db = _db(request)
@@ -1144,11 +1205,21 @@ async def score_lead(lead_id: str, request: Request):
     lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
     if not lead:
         raise HTTPException(404, "Lead not found")
+    conv_ctx = await _fetch_lead_conversation_context(db, lead_id, cid)
+    enriched_lead = {**lead}
+    if conv_ctx["conversation_history"]:
+        enriched_lead["conversation_history"] = conv_ctx["conversation_history"]
+    if conv_ctx["last_message"] and not enriched_lead.get("last_message"):
+        enriched_lead["last_message"] = conv_ctx["last_message"]
+    if conv_ctx.get("buying_signal"):
+        enriched_lead["buying_signal"] = conv_ctx["buying_signal"]
+    if conv_ctx.get("lead_quality_signal"):
+        enriched_lead["lead_quality_signal"] = conv_ctx["lead_quality_signal"]
     workflow = await orchestrate_lead_workflow(
         LeadWorkflowRequest(
             company_id=cid,
             lead_id=lead_id,
-            lead=lead,
+            lead=enriched_lead,
             source=str(lead.get("source") or "lead"),
             actor_user_id=cu.get("sub", ""),
             actor_user_role=cu.get("role", ""),
@@ -1173,7 +1244,9 @@ async def score_lead(lead_id: str, request: Request):
         source=str((updated or {}).get("source") or "lead"),
         action="lead_scored",
     )
-    return _serialize_lead(updated)
+    # Return the full lead detail (including nurture_messages, activities, etc.)
+    # so the frontend can update the selected lead without losing existing data.
+    return await _load_lead_details(db, lead_id, cid)
 
 
 @router.post("/leads/{lead_id}/auto-score")
@@ -1184,11 +1257,21 @@ async def auto_score_lead(lead_id: str, request: Request):
     lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
     if not lead:
         raise HTTPException(404, "Lead not found")
+    conv_ctx = await _fetch_lead_conversation_context(db, lead_id, cid)
+    enriched_lead = {**lead}
+    if conv_ctx["conversation_history"]:
+        enriched_lead["conversation_history"] = conv_ctx["conversation_history"]
+    if conv_ctx["last_message"] and not enriched_lead.get("last_message"):
+        enriched_lead["last_message"] = conv_ctx["last_message"]
+    if conv_ctx.get("buying_signal"):
+        enriched_lead["buying_signal"] = conv_ctx["buying_signal"]
+    if conv_ctx.get("lead_quality_signal"):
+        enriched_lead["lead_quality_signal"] = conv_ctx["lead_quality_signal"]
     workflow = await orchestrate_lead_workflow(
         LeadWorkflowRequest(
             company_id=cid,
             lead_id=lead_id,
-            lead=lead,
+            lead=enriched_lead,
             source=str(lead.get("source") or "lead"),
             actor_user_id=cu.get("sub", ""),
             actor_user_role=cu.get("role", ""),
@@ -1237,7 +1320,7 @@ async def auto_score_lead(lead_id: str, request: Request):
         action="lead_auto_scored",
     )
     return {
-        "lead": _serialize_lead(updated),
+        "lead": await _load_lead_details(db, lead_id, cid),
         "ai_result": result,
     }
 
@@ -1250,18 +1333,20 @@ async def nurture_lead(lead_id: str, request: Request):
     lead = r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2 LIMIT 1", lead_id, cid))
     if not lead:
         raise HTTPException(404, "Lead not found")
-    company_context = await get_company_knowledge(
+    company_knowledge = await get_company_knowledge(
         db,
         cid,
         current_query=str(lead.get("notes") or lead.get("name") or ""),
         top_k=5,
     )
+    ctx = await _build_lead_nurture_context(db, lead, cid, company_knowledge)
     result = await generate_nurture_message(
         lead,
         lead.get("status", "new"),
-        company_context,
+        ctx["company_context"],
         db=db,
         company_id=cid,
+        conversation_history=ctx["conversation_history"],
     )
     message = _first_valid_nurture_message(result)
     stage = str(result.get("stage") or result.get("phase") or lead.get("status") or "new")
@@ -1519,11 +1604,148 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
     }
 
 
+async def _build_lead_nurture_context(db, lead: dict, cid: str, company_knowledge: str) -> dict:
+    """Build rich context for nurture generation.
+
+    Returns a dict with two separate sections:
+      - company_context: company knowledge + lead notes (what the company offers)
+      - conversation_history: recent messages + activity history (how to continue naturally)
+    """
+    lead_id = lead.get("id", "")
+
+    company_parts: list[str] = []
+    if company_knowledge:
+        company_parts.append(company_knowledge)
+    if lead.get("notes"):
+        company_parts.append(f"Lead notes: {lead.get('notes')}")
+
+    conversation_parts: list[str] = []
+
+    try:
+        customer = r(
+            await db.fetchrow(
+                "SELECT id, name, email, phone FROM customers WHERE lead_id=$1 AND company_id=$2 LIMIT 1",
+                lead_id,
+                cid,
+            )
+        )
+        if customer:
+            conv = r(
+                await db.fetchrow(
+                    "SELECT id, channel, last_message, last_message_at FROM conversations "
+                    "WHERE customer_id=$1 AND company_id=$2 ORDER BY last_message_at DESC LIMIT 1",
+                    customer["id"],
+                    cid,
+                )
+            )
+            if conv:
+                messages = rs(
+                    await db.fetch(
+                        "SELECT content, sender_type, created_at FROM messages "
+                        "WHERE conversation_id=$1 AND company_id=$2 "
+                        "AND COALESCE(TRIM(content), '') != '' "
+                        "ORDER BY created_at DESC LIMIT 10",
+                        conv["id"],
+                        cid,
+                    )
+                )
+                if messages:
+                    history_lines = []
+                    for msg in reversed(messages):
+                        role = "Customer" if msg["sender_type"] == "customer" else "Agent"
+                        history_lines.append(f"  {role}: {str(msg['content'] or '').strip()[:200]}")
+                    conversation_parts.append(
+                        f"Recent conversation ({conv.get('channel', 'chat')}):\n" + "\n".join(history_lines)
+                    )
+    except Exception as exc:
+        logger.debug("Could not fetch lead conversation context lead_id=%s: %s", lead_id, exc)
+
+    try:
+        activities = rs(
+            await db.fetch(
+                "SELECT type, content, stage, created_at FROM lead_activities "
+                "WHERE lead_id=$1 AND company_id=$2 AND type != 'auto_nurture' "
+                "ORDER BY created_at DESC LIMIT 5",
+                lead_id,
+                cid,
+            )
+        )
+        if activities:
+            act_lines = [
+                f"  [{a.get('type', '')}] {str(a.get('content') or '').strip()[:120]}"
+                for a in reversed(activities) if a.get("content")
+            ]
+            if act_lines:
+                conversation_parts.append("Lead activity history:\n" + "\n".join(act_lines))
+    except Exception as exc:
+        logger.debug("Could not fetch lead activities lead_id=%s: %s", lead_id, exc)
+
+    return {
+        "company_context": "\n\n".join(company_parts),
+        "conversation_history": "\n\n".join(conversation_parts),
+    }
+
+
+async def _nurture_single_lead(db, lead: dict, cid: str, company_knowledge: str) -> dict:
+    """Generate and persist a nurture message for one lead. Replace any unsent drafts."""
+    lead_id = lead["id"]
+    try:
+        # Replace existing unsent drafts with fresh ones (don't block on pending messages)
+        await db.execute(
+            "UPDATE lead_nurture_messages SET sent=TRUE, phase='replaced' "
+            "WHERE lead_id=$1 AND company_id=$2 AND sent=FALSE",
+            lead_id,
+            cid,
+        )
+
+        ctx = await _build_lead_nurture_context(db, lead, cid, company_knowledge)
+        result = await generate_nurture_message(
+            lead,
+            lead.get("status", "new"),
+            ctx["company_context"],
+            db=db,
+            company_id=cid,
+            conversation_history=ctx["conversation_history"],
+        )
+        message = _first_valid_nurture_message(result)
+        stage = str(result.get("stage") or result.get("phase") or lead.get("status") or "new")
+        message_id = ""
+        if message:
+            message_id = make_id()
+            await db.execute(
+                "INSERT INTO lead_activities(id,lead_id,company_id,type,content,stage,created_at) "
+                "VALUES($1,$2,$3,'auto_nurture',$4,$5,NOW())",
+                make_id(), lead_id, cid, message, stage,
+            )
+            await db.execute(
+                "INSERT INTO lead_nurture_messages(id,lead_id,company_id,message,phase,sent,created_at) "
+                "VALUES($1,$2,$3,$4,$5,FALSE,NOW())",
+                message_id, lead_id, cid, message, stage,
+            )
+        return {
+            "lead_id": lead_id,
+            "name": lead.get("name", ""),
+            "message_id": message_id,
+            "status": "nurtured" if message_id else "skipped_empty",
+        }
+    except Exception as exc:
+        logger.error("Auto-nurture failed for lead_id=%s: %s", lead_id, exc)
+        return {
+            "lead_id": lead_id,
+            "name": lead.get("name", ""),
+            "status": "failed",
+            "error": str(exc)[:200],
+        }
+
+
 @router.post("/leads/auto-nurture-all")
 async def auto_nurture_all_leads(request: Request):
     db = _db(request)
     cu = await require_roles(request, ["admin"])
     cid = cu.get("company_id", "")
+
+    # Include ALL eligible leads regardless of pending draft state
+    # Existing unsent drafts will be replaced with fresh context-aware messages
     leads = rs(
         await db.fetch(
             """
@@ -1531,85 +1753,32 @@ async def auto_nurture_all_leads(request: Request):
             FROM leads l
             WHERE l.company_id=$1
               AND l.status=ANY($2)
-              AND NOT EXISTS (
-                SELECT 1
-                FROM lead_nurture_messages nm
-                WHERE nm.lead_id=l.id
-                  AND nm.company_id=$1
-                  AND nm.sent=FALSE
-              )
-            LIMIT 50
+            ORDER BY l.updated_at DESC
+            LIMIT 20
             """,
             cid,
             ["new", "contacted", "qualified"],
         )
     )
-    results = []
-    for lead in leads:
-        try:
-            company_context = await get_company_knowledge(
-                db=db,
-                company_id=cid,
-                current_query=str(lead.get("notes") or lead.get("name") or ""),
-                top_k=5,
-            )
-            result = await generate_nurture_message(
-                lead,
-                lead.get("status", "new"),
-                company_context,
-                db=db,
-                company_id=cid,
-            )
-            message = _first_valid_nurture_message(result)
-            stage = str(result.get("stage") or result.get("phase") or lead.get("status") or "new")
-            message_id = ""
-            if message:
-                message_id = make_id()
-                await db.execute(
-                    "INSERT INTO lead_activities(id,lead_id,company_id,type,content,stage,created_at) VALUES($1,$2,$3,'auto_nurture',$4,$5,NOW())",  # noqa: E501
-                    make_id(),
-                    lead["id"],
-                    cid,
-                    message,
-                    stage,
-                )
-                await db.execute(
-                    "INSERT INTO lead_nurture_messages(id,lead_id,company_id,message,phase,sent,created_at) VALUES($1,$2,$3,$4,$5,FALSE,NOW())",  # noqa: E501
-                    message_id,
-                    lead["id"],
-                    cid,
-                    message,
-                    stage,
-                )
-            refreshed = r(
-                await db.fetchrow(
-                    "SELECT * FROM leads WHERE id=$1 AND company_id=$2",
-                    lead["id"],
-                    cid,
-                )
-            )
-            await _capture_lead_snapshot(
-                db,
-                refreshed,
-                source=str((refreshed or {}).get("source") or lead.get("source") or "lead"),
-                action="lead_auto_nurtured",
-            )
-            results.append(
-                {
-                    "lead_id": lead["id"],
-                    "name": lead["name"],
-                    "message_id": message_id,
-                    "status": "nurtured" if message_id else "skipped_empty",
-                }
-            )
-        except Exception as e:
-            logger.error(f"Auto-nurture failed for {lead['id']}: {e}")
-            results.append(
-                {
-                    "lead_id": lead["id"],
-                    "name": lead["name"],
-                    "status": "failed",
-                    "error": str(e),
-                }
-            )
-    return {"total_processed": len(results), "results": results}
+
+    if not leads:
+        return {"total_processed": 0, "results": [], "message": "No eligible leads found."}
+
+    # Fetch company knowledge once (shared across all leads for this batch)
+    company_knowledge = await get_company_knowledge(db=db, company_id=cid, current_query="", top_k=5)
+
+    # Process leads concurrently (max 3 at a time to stay within LLM rate limits)
+    semaphore = asyncio.Semaphore(3)
+
+    async def _bounded(lead: dict) -> dict:
+        async with semaphore:
+            return await _nurture_single_lead(db, lead, cid, company_knowledge)
+
+    results = list(await asyncio.gather(*[_bounded(lead) for lead in leads]))
+
+    nurtured = sum(1 for r in results if r.get("status") == "nurtured")
+    return {
+        "total_processed": len(results),
+        "total_nurtured": nurtured,
+        "results": results,
+    }

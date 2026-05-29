@@ -143,6 +143,7 @@ class NurtureRequest(BaseModel):
     stage: str = "awareness"
     company_id: str = ""
     company_context: str = ""
+    conversation_history: str = ""
 
 
 class MemoryUpdateRequest(BaseModel):

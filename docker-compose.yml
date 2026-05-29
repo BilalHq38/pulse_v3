@@ -113,6 +113,7 @@ services:
       context: .
       dockerfile: backend/whatsapp_bridge/Dockerfile
     container_name: pulse-whatsapp-bridge
+    shm_size: '256m'
     environment:
       BRIDGE_PORT: ${BRIDGE_PORT:-3001}
       PYTHON_BACKEND: ${PYTHON_BACKEND:-http://gateway:8000}
@@ -127,34 +128,38 @@ services:
       BRIDGE_COMPANY_ID: ${BRIDGE_COMPANY_ID:-${DEFAULT_TENANT_ID}}
       WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
       MY_WHATSAPP_NUMBER: ${MY_WHATSAPP_NUMBER:-}
-      WWEBJS_AUTH_TIMEOUT_MS: ${WWEBJS_AUTH_TIMEOUT_MS:-180000}
-      WWEBJS_READY_AFTER_INIT_TIMEOUT_MS: ${WWEBJS_READY_AFTER_INIT_TIMEOUT_MS:-180000}
+      # Reduced from 180s — retry faster on transient Chromium/WA errors
+      WWEBJS_AUTH_TIMEOUT_MS: ${WWEBJS_AUTH_TIMEOUT_MS:-60000}
+      WWEBJS_READY_AFTER_INIT_TIMEOUT_MS: ${WWEBJS_READY_AFTER_INIT_TIMEOUT_MS:-60000}
       WWEBJS_INIT_MAX_ATTEMPTS: ${WWEBJS_INIT_MAX_ATTEMPTS:-3}
-      WWEBJS_INIT_RETRY_BASE_DELAY_MS: ${WWEBJS_INIT_RETRY_BASE_DELAY_MS:-3000}
-      WWEBJS_INIT_RETRY_MAX_DELAY_MS: ${WWEBJS_INIT_RETRY_MAX_DELAY_MS:-20000}
-      BRIDGE_READY_TIMEOUT_MS: ${BRIDGE_READY_TIMEOUT_MS:-180000}
-      BRIDGE_CHECK_READY_TIMEOUT_MS: ${BRIDGE_CHECK_READY_TIMEOUT_MS:-180000}
-      PUPPETEER_PROTOCOL_TIMEOUT_MS: ${PUPPETEER_PROTOCOL_TIMEOUT_MS:-180000}
-      PUPPETEER_NAVIGATION_TIMEOUT_MS: ${PUPPETEER_NAVIGATION_TIMEOUT_MS:-180000}
+      WWEBJS_INIT_RETRY_BASE_DELAY_MS: ${WWEBJS_INIT_RETRY_BASE_DELAY_MS:-2000}
+      WWEBJS_INIT_RETRY_MAX_DELAY_MS: ${WWEBJS_INIT_RETRY_MAX_DELAY_MS:-10000}
+      BRIDGE_READY_TIMEOUT_MS: ${BRIDGE_READY_TIMEOUT_MS:-60000}
+      BRIDGE_CHECK_READY_TIMEOUT_MS: ${BRIDGE_CHECK_READY_TIMEOUT_MS:-60000}
+      PUPPETEER_PROTOCOL_TIMEOUT_MS: ${PUPPETEER_PROTOCOL_TIMEOUT_MS:-60000}
+      PUPPETEER_NAVIGATION_TIMEOUT_MS: ${PUPPETEER_NAVIGATION_TIMEOUT_MS:-60000}
     expose:
       - "3001"
     ports:
       - "${WHATSAPP_BRIDGE_HOST_PORT:-3001}:3001"
     volumes:
       - whatsapp-bridge-auth:/app/.wwebjs_auth
+    # Bridge only needs data services to be up — gateway dependency removed so
+    # Chromium initializes in parallel with Python services instead of after them.
+    # Webhook retries handle the case where gateway isn't ready on first message.
     depends_on:
-      gateway:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "node -e \"fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 180s
+      # wget is ~10x lighter than spawning a Node.js process for each health probe
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Express starts within 1-2s; 10s is generous for slow container boot
+      start_period: 10s
 
   auth:
     <<: *service-defaults

@@ -345,7 +345,7 @@ def ai_temperature(default: float = 0.7) -> float:
         return default
 
 
-def ai_max_tokens(default: int = 1024) -> int:
+def ai_max_tokens(default: int = 8192) -> int:
     try:
         return int(os.environ.get("AI_MAX_TOKENS", str(default)) or default)
     except ValueError:
@@ -387,7 +387,7 @@ def anthropic_model_name(default: str = "claude-3-5-sonnet-20241022") -> str:
     return (os.environ.get("ANTHROPIC_MODEL", default) or default).strip()
 
 
-def gemini_flash_model_name(default: str = "gemini-2.5-flash") -> str:
+def gemini_flash_model_name(default: str = "gemini-2.5-flash-lite") -> str:
     return (os.environ.get("GEMINI_FLASH_MODEL", default) or default).strip()
 
 
@@ -396,7 +396,7 @@ def gemini_pro_model_name(default: str = "gemini-2.5-pro") -> str:
 
 
 def gemini_fallback_models(
-    default: str = "gemini-2.5-flash,gemini-2.0-flash,gemini-2.0-flash-lite",
+    default: str = "gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash,gemini-2.0-flash-lite",
 ) -> list[str]:
     return [
         model.strip()

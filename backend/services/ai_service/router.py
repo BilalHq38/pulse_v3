@@ -305,6 +305,7 @@ async def nurture_lead(
         payload.lead,
         payload.stage,
         company_context=payload.company_context,
+        conversation_history=payload.conversation_history,
         db=db,
         company_id=company_id,
     )

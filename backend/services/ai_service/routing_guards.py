@@ -1206,6 +1206,22 @@ def lightweight_route_message(
                 "low_value": False,
             }
 
+    # MiniLM semantic fallback — handles complex/ambiguous messages the rule engine misses
+    try:
+        from services.ai_service.local_ml import classify_intent as _ml_intent  # noqa: PLC0415
+        ml = _ml_intent(text)
+        if ml.get("confidence", 0.0) >= 0.45 and ml.get("intent") not in {"general_question"}:
+            return {
+                "intent": ml["intent"],
+                "confidence": ml["confidence"],
+                "entities": {},
+                "urgency": ml.get("urgency", "low"),
+                "source": "local_minilm",
+                "low_value": False,
+            }
+    except Exception:
+        pass
+
     return {}
 
 

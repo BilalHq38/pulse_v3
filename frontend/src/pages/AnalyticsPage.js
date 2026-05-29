@@ -77,6 +77,7 @@ export default function AnalyticsPage() {
   const [dailySummaries, setDailySummaries] = useState([]);
   const [aiSessions, setAiSessions] = useState([]);
   const [analyticsReports, setAnalyticsReports] = useState([]);
+  const [aiScore, setAiScore] = useState(null);
   const [loading, setLoading] = useState(true);
   const [generatingDaily, setGeneratingDaily] = useState(false);
   const [expandedDay, setExpandedDay] = useState(null);
@@ -97,7 +98,8 @@ export default function AnalyticsPage() {
       api.get('/analytics/daily-summaries'),
       api.get('/ai/sessions', { params: { limit: 20 } }).catch(() => ({ data: [] })),
       api.get('/analytics/reports', { params: { limit: 10 } }).catch(() => ({ data: [] })),
-    ]).then(([ov, cd, ld, sd, ad, cs, ds, ais, ar]) => {
+      api.get('/analytics/ai-score').catch(() => ({ data: null })),
+    ]).then(([ov, cd, ld, sd, ad, cs, ds, ais, ar, asc]) => {
       setOverview(ov.data);
       setConvoData(cd.data);
       setLeadData(ld.data);
@@ -107,6 +109,7 @@ export default function AnalyticsPage() {
       setDailySummaries(ds.data || []);
       setAiSessions(ais.data || []);
       setAnalyticsReports(ar.data || []);
+      setAiScore(asc.data || null);
     }).catch(console.error).finally(() => setLoading(false));
   };
 
@@ -149,10 +152,11 @@ export default function AnalyticsPage() {
 
       {/* Top KPIs */}
       {overview && (
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4" data-testid="analytics-kpis">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4" data-testid="analytics-kpis">
           {[
             { label: 'Conversations', value: overview.total_conversations, icon: MessageSquare, color: 'violet' },
             { label: 'AI Rate', value: `${overview.ai_resolution_rate}%`, icon: Bot, color: 'purple' },
+            { label: 'AI Score', value: aiScore ? `${aiScore.ai_score}%` : '—', icon: Sparkles, color: 'purple' },
             { label: 'CSAT', value: overview.csat_score, icon: TrendingUp, color: 'emerald' },
             { label: 'NPS', value: overview.nps_score, icon: BarChart3, color: 'cyan' },
             { label: 'Leads', value: overview.total_leads, icon: Target, color: 'amber' },
@@ -291,6 +295,46 @@ export default function AnalyticsPage() {
         </table>
       </div>
 
+      {/* AI Score & Nature Breakdown */}
+      {aiScore && (
+        <div className="bg-white border border-slate-100 rounded-xl p-6" data-testid="ai-score-panel">
+          <div className="flex items-center gap-2 mb-5">
+            <Sparkles size={16} className="text-purple-500" />
+            <h3 className="text-sm font-semibold text-slate-900">AI Score &amp; Nature Breakdown</h3>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-5">
+            {[
+              { label: 'AI Score', value: `${aiScore.ai_score}%`, sub: 'composite', color: 'text-purple-700', bg: 'bg-purple-50' },
+              { label: 'Avg Confidence', value: `${aiScore.avg_confidence_pct}%`, sub: 'per conversation', color: 'text-blue-700', bg: 'bg-blue-50' },
+              { label: 'Resolution Rate', value: `${aiScore.resolution_rate}%`, sub: 'AI-handled', color: 'text-emerald-700', bg: 'bg-emerald-50' },
+              { label: 'Escalations', value: aiScore.ai_escalated, sub: 'AI-handled', color: 'text-red-700', bg: 'bg-red-50' },
+            ].map((stat) => (
+              <div key={stat.label} className={`${stat.bg} rounded-lg p-3 text-center`}>
+                <p className={`text-xl font-bold ${stat.color}`}>{stat.value}</p>
+                <p className="text-[11px] font-medium text-slate-700 mt-0.5">{stat.label}</p>
+                <p className="text-[10px] text-slate-400">{stat.sub}</p>
+              </div>
+            ))}
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Nature Distribution</p>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {[
+                { label: 'Excellent', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+                { label: 'Good', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
+                { label: 'Moderate', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+                { label: 'Low', cls: 'bg-red-50 text-red-700 border-red-200' },
+              ].map(({ label, cls }) => (
+                <div key={label} className={`rounded-lg border p-3 text-center ${cls}`}>
+                  <p className="text-xl font-bold">{(aiScore.nature_breakdown || {})[label] ?? 0}</p>
+                  <p className="text-[11px] font-semibold mt-0.5">{label}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Daily AI Summaries */}
       <div className="bg-white border border-slate-100 rounded-xl p-6" data-testid="daily-summaries">
         <div className="flex items-center justify-between mb-5">
@@ -304,13 +348,13 @@ export default function AnalyticsPage() {
             className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 text-white text-xs font-medium rounded-lg hover:bg-violet-700 disabled:opacity-50 transition-colors"
           >
             <RefreshCw size={12} className={generatingDaily ? 'animate-spin' : ''} />
-            {generatingDaily ? 'Generating...' : 'Generate Today'}
+            {generatingDaily ? 'Generating...' : "Generate Today's Summary"}
           </button>
         </div>
         {dailySummaries.length === 0 ? (
           <div className="text-center py-10 text-slate-400 text-sm">
             <Sparkles size={28} className="mx-auto mb-2 opacity-30" />
-            No daily summaries yet. Click "Generate Today" to create one.
+            No daily summaries yet. Click "Generate Today's Summary" to create one.
           </div>
         ) : (
           <div className="space-y-3">
@@ -327,6 +371,8 @@ export default function AnalyticsPage() {
                       >
                         <div className="flex items-center gap-3">
                           <Calendar size={14} className="text-violet-400" />
+                          {/* Date column */}
+                          <span className="text-xs font-mono text-slate-500 bg-slate-100 px-2 py-0.5 rounded">{ds.summary_date || ds.date}</span>
                           <span className="text-sm font-medium text-slate-700">{ds.date}</span>
                           <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                             ds.overall_sentiment === 'positive'
@@ -344,6 +390,22 @@ export default function AnalyticsPage() {
                       {expandedDay === dayKey && (
                         <div className="px-4 pb-4 space-y-4 border-t border-slate-100 pt-3">
                           {ds.summary_text && <p className="text-sm text-slate-600 leading-relaxed">{ds.summary_text}</p>}
+                          {/* Comprehensive stats cards */}
+                          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
+                            {[
+                              { label: 'Total Interactions', value: ds.total_interactions ?? '—', color: 'text-violet-700', bg: 'bg-violet-50' },
+                              { label: 'Total Messages', value: ds.total_messages ?? '—', color: 'text-blue-700', bg: 'bg-blue-50' },
+                              { label: 'Avg Sentiment', value: ds.avg_sentiment != null ? Number(ds.avg_sentiment).toFixed(2) : '—', color: 'text-emerald-700', bg: 'bg-emerald-50' },
+                              { label: 'Escalations', value: ds.escalations ?? '—', color: 'text-red-700', bg: 'bg-red-50' },
+                              { label: 'AI Handled', value: ds.ai_handled_count ?? '—', color: 'text-cyan-700', bg: 'bg-cyan-50' },
+                              { label: 'Date', value: ds.summary_date || ds.date || '—', color: 'text-slate-700', bg: 'bg-slate-100' },
+                            ].map((stat, i) => (
+                              <div key={i} className={`${stat.bg} rounded-lg p-3 text-center`}>
+                                <p className={`text-base font-bold ${stat.color}`}>{stat.value}</p>
+                                <p className="text-[10px] text-slate-500 mt-0.5">{stat.label}</p>
+                              </div>
+                            ))}
+                          </div>
                           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                             {ds.top_topics?.length > 0 && (
                               <div>

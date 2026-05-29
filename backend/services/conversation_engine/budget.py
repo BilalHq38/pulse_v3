@@ -23,14 +23,14 @@ Tier = Literal["simple", "medium", "heavy"]
 
 
 _TIER_TARGETS: dict[Tier, int] = {
-    "simple": 20_000,
-    "medium": 80_000,
-    "heavy": 250_000,
+    "simple": 32_000,
+    "medium": 128_000,
+    "heavy": 400_000,
 }
 _TIER_CEILINGS: dict[Tier, int] = {
-    "simple": 30_000,
-    "medium": 120_000,
-    "heavy": 400_000,
+    "simple": 48_000,
+    "medium": 200_000,
+    "heavy": 600_000,
 }
 
 

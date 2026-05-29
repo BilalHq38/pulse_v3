@@ -315,7 +315,7 @@ export default function DashboardPage() {
             <h2 className="text-sm font-semibold text-slate-900">Response Rate Gauge</h2>
           </div>
           <div className="rounded-2xl bg-slate-50 p-5">
-            <p className="text-4xl font-bold text-slate-900">{data.micro_visuals.response_rate_gauge}%</p>
+            <p className="text-4xl font-bold text-slate-900">{Math.min(100, data.micro_visuals.response_rate_gauge || 0)}%</p>
             <p className="text-xs text-slate-500 mt-1">AI response rate today</p>
             <div className="mt-4 h-3 rounded-full bg-slate-200 overflow-hidden">
               <div className="h-full rounded-full bg-violet-500" style={{ width: `${Math.min(100, data.micro_visuals.response_rate_gauge || 0)}%` }} />

@@ -13,6 +13,12 @@ COPY requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --retries 10 -r /app/requirements.txt
 
+RUN python -c "\
+from fastembed import TextEmbedding; \
+m = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); \
+list(m.embed(['warmup'])); \
+print('all-MiniLM-L6-v2 ready')"
+
 COPY backend /app/backend
 
 CMD ["uvicorn", "services.lead_service.main:app", "--host", "0.0.0.0", "--port", "8004"]

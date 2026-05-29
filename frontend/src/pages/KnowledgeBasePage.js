@@ -464,6 +464,7 @@ export default function KnowledgeBasePage() {
                 <button onClick={() => setSelected(null)} className="text-slate-400 hover:text-slate-600"><X size={20} /></button>
               </div>
               <div className="prose prose-invert max-w-none">
+                <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">Content</p>
                 <div className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{selected.content}</div>
               </div>
               {selected.key_points && (
@@ -472,11 +473,16 @@ export default function KnowledgeBasePage() {
                   <p className="text-sm text-slate-600 whitespace-pre-wrap">{selected.key_points}</p>
                 </div>
               )}
-              <div className="flex flex-wrap gap-1.5 mt-6">
-                {(selected.tags || []).map(tag => (
-                  <span key={tag} className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200"><Tag size={10} className="inline mr-1" />{tag}</span>
-                ))}
-              </div>
+              {(selected.tags || []).length > 0 && (
+                <div className="mt-6">
+                  <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">Tags</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(selected.tags || []).map(tag => (
+                      <span key={tag} className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200"><Tag size={10} className="inline mr-1" />{tag}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -530,16 +536,34 @@ export default function KnowledgeBasePage() {
                 <button onClick={() => { setShowForm(false); setEditMode(false); }} className="text-slate-400 hover:text-slate-600"><X size={20} /></button>
               </div>
               <div className="space-y-4">
-                <input value={form.title} onChange={(e) => setForm({...form, title: e.target.value})} placeholder="Article Title *" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-title" required />
-                <select value={form.category} onChange={(e) => setForm({...form, category: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-category">
-                  {categories.map(c => <option key={c} value={c}>{formatCategoryLabel(c)}</option>)}
-                </select>
-                <textarea value={form.content} onChange={(e) => setForm({...form, content: e.target.value})} placeholder="Article content..." rows={10} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20 resize-none" data-testid="kb-form-content" />
-                <textarea value={form.key_points} onChange={(e) => setForm({...form, key_points: e.target.value})} placeholder="Key points / how AI should use this article..." rows={4} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20 resize-none" />
-                <input value={form.tags} onChange={(e) => setForm({...form, tags: e.target.value})} placeholder="Tags (comma separated)" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-tags" />
-                <label className="flex items-center justify-between px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl">
-                  <span className="text-sm text-slate-700">Use this article as AI context</span>
-                  <input type="checkbox" checked={form.ai_context_enabled} onChange={(e) => setForm({ ...form, ai_context_enabled: e.target.checked })} />
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Article Title <span className="text-red-400">*</span></label>
+                  <input value={form.title} onChange={(e) => setForm({...form, title: e.target.value})} placeholder="e.g. How to reset your password" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-title" required />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Category</label>
+                  <select value={form.category} onChange={(e) => setForm({...form, category: e.target.value})} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-category">
+                    {categories.map(c => <option key={c} value={c}>{formatCategoryLabel(c)}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Article Content</label>
+                  <textarea value={form.content} onChange={(e) => setForm({...form, content: e.target.value})} placeholder="Write the full article content here..." rows={10} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20 resize-none" data-testid="kb-form-content" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Key Points <span className="text-slate-400 font-normal">(how the AI should use this article)</span></label>
+                  <textarea value={form.key_points} onChange={(e) => setForm({...form, key_points: e.target.value})} placeholder="e.g. Use this article when customers ask about account access or forgotten passwords..." rows={4} className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20 resize-none" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">Tags <span className="text-slate-400 font-normal">(comma separated)</span></label>
+                  <input value={form.tags} onChange={(e) => setForm({...form, tags: e.target.value})} placeholder="e.g. password, account, login" className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500/20" data-testid="kb-form-tags" />
+                </div>
+                <label className="flex items-center justify-between px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer">
+                  <div>
+                    <span className="text-sm font-medium text-slate-700">Use as AI context</span>
+                    <p className="text-xs text-slate-400 mt-0.5">AI will reference this article when answering customer questions</p>
+                  </div>
+                  <input type="checkbox" checked={form.ai_context_enabled} onChange={(e) => setForm({ ...form, ai_context_enabled: e.target.checked })} className="w-4 h-4 accent-blue-600" />
                 </label>
                 <button onClick={createDoc} className="w-full py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl text-sm font-medium hover:from-blue-500 hover:to-blue-600 transition-all shadow-lg shadow-blue-600/15" data-testid="kb-form-submit">{editMode ? 'Update Article' : 'Create Article'}</button>
               </div>

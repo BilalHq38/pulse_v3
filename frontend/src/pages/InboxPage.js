@@ -462,21 +462,25 @@ function normalizeSentimentScore(rawScore) {
 function getSentimentMeta(rawScore, label = '', emotion = '') {
   const score = normalizeSentimentScore(rawScore);
   if (score === null) return null;
-  
-  const percentage = Math.round(score * 100);
-  
+
+  // normalizeSentimentScore maps DB raw [-1,1] → [0,1] via (x+1)/2.
+  // Convert back to raw [-1,1] for meaningful threshold-based labelling.
+  const rawNormalized = score * 2 - 1;
+  const percentage = Math.round(((rawNormalized + 1) / 2) * 100);
+
   let tone, accentClass;
-  if (percentage < 40) {
-    tone = 'Negative';
-    accentClass = 'bg-red-50 text-red-700 border-red-200';
-  } else if (percentage < 60) {
-    tone = 'Neutral';
-    accentClass = 'bg-amber-50 text-amber-700 border-amber-200';
-  } else {
+  // Threshold: >0.2 = Positive, <-0.2 = Negative, else Neutral
+  if (rawNormalized > 0.2) {
     tone = 'Positive';
     accentClass = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  } else if (rawNormalized < -0.2) {
+    tone = 'Negative';
+    accentClass = 'bg-red-50 text-red-700 border-red-200';
+  } else {
+    tone = 'Neutral';
+    accentClass = 'bg-amber-50 text-amber-700 border-amber-200';
   }
-  
+
   const displayLabel = emotion || label || tone;
   return {
     score,
@@ -1529,7 +1533,7 @@ export default function InboxPage() {
                         <span className="text-[11px] text-slate-400">{new Date(convo.last_message_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         {convoSentiment && (
                           <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${convoSentiment.accentClass}`}>
-                            {convoSentiment.percentage}%
+                            {convoSentiment.tone} <span className="opacity-60">({convoSentiment.percentage}%)</span>
                           </span>
                         )}
                       </div>
@@ -1717,7 +1721,7 @@ export default function InboxPage() {
                                 <p className="text-[11px] text-slate-400">{new Date(convo.last_message_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
                                 {convoSentiment && (
                                   <span className={`text-[10px] px-1.5 py-0.5 rounded-md border font-medium ${convoSentiment.accentClass}`}>
-                                    {convoSentiment.percentage}%
+                                    {convoSentiment.tone} <span className="opacity-60">({convoSentiment.percentage}%)</span>
                                   </span>
                                 )}
                                 {isGroup && <span className="text-[10px] px-1.5 py-0.5 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 font-medium">Group</span>}
@@ -1794,7 +1798,7 @@ export default function InboxPage() {
                     <span className={`text-[10px] px-1.5 py-0.5 rounded ${chInfo?.lightBg} ${chInfo?.text} font-medium inline-flex items-center gap-1`}><ChannelLogo channelKey={chInfo?.key} size={11} />{chInfo?.label}</span>
                     {selectedConvoSentiment && (
                       <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${selectedConvoSentiment.accentClass}`}>
-                        Sentiment {selectedConvoSentiment.score.toFixed(2)}
+                        {selectedConvoSentiment.tone} <span className="opacity-60">({selectedConvoSentiment.percentage}%)</span>
                       </span>
                     )}
                     <span className="text-[11px] text-slate-400 hidden sm:inline truncate">{selectedConvo.subject}</span>
@@ -2082,7 +2086,7 @@ export default function InboxPage() {
                       </div>
                       {messageSentiment && (
                           <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border font-medium ${messageSentiment.accentClass}`}>
-                            {messageSentiment.percentage}%
+                            {messageSentiment.tone} <span className="opacity-60">({messageSentiment.percentage}%)</span>
                           </span>
                         )}
                       {reactions.length > 0 && (
@@ -2310,6 +2314,44 @@ export default function InboxPage() {
                         ))}
                       </div>
                     </div>
+
+                    {selectedConvo?.ai_handled && (() => {
+                      const rawConfidence = selectedConvo.ai_confidence != null ? Number(selectedConvo.ai_confidence) : null;
+                      const confidencePct = rawConfidence != null ? Math.round(rawConfidence * (rawConfidence <= 1 ? 100 : 1)) : null;
+                      const isResolved = selectedConvo.status === 'resolved';
+                      const isEscalated = selectedConvo.status === 'escalated' || Boolean(selectedConvo.escalation_notice);
+                      let aiNature = 'Moderate';
+                      let natureCls = 'bg-amber-50 text-amber-700 border-amber-200';
+                      if (isEscalated || (confidencePct != null && confidencePct < 40)) {
+                        aiNature = 'Low'; natureCls = 'bg-red-50 text-red-700 border-red-200';
+                      } else if (confidencePct != null && confidencePct >= 80 && isResolved) {
+                        aiNature = 'Excellent'; natureCls = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+                      } else if (confidencePct != null && confidencePct >= 60 && isResolved) {
+                        aiNature = 'Good'; natureCls = 'bg-blue-50 text-blue-700 border-blue-200';
+                      }
+                      return (
+                        <div>
+                          <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">AI Performance</p>
+                          <div className="bg-purple-50 border border-purple-100 rounded-lg p-2.5 space-y-2">
+                            {confidencePct != null && (
+                              <div>
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="text-[10px] text-slate-500 font-medium">AI Score</span>
+                                  <span className="text-[10px] font-bold text-purple-700">{confidencePct}%</span>
+                                </div>
+                                <div className="h-1.5 bg-white rounded-full overflow-hidden">
+                                  <div className={`h-full rounded-full ${confidencePct >= 80 ? 'bg-emerald-500' : confidencePct >= 60 ? 'bg-blue-500' : confidencePct >= 40 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${confidencePct}%` }} />
+                                </div>
+                              </div>
+                            )}
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] text-slate-500 font-medium">AI Nature</span>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${natureCls}`}>{aiNature}</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {customerInfo.social_profiles && Object.keys(customerInfo.social_profiles).length > 0 && (
                       <div>

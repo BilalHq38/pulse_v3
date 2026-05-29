@@ -35,7 +35,10 @@ from shared.product_ref_token import create_ref_token
 
 # Short-lived in-process cache for the full product catalog (browse queries).
 # Products change infrequently; 30 seconds cuts repeated DB reads per burst.
-_CATALOG_CACHE: dict[str, tuple[float, list]] = {}
+# Cache stores raw product rows + company_slug + images dict — NOT ContextChunks.
+# ContextChunks contain customer-specific signed ref-token URLs and must be
+# rebuilt per request; caching them would leak one customer's URL to another.
+_CATALOG_CACHE: dict[str, tuple[float, list, str, dict]] = {}
 _CATALOG_TTL = 30.0
 
 logger = logging.getLogger(__name__)
@@ -305,31 +308,43 @@ class ProductRetriever:
 
     async def _fetch_full_catalog(self, db, *, company_id: str, top_k: int = 6) -> list[ContextChunk]:
         """Return top-N active products ordered by name — used when the scored
-        ranker returns nothing (browse / generic queries)."""
+        ranker returns nothing (browse / generic queries).
+
+        The in-process cache stores raw product rows + company_slug + images so
+        that customer-specific signed ref-token URLs are rebuilt fresh per
+        request. Caching ContextChunks would embed one customer's URL into the
+        catalog and return it to unrelated customers on cache hits.
+        """
         cache_key = f"{company_id}:{top_k}"
         cached = _CATALOG_CACHE.get(cache_key)
-        if cached and (_time.monotonic() - cached[0]) < _CATALOG_TTL:
-            return cached[1]
-        try:
-            rows = await _rls_fetch(
-                db,
-                company_id,
-                "SELECT id, name, product_title, category, product_type, price, "
-                "price_currency, description, stock_quantity, slug, links "
-                "FROM company_products "
-                "WHERE company_id = $1 AND COALESCE(status, 'active') != 'archived' "
-                "ORDER BY name ASC LIMIT $2",
-                company_id,
-                max(1, int(top_k)),
-            )
-        except Exception:
-            return []
-        if not rows:
-            return []
-        products = [dict(r) for r in rows]
-        company_slug = await _resolve_company_slug(db, company_id)
-        product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
-        images = await _fetch_first_images(db, product_ids, company_id=company_id)
+        now = _time.monotonic()
+        if cached and (now - cached[0]) < _CATALOG_TTL:
+            _ts, products, company_slug, images = cached
+        else:
+            try:
+                rows = await _rls_fetch(
+                    db,
+                    company_id,
+                    "SELECT id, name, product_title, category, product_type, price, "
+                    "price_currency, description, stock_quantity, slug, links "
+                    "FROM company_products "
+                    "WHERE company_id = $1 AND COALESCE(status, 'active') != 'archived' "
+                    "ORDER BY name ASC LIMIT $2",
+                    company_id,
+                    max(1, int(top_k)),
+                )
+            except Exception:
+                return []
+            if not rows:
+                return []
+            products = [dict(r) for r in rows]
+            company_slug = await _resolve_company_slug(db, company_id)
+            product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
+            images = await _fetch_first_images(db, product_ids, company_id=company_id)
+            _CATALOG_CACHE[cache_key] = (now, products, company_slug, images)
+
+        # Rebuild ContextChunks fresh for this request so URLs carry the
+        # current customer's signed ref token, not a cached customer's token.
         chunks: list[ContextChunk] = []
         denom = max(1, len(products))
         for index, product in enumerate(products):
@@ -346,7 +361,6 @@ class ProductRetriever:
             )
             if chunk is not None:
                 chunks.append(chunk)
-        _CATALOG_CACHE[cache_key] = (_time.monotonic(), chunks)
         return chunks
 
 

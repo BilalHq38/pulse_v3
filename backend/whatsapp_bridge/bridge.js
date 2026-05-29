@@ -2381,7 +2381,8 @@ function buildClient(session) {
     headless: true,
     protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
     timeout: PUPPETEER_NAVIGATION_TIMEOUT_MS,
-    defaultViewport: { width: 1280, height: 900 },
+    // Minimal viewport — WhatsApp Web works fine at 800×600, saves ~30% render work
+    defaultViewport: { width: 800, height: 600 },
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
@@ -2402,11 +2403,20 @@ function buildClient(session) {
       "--metrics-recording-only",
       "--no-first-run",
       "--no-default-browser-check",
-      "--window-size=1280,900",
+      "--window-size=800,600",
       // Prevent Chromium from OOM-killing the renderer under memory pressure,
       // which causes TargetCloseError during whatsapp-web.js script injection.
       "--memory-pressure-off",
       "--disable-features=MemoryPressureBasedSourceBufferGC",
+      // Additional fast-start flags: skip GPU compositing, software rasterizer,
+      // and accelerated canvas — none of which WhatsApp Web needs.
+      "--disable-software-rasterizer",
+      "--disable-accelerated-2d-canvas",
+      "--disable-gl-drawing-for-tests",
+      // Skip process zygote fork — meaningfully faster startup under --no-sandbox
+      "--no-zygote",
+      // Reduce DNS prefetch and speculative connections — not needed for a single WA domain
+      "--dns-prefetch-disable",
     ],
   };
   if (chromeExecutablePath) {
@@ -2505,6 +2515,14 @@ function attachClientHandlers(session) {
       (client.info && client.info.wid && client.info.wid.user) || MY_NUMBER || "",
     ).trim();
     setSessionState(session, SESSION_STATES.READY);
+    // Emit a timing marker so ops can measure cold-start latency
+    const sinceContainerStart = Date.now() - _BRIDGE_START_MS;
+    logBridgeEvent("info", "whatsapp.session.ready_timing", {
+      scope: session.scopeKey,
+      ms_since_bridge_start: sinceContainerStart,
+      init_attempt: session.initAttempt || 1,
+      phone: maskPhone(session.phone),
+    });
     // #region agent log
     _dbgLog("H4", "bridge.js:ready", "client ready", { scopeKey: session.scopeKey });
     // #endregion
@@ -2709,11 +2727,13 @@ function rebuildSessionClient(session) {
 
 async function waitForReadyOrQr(session, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  // 200ms poll — QR/ready events are set synchronously in event handlers so
+  // 200ms is responsive while remaining CPU-light under a shared connection pool.
   while (Date.now() < deadline) {
     if (isSessionReady(session)) return "ready";
     if (session.lastQrString) return "qr";
     if (session.lastInitError) return "failed";
-    await sleep(500);
+    await sleep(200);
   }
   return isSessionReady(session) ? "ready" : "timeout";
 }
@@ -2865,7 +2885,7 @@ async function waitForReady(session, timeoutMs = BRIDGE_READY_TIMEOUT_MS) {
     if (isSessionReady(session)) return true;
     if (session.lastQrString) return false;
     if (session.lastInitError && !session.initPromise) return false;
-    await sleep(500);
+    await sleep(200);
   }
   return isSessionReady(session);
 }
@@ -3022,15 +3042,44 @@ const app = express();
 app.use(express.json({ limit: BRIDGE_JSON_LIMIT }));
 
 app.get("/health", (_req, res) => {
+  const sessionList = Array.from(sessions.values());
+  const readySessions = sessionList.filter((s) => isSessionReady(s));
+  const mu = process.memoryUsage();
   res.json({
-    status: sessions.size > 0 ? "running" : "idle",
+    status: sessionList.length > 0 ? "running" : "idle",
     bridgeSecretConfigured: Boolean(BRIDGE_SECRET),
     webhookSecretConfigured: Boolean(WEBHOOK_SIGNING_SECRET),
-    active_sessions: Array.from(sessions.values()).map((session) => ({
+    sessions_total: sessionList.length,
+    sessions_ready: readySessions.length,
+    uptime_seconds: Math.floor(process.uptime()),
+    memory_mb: Math.round(mu.heapUsed / 1024 / 1024),
+    active_sessions: sessionList.map((session) => ({
       ...sessionSnapshot(session),
       company_id: session.companyId || "",
       user_id: session.userId || "",
+      uptime_since_ready_ms: session.lastReadyAt ? Date.now() - session.lastReadyAt : 0,
     })),
+  });
+});
+
+// /ready returns 200 only when at least one session is fully connected.
+// Use this as a readiness probe in K8s or to gate outbound sends.
+app.get("/ready", (_req, res) => {
+  const readySessions = Array.from(sessions.values()).filter((s) => isSessionReady(s));
+  if (readySessions.length > 0) {
+    return res.json({ ready: true, sessions_ready: readySessions.length });
+  }
+  const qrSessions = Array.from(sessions.values()).filter((s) => s.lastQrString);
+  res.status(503).json({
+    ready: false,
+    sessions_total: sessions.size,
+    sessions_ready: 0,
+    sessions_awaiting_qr: qrSessions.length,
+    message: qrSessions.length > 0
+      ? "Session is waiting for QR scan"
+      : sessions.size > 0
+        ? "Session is initializing"
+        : "No sessions started",
   });
 });
 
@@ -3387,7 +3436,10 @@ app.get("/check/:phone", async (req, res) => {
 
 const bridgePort = Number.parseInt(String(BRIDGE_PORT), 10);
 
+const _BRIDGE_START_MS = Date.now();
+
 const bridgeServer = app.listen(bridgePort, () => {
+  const listenMs = Date.now() - _BRIDGE_START_MS;
   // #region agent log
   const mu = process.memoryUsage();
   _dbgLog("H3", "bridge.js:listen", "bridge listening (heap/rss)", {
@@ -3395,7 +3447,13 @@ const bridgeServer = app.listen(bridgePort, () => {
     rssMb: Math.round(mu.rss / 1024 / 1024),
   });
   // #endregion
-  console.log(`WhatsApp bridge HTTP listening on port ${bridgePort}`);
+  logBridgeEvent("info", "whatsapp.bridge.listening", {
+    port: bridgePort,
+    listen_ms: listenMs,
+    node_version: process.version,
+    memory_mb: Math.round(mu.heapUsed / 1024 / 1024),
+  });
+  console.log(`WhatsApp bridge HTTP listening on port ${bridgePort} (started in ${listenMs}ms)`);
 });
 
 bridgeServer.on("error", (err) => {

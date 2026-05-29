@@ -324,14 +324,25 @@ async def _send_brevo_async(
     async with httpx.AsyncClient(timeout=_email_http_timeout()) as client:
         resp = await client.post(api_url, json=payload, headers=headers)
     if resp.status_code >= 400:
+        raw_error = (resp.text or "")[:300]
         logger.error(
             "%s email send failed for %s with status %s: %s",
             label,
             to_email,
             resp.status_code,
-            (resp.text or "")[:300],
+            raw_error,
         )
-        raise HTTPException(status_code=500, detail="Email delivery failed.")
+        # 4xx = client/config error (bad API key, unverified sender, invalid recipient)
+        # 5xx = Brevo-side server error — both surface as 502 Bad Gateway so the
+        # caller knows the issue is upstream, not an internal bug.
+        user_msg = "Email delivery failed."
+        if resp.status_code == 401:
+            user_msg = "Email delivery failed: invalid API key. Check your Brevo API key in channel settings."
+        elif resp.status_code == 403:
+            user_msg = "Email delivery failed: sender address not verified on Brevo. Verify your sender email in Brevo dashboard."
+        elif resp.status_code == 400:
+            user_msg = f"Email delivery failed: {raw_error[:120]}"
+        raise HTTPException(status_code=502, detail=user_msg)
     logger.info("%s email sent to %s", label, to_email)
 
 

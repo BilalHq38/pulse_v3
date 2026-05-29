@@ -22,6 +22,20 @@ import {
 import { buildLeadMethods, CHANNEL_META } from '@/lib/channelUtils';
 
 const GRADE_COLORS = { hot: 'bg-red-50 text-red-500 border-red-500/30', warm: 'bg-amber-50 text-amber-600 border-amber-500/30', cold: 'bg-blue-50 text-blue-600 border-blue-500/30' };
+const SOURCE_COLORS = {
+  whatsapp: 'bg-green-100 text-green-700',
+  email: 'bg-sky-100 text-sky-700',
+  instagram: 'bg-pink-100 text-pink-700',
+  facebook: 'bg-blue-100 text-blue-700',
+  web_chat: 'bg-violet-100 text-violet-700',
+};
+const SOURCE_LABELS = {
+  whatsapp: 'WhatsApp',
+  email: 'Email',
+  instagram: 'Instagram',
+  facebook: 'Facebook',
+  web_chat: 'Web Chat',
+};
 const STATUS_COLORS = { new: 'bg-blue-50 text-blue-600', contacted: 'bg-cyan-50 text-cyan-600', qualified: 'bg-emerald-50 text-emerald-600', proposal: 'bg-amber-50 text-amber-600', negotiation: 'bg-fuchsia-50 text-fuchsia-600', converted: 'bg-indigo-50 text-indigo-600', won: 'bg-green-500/10 text-green-600', lost: 'bg-red-50 text-red-500' };
 const LEAD_BULK_TEMPLATE_HEADERS = ['name', 'email', 'phone', 'company', 'source', 'status', 'notes', 'tags', 'channels'];
 const LEAD_BULK_TEMPLATE_SAMPLE = ['Avery Stone', 'avery@northstar.io', '+1 415 555 0188', 'Northstar Labs', 'whatsapp', 'new', 'Requested a pricing follow-up', 'hot_lead, interested', 'whatsapp, email'];
@@ -285,9 +299,36 @@ export default function LeadsPage() {
     setAutoScoring(true);
     try {
       const res = await api.post(`/leads/${leadId}/score`);
-      upsertLeadState(res.data);
+      const scored = res.data;
+      // Merge score fields into existing selectedLead so nurture_messages/activities
+      // from the detail view are preserved even if the score response omits them.
+      setSelectedLead((prev) => {
+        if (!prev || prev.id !== leadId) return scored;
+        return {
+          ...prev,
+          ...scored,
+          // Preserve existing nurture_messages/activities if the score response omits them
+          nurture_messages: scored?.nurture_messages ?? prev.nurture_messages,
+          activities: scored?.activities ?? prev.activities,
+          channels: scored?.channels ?? prev.channels,
+          tags: scored?.tags ?? prev.tags,
+        };
+      });
+      setLeads((prev) => prev.map((item) => (item.id === leadId ? { ...item, ...scored } : item)));
       loadLeads();
-    } catch (err) { console.error(err); }
+      showToast({
+        type: 'success',
+        title: 'Lead Scored',
+        message: `${scored?.name || 'This lead'} received a score of ${scored?.score ?? '—'} (${scored?.grade || 'assessed'}).`,
+      });
+    } catch (err) {
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Scoring Failed',
+        message: getErrorMessage(err, 'We could not score that lead. Please try again.'),
+      });
+    }
     finally { setAutoScoring(false); }
   };
 
@@ -317,19 +358,15 @@ export default function LeadsPage() {
 
   const nurtureAllLeads = async () => {
     if (nurturingAll || sendingNurtureAll) return;
-    const existingPending = collectBatchNurtureDrafts(leads);
-    if (existingPending.length > 0) {
-      setPendingBatchNurture(existingPending);
-      showToast({
-        type: 'warning',
-        title: 'Drafts Already Pending',
-        message: `${existingPending.length} nurture drafts are ready to send. Send them before generating more.`,
-      });
-      return;
-    }
     setNurturingAll(true);
+    showToast({
+      type: 'info',
+      title: 'Generating Drafts',
+      message: 'Analyzing leads and generating personalized nurture messages. This may take up to 60 seconds…',
+    });
     try {
-      const res = await api.post('/leads/auto-nurture-all');
+      // Use a 120-second timeout — concurrent AI generation for up to 20 leads
+      const res = await api.post('/leads/auto-nurture-all', {}, { timeout: LONG_REQUEST_TIMEOUT_MS });
       const refreshed = await api.get('/leads');
       const refreshedLeads = Array.isArray(refreshed.data) ? refreshed.data : [];
       const generatedIds = new Set((res.data?.results || [])
@@ -340,18 +377,31 @@ export default function LeadsPage() {
         generatedIds.size ? (lead) => generatedIds.has(lead?.id) : undefined,
       );
       setPendingBatchNurture(pendingDrafts);
-      showToast({
-        type: 'success',
-        title: 'Drafts Generated',
-        message: `Generated ${pendingDrafts.length} nurture drafts. Review, then send when ready.`,
-      });
+      const nurtured = res.data?.total_nurtured ?? pendingDrafts.length;
+      const total = res.data?.total_processed ?? 0;
+      if (nurtured > 0) {
+        showToast({
+          type: 'success',
+          title: 'Drafts Generated',
+          message: `Generated ${nurtured} personalized nurture draft${nurtured !== 1 ? 's' : ''} from ${total} leads. Review and send when ready.`,
+        });
+      } else {
+        showToast({
+          type: 'warning',
+          title: 'No Drafts Generated',
+          message: total > 0 ? 'AI could not produce messages for these leads. Try again or add more lead data.' : 'No eligible leads found for nurturing.',
+        });
+      }
       await loadLeads();
     } catch (err) {
       console.error(err);
+      const isTimeout = err?.code === 'ECONNABORTED' || err?.message?.includes('timeout');
       showToast({
         type: 'error',
-        title: 'Batch Failed',
-        message: getErrorMessage(err, 'We could not run AI nurture for the selected leads.'),
+        title: isTimeout ? 'Generation Timed Out' : 'Batch Failed',
+        message: isTimeout
+          ? 'Nurture generation took too long. Try nurturing individual leads or reduce the number of eligible leads.'
+          : getErrorMessage(err, 'We could not run AI nurture for the selected leads.'),
       });
     }
     finally { setNurturingAll(false); }
@@ -1149,6 +1199,13 @@ export default function LeadsPage() {
                       >
                         {sendingNurtureId === getLatestDraft(lead)?.id ? 'Sending...' : 'Send Draft'}
                       </button>
+                    </div>
+                  )}
+                  {lead.source && (
+                    <div className="mb-2">
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${SOURCE_COLORS[lead.source] || 'bg-slate-100 text-slate-500'}`}>
+                        {SOURCE_LABELS[lead.source] || lead.source.replace('_', ' ')}
+                      </span>
                     </div>
                   )}
                   <div className="flex items-start justify-between mb-2">

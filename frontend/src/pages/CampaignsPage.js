@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import api from '@/lib/api';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
@@ -7,8 +7,11 @@ import {
   Pencil,
   Mail,
   Package,
+  Pause,
+  Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Send,
   Trash2,
   Users,
@@ -20,6 +23,7 @@ const STATUS_STYLES = {
   draft:      { label: 'Draft',     cls: 'bg-slate-50 text-slate-500 border-slate-200' },
   queued:     { label: 'Queued',    cls: 'bg-amber-50 text-amber-600 border-amber-200' },
   sending:    { label: 'Sending',   cls: 'bg-blue-50 text-blue-600 border-blue-200' },
+  paused:     { label: 'Paused',    cls: 'bg-orange-50 text-orange-600 border-orange-200' },
   completed:  { label: 'Completed', cls: 'bg-emerald-50 text-emerald-600 border-emerald-200' },
   failed:     { label: 'Failed',    cls: 'bg-red-50 text-red-500 border-red-200' },
   cancelled:  { label: 'Cancelled', cls: 'bg-slate-50 text-slate-400 border-slate-200' },
@@ -128,6 +132,8 @@ export default function CampaignsPage() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [sendNow, setSendNow] = useState(true);
+  const [campaignImages, setCampaignImages] = useState([]);
+  const campaignImageInputRef = useRef(null);
 
   const resetComposer = useCallback(() => {
     setEditingCampaignId('');
@@ -141,6 +147,7 @@ export default function CampaignsPage() {
     setAiGenerationError('');
     setPreview(null);
     setSendNow(true);
+    setCampaignImages([]);
   }, []);
 
   const loadCampaigns = useCallback(async () => {
@@ -215,6 +222,19 @@ export default function CampaignsPage() {
 
   const toggleAllCustomers = (checked) => {
     setSelectedCustomerIds(checked ? customers.slice(0, 80).map((customer) => customer.id).filter(Boolean) : []);
+  };
+
+  const handleCampaignImageAdd = (e) => {
+    const files = Array.from(e.target.files || []);
+    const imageFiles = files.filter(f => f.type.startsWith('image/'));
+    imageFiles.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        setCampaignImages(prev => [...prev, { name: file.name, dataUrl: ev.target.result, size: file.size }]);
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
   };
 
   const aiGenerationReady = Boolean(
@@ -364,6 +384,7 @@ export default function CampaignsPage() {
         html_body: form.html_body,
         filters: toFiltersPayload(filters, selectedLeadIds, selectedCustomerIds, form.product_id, aiDetails, htmlAiPrompt),
         send_now: sendNow,
+        attachments: campaignImages.map(img => ({ type: 'image', name: img.name, data_url: img.dataUrl })),
       };
       const res = editingCampaignId
         ? await api.put(`/campaigns/${editingCampaignId}`, payload)
@@ -410,6 +431,36 @@ export default function CampaignsPage() {
         title: 'Send Failed',
         message: getErrorMessage(err, 'We could not queue that campaign.'),
       });
+    }
+  };
+
+  const pauseCampaign = async (id) => {
+    try {
+      await api.post(`/campaigns/${id}/pause`);
+      loadCampaigns();
+      showToast({ type: 'success', title: 'Campaign Paused', message: 'The campaign has been paused.' });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Pause Failed', message: getErrorMessage(err, 'We could not pause that campaign.') });
+    }
+  };
+
+  const resumeCampaign = async (id) => {
+    try {
+      await api.post(`/campaigns/${id}/resume`);
+      loadCampaigns();
+      showToast({ type: 'success', title: 'Campaign Resumed', message: 'The campaign has been resumed.' });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Resume Failed', message: getErrorMessage(err, 'We could not resume that campaign.') });
+    }
+  };
+
+  const restartCampaign = async (id) => {
+    try {
+      await api.post(`/campaigns/${id}/restart`, {}, { timeout: LONG_REQUEST_TIMEOUT_MS });
+      loadCampaigns();
+      showToast({ type: 'success', title: 'Campaign Restarted', message: 'The campaign has been restarted from the beginning.' });
+    } catch (err) {
+      showToast({ type: 'error', title: 'Restart Failed', message: getErrorMessage(err, 'We could not restart that campaign.') });
     }
   };
 
@@ -548,7 +599,14 @@ export default function CampaignsPage() {
                   data-testid={`campaign-row-${c.id}`}
                 >
                   <div className="min-w-0 md:col-span-4">
-                    <div className="text-sm font-medium text-slate-800 truncate">{c.name || c.subject}</div>
+                    <div className="flex items-center gap-1.5 text-sm font-medium text-slate-800 truncate">
+                      {c.name || c.subject}
+                      {Array.isArray(c.attachments) && c.attachments.length > 0 && (
+                        <span className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50 text-slate-500 font-normal flex-shrink-0" title={`${c.attachments.length} image${c.attachments.length === 1 ? '' : 's'} attached`}>
+                          <Package size={10} /> {c.attachments.length}
+                        </span>
+                      )}
+                    </div>
                     <div className="text-[11px] text-slate-400 truncate">{c.subject}</div>
                   </div>
                   <div className="flex items-center justify-between gap-3 md:col-span-2 md:block">
@@ -569,7 +627,7 @@ export default function CampaignsPage() {
                   </div>
                   <div className="min-w-0 md:col-span-3">
                     <div className="flex flex-wrap items-center justify-start gap-1.5 md:justify-end">
-                      {c.status === 'draft' && (
+                      {(c.status === 'draft' || c.status === 'paused') && (
                         <button
                           onClick={() => openCampaignEditor(c)}
                           className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-500 transition-colors hover:bg-slate-50 focus:outline-none focus:ring-1 focus:ring-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
@@ -587,13 +645,57 @@ export default function CampaignsPage() {
                         >
                           <Send size={13} /> Start Campaign
                         </button>
-                      ) : c.status === 'failed' && (c.total_recipients || 0) > 0 ? (
+                      ) : (c.status === 'queued' || c.status === 'sending') ? (
                         <button
-                          onClick={() => sendCampaign(c.id)}
-                          className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 focus:outline-none focus:ring-1 focus:ring-blue-300 disabled:cursor-not-allowed disabled:opacity-50"
-                          data-testid={`send-campaign-${c.id}`}
+                          onClick={() => pauseCampaign(c.id)}
+                          className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-amber-200 bg-amber-50 px-2.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-100 focus:outline-none focus:ring-1 focus:ring-amber-300"
+                          data-testid={`pause-campaign-${c.id}`}
                         >
-                          <Send size={13} /> Send
+                          <Pause size={13} /> Pause
+                        </button>
+                      ) : c.status === 'paused' ? (
+                        <>
+                          <button
+                            onClick={() => resumeCampaign(c.id)}
+                            className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 focus:outline-none focus:ring-1 focus:ring-blue-300"
+                            data-testid={`resume-campaign-${c.id}`}
+                          >
+                            <Play size={13} /> Resume
+                          </button>
+                          <button
+                            onClick={() => restartCampaign(c.id)}
+                            className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 focus:outline-none focus:ring-1 focus:ring-slate-200"
+                            data-testid={`restart-campaign-${c.id}`}
+                          >
+                            <RotateCcw size={13} /> Restart
+                          </button>
+                        </>
+                      ) : c.status === 'failed' ? (
+                        <>
+                          {(c.total_recipients || 0) > 0 && (
+                            <button
+                              onClick={() => sendCampaign(c.id)}
+                              className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 focus:outline-none focus:ring-1 focus:ring-blue-300"
+                              data-testid={`send-campaign-${c.id}`}
+                            >
+                              <Send size={13} /> Send
+                            </button>
+                          )}
+                          <button
+                            onClick={() => restartCampaign(c.id)}
+                            className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 focus:outline-none focus:ring-1 focus:ring-slate-200"
+                            data-testid={`restart-campaign-${c.id}`}
+                          >
+                            <RotateCcw size={13} /> Restart
+                          </button>
+                        </>
+                      ) : c.status === 'completed' ? (
+                        <button
+                          onClick={() => restartCampaign(c.id)}
+                          className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 focus:outline-none focus:ring-1 focus:ring-slate-200"
+                          data-testid={`restart-campaign-${c.id}`}
+                        >
+                          <RotateCcw size={13} /> Restart
                         </button>
                       ) : null}
                       <button
@@ -693,6 +795,40 @@ export default function CampaignsPage() {
                     </p>
                   ) : null}
                 </Field>
+
+                {/* Image Attachments */}
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Campaign Images</label>
+                  <input
+                    ref={campaignImageInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    onChange={handleCampaignImageAdd}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => campaignImageInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-600 hover:bg-slate-50"
+                  >
+                    <Package size={13} /> Attach Images
+                  </button>
+                  {campaignImages.length > 0 && (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {campaignImages.map((img, idx) => (
+                        <div key={idx} className="relative group">
+                          <img src={img.dataUrl} alt={img.name} className="h-16 w-16 object-cover rounded-lg border border-slate-200" />
+                          <button
+                            type="button"
+                            onClick={() => setCampaignImages(prev => prev.filter((_, i) => i !== idx))}
+                            className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full w-4 h-4 flex items-center justify-center text-[10px] opacity-0 group-hover:opacity-100"
+                          >×</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <Field label="Campaign goal *">

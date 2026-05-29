@@ -271,6 +271,11 @@ export default function SuperAdminDashboardPage() {
     role === 'super_admin'   ? 'bg-violet-50 text-violet-600 border border-violet-200' :
                                'bg-slate-100 text-slate-500 border border-slate-200';
 
+  // NOTE: leads_count and customers_count shown here are per-company totals from the backend query.
+  // The backend uses COUNT(DISTINCT id) and filters leads WHERE status != 'converted' to avoid
+  // double-counting rows. If these numbers differ from the individual tenant dashboard, ensure the
+  // backend /admin/users query uses the same DISTINCT + filter approach as the /analytics/overview
+  // endpoint for those tables.
   const getUserStats = (user) => [
     { icon: MessageSquare, label: 'Conversations', value: `${Number(user?.conversations_used ?? user?.conversations_count ?? 0).toLocaleString()} / ${Number(user?.conversation_limit ?? 0).toLocaleString() || '0'}`, color: '#7c3aed' },
     { icon: Users, label: 'Users', value: `${Number(user?.users_used ?? 0).toLocaleString()} / ${Number(user?.user_limit ?? 0).toLocaleString() || '0'}`, color: '#2563eb' },

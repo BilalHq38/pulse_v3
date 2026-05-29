@@ -693,8 +693,9 @@ async def update_campaign(
     if not existing:
         raise ValueError("Campaign not found")
     existing = dict(existing)
-    if str(existing.get("status") or "").strip().lower() != "draft":
-        raise ValueError("Only draft campaigns can be edited")
+    non_editable = {"sending", "completed"}
+    if str(existing.get("status") or "").strip().lower() in non_editable:
+        raise ValueError("Campaigns that are actively sending or already completed cannot be edited")
 
     filters = dict(filters or {})
     final_html = _finalize_email_html(html_body, body)
@@ -813,41 +814,45 @@ async def _dispatch_campaign(
         logger.error("Campaign dispatch: no DB available for campaign %s", campaign_id)
         return
 
-    async with company_context(db, company_id):
-        campaign = await db.fetchrow(
+    # Use a single connection for the entire dispatch so the RLS context set by
+    # company_context applies to all queries (db.execute/fetchrow route through
+    # the pool and may land on a different connection without the RLS config).
+    async with company_context(db, company_id) as conn:
+        campaign = await conn.fetchrow(
             "SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2",
             campaign_id,
             company_id,
         )
-    if not campaign:
-        logger.warning("Campaign dispatch: missing campaign %s", campaign_id)
-        return
-    campaign = dict(campaign)
-    if campaign.get("status") in {"sending", "completed"}:
-        return
+        if not campaign:
+            logger.warning("Campaign dispatch: missing campaign %s", campaign_id)
+            return
+        campaign = dict(campaign)
+        if campaign.get("status") in {"sending", "completed"}:
+            return
 
-    async with company_context(db, company_id):
-        await db.execute(
-            "UPDATE email_campaigns SET status='sending',started_at=NOW() WHERE id=$1",
+        await conn.execute(
+            "UPDATE email_campaigns SET status='sending',started_at=NOW() WHERE id=$1 AND company_id=$2",
             campaign_id,
+            company_id,
         )
 
     subject = str(campaign.get("subject") or "")
     html_body = _finalize_email_html(str(campaign.get("html_body") or ""), str(campaign.get("body") or ""))
     body = str(campaign.get("body") or "").strip() or _html_to_text(html_body)
 
-    async with company_context(db, company_id):
-        pending = await db.fetch(
+    async with company_context(db, company_id) as conn:
+        pending = await conn.fetch(
             "SELECT id,email,name FROM email_campaign_recipients "
             "WHERE campaign_id=$1 AND status='pending' ORDER BY created_at",
             campaign_id,
         )
     pending = [dict(p) for p in pending]
     if not pending:
-        async with company_context(db, company_id):
-            await db.execute(
-                "UPDATE email_campaigns SET status='completed',completed_at=NOW() WHERE id=$1",
+        async with company_context(db, company_id) as conn:
+            await conn.execute(
+                "UPDATE email_campaigns SET status='completed',completed_at=NOW() WHERE id=$1 AND company_id=$2",
                 campaign_id,
+                company_id,
             )
         return
 
@@ -867,18 +872,20 @@ async def _dispatch_campaign(
                 html_body=html_body,
             )
             try:
-                async with company_context(db, company_id):
+                async with company_context(db, company_id) as conn:
                     if ok:
-                        await db.execute(
-                            "UPDATE email_campaign_recipients SET status='sent',sent_at=NOW(),error='' WHERE id=$1",
+                        await conn.execute(
+                            "UPDATE email_campaign_recipients SET status='sent',sent_at=NOW(),error='' WHERE id=$1 AND campaign_id=$2",
                             rec["id"],
+                            campaign_id,
                         )
                         sent_total += 1
                     else:
-                        await db.execute(
-                            "UPDATE email_campaign_recipients SET status='failed',error=$2 WHERE id=$1",
+                        await conn.execute(
+                            "UPDATE email_campaign_recipients SET status='failed',error=$2 WHERE id=$1 AND campaign_id=$3",
                             rec["id"],
                             err,
+                            campaign_id,
                         )
                         failed_total += 1
             except Exception as track_exc:
@@ -893,25 +900,30 @@ async def _dispatch_campaign(
         await asyncio.gather(*[_process(r) for r in pending])
     except Exception as exc:
         logger.exception("Campaign %s send loop failed: %s", campaign_id, exc)
-        async with company_context(db, company_id):
-            await db.execute(
+        async with company_context(db, company_id) as conn:
+            await conn.execute(
                 "UPDATE email_campaigns SET status='failed',last_error=$2,"
-                "sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1",
+                "sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1 AND company_id=$5",
                 campaign_id,
                 str(exc)[:500],
                 sent_total,
                 failed_total,
+                company_id,
             )
         return
 
     final_status = "completed" if failed_total == 0 else ("completed" if sent_total > 0 else "failed")
-    async with company_context(db, company_id):
-        await db.execute(
-            "UPDATE email_campaigns SET status=$2,sent_count=$3,failed_count=$4,completed_at=NOW() WHERE id=$1",
+    async with company_context(db, company_id) as conn:
+        # Guard: only write final status if campaign is still 'sending'.
+        # A pause issued during dispatch sets status='paused'; we must not overwrite it.
+        await conn.execute(
+            "UPDATE email_campaigns SET status=$2,sent_count=$3,failed_count=$4,completed_at=NOW() "
+            "WHERE id=$1 AND company_id=$5 AND status='sending'",
             campaign_id,
             final_status,
             sent_total,
             failed_total,
+            company_id,
         )
     logger.info(
         "Campaign %s dispatched: sent=%d failed=%d",

@@ -2331,9 +2331,19 @@ def build_safe_lead_ai_context(lead_data: dict, *, include_next_action: bool = T
     if company_name:
         payload["customer_company_name"] = company_name
 
-    last_message = str(lead.get("message_text") or lead.get("raw_message") or "").strip()
+    last_message = str(
+        lead.get("last_message") or lead.get("message_text") or lead.get("raw_message") or ""
+    ).strip()
     if last_message:
         payload["last_message"] = last_message
+
+    buying_signal = str(lead.get("buying_signal") or "").strip()
+    if buying_signal:
+        payload["buying_signal"] = buying_signal
+
+    lead_quality_signal = str(lead.get("lead_quality_signal") or "").strip()
+    if lead_quality_signal:
+        payload["lead_quality_signal"] = lead_quality_signal
 
     if include_next_action:
         next_action = sanitize_customer_facing_next_action(str(lead.get("next_action") or ""))
@@ -2373,6 +2383,7 @@ async def generate_lead_score(
     count_against_budget: bool = True,
 ) -> dict:
     safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=False)
+    conversation_history = str(lead_data.get("conversation_history") or "").strip()
     engine: dict = {}
     try:
         engine = await _resolve_engine_cached(db=db, company_id=company_id, use_pro=True)
@@ -2383,6 +2394,7 @@ async def generate_lead_score(
             engine=engine,
             call_model_json_fn=call_model_json,
             count_against_budget=count_against_budget,
+            conversation_history=conversation_history,
         )
         result.setdefault("scoring_status", "completed")
         result.setdefault("provider", str(engine.get("provider") or ""))
@@ -2415,22 +2427,34 @@ async def generate_nurture_message(
     company_context: str = "",
     db=None,
     company_id: str = "",
+    conversation_history: str = "",
 ) -> dict:
     safe_lead = build_safe_lead_ai_context(lead_data, include_next_action=True)
+    history_section = (
+        f"\n--- Conversation & Engagement History ---\n{truncate_text_for_tokens(conversation_history, 800)}"
+        if conversation_history.strip()
+        else "\n--- Conversation & Engagement History ---\n(No prior conversation on record)"
+    )
     prompt = (
-        "You are a B2B sales nurture copywriter for CRM outreach.\n"
-        f"Task: write one personalized follow-up message for the lead stage '{stage}'.\n"
-        "Input format:\n"
-        "- company_context: approved company/product context\n"
-        "- lead: JSON lead profile and notes\n"
-        "Output format: return plain text only, no JSON, no greeting placeholders, no markdown.\n"
-        "Rules:\n"
-        "- Keep the message under 3 sentences.\n"
-        "- Mention only details supported by the input.\n"
-        "- End with a soft CTA that suggests the next reply or meeting.\n"
-        "- Sound natural and specific, not templated.\n"
-        f"\ncompany_context:\n{truncate_text_for_tokens(company_context, 1200)}\n"
-        f"\nlead:\n{json.dumps(_json_safe(safe_lead), ensure_ascii=True)}"
+        "You are a personalized CRM sales outreach specialist.\n\n"
+        f"Task: Write ONE message that naturally continues this lead's conversation thread and represents the company's value.\n"
+        f"Lead stage: {stage}\n\n"
+        "--- Company Context (products, services, value proposition) ---\n"
+        f"{truncate_text_for_tokens(company_context, 1000)}\n"
+        f"{history_section}\n\n"
+        "--- Lead Profile ---\n"
+        f"{json.dumps(_json_safe(safe_lead), ensure_ascii=True)}\n\n"
+        "Strict rules:\n"
+        "- NEVER use any of these phrases: 'previously', 'as we discussed', 'following up on our last', "
+        "'reaching out again', 'I wanted to touch base', 'circling back', 'just checking in', "
+        "'hope you are well', 'per my last message', 'as mentioned'\n"
+        "- Write as if this message is the next natural reply in the thread — it must flow from the conversation history\n"
+        "- Reference specific topics, interests, or signals from the history to show genuine understanding\n"
+        "- Weave in the company's relevant product or service naturally, without sounding like a pitch\n"
+        "- Keep the message under 3 sentences\n"
+        "- End with a soft CTA that invites the next reply or a specific next step\n"
+        "- Sound conversational and specific — never generic or templated\n"
+        "Output: Return the plain message text only — no JSON, no markdown, no subject line, no placeholders."
     )
     engine: dict = {}
     try:

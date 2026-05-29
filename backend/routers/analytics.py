@@ -128,6 +128,87 @@ async def analytics_overview(request: Request):
     }
 
 
+@router.get("/analytics/ai-score")
+async def analytics_ai_score(request: Request):
+    """Return a composite AI Score and nature breakdown for the company."""
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = cu.get("company_id", "")
+
+    total = int(
+        await db.fetchval(
+            "SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND status=ANY($2)",
+            cid,
+            _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
+        ) or 0
+    )
+    ai_handled = int(
+        await db.fetchval(
+            "SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND status=ANY($2)",
+            cid,
+            _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
+        ) or 0
+    )
+    ai_resolved = int(
+        await db.fetchval(
+            "SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND status='resolved'",
+            cid,
+        ) or 0
+    )
+    ai_escalated = int(
+        await db.fetchval(
+            "SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND status='escalated'",
+            cid,
+        ) or 0
+    )
+
+    # Average ai_confidence across AI-handled conversations that have the field populated.
+    avg_confidence_row = await db.fetchval(
+        "SELECT AVG(ai_confidence) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND ai_confidence IS NOT NULL",
+        cid,
+    )
+    avg_confidence = float(avg_confidence_row or 0)
+    confidence_pct = round(avg_confidence * 100 if avg_confidence <= 1 else avg_confidence, 1)
+
+    resolution_rate = round((ai_resolved / ai_handled * 100) if ai_handled else 0, 1)
+
+    # Composite score: 60% confidence + 40% resolution rate.
+    composite = round(confidence_pct * 0.6 + resolution_rate * 0.4, 1)
+
+    # Nature breakdown counts.
+    def _nature(confidence, resolved, escalated):
+        if escalated or confidence < 40:
+            return "Low"
+        if confidence >= 80 and resolved:
+            return "Excellent"
+        if confidence >= 60 and resolved:
+            return "Good"
+        return "Moderate"
+
+    nature_rows = await db.fetch(
+        "SELECT ai_confidence, status FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND ai_confidence IS NOT NULL LIMIT 500",
+        cid,
+    )
+    nature_counts = {"Excellent": 0, "Good": 0, "Moderate": 0, "Low": 0}
+    for row in nature_rows or []:
+        conf = float(row["ai_confidence"] or 0)
+        conf_pct = conf * 100 if conf <= 1 else conf
+        resolved = str(row["status"] or "") == "resolved"
+        escalated = str(row["status"] or "") == "escalated"
+        nature_counts[_nature(conf_pct, resolved, escalated)] += 1
+
+    return {
+        "ai_score": composite,
+        "avg_confidence_pct": confidence_pct,
+        "resolution_rate": resolution_rate,
+        "ai_handled": ai_handled,
+        "ai_resolved": ai_resolved,
+        "ai_escalated": ai_escalated,
+        "total_conversations": total,
+        "nature_breakdown": nature_counts,
+    }
+
+
 @router.get("/analytics/conversations")
 async def analytics_conversations(request: Request, days: int = 30):
     db = _db(request)

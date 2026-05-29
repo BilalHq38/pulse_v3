@@ -300,7 +300,7 @@ async def public_buy_product(
                         "quantity, variant, size, color, customer_name, customer_email, customer_phone, "
                         "delivery_address, notes, status, source_channel, created_by, raw_details, "
                         "missing_fields, idempotency_key, total_price, created_at, updated_at"
-                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'pending',$14,'public',"
+                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'confirmed',$14,'public',"
                         "'{}'::jsonb,'[]'::jsonb,$15,$16,NOW(),NOW())",
                         order_id,
                         company_id,
@@ -399,9 +399,16 @@ async def public_buy_product(
 
         except HTTPException:
             raise
-        except Exception:
+        except asyncpg.UndefinedColumnError as exc:
+            logger.error(
+                "public_buy_schema_error company_id=%s product_slug=%s missing_column=%s",
+                company_id, product_slug, exc,
+            )
+            raise HTTPException(500, "order_creation_failed: database schema mismatch. Please apply latest migrations.") from exc
+        except Exception as exc:
             logger.exception(
-                "public_buy_failed company_id=%s product_slug=%s", company_id, product_slug
+                "public_buy_failed company_id=%s product_slug=%s error=%s",
+                company_id, product_slug, exc,
             )
             raise HTTPException(500, "order_creation_failed")
 
@@ -412,11 +419,78 @@ async def public_buy_product(
     return {
         "order_id": order_id,
         "order_ref": order_ref,
-        "status": "pending",
+        "status": "confirmed",
         "deduplicated": False,
         "customer_id": resolved_customer_id or None,
         "lead_converted": bool(resolved_lead_id),
     }
+
+
+@router.post("/public/track/click")
+@router.post("/public/companies/{company_slug}/track/click")
+async def track_product_link_click(request: Request, company_slug: str = ""):
+    """Record a product link click from the conversation engine.
+
+    Called by the frontend product page on load when a ref token is present.
+    Creates a pending order if one doesn't exist yet for this customer+product.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    ref_raw = str(body.get("ref") or request.query_params.get("ref") or "").strip()
+    product_id = str(body.get("product_id") or "").strip()
+    product_slug_from_body = str(body.get("product_slug") or "").strip()
+
+    click_id = make_id()
+    ip_address = str(
+        request.headers.get("X-Forwarded-For") or
+        request.headers.get("X-Real-IP") or
+        (request.client.host if request.client else "")
+    ).split(",")[0].strip()[:64]
+    user_agent = str(request.headers.get("User-Agent") or "")[:256]
+
+    ref_payload = decode_ref_token(ref_raw) if ref_raw else None
+    customer_id = str((ref_payload or {}).get("customer_id") or "")
+    session_id = str((ref_payload or {}).get("session_id") or "")
+    token_company_id = str((ref_payload or {}).get("company_id") or "")
+
+    db = _db(request)
+    try:
+        async with platform_admin_context(db) as conn:
+            # Resolve company_id from slug if not available from token
+            resolved_company = token_company_id
+            if not resolved_company and company_slug:
+                resolved_company = await _resolve_company_id(conn, company_slug)
+
+            if not resolved_company:
+                return {"tracked": False, "reason": "company_not_resolved"}
+
+            # Resolve product_id from slug if needed
+            if not product_id and product_slug_from_body:
+                row = await conn.fetchrow(
+                    "SELECT id FROM company_products WHERE company_id=$1 AND slug=$2 LIMIT 1",
+                    resolved_company, product_slug_from_body,
+                )
+                if row:
+                    product_id = str(row["id"])
+
+            await conn.execute(
+                "INSERT INTO link_clicks(id,company_id,customer_id,product_id,session_id,ref_token,ip_address,user_agent,clicked_at,created_at) "
+                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())",
+                click_id, resolved_company, customer_id, product_id,
+                session_id, ref_raw[:500], ip_address, user_agent,
+            )
+            logger.info(
+                "product_link_clicked company_id=%s customer_id=%s product_id=%s click_id=%s",
+                resolved_company, customer_id, product_id, click_id,
+            )
+    except Exception as exc:
+        logger.warning("link_click_tracking_failed: %s", exc)
+        return {"tracked": False, "reason": str(exc)[:100]}
+
+    return {"tracked": True, "click_id": click_id}
 
 
 __all__ = ["router"]

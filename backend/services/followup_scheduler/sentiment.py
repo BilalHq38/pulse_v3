@@ -74,8 +74,22 @@ def _any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
 def classify_sentiment(text: str) -> Sentiment:
     """Return positive/neutral/negative.
 
-    The rule is: negative wins ties so we never upsell to an unhappy customer.
+    Uses all-MiniLM-L6-v2 for semantic accuracy when available.
+    Falls back to keyword matching so we never upsell to an unhappy customer
+    even if the model is unavailable.
+    Negative always wins ties in the keyword fallback.
     """
+    # MiniLM primary
+    try:
+        from services.ai_service.local_ml import classify_sentiment as _ml  # noqa: PLC0415
+        result = _ml(text or "")
+        label = result.get("label", "neutral")
+        if label in {"positive", "neutral", "negative"}:
+            return label  # type: ignore[return-value]
+    except Exception:
+        pass
+
+    # Keyword fallback
     normalised = _normalise(text)
     if not normalised:
         return "neutral"

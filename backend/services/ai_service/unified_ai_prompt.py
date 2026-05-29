@@ -269,15 +269,20 @@ Output schema, all keys required:
 }
 
 Scoring rules:
+- CRITICAL: Extract scoring signals from BOTH the lead record AND the conversation history. A signal found in conversation counts equally to one in the lead record.
 - Start at 40 base points.
-- Add 20 if both email and phone are present.
-- Add 10 if only one of email or phone is present.
-- Add 10 if company name is known.
-- Add 10 if a clear goal or need is stated.
-- Add 10 if budget or timeline is mentioned.
-- Subtract 10 if the lead message is vague or very short.
+- Add 20 if both email and phone are present or mentioned anywhere (lead data or conversation).
+- Add 10 if only one of email or phone is present or inferable.
+- Add 10 if company name is known or mentioned in conversation.
+- Add 10 if a clear goal or need is stated in notes OR in conversation messages.
+- Add 10 if budget or timeline is mentioned anywhere (lead data or conversation).
+- Add 10 if buying_signal is "high_intent" (ML-detected strong purchase intent).
+- Add 5 if buying_signal is "interested" OR lead_quality_signal is "hot".
+- Subtract 10 if there is no conversation history AND the lead message is vague or empty.
 - score >= 80 is hot, score >= 60 is warm, otherwise cold.
-- Empty nurture_message if the lead has no contact info.
+- missing_fields should only list fields not found in EITHER the lead record OR the conversation.
+- For nurture_message: write a short, personalized message that naturally continues the conversation thread. Reference specific topics from the conversation history. Do NOT use phrases like 'previously', 'as we discussed', 'following up', or 'reaching out again'. If no conversation exists, write a warm opening based on lead source and notes.
+- Empty nurture_message only if the lead has no contact info AND no conversation messages at all.
 """
 
 
@@ -293,6 +298,9 @@ company_id: {company_id}
 
 === RAW LEAD MESSAGE / NOTES ===
 {raw_message}
+
+=== CONVERSATION HISTORY ===
+{conversation_block}
 
 Return the JSON object only.
 
@@ -315,7 +323,10 @@ def _fmt_lead(lead: dict) -> str:
     if not lead:
         return "(no lead data)"
     lines = []
-    for key in ("id", "name", "email", "phone", "source", "status", "phase", "grade", "score", "notes"):
+    for key in (
+        "id", "name", "email", "phone", "source", "status", "phase", "grade", "score",
+        "notes", "buying_signal", "lead_quality_signal",
+    ):
         val = lead.get(key)
         if val is not None and str(val).strip():
             lines.append(f"  {key}: {val}")
@@ -729,17 +740,20 @@ async def call_unified_lead_ai(
     engine: Any = None,
     call_model_json_fn: Any = None,
     count_against_budget: bool = True,
+    conversation_history: str = "",
 ) -> dict:
     if call_model_json_fn is None:
         from services.ai_service.llm_client import call_model_json as call_model_json_fn
 
     raw_message = str((lead or {}).get("notes") or (lead or {}).get("message_text") or "").strip()
     lead_json = json.dumps(lead or {}, ensure_ascii=True, default=str, sort_keys=True)
+    conv_block = conversation_history.strip() if conversation_history.strip() else "(no conversation on record)"
     user_msg = LEAD_USER_TEMPLATE.format(
         company_id=company_id or "",
         lead_block=_fmt_lead(lead or {}),
         customer_block=_fmt_customer(customer or {}),
         raw_message=raw_message or "(no message)",
+        conversation_block=conv_block,
         lead_json=lead_json,
     )
     prompt = f"{LEAD_SYSTEM_PROMPT}\n\n{user_msg}"

@@ -96,46 +96,30 @@ function normalizeListPayload(payload, keys = []) {
 
 const MCP_PRESETS = [
   {
-    id: 'claude-desktop',
-    name: 'Claude Desktop',
-    description: 'Local desktop bridge with a ready-to-use localhost endpoint and desktop-friendly defaults.',
-    endpoint: 'http://127.0.0.1:8811/mcp',
-    region: 'desktop-local',
+    id: 'international-server',
+    name: 'International MCP Server',
+    description: 'Connect to a custom MCP server hosted anywhere in the world. Configure your server endpoint, authentication, and region below.',
+    endpoint: '',
+    region: 'custom',
     status: 'active',
     capabilities: {
-      platform: 'Claude Desktop',
-      transport: 'Local HTTP bridge',
-      auth: 'Local session',
-      connection_details: 'Use this when your MCP bridge runs locally on port 8811.',
-    },
-  },
-  {
-    id: 'cursor-ide',
-    name: 'Cursor / Codex IDE',
-    description: 'Preset for IDE-based local MCP servers with a loopback endpoint and low-friction connection details.',
-    endpoint: 'http://127.0.0.1:8812/mcp',
-    region: 'ide-local',
-    status: 'active',
-    capabilities: {
-      platform: 'Cursor / Codex IDE',
-      transport: 'Loopback HTTP',
-      auth: 'Workspace token',
-      connection_details: 'Use this when your editor exposes an MCP bridge on port 8812.',
-    },
-  },
-  {
-    id: 'https-gateway',
-    name: 'Hosted HTTPS Gateway',
-    description: 'Cloud-friendly preset for a remote MCP endpoint behind HTTPS with secure token auth.',
-    endpoint: 'https://mcp.your-company.com/connect',
-    region: 'global',
-    status: 'active',
-    capabilities: {
-      platform: 'Hosted MCP',
+      platform: 'Custom MCP Server',
       transport: 'HTTPS',
-      auth: 'Bearer token',
-      connection_details: 'Replace the hostname with your hosted MCP gateway if you connect through a cloud platform.',
+      auth: 'Bearer token or API key',
+      connection_details: 'Enter your server URL and authentication details below. Your server must expose an MCP-compatible endpoint and accept connections from Pulse Engine.',
     },
+    setup_steps: [
+      'Host an MCP-compatible server accessible via HTTPS',
+      'Obtain your server endpoint URL (e.g. https://mcp.yourserver.com/connect)',
+      'Generate or retrieve your API key or Bearer token',
+      'Enter the URL and credentials below and click Add Server',
+    ],
+    requirements: [
+      'Server must support MCP protocol over HTTPS',
+      'TLS/SSL certificate required for production endpoints',
+      'Server must allow connections from this platform\'s IP range',
+      'Latency should be under 2 seconds for reliable AI tool calls',
+    ],
   },
 ];
 
@@ -502,6 +486,7 @@ export default function SettingsPage() {
   };
   const [channels, setChannels] = useState([]);
   const [company, setCompany] = useState(null);
+  const [companyLogoError, setCompanyLogoError] = useState(false);
   const [companyValidationErrors, setCompanyValidationErrors] = useState({});
   const [users, setUsers] = useState([]);
   const [showKeyMap, setShowKeyMap] = useState({});
@@ -1176,6 +1161,7 @@ export default function SettingsPage() {
 
   const updateCompanyField = (field, value) => {
     setCompany((prev) => ({ ...(prev || {}), [field]: value }));
+    if (field === 'logo_url') setCompanyLogoError(false);
     setCompanyValidationErrors((prev) => {
       if (!prev[field]) return prev;
       const next = { ...prev };
@@ -1203,7 +1189,7 @@ export default function SettingsPage() {
         language: company?.language || 'en',
       };
       const res = await api.put('/settings/company', payload);
-      if (res?.data) setCompany(res.data);
+      if (res?.data) { setCompany(res.data); setCompanyLogoError(false); }
       const updatedCompanyName = res?.data?.company_name || company?.company_name || '';
       if (updatedCompanyName) {
         localStorage.setItem('pe_company_name', updatedCompanyName);
@@ -1317,6 +1303,7 @@ export default function SettingsPage() {
       const res = await api.post('/settings/company/logo/upload', formData);
       const nextCompany = res?.data?.company || { ...(company || {}), logo_url: res?.data?.url || '' };
       setCompany(nextCompany);
+      setCompanyLogoError(false);
       showToast({
         type: 'success',
         title: 'Logo Updated',
@@ -2458,8 +2445,8 @@ export default function SettingsPage() {
               {/* Profile preview card */}
               <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 rounded-xl p-5 flex items-center gap-5">
                 <div className="relative">
-                  {company.logo_url
-                    ? <img src={resolveMediaUrl(company.logo_url)} alt="logo" className="w-16 h-16 rounded-xl object-cover border border-white shadow" onError={() => setCompany((prev) => ({ ...(prev || {}), logo_url: '' }))} />
+                  {company.logo_url && !companyLogoError
+                    ? <img key={company.logo_url} src={resolveMediaUrl(company.logo_url)} alt="logo" className="w-16 h-16 rounded-xl object-cover border border-white shadow" onError={() => setCompanyLogoError(true)} />
                     : <div className="w-16 h-16 rounded-xl bg-white border border-blue-200 shadow flex items-center justify-center"><Building2 size={28} className="text-blue-400" /></div>
                   }
                   <LogoUploadTrigger
@@ -2521,7 +2508,7 @@ export default function SettingsPage() {
                 <div>
                   <label className="text-xs text-slate-400 mb-1 block flex items-center gap-1"><Image size={11} /> Logo URL</label>
                   <div className="flex gap-2">
-                    <input value={company.logo_url || ''} onChange={(e) => setCompany({...company, logo_url: e.target.value})} placeholder="https://yourcompany.com/logo.png" className="min-w-0 flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" />
+                    <input value={company.logo_url || ''} onChange={(e) => { setCompany({...company, logo_url: e.target.value}); setCompanyLogoError(false); }} placeholder="https://yourcompany.com/logo.png" className="min-w-0 flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" />
                     <button
                       type="button"
                       onClick={() => companyLogoInputRef.current?.click()}
