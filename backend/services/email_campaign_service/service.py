@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # with the rest of the API. Override via CAMPAIGN_SEND_CONCURRENCY env if needed.
 DEFAULT_BATCH_CONCURRENCY = 10
 RECIPIENT_HARD_CAP = 50_000
-CAMPAIGN_COPY_MIN_OUTPUT_TOKENS = 1200
-HTML_BODY_MIN_OUTPUT_TOKENS = 1000
+CAMPAIGN_COPY_MIN_OUTPUT_TOKENS = 800
+HTML_BODY_MIN_OUTPUT_TOKENS = 600
 CAMPAIGN_AI_OUTPUT_TOKEN_CEILING = 2048
 
 
@@ -388,8 +388,10 @@ async def generate_campaign_copy(
         raise ValueError("company_id is required")
 
     async with company_context(db, company_id):
-        product = await _load_campaign_product(db, company_id=company_id, product_id=product_id)
-        engine = await get_active_llm_engine(db, company_id)
+        product, engine = await asyncio.gather(
+            _load_campaign_product(db, company_id=company_id, product_id=product_id),
+            get_active_llm_engine(db, company_id),
+        )
     if not product:
         raise ValueError("Selected product was not found")
 
@@ -488,8 +490,11 @@ async def generate_html_email_body(
         raise ValueError("Describe what the HTML email body should say.")
 
     async with company_context(db, company_id):
-        product = await _load_campaign_product(db, company_id=company_id, product_id=product_id) if product_id else None
-        engine = await get_active_llm_engine(db, company_id)
+        _product_coro = (
+            _load_campaign_product(db, company_id=company_id, product_id=product_id)
+            if product_id else asyncio.sleep(0)
+        )
+        product, engine = await asyncio.gather(_product_coro, get_active_llm_engine(db, company_id))
     product_context = "No product selected."
     if product:
         feature_lines = (

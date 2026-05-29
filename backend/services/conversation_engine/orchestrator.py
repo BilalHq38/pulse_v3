@@ -118,6 +118,14 @@ class Orchestrator:
                 "purchased. Only mention products that appear in the retrieved "
                 "context. Do not pressure the customer. One short paragraph."
             )
+        elif workflow_kind == "order_confirmed":
+            directive = (
+                "The customer's order has just been confirmed. Compose a brief, "
+                "warm message acknowledging this and letting them know what to "
+                "expect next. If the retrieved context contains a highly relevant "
+                "complementary product, mention it gently — but only if it adds "
+                "clear value. Be non-aggressive. One short paragraph."
+            )
         else:
             directive = "Compose a brief follow-up message."
         request = TurnRequest(
