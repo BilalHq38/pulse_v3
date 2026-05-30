@@ -22,15 +22,26 @@ def _deterministic_lead_score(lead_data: dict) -> dict:
             score += 10
         if lead_data.get("name"):
             score += 5
+        # Sentiment adjustment: satisfied customers convert at higher rates;
+        # dissatisfied customers need recovery actions before scoring them warm.
+        sentiment = str(lead_data.get("sentiment_label") or lead_data.get("sentiment") or "").strip().lower()
+        if sentiment in {"positive", "satisfied", "happy"}:
+            score += 10
+        elif sentiment in {"negative", "dissatisfied", "angry", "frustrated"}:
+            score -= 15
     score = max(0, min(100, score))
     grade = str(lead_data.get("grade") or "").strip().lower()
     if grade not in {"hot", "warm", "cold"}:
         grade = "hot" if score >= 80 else "warm" if score >= 60 else "cold"
+    sentiment_note = ""
+    raw_sentiment = str(lead_data.get("sentiment_label") or lead_data.get("sentiment") or "").strip().lower()
+    if raw_sentiment in {"negative", "dissatisfied", "angry", "frustrated"}:
+        sentiment_note = " Negative sentiment detected — prioritise issue resolution before nurturing."
     return {
         "score": score,
         "grade": grade,
         "phase": str(lead_data.get("phase") or "awareness").strip().lower(),
-        "reasoning": "Local lead metric snapshot; LLM scoring is not run from inbound message pipeline.",
+        "reasoning": f"Local lead metric snapshot; LLM scoring is not run from inbound message pipeline.{sentiment_note}",
         "next_action": str(lead_data.get("next_action") or "Review lead activity"),
     }
 

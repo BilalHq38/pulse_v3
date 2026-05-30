@@ -76,18 +76,14 @@ class ShortTermMemory:
         *,
         conversation_id: str = "",
     ) -> None:
-        """Append a message to the recent messages list."""
+        """Append a message to the recent messages list (atomic RPUSH+LTRIM)."""
         key = self._key(tenant_id, user_id, "messages", conversation_id=conversation_id)
-
-        existing = await self._cache.get_json(key)
-        messages: list[dict] = existing if isinstance(existing, list) else []
-        messages.append(message)
-
-        # Keep only the most recent messages
-        if len(messages) > _MAX_RECENT_MESSAGES:
-            messages = messages[-_MAX_RECENT_MESSAGES:]
-
-        await self._cache.set_json(key, messages, ttl_seconds=_DEFAULT_TTL)
+        await self._cache.append_to_list(
+            key,
+            message,
+            max_length=_MAX_RECENT_MESSAGES,
+            ttl_seconds=_DEFAULT_TTL,
+        )
 
     async def store_session(
         self,
@@ -156,8 +152,7 @@ class ShortTermMemory:
 
     async def _get_recent_messages(self, tenant_id: str, user_id: str, *, conversation_id: str = "") -> list[dict]:
         key = self._key(tenant_id, user_id, "messages", conversation_id=conversation_id)
-        data = await self._cache.get_json(key)
-        return data if isinstance(data, list) else []
+        return await self._cache.get_list(key)
 
     async def _get_json(self, tenant_id: str, user_id: str, suffix: str, *, conversation_id: str = "") -> dict:
         key = self._key(tenant_id, user_id, suffix, conversation_id=conversation_id)

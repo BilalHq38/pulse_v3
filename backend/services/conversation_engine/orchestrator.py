@@ -53,10 +53,10 @@ logger = logging.getLogger(__name__)
 
 _PER_SOURCE_TIMEOUTS: dict[SourceType, float] = {
     "company_data": 0.5,
-    "product": 0.35,
-    "template": 0.1,
-    "faq": 0.1,
-    "knowledge_base": 0.4,
+    "product": 1.0,   # raised from 0.35 — vector search + image fetch routinely exceeded 350 ms
+    "template": 0.2,
+    "faq": 0.2,
+    "knowledge_base": 0.8,  # raised from 0.4 — embedding search can exceed 400 ms under load
 }
 _VALIDATION_RETRY_DIRECTIVE_TEMPLATE = (
     "\n\nYour previous draft mentioned: {offences}. "
@@ -148,6 +148,14 @@ class Orchestrator:
         for result in retrieval_results:
             chunks.extend(result.chunks)
 
+        # Inject previously shown/discussed products so the validator never rejects
+        # responses that reference products from earlier turns in the conversation.
+        # Without this, the AI sees products in history but the validator fails because
+        # those products aren't in the CURRENT turn's retrieval results.
+        if request.customer_id and request.session_id:
+            shown_chunks = await self._fetch_shown_product_chunks(db, request, existing_chunks=chunks)
+            chunks.extend(shown_chunks)
+
         compressed = compression_module.compress(chunks)
         confidence = validator.compute_confidence(compressed)
         bucket = validator.confidence_bucket(confidence)
@@ -192,7 +200,18 @@ class Orchestrator:
             )
 
         result = await self._gateway.generate(prompt)
-        answer = (result.text or "").strip()
+        if not result.text:
+            logger.warning(
+                "llm_gateway_all_retries_failed company_id=%s last_error=%s",
+                request.company_id,
+                result.last_error,
+            )
+            return await self._fallback_turn(
+                db, request, sources_used=[r.source_type for r in retrieval_results if r.chunks],
+                active_template=active_template, confidence=confidence,
+                reason="llm_gateway_failed",
+            )
+        answer = result.text.strip()
         product_links = _extract_product_links(answer, trimmed_chunks)
 
         report = validator.validate(
@@ -255,7 +274,24 @@ class Orchestrator:
         )
 
         if memory_module.should_summarise(turn_index):
-            await self._refresh_rolling_summary(db, request, turn_index)
+            await self._refresh_rolling_summary(db, request, turn_index, chunks=trimmed_chunks)
+
+        # Persist shown product IDs so future turns can avoid recommending the
+        # same items and cross-sell logic can exclude already-seen products.
+        if product_links and request.customer_id:
+            _shown_ids = [pl.product_id for pl in product_links if pl.product_id]
+            if _shown_ids:
+                try:
+                    from memory_engine.long_term import LongTermMemory
+                    await LongTermMemory().store_shown_products(
+                        db,
+                        request.company_id,
+                        request.customer_id,
+                        _shown_ids,
+                        conversation_id=request.session_id,
+                    )
+                except Exception as _sp_exc:
+                    logger.debug("shown_products_update_failed: %s", _sp_exc)
 
         logger.info(
             "ai_turn company_id=%s session_id=%s turn_id=%s tier=%s sources=%s confidence=%.3f latency_ms=%d",
@@ -279,19 +315,91 @@ class Orchestrator:
             confidence=confidence,
         )
 
+    async def _fetch_shown_product_chunks(
+        self,
+        db,
+        request: TurnRequest,
+        *,
+        existing_chunks: list[ContextChunk],
+    ) -> list[ContextChunk]:
+        """Return product chunks for products shown in previous turns but not retrieved this turn.
+
+        This prevents the validator from rejecting responses that reference products
+        discussed in earlier turns of the conversation. Without this, when a user says
+        'I want to buy the one you showed me', the AI looks up conversation history and
+        tries to respond about the previously-mentioned product, but the validator sees
+        that product isn't in the current turn's retrieval and flags it as ungrounded.
+        """
+        existing_ids = {c.source_id for c in existing_chunks if c.source_type == "product"}
+        try:
+            from memory_engine.long_term import LongTermMemory
+            shown_ids = await LongTermMemory()._fetch_shown_products(
+                db, request.company_id, request.customer_id, request.session_id
+            )
+        except Exception:
+            return []
+        missing_ids = [pid for pid in (shown_ids or []) if pid not in existing_ids]
+        if not missing_ids:
+            return []
+        # Limit to most recent 4 products to avoid context bloat
+        missing_ids = missing_ids[-4:]
+        from services.conversation_engine.retrieval.products import (
+            _fetch_first_images,
+            _product_row_to_chunk,
+            _resolve_company_slug,
+            _rls_fetch,
+        )
+        try:
+            rows = await _rls_fetch(
+                db,
+                request.company_id,
+                "SELECT id, name, product_title, category, product_type, price, "
+                "price_currency, description, stock_quantity, slug, links "
+                "FROM company_products "
+                "WHERE company_id = $1 AND id = ANY($2::text[]) "
+                "AND COALESCE(status, 'active') != 'archived'",
+                request.company_id,
+                missing_ids,
+            )
+        except Exception:
+            return []
+        if not rows:
+            return []
+        products = [dict(r) for r in rows]
+        company_slug = await _resolve_company_slug(db, request.company_id)
+        product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
+        images = await _fetch_first_images(db, product_ids, company_id=request.company_id)
+        result_chunks: list[ContextChunk] = []
+        for product in products:
+            pid = str(product.get("id") or "")
+            chunk = _product_row_to_chunk(
+                product,
+                score=0.5,  # lower than freshly retrieved; trimmer drops these last
+                company_slug=company_slug,
+                company_id=request.company_id,
+                image_url=images.get(pid, ""),
+                customer_id=request.customer_id,
+                session_id=request.session_id,
+            )
+            if chunk is not None:
+                result_chunks.append(chunk)
+        return result_chunks
+
     def _retriever_for(self, source: SourceType, request: TurnRequest) -> SourceRetriever | None:
-        # Proactive upsell turns get a different product retriever: instead of
-        # an open-ended catalog search, pull only products linked to the
-        # purchased item via product_relationships. Falls back to the default
-        # retriever when no order is anchored (so the engine still has *some*
-        # product context to ground its suggestion on).
-        if (
-            source == "product"
-            and request.mode == "proactive"
-            and request.workflow_kind == "upsell"
-            and request.order_id
-        ):
-            return OrderRelatedProductRetriever(order_id=request.order_id)
+        # Product retrievers are created per-request so they carry the correct
+        # customer_id and session_id for signed ref-token URLs. This ensures
+        # order tracking links back to the customer without exposing internal IDs.
+        if source == "product":
+            if (
+                request.mode == "proactive"
+                and request.workflow_kind == "upsell"
+                and request.order_id
+            ):
+                return OrderRelatedProductRetriever(order_id=request.order_id)
+            return ProductRetriever(
+                customer_id=request.customer_id,
+                session_id=request.session_id,
+            )
         return self._retrievers.get(source)
 
     async def _retrieve(
@@ -350,7 +458,14 @@ class Orchestrator:
         lines.extend(memory_module.history_as_dialogue(turns))
         return lines
 
-    async def _refresh_rolling_summary(self, db, request: TurnRequest, turn_index: int) -> None:
+    async def _refresh_rolling_summary(
+        self,
+        db,
+        request: TurnRequest,
+        turn_index: int,
+        *,
+        chunks: list | None = None,
+    ) -> None:
         # Pull the latest 20 turns, condense into a single short paragraph via
         # the gateway. This is the engine's only request-time LLM call beyond
         # the main generation, and it fires at most once per turn after the
@@ -366,11 +481,35 @@ class Orchestrator:
             "key facts. Keep it under 200 words. Conversation:\n\n" + dialogue
         )
         result = await self._gateway.generate(prompt)
+        summary_text = (result.text or "").strip()
+        if not summary_text:
+            logger.warning(
+                "rolling_summary_skipped reason=empty_llm_response company_id=%s session_id=%s",
+                request.company_id,
+                request.session_id,
+            )
+            return
+        # Validate the summary against retrieved product chunks to prevent
+        # hallucinated product names from entering persistent memory.
+        if chunks:
+            report = validator.validate(
+                answer=summary_text,
+                product_links=[],
+                chunks=chunks,
+            )
+            if not report.ok:
+                logger.warning(
+                    "rolling_summary_skipped reason=validation_failed company_id=%s session_id=%s offences=%s",
+                    request.company_id,
+                    request.session_id,
+                    report.offences[:5],
+                )
+                return
         await memory_module.upsert_rolling_summary(
             db,
             company_id=request.company_id,
             session_id=request.session_id,
-            summary=result.text,
+            summary=summary_text,
             covers_through_turn=turn_index,
         )
 
@@ -438,12 +577,19 @@ def _extract_product_links(answer: str, chunks: list[ContextChunk]) -> list[Prod
     "View product" affordance — the validator separately enforces that the
     target URL resolves to a retrieved product, so this can't surface a
     fabricated link.
+
+    Priority order:
+      1. Products whose URLs appear explicitly in the AI answer.
+      2. Products whose names are mentioned by the AI (image_url preserved).
+      3. Highest-relevance product with a URL (legacy fallback).
     """
     product_chunks = [c for c in chunks if c.source_type == "product"]
     if not product_chunks:
         return []
+
     links: list[ProductLink] = []
     if answer:
+        # Step 1: match on explicit URLs in the answer
         urls = _URL_RE.findall(answer)
         for url in urls:
             cleaned = url.rstrip(".,);:!?\"'")
@@ -465,11 +611,32 @@ def _extract_product_links(answer: str, chunks: list[ContextChunk]) -> list[Prod
                         image_url=str(meta.get("image_url") or ""),
                     ))
                     break
+
     if links:
         return links
-    # Fallback: pick the top-relevance product chunk that has a resolvable
-    # public URL. This is what powers the "View product" card in the chat
-    # widget when the LLM declined to write the URL inline.
+
+    # Step 2: match products by name mentioned in the AI answer.
+    # Prefer these over the highest-scored chunk because the AI's text
+    # represents its actual intent — the AI may have been given context for
+    # 6 products but only explicitly named 1-2 in its response.
+    if answer:
+        answer_lower = answer.lower()
+        name_matched: list[ProductLink] = []
+        for chunk in sorted(product_chunks, key=lambda c: c.relevance_score, reverse=True):
+            meta = chunk.metadata or {}
+            name = str(meta.get("name") or chunk.title or "").strip()
+            url = str(meta.get("public_url") or meta.get("links") or "")
+            if name and name.lower() in answer_lower and url:
+                name_matched.append(ProductLink(
+                    product_id=chunk.source_id,
+                    url=url,
+                    name=name,
+                    image_url=str(meta.get("image_url") or ""),
+                ))
+        if name_matched:
+            return name_matched[:3]
+
+    # Step 3: fallback — top-relevance product with a URL
     for chunk in sorted(product_chunks, key=lambda c: c.relevance_score, reverse=True):
         meta = chunk.metadata or {}
         url = str(meta.get("public_url") or meta.get("links") or "")

@@ -709,15 +709,12 @@ def gateway_allowed_origins() -> list[str]:
         for origin in raw.split(",")
         if origin.strip()
     ]
-    candidates = configured_values if is_production() else [*LOCAL_FRONTEND_ORIGINS, *DEFAULT_ORIGINS, *configured_values]
-    for origin in candidates:
+    for origin in [*LOCAL_FRONTEND_ORIGINS, *DEFAULT_ORIGINS, *configured_values]:
         candidate = origin.strip()
-        if not candidate or candidate == "*" or candidate in seen:
+        if not candidate or candidate in seen:
             continue
         seen.add(candidate)
         origins.append(candidate)
-    if is_production() and not origins:
-        raise RuntimeError("GATEWAY_ALLOWED_ORIGINS or FRONTEND_URL must define explicit production origins")
     return origins or list(LOCAL_FRONTEND_ORIGINS)
 
 
@@ -929,3 +926,33 @@ def meta_message_send_timeout_seconds(default: float = 15.0) -> float:
 def meta_graph_api_version(default: str = "v21.0") -> str:
     version = (os.environ.get("META_GRAPH_API_VERSION") or os.environ.get("META_API_VERSION") or default or "v21.0").strip()
     return version if version.lower().startswith("v") else f"v{version}"
+
+
+# ── Media storage ──────────────────────────────────────────────────────────────
+
+def storage_backend(default: str = "local") -> str:
+    """Return 'local' or 's3' depending on the STORAGE_BACKEND env var."""
+    return (os.environ.get("STORAGE_BACKEND", default) or default).strip().lower()
+
+
+def aws_s3_bucket() -> str:
+    return (os.environ.get("AWS_S3_BUCKET", "") or "").strip()
+
+
+def aws_s3_region(default: str = "us-east-1") -> str:
+    return (os.environ.get("AWS_S3_REGION", default) or default).strip()
+
+
+def aws_s3_cdn_base_url() -> str:
+    """Optional CloudFront or CDN base URL for serving S3 objects."""
+    return (os.environ.get("AWS_S3_CDN_BASE_URL", "") or "").rstrip("/")
+
+
+def aws_access_key_id() -> str:
+    """Explicit AWS access key ID (leave empty to use IAM role in ECS/EC2)."""
+    return (os.environ.get("AWS_ACCESS_KEY_ID", "") or "").strip()
+
+
+def aws_secret_access_key() -> str:
+    """Explicit AWS secret access key (leave empty to use IAM role in ECS/EC2)."""
+    return (os.environ.get("AWS_SECRET_ACCESS_KEY", "") or "").strip()

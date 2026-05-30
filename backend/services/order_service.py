@@ -1665,10 +1665,7 @@ async def handle_order_flow(
     if latest_order and latest_order.get("status") in {"admin_review", "placed", "confirmed"} and not active_order:
         # Only block duplicate order if the previous order was placed very recently (within 2 hours).
         # If the order is older than 2 hours, the user is allowed to place a new order.
-        # A repeated confirmation must remain idempotent even after the
-        # short new-order window expires. New purchase intent may still start a
-        # fresh order once the prior order is old enough.
-        _recent_block = is_order_confirmation(message_text)
+        _recent_block = False
         _order_updated = latest_order.get("updated_at") or latest_order.get("created_at")
         if _order_updated:
             try:
@@ -1678,9 +1675,9 @@ async def handle_order_flow(
                 if _order_updated.tzinfo is None:
                     _order_updated = _order_updated.replace(tzinfo=_dt.timezone.utc)
                 _age_hours = (_now - _order_updated).total_seconds() / 3600
-                _recent_block = is_order_confirmation(message_text) or _age_hours < 2.0
+                _recent_block = _age_hours < 2.0
             except Exception:
-                _recent_block = is_order_confirmation(message_text)
+                _recent_block = False
         if _recent_block:
             logger.info(
                 "order_duplicate_prevented company_id=%s conversation_id=%s order_id=%s status=%s age_check=recent",

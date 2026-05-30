@@ -564,9 +564,11 @@ async def update_customer_memory(
     if db and customer_id:
         try:
             await db.execute(
-                "UPDATE customers SET long_term_summary=$1,historical_sentiment=$2,updated_at=NOW() WHERE id=$3",
+                "UPDATE customers SET long_term_summary=$1,historical_sentiment=$2,updated_at=NOW() "
+                "WHERE company_id=$3 AND id=$4",
                 payload["summary"],
                 payload["overall_sentiment"],
+                company_id,
                 customer_id,
             )
             if company_id:

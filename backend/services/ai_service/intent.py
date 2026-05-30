@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 import re
 
 from services.ai_service.common import IntentResult
@@ -241,6 +243,8 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
                 error_type,
                 error_reason,
             )
+            # Exponential backoff with jitter to prevent retry storms
+            await asyncio.sleep(0.15 * (2 ** attempt) + random.uniform(0, 0.1))
             continue
     fallback = _fallback_intent(text, previous_intent=previous_intent, exc=last_exc)
     logger.warning(

@@ -75,24 +75,17 @@ async def _rls_fetch(db, company_id: str, sql: str, *args) -> list:
         # db is already a plain connection — use directly
         try:
             return list(await db.fetch(sql, *args))
-        except Exception:
+        except Exception as exc:
+            logger.warning("product_rls_fetch_failed company_id=%s error=%s", company_id, exc)
             return []
-    except Exception:
+    except Exception as exc:
+        logger.warning("product_rls_fetch_failed company_id=%s error=%s", company_id, exc)
         return []
 
 
 async def _rls_fetchrow(db, company_id: str, sql: str, *args):
-    try:
-        async with db.acquire() as conn:
-            await _set_tenant(conn, company_id)
-            return await conn.fetchrow(sql, *args)
-    except AttributeError:
-        try:
-            return await db.fetchrow(sql, *args)
-        except Exception:
-            return None
-    except Exception:
-        return None
+    rows = await _rls_fetch(db, company_id, sql, *args)
+    return rows[0] if rows else None
 
 
 async def _fetch_categories(db, company_id: str) -> list[ContextChunk]:
@@ -440,7 +433,7 @@ class OrderRelatedProductRetriever:
             weight = float(record.get("weight") or 0.5)
             score = max(0.0, min(1.0, weight))
             pid = str(record.get("id") or "")
-            chunk = _product_row_to_chunk(record, score=score, company_slug=company_slug, image_url=images.get(pid, ""))
+            chunk = _product_row_to_chunk(record, score=score, company_slug=company_slug, company_id=company_id, image_url=images.get(pid, ""))
             if chunk is None:
                 continue
             chunk.metadata["relation_kind"] = str(record.get("relation_kind") or "")

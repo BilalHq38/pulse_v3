@@ -93,20 +93,11 @@ class MemoryManager:
             labels={"tenant_id": tenant_id},
         )
 
-        # Parallel fetch across all tiers
-        from memory_engine.schemas import ShortTermContext
-
-        if not conversation_id:
-            logger.info(
-                "memory_short_term_disabled reason=missing_conversation_scope tenant=%s user=%s",
-                tenant_id,
-                user_id,
-            )
-        short_term_task = (
-            self.short_term.load(tenant_id, user_id, conversation_id=conversation_id)
-            if conversation_id
-            else asyncio.sleep(0, result=ShortTermContext())
-        )
+        # Parallel fetch across all tiers.
+        # Always load short-term memory even without a conversation_id; the
+        # _key() method falls back to user-level keys so first-message turns
+        # still get any previously cached intent/session state.
+        short_term_task = self.short_term.load(tenant_id, user_id, conversation_id=conversation_id)
 
         tasks = [
             short_term_task,
@@ -274,7 +265,7 @@ class MemoryManager:
 
         elif memory_type == "preference":
             for key, value in content.items():
-                await self.long_term.store_preference(self.db, user_id, key, str(value))
+                await self.long_term.store_preference(self.db, tenant_id, user_id, key, str(value))
 
         elif memory_type == "customer_summary":
             await self.long_term.update_customer_summary(

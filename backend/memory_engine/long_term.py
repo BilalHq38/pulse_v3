@@ -51,7 +51,7 @@ class LongTermMemory:
         ) = await asyncio.gather(
             self._fetch_customer(db, tenant_id, user_id),
             self._fetch_interaction_summaries(db, tenant_id, user_id),
-            self._fetch_preferences(db, user_id),
+            self._fetch_preferences(db, tenant_id, user_id),
             self._fetch_intent_history(db, tenant_id, user_id),
             self._fetch_sentiment_trend(db, tenant_id, user_id),
             self._fetch_shown_products(db, tenant_id, user_id, conversation_id),
@@ -126,13 +126,15 @@ class LongTermMemory:
         sentiment: str = "",
     ) -> None:
         """Update the customer's long-term summary and sentiment."""
-        if not db or not user_id:
+        if not db or not tenant_id or not user_id:
             return
         try:
             await db.execute(
-                "UPDATE customers SET long_term_summary=$1, historical_sentiment=$2, updated_at=NOW() WHERE id=$3",
+                "UPDATE customers SET long_term_summary=$1, historical_sentiment=$2, updated_at=NOW() "
+                "WHERE company_id=$3 AND id=$4",
                 summary,
                 sentiment or "",
+                tenant_id,
                 user_id,
             )
         except Exception as exc:
@@ -141,18 +143,20 @@ class LongTermMemory:
     async def store_preference(
         self,
         db,
+        tenant_id: str,
         user_id: str,
         key: str,
         value: str,
     ) -> None:
         """Store or update a customer preference."""
-        if not db or not user_id or not key:
+        if not db or not tenant_id or not user_id or not key:
             return
         try:
             await db.execute(
-                "INSERT INTO customer_profile_preferences(customer_id,pref_key,pref_value) "
-                "VALUES($1,$2,$3) "
-                "ON CONFLICT(customer_id,pref_key) DO UPDATE SET pref_value=$3",
+                "INSERT INTO customer_profile_preferences(company_id,customer_id,pref_key,pref_value) "
+                "VALUES($1,$2,$3,$4) "
+                "ON CONFLICT(company_id,customer_id,pref_key) DO UPDATE SET pref_value=$4",
+                tenant_id,
                 user_id,
                 key.strip(),
                 value.strip(),
@@ -258,11 +262,13 @@ class LongTermMemory:
             logger.debug("Interaction summaries fetch failed: %s", exc)
             return []
 
-    async def _fetch_preferences(self, db, user_id: str) -> dict[str, str]:
-        """Fetch customer preferences."""
+    async def _fetch_preferences(self, db, tenant_id: str, user_id: str) -> dict[str, str]:
+        """Fetch customer preferences (tenant-scoped to prevent cross-tenant leakage)."""
         try:
             rows = await db.fetch(
-                "SELECT pref_key, pref_value FROM customer_profile_preferences WHERE customer_id=$1",
+                "SELECT pref_key, pref_value FROM customer_profile_preferences "
+                "WHERE company_id=$1 AND customer_id=$2",
+                tenant_id,
                 user_id,
             )
             return {str(row["pref_key"]): str(row["pref_value"]) for row in (rows or []) if row}

@@ -50,7 +50,7 @@ export function accountStatusCopy(status) {
 
 export default function AccountStatusPage() {
   const { user, logout } = useAuth();
-  const status = user?.account_status || user?.status || sessionStorage.getItem('pe_account_status') || 'pending_approval';
+  const status = user?.account_status || user?.status || localStorage.getItem('pe_account_status') || 'pending_approval';
   const copy = accountStatusCopy(status);
   const Icon = copy.icon;
 

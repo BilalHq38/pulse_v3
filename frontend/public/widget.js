@@ -108,10 +108,10 @@
     }
 
     _getSessionId() {
-      let sessionId = sessionStorage.getItem('pulse_chat_session');
+      let sessionId = localStorage.getItem('pulse_chat_session');
       if (!sessionId) {
         sessionId = `web_${Math.random().toString(36).slice(2, 11)}`;
-        sessionStorage.setItem('pulse_chat_session', sessionId);
+        localStorage.setItem('pulse_chat_session', sessionId);
       }
       return sessionId;
     }
@@ -313,8 +313,8 @@
             session_id: this.sessionId,
             content,
             attachments,
-            customer_name: sessionStorage.getItem('pulse_chat_name') || 'Website Visitor',
-            customer_email: sessionStorage.getItem('pulse_chat_email') || '',
+            customer_name: localStorage.getItem('pulse_chat_name') || 'Website Visitor',
+            customer_email: localStorage.getItem('pulse_chat_email') || '',
             company_id: this.config.companyId,
             page_url: window.location.href,
           }),

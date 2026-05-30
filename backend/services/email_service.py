@@ -515,6 +515,265 @@ def _send_tenant_email_from_credentials(
     )
 
 
+def render_onboarding_email_html(
+    user_name: str,
+    company_name: str,
+    login_url: str,
+) -> str:
+    """
+    Render a professional onboarding welcome email for newly approved users.
+    Uses inline styles only; mobile-responsive with max-width 600px.
+    """
+    accent = "#2563eb"
+    safe_name = html.escape(str(user_name or "there"))
+    safe_company = html.escape(str(company_name or "your company"))
+    safe_login_url = html.escape(str(login_url or ""), quote=True)
+
+    logo_uri = get_platform_logo_data_uri()
+    logo_html = (
+        f'<img src="{logo_uri}" alt="Pulse Engine" '
+        f'style="display:block;width:44px;height:auto;" />'
+        if logo_uri
+        else ""
+    )
+
+    steps = [
+        ("1", "Company Settings", "Configure your company profile and core preferences."),
+        ("2", "Profile Settings", "Update your personal account details and notifications."),
+        ("3", "Business Information", "Enter your business address, tax info, and legal details."),
+        ("4", "Branding", "Upload your logo, set brand colors, and customize your appearance."),
+        ("5", "AI Configuration", "Connect your AI provider and tune response settings."),
+        ("6", "Knowledge Base", "Add FAQs, policies, and documents to train your AI assistant."),
+        ("7", "Products", "Add your products or services with images, prices, and descriptions."),
+        ("8", "FAQs", "Create a quick-access FAQ list for your customers and AI."),
+        ("9", "Channel Configuration", "Connect WhatsApp, email, webchat, and other channels."),
+    ]
+
+    steps_html = ""
+    for num, title, desc in steps:
+        steps_html += (
+            f'<div style="display:flex;align-items:flex-start;gap:14px;'
+            f'margin-bottom:14px;padding:14px 16px;border-radius:14px;'
+            f'background:#f8fafc;border:1px solid #e2e8f0;">'
+            f'<div style="flex-shrink:0;width:32px;height:32px;border-radius:50%;'
+            f'background:{accent};color:#fff;font-size:14px;font-weight:800;'
+            f'display:flex;align-items:center;justify-content:center;'
+            f'line-height:32px;text-align:center;">{num}</div>'
+            f'<div style="flex:1;">'
+            f'<div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:2px;">'
+            f'{html.escape(title)}</div>'
+            f'<div style="font-size:13px;color:#64748b;line-height:1.5;">{html.escape(desc)}</div>'
+            f'</div></div>'
+        )
+
+    return f"""\
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:system-ui,-apple-system,sans-serif;">
+  <div style="max-width:600px;margin:0 auto;padding:32px 16px;">
+    <div style="background:linear-gradient(180deg,#f0f7ff 0%,#f8fafc 100%);
+        border:1px solid #bfdbfe;border-radius:28px;padding:28px 28px 24px;
+        box-shadow:0 18px 45px rgba(15,23,42,0.09);">
+
+      <!-- Header / Logo -->
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px;">
+        {logo_html}
+        <div>
+          <div style="font-size:20px;font-weight:800;color:#0f172a;letter-spacing:-0.02em;">Pulse Engine</div>
+          <div style="font-size:11px;color:#64748b;font-weight:700;letter-spacing:0.08em;
+              text-transform:uppercase;">CRM Platform</div>
+        </div>
+      </div>
+
+      <!-- Main card -->
+      <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:22px;padding:30px;">
+
+        <!-- Badge -->
+        <div style="display:inline-flex;align-items:center;padding:6px 12px;border-radius:999px;
+            background:#eff6ff;color:{accent};font-size:11px;font-weight:800;
+            letter-spacing:0.08em;text-transform:uppercase;margin-bottom:18px;">
+          Welcome Aboard
+        </div>
+
+        <!-- Title -->
+        <h1 style="margin:0 0 6px;color:#0f172a;font-size:28px;line-height:1.15;
+            letter-spacing:-0.03em;">
+          Hello, {safe_name}!
+        </h1>
+        <p style="margin:0 0 20px;color:#475569;font-size:15px;line-height:1.7;">
+          Your account for <strong>{safe_company}</strong> has been approved and is now active.
+          You're all set to get started with Pulse Engine CRM.
+        </p>
+
+        <!-- Intro highlight -->
+        <div style="padding:18px 20px;border-radius:16px;background:{accent}0d;
+            border:1px solid {accent}33;margin-bottom:24px;">
+          <p style="margin:0;color:#1e40af;font-size:15px;font-weight:600;line-height:1.6;">
+            Complete the onboarding steps below to configure your workspace.
+            Once all steps are done and channels are connected, your platform will be
+            fully operational and ready to engage with customers.
+          </p>
+        </div>
+
+        <!-- Onboarding steps -->
+        <div style="margin-bottom:24px;">
+          <div style="font-size:13px;font-weight:800;color:#64748b;letter-spacing:0.06em;
+              text-transform:uppercase;margin-bottom:14px;">Onboarding Checklist</div>
+          {steps_html}
+        </div>
+
+        <!-- Completion note -->
+        <div style="padding:14px 18px;border-radius:14px;background:#f0fdf4;
+            border:1px solid #bbf7d0;margin-bottom:24px;">
+          <p style="margin:0;color:#166534;font-size:14px;font-weight:600;line-height:1.6;">
+            Once all 9 steps are configured and your channels are connected,
+            your Pulse Engine workspace will be fully operational.
+          </p>
+        </div>
+
+        <!-- CTA -->
+        <div style="margin-bottom:8px;">
+          <a href="{safe_login_url}"
+             style="display:inline-block;background:{accent};color:#ffffff;
+                    text-decoration:none;padding:13px 26px;border-radius:12px;
+                    font-weight:700;font-size:15px;letter-spacing:0.01em;">
+            Go to Dashboard
+          </a>
+        </div>
+
+        <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6;">
+          If you did not expect this email or have questions, please contact our support team.
+        </p>
+      </div>
+    </div>
+
+    <p style="margin:14px 6px 0;color:#94a3b8;font-size:12px;text-align:center;">
+      Pulse Engine &bull; Secure account notifications
+    </p>
+  </div>
+</body>
+</html>
+"""
+
+
+async def send_onboarding_email_async(
+    db,
+    *,
+    user_id: str,
+    user_name: str,
+    user_email: str,
+    company_name: str,
+) -> bool:
+    """
+    Send a one-time onboarding welcome email when a user is approved by super admin.
+
+    Idempotent: checks system_logs for action='onboarding_email_sent' with
+    entity_id=user_id before sending.  Records a log entry on success.
+    Never raises — any exception is logged and False is returned.
+    """
+    try:
+        user_id = str(user_id or "").strip()
+        user_email = str(user_email or "").strip()
+        if not user_id or not user_email or "@" not in user_email:
+            logger.warning(
+                "send_onboarding_email_async skipped: invalid user_id=%s or email=%s",
+                user_id,
+                user_email,
+            )
+            return False
+
+        # Idempotency check — look for a previous send record (no company context needed
+        # because super_admin system_logs may have empty company_id).
+        try:
+            already_sent = await db.fetchval(
+                "SELECT id FROM system_logs WHERE action='onboarding_email_sent' AND entity_id=$1 LIMIT 1",
+                user_id,
+            )
+        except Exception as check_exc:
+            logger.warning(
+                "send_onboarding_email_async idempotency check failed user_id=%s error=%s",
+                user_id,
+                check_exc,
+            )
+            already_sent = None
+
+        if already_sent:
+            logger.info(
+                "send_onboarding_email_async skipped — already sent user_id=%s",
+                user_id,
+            )
+            return True
+
+        from shared.config import frontend_url as _frontend_url
+
+        login_url = _frontend_url().rstrip("/") + "/login"
+        html_body = render_onboarding_email_html(
+            user_name=user_name,
+            company_name=company_name,
+            login_url=login_url,
+        )
+        plain_body = (
+            f"Welcome to Pulse Engine, {user_name or 'there'}!\n\n"
+            f"Your account for {company_name or 'your company'} has been approved.\n"
+            "Please log in to complete your onboarding:\n"
+            f"{login_url}\n\n"
+            "Onboarding steps: Company Settings, Profile Settings, Business Information, "
+            "Branding, AI Configuration, Knowledge Base, Products, FAQs, Channel Configuration.\n\n"
+            "Once all steps are complete and channels are connected, your platform is fully operational."
+        )
+
+        sent = await send_email_async(
+            user_email,
+            "Welcome to Pulse Engine — Your Account is Active",
+            plain_body,
+            html_body,
+        )
+        if not sent:
+            logger.warning(
+                "send_onboarding_email_async email delivery failed user_id=%s email=%s",
+                user_id,
+                user_email,
+            )
+            return False
+
+        # Record the send so we never send it twice.
+        try:
+            from core.utils import make_id
+
+            log_id = make_id()
+            await db.execute(
+                "INSERT INTO system_logs(id,user_id,company_id,action,entity_type,entity_id,created_at) "
+                "VALUES($1,$2,'',$3,$4,$5,NOW())",
+                log_id,
+                user_id,
+                "onboarding_email_sent",
+                "user",
+                user_id,
+            )
+        except Exception as log_exc:
+            # Log failure is non-fatal — email was already sent successfully.
+            logger.warning(
+                "send_onboarding_email_async failed to record log user_id=%s error=%s",
+                user_id,
+                log_exc,
+            )
+
+        logger.info(
+            "send_onboarding_email_async sent user_id=%s email=%s",
+            user_id,
+            user_email,
+        )
+        return True
+
+    except Exception as exc:
+        logger.exception(
+            "send_onboarding_email_async unexpected error user_id=%s error=%s",
+            user_id,
+            exc,
+        )
+        return False
+
+
 async def send_tenant_email_async(
     db,
     company_id: str,

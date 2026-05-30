@@ -4,10 +4,6 @@ from services.ai_service import response_generator
 from services.ai_service.facade import _safe_ai_reply_default
 from services.ai_service.routing_guards import is_low_value_message, lightweight_route_message, should_lightweight_bypass
 
-pytestmark = pytest.mark.skip(
-    reason="Retired Wave 7 legacy response-generator contract; Wave 8 removed generate_ai_response and covers the unified path separately."
-)
-
 
 def _latest_from_prompt(prompt: str) -> str:
     if "Latest customer message:\n" not in prompt:

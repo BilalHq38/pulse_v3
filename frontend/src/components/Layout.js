@@ -96,12 +96,12 @@ export default function Layout({ children }) {
   const [profileView, setProfileView] = useState(null);
   const [profileEditForm, setProfileEditForm] = useState({ name: '', email: '', mobile_number: '' });
   const [profileImageUrl, setProfileImageUrl] = useState('');
-  const [userAvatar, setUserAvatar] = useState(() => normalizeAvatarUrl(sessionStorage.getItem('pe_avatar') || ''));
+  const [userAvatar, setUserAvatar] = useState(() => normalizeAvatarUrl(localStorage.getItem('pe_avatar') || ''));
   const saveUserAvatar = useCallback((rawUrl) => {
     const avatar = normalizeAvatarUrl(rawUrl || '');
     setUserAvatar(avatar);
-    if (avatar) sessionStorage.setItem('pe_avatar', avatar);
-    else sessionStorage.removeItem('pe_avatar');
+    if (avatar) localStorage.setItem('pe_avatar', avatar);
+    else localStorage.removeItem('pe_avatar');
     return avatar;
   }, []);
 
@@ -115,8 +115,8 @@ export default function Layout({ children }) {
   const [profileSaved, setProfileSaved] = useState(false);
   const [modalCompanyName, setModalCompanyName] = useState('');
   const avatarInputRef = useRef(null);
-  const [companyName, setCompanyName] = useState(() => sessionStorage.getItem('pe_company_name') || '');
-  const saveCompanyName = (name) => { setCompanyName(name); if (name) sessionStorage.setItem('pe_company_name', name); };
+  const [companyName, setCompanyName] = useState(() => localStorage.getItem('pe_company_name') || '');
+  const saveCompanyName = (name) => { setCompanyName(name); if (name) localStorage.setItem('pe_company_name', name); };
   const [openMenus, setOpenMenus] = useState({});
   const profileRef = useRef(null);
   const notifRef = useRef(null);

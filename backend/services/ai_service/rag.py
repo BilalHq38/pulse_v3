@@ -653,10 +653,12 @@ async def rank_products_for_query(
                 bool(query_info.get("general")),
                 len(products),
             )
+        _MIN_PRODUCT_VECTOR_SIMILARITY = 0.35
         vector_scores = {
             str(row.get("source_id") or ""): float(row.get("similarity") or 0)
             for row in vector_rows
             if str(row.get("source_id") or "").strip()
+            and float(row.get("similarity") or 0) >= _MIN_PRODUCT_VECTOR_SIMILARITY
         }
 
         ranked: list[tuple[float, dict]] = []

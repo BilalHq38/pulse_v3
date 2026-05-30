@@ -533,7 +533,11 @@ def _build_generation_config(
         base_temperature += negative_delta
     if len(recent_ai_replies) >= 2:
         base_temperature += repetition_delta
-    jitter = random.randint(0, jitter_steps) / 100.0
+    # Deterministic jitter derived from query content so the same message always
+    # maps to the same temperature across workers, preventing response variance
+    # caused by non-reproducible random seeds.
+    query_hash = int(hashlib.sha256((query or "").encode("utf-8", errors="replace")).hexdigest(), 16)
+    jitter = (query_hash % max(1, jitter_steps + 1)) / 100.0
     temperature = max(min_temperature, min(max_temperature, base_temperature + jitter))
     return {"temperature": round(temperature, 2), "max_output_tokens": 1024}
 

@@ -16,7 +16,7 @@ const SOCKET_EVENTS = [
 
 const SOCKET_URL = (
   process.env.REACT_APP_SOCKET_URL
-  || window.location.origin
+  || `${window.location.protocol}//${window.location.hostname}:8003`
 ).replace(/\/$/, '');
 
 /**

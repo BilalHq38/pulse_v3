@@ -23,4 +23,4 @@ print('all-MiniLM-L6-v2 ready')"
 
 COPY backend /app/backend
 
-CMD ["uvicorn", "services.ai_service.main:app", "--host", "0.0.0.0", "--port", "8005"]
+CMD ["uvicorn", "services.ai_service.main:app", "--host", "0.0.0.0", "--port", "8005", "--workers", "2", "--timeout-graceful-shutdown", "30"]

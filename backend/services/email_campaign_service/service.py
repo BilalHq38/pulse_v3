@@ -148,6 +148,21 @@ def _finalize_email_html(html_body: str, plain_body: str = "") -> str:
     )
 
 
+def _inject_product_block(html_body: str, product_block: str) -> str:
+    """
+    Insert a product HTML block into the email.
+    Tries to place it just before </body>; falls back to appending.
+    If product_block is empty, returns html_body unchanged.
+    """
+    if not product_block or not html_body:
+        return html_body
+    close_body = re.search(r"(?i)</\s*body\s*>", html_body)
+    if close_body:
+        insert_pos = close_body.start()
+        return html_body[:insert_pos] + product_block + html_body[insert_pos:]
+    return html_body + product_block
+
+
 def _campaign_ai_engine(engine: dict | None, *, min_output_tokens: int) -> dict:
     tuned = dict(engine or {})
     try:
@@ -372,6 +387,75 @@ async def _load_campaign_product(db, *, company_id: str, product_id: str) -> dic
     return result
 
 
+async def get_campaign_products_with_images(db, *, company_id: str) -> list[dict]:
+    """
+    Return a list of products for the given company with their first image,
+    price, name, slug, and purchase link.  Used by the frontend to populate
+    the product picker in the campaign builder.
+
+    Each item: {product_id, name, image_url, price, price_currency, slug, purchase_link}
+    """
+    if not company_id:
+        return []
+    try:
+        async with company_context(db, company_id):
+            rows = await db.fetch(
+                "SELECT p.id, p.name, p.product_title, p.price, p.price_currency, "
+                "       COALESCE(p.slug, '')::text AS slug, "
+                "       COALESCE(p.links, '')::text AS links, "
+                "       (SELECT image_url FROM product_images "
+                "        WHERE product_id=p.id ORDER BY sort_order LIMIT 1) AS image_url "
+                "FROM company_products p "
+                "WHERE p.company_id=$1 AND (p.status='active' OR p.status IS NULL OR p.status='') "
+                "ORDER BY p.updated_at DESC NULLS LAST, p.name ASC LIMIT 200",
+                company_id,
+            )
+            company_slug_row = await db.fetchval(
+                "SELECT COALESCE(slug, '') FROM companies WHERE id=$1 LIMIT 1",
+                company_id,
+            )
+        company_slug = str(company_slug_row or "").strip()
+        from shared.config import frontend_url as _frontend_url
+
+        base_url = _frontend_url().rstrip("/")
+        result = []
+        for row in rows:
+            product_id = str(row["id"] or "")
+            name = str(row["name"] or row.get("product_title") or "")
+            image_url = str(row["image_url"] or "") if row["image_url"] else ""
+            price = str(row["price"] or "")
+            price_currency = str(row["price_currency"] or "")
+            slug = str(row["slug"] or "").strip()
+            manual_link = str(row["links"] or "").strip()
+
+            if manual_link and manual_link.startswith(("http://", "https://")):
+                purchase_link = manual_link
+            elif company_slug and slug:
+                purchase_link = f"{base_url}/c/{company_slug}/product/{slug}"
+            else:
+                purchase_link = ""
+
+            result.append(
+                {
+                    "product_id": product_id,
+                    "name": name,
+                    "image_url": image_url,
+                    "price": price,
+                    "price_currency": price_currency,
+                    "slug": slug,
+                    "purchase_link": purchase_link,
+                }
+            )
+        return result
+    except Exception as exc:
+        logger.exception(
+            "get_campaign_products_with_images failed company_id=%s error=%s",
+            company_id,
+            exc,
+        )
+        return []
+
+
 async def generate_campaign_copy(
     db,
     *,
@@ -392,6 +476,13 @@ async def generate_campaign_copy(
             _load_campaign_product(db, company_id=company_id, product_id=product_id),
             get_active_llm_engine(db, company_id),
         )
+        company_slug = str(
+            await db.fetchval(
+                "SELECT COALESCE(slug, '') FROM companies WHERE id=$1 LIMIT 1",
+                company_id,
+            )
+            or ""
+        )
     if not product:
         raise ValueError("Selected product was not found")
 
@@ -405,6 +496,7 @@ async def generate_campaign_copy(
     if missing:
         raise ValueError(f"Missing campaign details: {', '.join(missing)}")
 
+    purchase_url = _build_product_purchase_url(product, company_slug)
     feature_lines = (
         "\n".join(f"- {feature}" for feature in product.get("features") or [])
         or "- No structured features stored"
@@ -455,7 +547,10 @@ async def generate_campaign_copy(
         ).model_dump()
         if not generated.get("html_body"):
             generated["html_body"] = _body_to_html(generated.get("body", ""))
-        generated["html_body"] = _finalize_email_html(generated.get("html_body", ""), generated.get("body", ""))
+        base_html = _finalize_email_html(generated.get("html_body", ""), generated.get("body", ""))
+        # Inject product image + Buy Now block before closing </body> tag.
+        product_block = _build_product_email_block(product, purchase_url)
+        generated["html_body"] = _inject_product_block(base_html, product_block)
         return generated
     except Exception as exc:
         logger.exception(
@@ -495,6 +590,15 @@ async def generate_html_email_body(
             if product_id else asyncio.sleep(0)
         )
         product, engine = await asyncio.gather(_product_coro, get_active_llm_engine(db, company_id))
+        company_slug = ""
+        if product_id:
+            company_slug = str(
+                await db.fetchval(
+                    "SELECT COALESCE(slug, '') FROM companies WHERE id=$1 LIMIT 1",
+                    company_id,
+                )
+                or ""
+            )
     product_context = "No product selected."
     if product:
         feature_lines = (
@@ -527,10 +631,15 @@ async def generate_html_email_body(
         generated = HtmlEmailBodyDraft.model_validate(
             await call_model_json(prompt, HtmlEmailBodyDraft, engine=tuned_engine, call_purpose="email_html_body")
         ).model_dump()
-        html_body = _finalize_email_html(generated.get("html_body", ""), current_body)
-        if not html_body:
+        base_html = _finalize_email_html(generated.get("html_body", ""), current_body)
+        if not base_html:
             raise CampaignAIUnavailableError(_campaign_ai_unavailable_message("html"))
-        return {"html_body": html_body}
+        # Inject product image + Buy Now block when a product was selected.
+        if product:
+            purchase_url = _build_product_purchase_url(product, company_slug)
+            product_block = _build_product_email_block(product, purchase_url)
+            base_html = _inject_product_block(base_html, product_block)
+        return {"html_body": base_html}
     except CampaignAIUnavailableError:
         raise
     except Exception as exc:
@@ -563,7 +672,96 @@ def _campaign_product_snapshot(product: dict | None) -> dict | None:
         "product_type": str(product.get("product_type") or "").strip(),
         "features": list(product.get("features") or []),
         "images": list(product.get("images") or []),
+        "slug": str(product.get("slug") or "").strip(),
+        "links": str(product.get("links") or "").strip(),
     }
+
+
+def _build_product_purchase_url(product: dict, company_slug: str = "") -> str:
+    """
+    Return the best purchase/view URL for the product.
+    Prefers explicit ``links`` field; falls back to /c/{company_slug}/product/{slug}.
+    Returns empty string if neither is available.
+    """
+    manual_link = str(product.get("links") or "").strip()
+    if manual_link and manual_link.startswith(("http://", "https://")):
+        return manual_link
+
+    slug = str(product.get("slug") or "").strip()
+    if company_slug and slug:
+        from shared.config import frontend_url as _frontend_url
+
+        base = _frontend_url().rstrip("/")
+        return f"{base}/c/{company_slug}/product/{slug}"
+
+    return ""
+
+
+def _build_product_email_block(product: dict, purchase_url: str = "") -> str:
+    """
+    Return an HTML block for the product suitable for email insertion.
+    Includes the first available image (if any), product name, price, description
+    snippet, and a "Buy Now" button linking to purchase_url.
+    Gracefully handles missing image or missing purchase_url.
+    """
+    name = html.escape(str(product.get("name") or product.get("product_title") or "Product"))
+    price = str(product.get("price") or "").strip()
+    currency = str(product.get("price_currency") or "").strip()
+    description = str(product.get("description") or "").strip()
+    images = list(product.get("images") or [])
+    image_url = images[0] if images else ""
+
+    price_display = ""
+    if price:
+        price_display = f"{price} {currency}".strip()
+
+    img_html = ""
+    if image_url:
+        safe_image_url = html.escape(image_url, quote=True)
+        img_html = (
+            f'<div style="text-align:center;margin-bottom:14px;">'
+            f'<img src="{safe_image_url}" alt="{name}" '
+            f'style="max-width:100%;width:320px;height:auto;border-radius:10px;'
+            f'border:1px solid #e2e8f0;display:inline-block;" /></div>'
+        )
+
+    price_html = ""
+    if price_display:
+        safe_price = html.escape(price_display)
+        price_html = (
+            f'<div style="font-size:22px;font-weight:800;color:#0f172a;margin:8px 0;">'
+            f'{safe_price}</div>'
+        )
+
+    desc_html = ""
+    if description:
+        snippet = description[:200] + ("…" if len(description) > 200 else "")
+        desc_html = (
+            f'<p style="margin:8px 0 14px;color:#475569;font-size:14px;line-height:1.6;">'
+            f'{html.escape(snippet)}</p>'
+        )
+
+    button_html = ""
+    if purchase_url:
+        safe_url = html.escape(purchase_url, quote=True)
+        button_html = (
+            f'<div style="text-align:center;margin-top:16px;">'
+            f'<a href="{safe_url}" '
+            f'style="display:inline-block;background:#2563eb;color:#ffffff;'
+            f'text-decoration:none;padding:12px 28px;border-radius:10px;'
+            f'font-weight:700;font-size:15px;">Buy Now</a></div>'
+        )
+
+    return (
+        f'<div style="border:1px solid #e2e8f0;border-radius:14px;padding:20px;'
+        f'margin:20px 0;background:#f8fafc;">'
+        f'{img_html}'
+        f'<div style="font-size:18px;font-weight:700;color:#0f172a;margin-bottom:4px;">{name}</div>'
+        f'{price_html}'
+        f'{desc_html}'
+        f'{button_html}'
+        f'</div>'
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -698,9 +896,9 @@ async def update_campaign(
     if not existing:
         raise ValueError("Campaign not found")
     existing = dict(existing)
-    non_editable = {"sending", "completed"}
+    non_editable = {"sending", "queued"}
     if str(existing.get("status") or "").strip().lower() in non_editable:
-        raise ValueError("Campaigns that are actively sending or already completed cannot be edited")
+        raise ValueError("Campaigns that are currently sending or queued cannot be edited. Pause first.")
 
     filters = dict(filters or {})
     final_html = _finalize_email_html(html_body, body)
@@ -943,14 +1141,19 @@ def schedule_campaign_send(app, campaign_id: str, company_id: str) -> None:
 
     We route through the shared safe detached-task wrapper, which keeps the
     existing background queue behavior and adds failure observability.
-    """
 
+    A unique dispatch_id is generated per call so that restart/resume always
+    enqueues a fresh task. Using a fixed job_id caused Redis deduplication to
+    silently drop the task when the previous run's state key (24 hr TTL) still
+    existed, leaving the campaign stuck in 'queued' forever.
+    """
     db = getattr(app.state, "db", None)
+    dispatch_id = f"campaign:{campaign_id}:{make_id()}"
     create_safe_detached_task(
         db,
         _dispatch_campaign(db, campaign_id, company_id),
         name=f"email_campaign:{campaign_id}",
-        job_id=f"campaign:{campaign_id}",
+        job_id=dispatch_id,
         company_id=company_id,
         channel="email_campaign",
         event_id=campaign_id,

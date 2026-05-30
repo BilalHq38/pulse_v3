@@ -3,7 +3,7 @@
 
 # Web framework (keep pydantic/starlette aligned for pip's resolver in slim images)
 fastapi>=0.115.0,<0.137
-uvicorn[standard]>=0.29.0,<0.45
+uvicorn[standard]>=0.29.0,<0.35
 pydantic>=2.10.0,<2.14.0
 
 # PostgreSQL (asyncpg replaces motor/pymongo entirely)
@@ -19,10 +19,6 @@ google-genai>=1.11.0
 openai>=1.68.0
 anthropic>=0.49.0
 redis>=5.0.0
-boto3>=1.42.0
-alembic>=1.16.0
-psycopg>=3.2.0
-SQLAlchemy>=2.0.0
 
 # Auth
 python-jose[cryptography]>=3.3.0
@@ -30,9 +26,10 @@ cryptography>=43.0.0
 passlib[bcrypt]>=1.7.4
 stripe>=11.0.0
 
-# File uploads
+# File uploads / cloud storage
 python-multipart>=0.0.9
 aiofiles>=23.2.1
+boto3>=1.34.0
 
 # Office file handling (onboarding doc uploads)
 Pillow>=10.0.0

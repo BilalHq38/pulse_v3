@@ -31,12 +31,12 @@ from services.email_campaign_service.service import (
     create_campaign,
     generate_campaign_copy,
     generate_html_email_body,
+    get_campaign_products_with_images,
     resolve_recipients,
     schedule_campaign_send,
     update_campaign,
 )
 from shared.database import company_context
-
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -61,6 +61,28 @@ async def _ensure_company_ai_available(db, company_id: str) -> None:
         )
     if enabled is False:
         raise CampaignAIQuotaExceededError(campaign_ai_quota_message())
+
+
+@router.get("/campaigns/product-images")
+async def list_campaign_product_images(
+    request: Request,
+    company_id: Optional[str] = Query(default=None),
+):
+    """
+    Return all active products for the company with their first image_url,
+    price, slug, and purchase_link.  Used by the campaign builder frontend
+    to populate the product picker.
+
+    Authentication is required; company_id falls back to the JWT claim.
+    """
+    db = _db(request)
+    cu = await get_current_user_flexible(request)
+    cid = company_id or get_company_id(cu)
+    if not cid:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    products = await get_campaign_products_with_images(db, company_id=cid)
+    return products
 
 
 @router.get("/campaigns")
@@ -368,24 +390,22 @@ async def pause_campaign(campaign_id: str, request: Request):
     cid = get_company_id(cu)
     if not cid:
         raise HTTPException(status_code=403, detail="Company context required")
-    async with company_context(db, cid) as conn:
-        campaign = r(await conn.fetchrow(
-            "SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2",
-            campaign_id, cid,
-        ))
-        if not campaign:
-            raise HTTPException(status_code=404, detail="Campaign not found")
-        if campaign.get("status") not in {"queued", "sending"}:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot pause a campaign with status '{campaign.get('status')}'. Only queued or sending campaigns can be paused.",
-            )
-        # Atomic update: only succeeds if status is still queued/sending
-        result = await conn.execute(
-            "UPDATE email_campaigns SET status='paused' "
-            "WHERE id=$1 AND company_id=$2 AND status IN ('queued','sending')",
-            campaign_id, cid,
+    campaign = r(await db.fetchrow(
+        "SELECT id, status FROM email_campaigns WHERE id=$1 AND company_id=$2",
+        campaign_id, cid,
+    ))
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("status") not in {"queued", "sending"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot pause a campaign with status '{campaign.get('status')}'. Only queued or sending campaigns can be paused.",
         )
+    result = await db.execute(
+        "UPDATE email_campaigns SET status='paused',updated_at=NOW() "
+        "WHERE id=$1 AND company_id=$2 AND status IN ('queued','sending')",
+        campaign_id, cid,
+    )
     if result == "UPDATE 0":
         raise HTTPException(status_code=409, detail="Campaign status changed before pause could be applied. Please refresh and try again.")
     return {"id": campaign_id, "status": "paused"}
@@ -398,18 +418,23 @@ async def resume_campaign(campaign_id: str, request: Request):
     cid = get_company_id(cu)
     if not cid:
         raise HTTPException(status_code=403, detail="Company context required")
-    campaign = r(await db.fetchrow("SELECT * FROM email_campaigns WHERE id=$1 AND company_id=$2", campaign_id, cid))
+    campaign = r(await db.fetchrow(
+        "SELECT id, status, total_recipients FROM email_campaigns WHERE id=$1 AND company_id=$2",
+        campaign_id, cid,
+    ))
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     if campaign.get("status") != "paused":
         raise HTTPException(status_code=400, detail="Only paused campaigns can be resumed")
     if not int(campaign.get("total_recipients") or 0):
         raise HTTPException(status_code=400, detail="Campaign has no recipients")
-    async with company_context(db, cid) as conn:
-        await conn.execute(
-            "UPDATE email_campaigns SET status='queued' WHERE id=$1 AND company_id=$2 AND status='paused'",
-            campaign_id, cid,
-        )
+    result = await db.execute(
+        "UPDATE email_campaigns SET status='queued',updated_at=NOW() "
+        "WHERE id=$1 AND company_id=$2 AND status='paused'",
+        campaign_id, cid,
+    )
+    if result == "UPDATE 0":
+        raise HTTPException(status_code=409, detail="Campaign status changed before resume could be applied. Please refresh and try again.")
     schedule_campaign_send(request.app, campaign_id, cid)
     return {"id": campaign_id, "status": "queued"}
 
@@ -426,17 +451,16 @@ async def restart_campaign(campaign_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Campaign not found")
     if campaign.get("status") == "sending":
         raise HTTPException(status_code=400, detail="Campaign is currently sending. Pause it first to restart.")
-    # Reset all recipients to pending and campaign stats
     await db.execute(
-        "UPDATE email_campaign_recipients SET status='pending',sent_at=NULL,error='' WHERE campaign_id=$1 AND company_id=$2",
-        campaign_id,
-        cid,
+        "UPDATE email_campaign_recipients SET status='pending',sent_at=NULL,error='' "
+        "WHERE campaign_id=$1 AND company_id=$2",
+        campaign_id, cid,
     )
     await db.execute(
-        "UPDATE email_campaigns SET status='queued',sent_count=0,failed_count=0,started_at=NULL,completed_at=NULL,"
-        "last_error='',updated_at=NOW() WHERE id=$1 AND company_id=$2",
-        campaign_id,
-        cid,
+        "UPDATE email_campaigns SET status='queued',sent_count=0,failed_count=0,"
+        "started_at=NULL,completed_at=NULL,last_error='',updated_at=NOW() "
+        "WHERE id=$1 AND company_id=$2",
+        campaign_id, cid,
     )
     schedule_campaign_send(request.app, campaign_id, cid)
     return {"id": campaign_id, "status": "queued"}

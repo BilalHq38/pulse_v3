@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import HTTPException
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse
+
+from shared.config import is_production
+
+logger = logging.getLogger(__name__)
+
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local")
+
+if is_production() and STORAGE_BACKEND != "s3":
+    raise RuntimeError(
+        f"Production requires STORAGE_BACKEND=s3 (got '{STORAGE_BACKEND}'). "
+        "Set STORAGE_BACKEND=s3 and configure AWS_S3_BUCKET in your environment."
+    )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_UPLOAD_ROOT = PROJECT_ROOT / "uploads"
@@ -31,41 +47,135 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_VIDEO_BYTES = 16 * 1024 * 1024
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.IGNORECASE | re.DOTALL)
 _SAFE_SEGMENT_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+# ── S3 client (lazily initialised) ────────────────────────────────────────────
+
 _S3_CLIENT = None
 
 
-def storage_backend() -> str:
-    backend = (os.environ.get("MEDIA_STORAGE_BACKEND") or "local").strip().lower()
-    if backend not in {"local", "s3"}:
-        raise RuntimeError("MEDIA_STORAGE_BACKEND must be 'local' or 's3'")
-    if (os.environ.get("ENVIRONMENT") or os.environ.get("APP_ENV") or "").strip().lower() in {"prod", "production"}:
-        if backend != "s3":
-            raise RuntimeError("Production media storage requires MEDIA_STORAGE_BACKEND=s3")
-    return backend
-
-
-def _s3_client():
+def _get_s3_client():
     global _S3_CLIENT
     if _S3_CLIENT is None:
-        import boto3
-
-        _S3_CLIENT = boto3.client("s3", region_name=(os.environ.get("AWS_REGION") or "").strip() or None)
+        kwargs: dict = {"region_name": os.environ.get("AWS_S3_REGION", "us-east-1")}
+        # In production use an IAM role (no explicit keys needed).
+        # For local/dev supply explicit credentials via environment variables.
+        if os.environ.get("AWS_ACCESS_KEY_ID"):
+            kwargs["aws_access_key_id"] = os.environ["AWS_ACCESS_KEY_ID"]
+            kwargs["aws_secret_access_key"] = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        _S3_CLIENT = boto3.client("s3", **kwargs)
     return _S3_CLIENT
 
 
-def _s3_bucket() -> str:
-    bucket = (os.environ.get("MEDIA_S3_BUCKET") or "").strip()
+# ── S3 helpers ─────────────────────────────────────────────────────────────────
+
+
+async def store_media_bytes_s3(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+    company_id: str,
+) -> str:
+    """Upload *file_bytes* to S3 and return the public URL."""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
     if not bucket:
-        raise RuntimeError("MEDIA_S3_BUCKET is required when MEDIA_STORAGE_BACKEND=s3")
-    return bucket
+        raise ValueError("AWS_S3_BUCKET environment variable is not set")
+
+    key = f"media/{company_id}/{filename}"
+
+    def _upload() -> None:
+        _get_s3_client().put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=file_bytes,
+            ContentType=content_type,
+            ServerSideEncryption="AES256",
+        )
+
+    await asyncio.to_thread(_upload)
+
+    cdn_base = os.environ.get("AWS_S3_CDN_BASE_URL", "").rstrip("/")
+    if cdn_base:
+        return f"{cdn_base}/{key}"
+
+    region = os.environ.get("AWS_S3_REGION", "us-east-1")
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
 
 
-def _media_url(*, storage_key: str, public_url_prefix: str, company_id: str, filename: str) -> str:
-    public_base = (os.environ.get("MEDIA_PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    if public_base:
-        return f"{public_base}/{storage_key}"
-    prefix = "/" + public_url_prefix.strip("/")
-    return f"{prefix}/{company_id}/{filename}"
+async def delete_media_s3(key_or_url: str) -> None:
+    """Delete a file from S3 by object key or full URL."""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return
+
+    key = key_or_url
+    if key_or_url.startswith("http"):
+        # Extract key from an s3.amazonaws.com URL
+        parts = key_or_url.split(".amazonaws.com/", 1)
+        if len(parts) == 2:
+            key = parts[1]
+        else:
+            # Try to strip a CloudFront / CDN base URL
+            cdn_base = os.environ.get("AWS_S3_CDN_BASE_URL", "").rstrip("/")
+            if cdn_base and key_or_url.startswith(cdn_base):
+                key = key_or_url[len(cdn_base):].lstrip("/")
+
+    def _delete() -> None:
+        try:
+            _get_s3_client().delete_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            logger.warning("s3_delete_failed key=%s error=%s", key, exc)
+
+    await asyncio.to_thread(_delete)
+
+
+async def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
+    """Generate a presigned URL for temporary private access to an S3 object."""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+
+    def _presign() -> str:
+        return _get_s3_client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+
+    return await asyncio.to_thread(_presign)
+
+
+# ── S3 dispatch for the existing public interface ─────────────────────────────
+
+
+async def store_media(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+    company_id: str = "",
+) -> str:
+    """Dispatch to S3 or local storage based on STORAGE_BACKEND env var.
+
+    Returns a public URL string (S3) or a local storage path string (local).
+    """
+    if STORAGE_BACKEND == "s3":
+        return await store_media_bytes_s3(file_bytes, filename, content_type, company_id)
+    return await _store_media_local(file_bytes, filename, content_type, company_id)
+
+
+async def _store_media_local(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+    company_id: str,
+) -> str:
+    """Write *file_bytes* to the local upload directory and return the path."""
+    safe_company = safe_path_segment(company_id, "company")
+    directory = upload_root() / safe_company
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / filename
+    path.write_bytes(file_bytes)
+    return str(path)
+
+
+# ── Local-storage helpers (original implementation, preserved) ────────────────
 
 
 def upload_root() -> Path:
@@ -143,30 +253,15 @@ def _store_media_bytes(
     safe_company = safe_path_segment(company_id, "company")
     safe_category = safe_path_segment(category, "media")
     file_name = f"{uuid4().hex}{extension}"
-    storage_key = f"{safe_category}/{safe_company}/{file_name}"
-    path = None
-    if storage_backend() == "s3":
-        _s3_client().put_object(
-            Bucket=_s3_bucket(),
-            Key=storage_key,
-            Body=raw,
-            ContentType=mime_type,
-            ServerSideEncryption=(os.environ.get("MEDIA_S3_SERVER_SIDE_ENCRYPTION") or "AES256").strip(),
-        )
-    else:
-        directory = upload_root() / safe_category / safe_company
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / file_name
-        path.write_bytes(raw)
+    directory = upload_root() / safe_category / safe_company
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / file_name
+    path.write_bytes(raw)
+    prefix = "/" + public_url_prefix.strip("/")
     return {
-        "url": _media_url(
-            storage_key=storage_key,
-            public_url_prefix=public_url_prefix,
-            company_id=safe_company,
-            filename=file_name,
-        ),
-        "storage_path": str(path or ""),
-        "storage_key": storage_key,
+        "url": f"{prefix}/{safe_company}/{file_name}",
+        "storage_path": str(path),
+        "storage_key": f"{safe_category}/{safe_company}/{file_name}",
         "mime_type": mime_type,
         "file_size": len(raw),
         "file_name": original_filename.strip() or file_name,
@@ -231,21 +326,7 @@ def resolve_upload_path(*, category: str, company_id: str, filename: str) -> Pat
     return path
 
 
-def serve_stored_media(*, category: str, company_id: str, filename: str) -> Response:
-    if storage_backend() == "s3":
-        storage_key = "/".join(
-            (
-                safe_path_segment(category, "media"),
-                safe_path_segment(company_id, "company"),
-                safe_path_segment(filename, "file"),
-            )
-        )
-        url = _s3_client().generate_presigned_url(
-            "get_object",
-            Params={"Bucket": _s3_bucket(), "Key": storage_key},
-            ExpiresIn=max(60, int(os.environ.get("MEDIA_S3_PRESIGNED_URL_TTL_SECONDS", "300") or 300)),
-        )
-        return RedirectResponse(url=url, status_code=307)
+def serve_stored_media(*, category: str, company_id: str, filename: str) -> FileResponse:
     path = resolve_upload_path(category=category, company_id=company_id, filename=filename)
     if not path.exists() or not path.is_file():
         raise HTTPException(404, "media not found")

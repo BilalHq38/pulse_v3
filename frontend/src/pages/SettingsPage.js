@@ -494,14 +494,14 @@ export default function SettingsPage() {
   const [products, setProducts] = useState([]);
   const [faqs, setFaqs] = useState([]);
   const [personalSettings, setPersonalSettings] = useState(null);
-  const [personalAvatarUrl, setPersonalAvatarUrl] = useState(() => normalizeAvatarUrl(sessionStorage.getItem('pe_avatar') || ''));
+  const [personalAvatarUrl, setPersonalAvatarUrl] = useState(() => normalizeAvatarUrl(localStorage.getItem('pe_avatar') || ''));
   const savePersonalAvatar = (rawUrl) => {
     const avatar = normalizeAvatarUrl(rawUrl || '');
     setPersonalAvatarUrl(avatar);
     if (avatar) {
-      sessionStorage.setItem('pe_avatar', avatar);
+      localStorage.setItem('pe_avatar', avatar);
     } else {
-      sessionStorage.removeItem('pe_avatar');
+      localStorage.removeItem('pe_avatar');
     }
     window.dispatchEvent(new CustomEvent('pe-avatar-changed', { detail: avatar }));
     return avatar;
@@ -1192,7 +1192,7 @@ export default function SettingsPage() {
       if (res?.data) { setCompany(res.data); setCompanyLogoError(false); }
       const updatedCompanyName = res?.data?.company_name || company?.company_name || '';
       if (updatedCompanyName) {
-        sessionStorage.setItem('pe_company_name', updatedCompanyName);
+        localStorage.setItem('pe_company_name', updatedCompanyName);
         window.dispatchEvent(new CustomEvent('pe-company-changed', { detail: { company_name: updatedCompanyName } }));
       }
       setCompanyValidationErrors({});

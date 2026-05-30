@@ -19,6 +19,7 @@ from services.conversation_engine.schemas import ContextChunk
 
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9']+")
+_FAQ_MIN_RELEVANCE_SCORE = 0.15  # FAQs with score below this are too weakly matched to be useful
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
     "has", "have", "i", "in", "is", "it", "its", "of", "on", "or",
@@ -69,6 +70,8 @@ class TemplatesAndFaqsRetriever:
             if overlap == 0 and query_tokens:
                 continue
             score = overlap / max(len(query_tokens), 1) if query_tokens else 0.5
+            if score < _FAQ_MIN_RELEVANCE_SCORE:
+                continue
             scored.append((score, record))
 
         scored.sort(key=lambda item: item[0], reverse=True)

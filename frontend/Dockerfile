@@ -28,6 +28,7 @@ RUN --mount=type=cache,target=/app/node_modules/.cache \
 
 FROM nginx:1.27-alpine
 
+COPY frontend/nginx-rate-limit.conf /etc/nginx/conf.d/00-rate-limit.conf
 COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/build /usr/share/nginx/html
 

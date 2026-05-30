@@ -303,8 +303,7 @@ async def test_nurture_prompt_uses_safe_lead_context(monkeypatch):
         company_id="company-1",
     )
 
-    payload_text = captured["prompt"].split("--- Lead Profile ---\n", 1)[1].split("\n\nStrict rules:", 1)[0]
-    payload = json.loads(payload_text)
+    payload = json.loads(captured["prompt"].split("\nlead:\n", 1)[1])
     assert payload["name"] == "Avery"
     assert payload["customer_company_name"] == "Northstar"
     assert payload["next_action"] == "Schedule a quick call"
