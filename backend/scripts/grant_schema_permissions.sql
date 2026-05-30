@@ -13,6 +13,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA analytics_service T
 ALTER DEFAULT PRIVILEGES IN SCHEMA analytics_service
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pulse_app;
 
+-- data_pipeline_service schema
+GRANT USAGE ON SCHEMA data_pipeline_service TO pulse_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA data_pipeline_service TO pulse_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA data_pipeline_service
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pulse_app;
+
 -- public schema (for pending_signups, context_memory_dedup, etc.)
 GRANT USAGE ON SCHEMA public TO pulse_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pulse_app;
@@ -22,5 +28,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- pulse_migrator keeps full DDL rights
 GRANT ALL ON SCHEMA agent_orchestrator TO pulse_migrator;
 GRANT ALL ON SCHEMA analytics_service TO pulse_migrator;
+GRANT ALL ON SCHEMA data_pipeline_service TO pulse_migrator;
 GRANT ALL ON ALL TABLES IN SCHEMA agent_orchestrator TO pulse_migrator;
 GRANT ALL ON ALL TABLES IN SCHEMA analytics_service TO pulse_migrator;
+GRANT ALL ON ALL TABLES IN SCHEMA data_pipeline_service TO pulse_migrator;

@@ -709,12 +709,20 @@ def gateway_allowed_origins() -> list[str]:
         for origin in raw.split(",")
         if origin.strip()
     ]
-    for origin in [*LOCAL_FRONTEND_ORIGINS, *DEFAULT_ORIGINS, *configured_values]:
+    if is_production():
+        if not configured_values:
+            raise RuntimeError("Gateway CORS requires explicit production origins")
+        source_origins = configured_values
+    else:
+        source_origins = [*LOCAL_FRONTEND_ORIGINS, *DEFAULT_ORIGINS, *configured_values]
+    for origin in source_origins:
         candidate = origin.strip()
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
         origins.append(candidate)
+    if is_production() and "*" in origins:
+        raise RuntimeError("Gateway CORS requires explicit production origins")
     return origins or list(LOCAL_FRONTEND_ORIGINS)
 
 

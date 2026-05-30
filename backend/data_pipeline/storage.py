@@ -4,10 +4,10 @@ import json
 from typing import Any
 
 from core.utils import make_id
-from data_pipeline.constants import RAW_EVENT_TABLE, RAW_LEAD_TABLE, RAW_MESSAGE_TABLE, RAW_TABLES
+from data_pipeline.constants import PIPELINE_SCHEMA, RAW_EVENT_TABLE, RAW_LEAD_TABLE, RAW_MESSAGE_TABLE, RAW_TABLES
 from data_pipeline.utils import safe_float, safe_int, stable_json_dumps
 
-_PIPELINE_SCHEMA = "analytics_service"
+_PIPELINE_SCHEMA = PIPELINE_SCHEMA
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:

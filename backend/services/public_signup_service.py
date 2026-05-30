@@ -36,6 +36,7 @@ from services.db_helpers import (
 )
 from shared.auth.jwt import hash_password
 from shared.billing_cache import invalidate_billing_cache
+from shared.config import is_production
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,25 @@ async def _migrate_pending_signup_stripe_columns(db) -> None:
 
 
 async def ensure_pending_signup_primitives(db) -> None:
+    if is_production():
+        await runtime_schema_ready(
+            db,
+            "pending_signups",
+            required_relations=("public.pending_signups",),
+            required_columns=(
+                ("pending_signups", "stripe_checkout_session_id"),
+                ("pending_signups", "stripe_customer_id"),
+                ("pending_signups", "stripe_subscription_id"),
+                ("pending_signups", "stripe_event_id"),
+            ),
+            required_indexes=(
+                "idx_pending_signups_status",
+                "idx_pending_signups_expires_at",
+                "uq_pending_signups_checkout_nonempty",
+            ),
+            raise_on_missing=True,
+        )
+        return
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS public.pending_signups (

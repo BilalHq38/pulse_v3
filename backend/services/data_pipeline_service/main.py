@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uvicorn
 
+from data_pipeline.constants import PIPELINE_SCHEMA
 from data_pipeline.schedulers import start_pipeline_scheduler, stop_pipeline_scheduler
 from services.bootstrap import bootstrap_data_pipeline
 from services.data_pipeline_service.routes import routers
@@ -13,7 +14,7 @@ app = create_service_app(
     service_name="data-pipeline",
     title="Pulse Engine Data Pipeline Service",
     routers=routers,
-    db_schema="analytics_service",
+    db_schema=PIPELINE_SCHEMA,
     startup_tasks=(bootstrap_data_pipeline,),
 )
 

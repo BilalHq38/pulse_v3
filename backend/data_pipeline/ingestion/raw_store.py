@@ -5,7 +5,7 @@ from typing import Any
 
 from core.utils import make_id
 from data_pipeline.bootstrap import ensure_pipeline_tables
-from data_pipeline.constants import PIPELINE_SERVICE_LABEL
+from data_pipeline.constants import PIPELINE_SCHEMA, PIPELINE_SERVICE_LABEL
 from data_pipeline.utils import (
     dedupe_key,
     metric_date_for,
@@ -101,10 +101,10 @@ async def capture_raw_event(
         stable_json_hash(normalized_payload),
     )
     async with company_context(db, scoped_company_id):
-        # Pipeline tables live in analytics_service schema; callers may be using
+        # Pipeline tables live in the data pipeline schema; callers may be using
         # another schema (e.g. lead_service/customer_service). Force search_path
         # for this connection so raw_* inserts land where the pipeline worker reads.
-        await db.execute('SET search_path TO "analytics_service", public')
+        await db.execute(f'SET search_path TO "{PIPELINE_SCHEMA}", public')
         await ensure_pipeline_tables(db)
         row = await db.fetchrow(
             "INSERT INTO raw_events("
@@ -185,7 +185,7 @@ async def capture_raw_message(
     )
     resolved_event_id = str(payload.get("event_id") or "").strip() or resolved_dedupe_key
     async with company_context(db, scoped_company_id):
-        await db.execute('SET search_path TO "analytics_service", public')
+        await db.execute(f'SET search_path TO "{PIPELINE_SCHEMA}", public')
         await ensure_pipeline_tables(db)
         row = await db.fetchrow(
             "INSERT INTO raw_messages("
@@ -276,7 +276,7 @@ async def capture_raw_lead(
         str(payload.get("event_id") or metadata_payload.get("event_id") or "").strip() or resolved_dedupe_key
     )
     async with company_context(db, scoped_company_id):
-        await db.execute('SET search_path TO "analytics_service", public')
+        await db.execute(f'SET search_path TO "{PIPELINE_SCHEMA}", public')
         await ensure_pipeline_tables(db)
         row = await db.fetchrow(
             "INSERT INTO raw_leads("

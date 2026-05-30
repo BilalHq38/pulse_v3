@@ -46,6 +46,7 @@ from services.ai_service.model_catalog import (
 )
 from services.media_storage import store_media_data_url
 from shared.database import company_context
+from shared.config import is_production
 from shared.auth.dependencies import forbidden_exception, resolve_request_user, unauthorized_exception
 
 logger = logging.getLogger(__name__)
@@ -1096,9 +1097,25 @@ async def ensure_embedding_vector_optimizations(db) -> None:
                     DEPLOYMENT_SCHEMA_MIGRATION,
                     ",".join(f"index:{item}" for item in missing_indexes),
                 )
+            dedup_missing = not bool(await db.fetchval("SELECT to_regclass('context_memory_dedup') IS NOT NULL"))
+            if dedup_missing:
+                logger.warning(
+                    "runtime_schema_migration_required area=context_memory_dedup migration=%s missing=relation:context_memory_dedup",
+                    DEPLOYMENT_SCHEMA_MIGRATION,
+                )
+            if is_production() and (missing_indexes or dedup_missing):
+                missing = [*(f"index:{item}" for item in missing_indexes)]
+                if dedup_missing:
+                    missing.append("relation:context_memory_dedup")
+                raise RuntimeError(
+                    "Database schema is missing required AI runtime objects. "
+                    f"Run Alembic migrations before starting production services: {', '.join(missing)}"
+                )
             _embedding_vector_ready = True
             logger.info("Embedding vector schema checked")
         except Exception as exc:
+            if is_production():
+                raise
             logger.warning("Embedding vector optimization skipped: %s", exc)
 
 

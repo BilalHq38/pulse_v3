@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 
-_PIPELINE_SCHEMA = "analytics_service"
+from data_pipeline.constants import PIPELINE_SCHEMA
+from shared.config import is_production
+
+_PIPELINE_SCHEMA = PIPELINE_SCHEMA
 
 _SCHEMA_READY = False
 _SCHEMA_LOCK = asyncio.Lock()
@@ -215,6 +218,34 @@ _RLS_TABLES = (
 )
 
 
+async def _verify_pipeline_schema(conn) -> None:
+    missing: list[str] = []
+    for table_name in _RLS_TABLES:
+        relation = f"{_PIPELINE_SCHEMA}.{table_name}"
+        exists = bool(await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", relation))
+        if not exists:
+            missing.append(f"relation:{relation}")
+            continue
+        rls_state = await conn.fetchrow(
+            """
+            SELECT c.relrowsecurity, c.relforcerowsecurity
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = $2
+             LIMIT 1
+            """,
+            _PIPELINE_SCHEMA,
+            table_name,
+        )
+        if not rls_state or not bool(rls_state["relrowsecurity"]) or not bool(rls_state["relforcerowsecurity"]):
+            missing.append(f"rls:{relation}")
+    if missing:
+        raise RuntimeError(
+            "Data pipeline schema is missing required migrated objects: "
+            f"{', '.join(missing)}. Run Alembic migrations before starting production services."
+        )
+
+
 async def ensure_pipeline_tables(db) -> None:
     global _SCHEMA_READY
     if _SCHEMA_READY:
@@ -224,6 +255,10 @@ async def ensure_pipeline_tables(db) -> None:
             return
         pool = await db._get_pool()
         async with pool.acquire() as conn:
+            if is_production():
+                await _verify_pipeline_schema(conn)
+                _SCHEMA_READY = True
+                return
             await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{_PIPELINE_SCHEMA}"')
             await conn.execute(f'SET search_path TO "{_PIPELINE_SCHEMA}", public')
             for statement in _DDL_STATEMENTS:

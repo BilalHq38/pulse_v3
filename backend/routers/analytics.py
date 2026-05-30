@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
+from data_pipeline.constants import PIPELINE_SCHEMA
 from services.ai_service.facade import generate_daily_ai_summary
 from core.utils import make_id, format_response_minutes, parse_dt, sentiment_score_to_csat
 from services.db_helpers import (
@@ -19,6 +20,9 @@ router = APIRouter()
 
 _ANALYTICS_INCLUDED_CONVERSATION_STATUSES = ["open", "pending", "escalated", "resolved"]
 _ANALYTICS_ACTIVE_CONVERSATION_STATUSES = ["open", "pending", "escalated"]
+_CONVERSATION_METRICS_TABLE = f"{PIPELINE_SCHEMA}.conversation_metrics"
+_LEAD_METRICS_TABLE = f"{PIPELINE_SCHEMA}.lead_metrics"
+_SENTIMENT_LOGS_TABLE = f"{PIPELINE_SCHEMA}.sentiment_logs"
 
 
 def _db(req):
@@ -217,7 +221,7 @@ async def analytics_conversations(request: Request, days: int = 30):
     try:
         rows = await db.fetch(
             "SELECT metric_date AS date,COUNT(*) AS count,SUM(CASE WHEN ai_handled THEN 1 ELSE 0 END) AS ai_handled "
-            "FROM conversation_metrics WHERE company_id=$1 GROUP BY metric_date ORDER BY date DESC LIMIT $2",
+            f"FROM {_CONVERSATION_METRICS_TABLE} WHERE company_id=$1 GROUP BY metric_date ORDER BY date DESC LIMIT $2",
             cid,
             days,
         )
@@ -251,7 +255,7 @@ async def analytics_leads(request: Request):
     try:
         latest_metrics = await db.fetch(
             "SELECT DISTINCT ON (lead_id) lead_id,status,source,grade "
-            "FROM lead_metrics WHERE company_id=$1 "
+            f"FROM {_LEAD_METRICS_TABLE} WHERE company_id=$1 "
             "ORDER BY lead_id, metric_date DESC, updated_at DESC",
             cid,
         )
@@ -284,7 +288,7 @@ async def analytics_sentiment(request: Request):
     try:
         rows = await db.fetch(
             "SELECT DATE(occurred_at) AS date,AVG(sentiment_score) AS avg_score,COUNT(*) AS count "
-            "FROM sentiment_logs WHERE company_id=$1 AND sentiment_score IS NOT NULL "
+            f"FROM {_SENTIMENT_LOGS_TABLE} WHERE company_id=$1 AND sentiment_score IS NOT NULL "
             "GROUP BY DATE(occurred_at) ORDER BY date DESC LIMIT 30",
             cid,
         )

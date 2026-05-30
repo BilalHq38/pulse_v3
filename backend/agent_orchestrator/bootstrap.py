@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import asyncio
 
+from shared.config import is_production
+
 _BOOTSTRAP_LOCK = asyncio.Lock()
 _BOOTSTRAP_READY = False
+_SCHEMA = "agent_orchestrator"
+_TABLES = (
+    "global_memory",
+    "workflows",
+    "workflow_executions",
+    "workflow_transitions",
+    "agent_memory",
+)
 
 _DDL = (
-    "CREATE SCHEMA IF NOT EXISTS agent_orchestrator",
+    f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}",
     """
     CREATE TABLE IF NOT EXISTS global_memory (
         id TEXT PRIMARY KEY,
@@ -111,12 +121,30 @@ _DDL = (
 )
 
 
+async def _verify_agent_orchestrator_schema(db) -> None:
+    missing: list[str] = []
+    for table_name in _TABLES:
+        relation = f"{_SCHEMA}.{table_name}"
+        exists = bool(await db.fetchval("SELECT to_regclass($1) IS NOT NULL", relation))
+        if not exists:
+            missing.append(f"relation:{relation}")
+    if missing:
+        raise RuntimeError(
+            "Agent orchestrator schema is missing required migrated objects: "
+            f"{', '.join(missing)}. Run Alembic migrations before starting production services."
+        )
+
+
 async def bootstrap_agent_orchestrator(db) -> None:
     global _BOOTSTRAP_READY
     if _BOOTSTRAP_READY:
         return
     async with _BOOTSTRAP_LOCK:
         if _BOOTSTRAP_READY:
+            return
+        if is_production():
+            await _verify_agent_orchestrator_schema(db)
+            _BOOTSTRAP_READY = True
             return
         for statement in _DDL:
             await db.execute(statement)

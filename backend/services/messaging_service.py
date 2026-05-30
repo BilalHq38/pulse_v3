@@ -10,6 +10,7 @@ import httpx
 from fastapi import HTTPException
 
 from core.config import WHATSAPP_PHONE_ID, WHATSAPP_TOKEN
+from core.request_helpers import normalize_public_media_url
 from channel_layer.channel_identity import normalize_whatsapp_phone
 from shared.config import (
     messaging_http_connect_timeout_seconds,
@@ -83,6 +84,27 @@ def _attachment_metadata(attachment: dict | None) -> dict[str, Any]:
         if item.get(key) not in (None, "") and key not in metadata:
             metadata[key] = item.get(key)
     return metadata
+
+
+def _normalize_outbound_attachments(attachments: list | None, *, channel: str = "whatsapp") -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in attachments or []:
+        if not isinstance(item, dict):
+            continue
+        attachment = dict(item)
+        data_url = str(attachment.get("data_url") or "").strip()
+        raw_url = str(attachment.get("url") or "").strip()
+        if data_url and not raw_url:
+            normalized.append(attachment)
+            continue
+        if raw_url:
+            public_url = normalize_public_media_url(raw_url)
+            if not public_url:
+                logger.warning("outbound_media_skipped channel=%s url=%s", channel, raw_url)
+                continue
+            attachment["url"] = public_url
+        normalized.append(attachment)
+    return normalized
 
 
 def _caption_context_source(
@@ -1062,6 +1084,7 @@ async def send_whatsapp_message(
     scoped_conversation_id = (conversation_id or "").strip()
     scoped_customer_id = (customer_id or "").strip()
     scoped_idempotency_key = (idempotency_key or "").strip()
+    attachments = _normalize_outbound_attachments(attachments)
     sent = False
     error = ""
     external_message_id = ""

@@ -8,6 +8,9 @@ pydantic>=2.10.0,<2.14.0
 
 # PostgreSQL (asyncpg replaces motor/pymongo entirely)
 asyncpg>=0.29.0
+SQLAlchemy>=2.0.44,<2.1
+alembic>=1.16.5,<1.17
+psycopg[binary]>=3.2.13,<3.3
 greenlet>=3.4.0,<4
 
 # WebSockets / real-time

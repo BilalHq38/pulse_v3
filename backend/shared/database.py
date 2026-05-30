@@ -9,6 +9,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 import asyncpg
 
@@ -261,6 +262,22 @@ def _allow_insecure_db_role() -> bool:
     return is_truthy(os.environ.get("ALLOW_INSECURE_DB_ROLE"))
 
 
+def _assert_encrypted_database_configuration(url: str) -> None:
+    if not is_production():
+        return
+    parsed = urlparse(url or "")
+    query_sslmode = (parse_qs(parsed.query).get("sslmode") or [""])[0].strip().lower()
+    configured_sslmode = (
+        os.environ.get("POSTGRES_SSLMODE")
+        or os.environ.get("PGSSLMODE")
+        or os.environ.get("DATABASE_SSLMODE")
+        or query_sslmode
+        or ""
+    ).strip().lower()
+    if configured_sslmode not in {"require", "verify-ca", "verify-full"}:
+        raise RuntimeError("Production database configuration must use sslmode require, verify-ca, or verify-full")
+
+
 async def _validate_database_role_security(conn: asyncpg.Connection, *, app_name: str) -> None:
     role_row = await conn.fetchrow("SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
     if not role_row:
@@ -359,6 +376,7 @@ class Database:
             return self._pool
         async with self._lock:
             if self._pool is None:
+                _assert_encrypted_database_configuration(self._url)
                 logger.info(
                     "Connecting to PostgreSQL for %s using schema %s",
                     self._application_name,

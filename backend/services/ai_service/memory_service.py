@@ -4,6 +4,7 @@ import json
 import logging
 
 from core.utils import make_id
+from shared.config import is_production
 from shared.cache import get_cache_client
 from services.ai_service.common import (
     DailySummaryResult,
@@ -241,17 +242,30 @@ async def store_context_memory(
     if message_id:
         dedupe_key = f"{company_id}:{entity_id}:{convo_id}:{message_id}:{memory_type}"
         if not _MEMORY_DEDUP_TABLE_READY:
-            try:
-                await db.execute(
-                    "CREATE TABLE IF NOT EXISTS context_memory_dedup ("
-                    "company_id TEXT NOT NULL, convo_id TEXT NOT NULL DEFAULT '', "
-                    "message_id TEXT NOT NULL, memory_type TEXT NOT NULL, memory_id TEXT NOT NULL DEFAULT '', "
-                    "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-                    "PRIMARY KEY(company_id, convo_id, message_id, memory_type))"
-                )
-                _MEMORY_DEDUP_TABLE_READY = True
-            except Exception as exc:
-                logger.debug("memory dedupe table bootstrap skipped: %s", exc)
+            if is_production():
+                try:
+                    _MEMORY_DEDUP_TABLE_READY = bool(
+                        await db.fetchval("SELECT to_regclass('context_memory_dedup') IS NOT NULL")
+                    )
+                except Exception as exc:
+                    logger.debug("memory dedupe table check skipped: %s", exc)
+                if not _MEMORY_DEDUP_TABLE_READY:
+                    logger.error(
+                        "runtime_schema_migration_required area=context_memory_dedup "
+                        "missing=relation:context_memory_dedup"
+                    )
+            else:
+                try:
+                    await db.execute(
+                        "CREATE TABLE IF NOT EXISTS context_memory_dedup ("
+                        "company_id TEXT NOT NULL, convo_id TEXT NOT NULL DEFAULT '', "
+                        "message_id TEXT NOT NULL, memory_type TEXT NOT NULL, memory_id TEXT NOT NULL DEFAULT '', "
+                        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                        "PRIMARY KEY(company_id, convo_id, message_id, memory_type))"
+                    )
+                    _MEMORY_DEDUP_TABLE_READY = True
+                except Exception as exc:
+                    logger.debug("memory dedupe table bootstrap skipped: %s", exc)
         if _MEMORY_DEDUP_TABLE_READY:
             existing_dedupe_id = await db.fetchval(
                 "SELECT memory_id FROM context_memory_dedup "

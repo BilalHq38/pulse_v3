@@ -1,6 +1,6 @@
 import ipaddress
 import os
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from fastapi import Request
 
@@ -14,6 +14,56 @@ def get_client_ip(request: Request) -> str:
 
 def normalize_base_url(value: str) -> str:
     return (value or "").strip().rstrip("/")
+
+
+def _public_backend_base_url() -> str:
+    return _first_configured_base_url("PUBLIC_BACKEND_URL", "BACKEND_PUBLIC_URL", "BACKEND_URL", "APP_URL")
+
+
+def _is_internal_media_host(hostname: str) -> bool:
+    host = (hostname or "").strip().lower()
+    return host in {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "api-gateway",
+        "gateway",
+    }
+
+
+def normalize_public_media_url(url: str) -> str:
+    """Return an absolute public URL for media sent to external providers."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("data:"):
+        return raw
+
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        if not _is_internal_media_host(parsed.hostname or ""):
+            return raw
+        base = _public_backend_base_url()
+        if not base:
+            return ""
+        public_base = urlparse(base)
+        return urlunparse(
+            (
+                public_base.scheme,
+                public_base.netloc,
+                parsed.path or "/",
+                "",
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+    base = _public_backend_base_url()
+    if not base:
+        return ""
+    path = raw if raw.startswith("/") else f"/{raw}"
+    return f"{base}{path}"
 
 
 def _is_dev_trusted_frontend_host(hostname: str) -> bool:

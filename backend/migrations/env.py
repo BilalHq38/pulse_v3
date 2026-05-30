@@ -13,11 +13,11 @@ target_metadata = None
 
 def get_url():
     url = os.environ.get("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
-    # Convert asyncpg URL to psycopg2 for Alembic
-    if url and "asyncpg" in url:
-        url = url.replace("postgresql+asyncpg://", "postgresql://")
+    # Alembic runs synchronously; use SQLAlchemy's psycopg v3 dialect.
+    if url and url.startswith("postgresql+asyncpg://"):
+        return url.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
     if url and url.startswith("postgresql://"):
-        return url
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
     return url
 
 

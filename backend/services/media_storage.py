@@ -13,10 +13,11 @@ import boto3
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
+from shared.config import is_production
 
 logger = logging.getLogger(__name__)
 
-STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local")
+STORAGE_BACKEND = os.environ.get("MEDIA_STORAGE_BACKEND") or os.environ.get("STORAGE_BACKEND", "local")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_UPLOAD_ROOT = PROJECT_ROOT / "uploads"
@@ -43,6 +44,20 @@ _SAFE_SEGMENT_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 # ── S3 client (lazily initialised) ────────────────────────────────────────────
 
 _S3_CLIENT = None
+
+
+def storage_backend(default: str = "local") -> str:
+    backend = (
+        os.environ.get("MEDIA_STORAGE_BACKEND")
+        or os.environ.get("STORAGE_BACKEND")
+        or default
+        or "local"
+    ).strip().lower()
+    if backend not in {"local", "s3"}:
+        raise RuntimeError("MEDIA_STORAGE_BACKEND must be 'local' or 's3'")
+    if is_production() and backend != "s3":
+        raise RuntimeError("Production media storage requires MEDIA_STORAGE_BACKEND=s3")
+    return backend
 
 
 def _get_s3_client():
@@ -147,7 +162,7 @@ async def store_media(
 
     Returns a public URL string (S3) or a local storage path string (local).
     """
-    if STORAGE_BACKEND == "s3":
+    if storage_backend() == "s3":
         return await store_media_bytes_s3(file_bytes, filename, content_type, company_id)
     return await _store_media_local(file_bytes, filename, content_type, company_id)
 
