@@ -87,8 +87,6 @@ services:
     command: ["postgres", "-c", "max_connections=300"]
     expose:
       - "5432"
-    ports:
-      - "${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./backend/sql_schema.sql:/docker-entrypoint-initdb.d/10-monolith-schema.sql:ro
@@ -109,7 +107,7 @@ services:
     <<: *service-defaults
     image: redis:7-alpine
     container_name: pulse-redis-engine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
     expose:
       - "6379"
     volumes:
@@ -463,7 +461,7 @@ services:
       <<: *common-env
       SERVICE_NAME: data-pipeline
       PORT: 8012
-      DB_SCHEMA: analytics_service
+      DB_SCHEMA: data_pipeline_service
     depends_on:
       postgres:
         condition: service_healthy
@@ -543,8 +541,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
-    ports:
-      - "${SUPER_ADMIN_HOST_PORT:-8011}:8011"
     expose:
       - "8011"
 

@@ -261,6 +261,18 @@ def _allow_insecure_db_role() -> bool:
     return is_truthy(os.environ.get("ALLOW_INSECURE_DB_ROLE"))
 
 
+def _check_production_tls() -> None:
+    """Raise in production when the database connection is not TLS-encrypted."""
+    if not is_production():
+        return
+    ssl_mode = os.environ.get("POSTGRES_SSLMODE", os.environ.get("PGSSLMODE", "disable")).strip().lower()
+    if ssl_mode not in ("require", "verify-ca", "verify-full"):
+        raise RuntimeError(
+            f"Production requires POSTGRES_SSLMODE=require (got '{ssl_mode}'). "
+            "Set POSTGRES_SSLMODE=require in your environment or Secrets Manager entry."
+        )
+
+
 async def _validate_database_role_security(conn: asyncpg.Connection, *, app_name: str) -> None:
     role_row = await conn.fetchrow("SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
     if not role_row:
@@ -359,6 +371,7 @@ class Database:
             return self._pool
         async with self._lock:
             if self._pool is None:
+                _check_production_tls()
                 logger.info(
                     "Connecting to PostgreSQL for %s using schema %s",
                     self._application_name,
