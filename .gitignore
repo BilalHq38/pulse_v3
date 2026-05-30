@@ -90,7 +90,9 @@ backend/.wwebjs_auth/
 backend/.wwebjs_cache/
 .wwebjs_auth/
 .wwebjs_cache/
-backend/secrets/
+backend/secrets/*.json
+backend/secrets/*.p12
+backend/secrets/*.pem
 
 # OS files
 .DS_Store

@@ -275,7 +275,7 @@ services:
       - "8003"
     volumes:
       - uploads-data:/app/uploads
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
+      - ./backend/secrets:/app/secrets:ro
     logging: *default-logging
     deploy:
       resources:
@@ -329,7 +329,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
+      - ./backend/secrets:/app/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
       interval: 15s
@@ -361,7 +361,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
+      - ./backend/secrets:/app/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
       interval: 15s
@@ -393,7 +393,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
+      - ./backend/secrets:/app/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
       interval: 15s
@@ -590,7 +590,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
+      - ./backend/secrets:/app/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).read()\""]
       interval: 15s
