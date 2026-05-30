@@ -1480,7 +1480,7 @@ async def _verify_web_chat_widget_request(
         ):
             raise HTTPException(401, "Invalid widget key")
     else:
-        allow_unsigned = _is_truthy(os.environ.get("ALLOW_UNSIGNED_WEB_CHAT_WIDGET", "true"))
+        allow_unsigned = _is_truthy(os.environ.get("ALLOW_UNSIGNED_WEB_CHAT_WIDGET", "false"))
         if is_production() or not allow_unsigned:
             raise HTTPException(
                 401,

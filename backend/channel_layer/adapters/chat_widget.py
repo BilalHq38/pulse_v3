@@ -200,13 +200,13 @@ class ChatWidgetAdapter(BaseChannelAdapter):
         # No key configured — allow in dev, reject in prod
         from shared.config import is_production
 
-        allow_unsigned = os.environ.get("ALLOW_UNSIGNED_WEB_CHAT_WIDGET", "true").strip().lower() in {
+        allow_unsigned = os.environ.get("ALLOW_UNSIGNED_WEB_CHAT_WIDGET", "false").strip().lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
-        return not is_production() or allow_unsigned
+        return not is_production() and allow_unsigned
 
     async def health_check(self) -> AdapterHealthStatus:
         """Chat widget is always available as it's server-side."""

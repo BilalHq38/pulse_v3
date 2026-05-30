@@ -25,7 +25,7 @@ function pickWelcomeMessage(senderName) {
 
 function loadSession() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = sessionStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object') return parsed;
@@ -37,7 +37,7 @@ function loadSession() {
 
 function saveSession(session) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(session));
   } catch {
     // ignore
   }
@@ -45,7 +45,7 @@ function saveSession(session) {
 
 function loadHistory() {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
+    const raw = sessionStorage.getItem(HISTORY_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -71,7 +71,7 @@ function saveHistory(messages) {
       ...m,
       ts: m.ts instanceof Date ? m.ts.toISOString() : m.ts,
     }));
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(serializable));
+    sessionStorage.setItem(HISTORY_KEY, JSON.stringify(serializable));
   } catch {
     // ignore
   }

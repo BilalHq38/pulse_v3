@@ -86,7 +86,13 @@ async def _rls_fetchval(db, company_id: str, sql: str, *args) -> Any:
             return await conn.fetchval(sql, *args)
     except AttributeError:
         try:
-            return await db.fetchval(sql, *args)
+            fetchval = getattr(db, "fetchval", None)
+            if fetchval is not None:
+                return await fetchval(sql, *args)
+            row = await db.fetchrow(sql, *args)
+            if not row:
+                return None
+            return next(iter(dict(row).values()), None)
         except Exception:
             return None
     except Exception:

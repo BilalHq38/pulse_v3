@@ -68,10 +68,14 @@ def apply_engine_response_to_support_plan(
             "sources_used": list(engine_sources_used or []),
             "product_links": [
                 {
-                    "product_id": pl.product_id,
-                    "url": pl.url,
-                    "name": getattr(pl, "name", ""),
-                    "image_url": getattr(pl, "image_url", ""),
+                    key: value
+                    for key, value in {
+                        "product_id": pl.product_id,
+                        "url": pl.url,
+                        "name": getattr(pl, "name", ""),
+                        "image_url": getattr(pl, "image_url", ""),
+                    }.items()
+                    if value
                 }
                 for pl in (engine_product_links or [])
             ],

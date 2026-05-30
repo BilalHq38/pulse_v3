@@ -55,6 +55,11 @@ x-common-env: &common-env
   WHATSAPP_MODE: ${WHATSAPP_MODE:-bridge}
   WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
   UPLOAD_STORAGE_DIR: ${UPLOAD_STORAGE_DIR:-/app/uploads}
+  MEDIA_STORAGE_BACKEND: ${MEDIA_STORAGE_BACKEND:-local}
+  MEDIA_S3_BUCKET: ${MEDIA_S3_BUCKET:-}
+  MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-}
+  MEDIA_S3_SERVER_SIDE_ENCRYPTION: ${MEDIA_S3_SERVER_SIDE_ENCRYPTION:-AES256}
+  AWS_REGION: ${AWS_REGION:-}
 
 x-service-defaults: &service-defaults
   env_file:
@@ -62,6 +67,16 @@ x-service-defaults: &service-defaults
   restart: always
   networks:
     - pulse-network
+  logging:
+    driver: json-file
+    options:
+      max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+      max-file: ${DOCKER_LOG_MAX_FILES:-5}
+  deploy:
+    resources:
+      limits:
+        cpus: ${SERVICE_CPU_LIMIT:-1.0}
+        memory: ${SERVICE_MEMORY_LIMIT:-1024M}
 
 services:
   postgres:
@@ -79,8 +94,6 @@ services:
       PGUSER: ${POSTGRES_USER:-pulse_engine_app}
     expose:
       - "5432"
-    ports:
-      - "${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./backend/sql_schema.sql:/docker-entrypoint-initdb.d/10-monolith-schema.sql:ro
@@ -95,7 +108,7 @@ services:
     <<: *service-defaults
     image: redis:7-alpine
     container_name: pulse-redis-engine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "${REDIS_MAXMEMORY:-512mb}", "--maxmemory-policy", "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}"]
     expose:
       - "6379"
     volumes:
@@ -140,8 +153,6 @@ services:
       PUPPETEER_NAVIGATION_TIMEOUT_MS: ${PUPPETEER_NAVIGATION_TIMEOUT_MS:-60000}
     expose:
       - "3001"
-    ports:
-      - "${WHATSAPP_BRIDGE_HOST_PORT:-3001}:3001"
     volumes:
       - whatsapp-bridge-auth:/app/.wwebjs_auth
     # Bridge only needs data services to be up — gateway dependency removed so
@@ -220,7 +231,6 @@ services:
       GOOGLE_GENAI_USE_VERTEXAI: "true"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
       VERTEX_AI_ENABLED: "true"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
@@ -234,13 +244,10 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
-    ports:
-      - "8003:8003"
     expose:
       - "8003"
     volumes:
       - uploads-data:/app/uploads
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
 
   lead:
     <<: *service-defaults
@@ -278,7 +285,6 @@ services:
       GOOGLE_GENAI_USE_VERTEXAI: "true"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
       VERTEX_AI_ENABLED: "true"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
@@ -287,8 +293,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
       interval: 15s
@@ -310,7 +314,6 @@ services:
       GOOGLE_GENAI_USE_VERTEXAI: "true"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
       VERTEX_AI_ENABLED: "true"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
@@ -319,8 +322,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
       interval: 15s
@@ -342,7 +343,6 @@ services:
       GOOGLE_GENAI_USE_VERTEXAI: "true"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
       VERTEX_AI_ENABLED: "true"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
@@ -351,8 +351,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
       interval: 15s
@@ -498,8 +496,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
-    ports:
-      - "${SUPER_ADMIN_HOST_PORT:-8011}:8011"
     expose:
       - "8011"
 
@@ -517,7 +513,6 @@ services:
       GOOGLE_GENAI_USE_VERTEXAI: "true"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/gcp-vertex-sa.json
       VERTEX_AI_ENABLED: "true"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
@@ -548,8 +543,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).read()\""]
       interval: 15s
@@ -565,7 +558,7 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-http://localhost:8000}
-        REACT_APP_SOCKET_URL: ${REACT_APP_SOCKET_URL:-http://localhost:8003}
+        REACT_APP_SOCKET_URL: ${REACT_APP_SOCKET_URL:-http://localhost:3000}
         REACT_APP_DEMO_MODE: ${DEMO_MODE:-false}
     depends_on:
       gateway:

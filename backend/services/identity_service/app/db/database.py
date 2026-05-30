@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import ssl
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from fastapi import Request
@@ -28,15 +30,50 @@ load_dotenv(PROJECT_ROOT / ".env", override=False)
 DATABASE_URL = (
     os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or os.environ.get("POSTGRES_DSN") or ""
 ).strip() or shared_database_url()
+_TLS_SSLMODES = {"require", "verify-ca", "verify-full"}
 
 if not DATABASE_URL:
     raise RuntimeError("Identity service DATABASE_URL (or POSTGRES_* settings) is required")
 
-ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 REDIS_URL = (
     os.environ.get("CACHE_REDIS_URL") or os.environ.get("REDIS_URL") or os.environ.get("RATE_LIMIT_REDIS_URL") or ""
 )
+_TLS_SSLMODES = {"require", "verify-ca", "verify-full"}
 
+
+def _configured_sslmode() -> str:
+    query = dict(parse_qsl(urlsplit(DATABASE_URL).query))
+    return str(
+        query.get("sslmode")
+        or os.environ.get("POSTGRES_SSLMODE")
+        or os.environ.get("PGSSLMODE")
+        or os.environ.get("DATABASE_SSLMODE")
+        or ""
+    ).strip().lower()
+
+
+def _async_database_url() -> str:
+    parsed = urlsplit(DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1))
+    query = urlencode([(key, value) for key, value in parse_qsl(parsed.query) if key != "sslmode"])
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _identity_connect_args() -> dict:
+    sslmode = _configured_sslmode()
+    if sslmode not in _TLS_SSLMODES:
+        return {}
+    context = ssl.create_default_context()
+    root_cert = (os.environ.get("PGSSLROOTCERT") or "").strip()
+    if root_cert:
+        context.load_verify_locations(cafile=root_cert)
+    if sslmode == "require":
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    elif sslmode == "verify-ca":
+        context.check_hostname = False
+    return {"ssl": context}
+
+ASYNC_DATABASE_URL = _async_database_url()
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
     pool_size=int(os.environ.get("DB_POOL_SIZE", "20")),
@@ -44,6 +81,7 @@ engine = create_async_engine(
     pool_timeout=int(os.environ.get("DB_POOL_TIMEOUT", "30")),
     pool_recycle=int(os.environ.get("DB_POOL_RECYCLE", "1800")),
     pool_pre_ping=True,
+    connect_args=_identity_connect_args(),
     echo=False,
 )
 
@@ -60,6 +98,11 @@ Base = declarative_base()
 
 def _allow_insecure_db_role() -> bool:
     return is_truthy(os.environ.get("ALLOW_INSECURE_DB_ROLE"))
+
+
+def _assert_encrypted_database_configuration() -> None:
+    if is_production() and _configured_sslmode() not in _TLS_SSLMODES:
+        raise RuntimeError("Production PostgreSQL connections require POSTGRES_SSLMODE=require, verify-ca, or verify-full")
 
 
 async def _assert_database_role_security(conn) -> None:
@@ -166,6 +209,7 @@ async def init_db_schema() -> None:
 
     attempts = db_startup_retries()
     base_delay = db_startup_retry_backoff_seconds()
+    _assert_encrypted_database_configuration()
     for attempt in range(1, attempts + 1):
         try:
             async with engine.begin() as conn:

@@ -23,11 +23,12 @@ from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
-WorkflowKind = Literal["post_delivery_feedback", "upsell"]
+WorkflowKind = Literal["post_delivery_feedback", "upsell", "order_confirmed"]
 
 # Defaults; overridable via env vars without redeploy.
 _FEEDBACK_DELAY_SECONDS = int(os.environ.get("AI_FOLLOWUP_FEEDBACK_DELAY_SECONDS", "3600") or 3600)
 _UPSELL_DELAY_SECONDS = int(os.environ.get("AI_FOLLOWUP_UPSELL_DELAY_SECONDS", "86400") or 86400)
+_ORDER_CONFIRMED_DELAY_SECONDS = int(os.environ.get("AI_FOLLOWUP_ORDER_CONFIRMED_DELAY_SECONDS", "300") or 300)
 _COOLDOWN_DAYS = int(os.environ.get("AI_FOLLOWUP_COOLDOWN_DAYS", "7") or 7)
 _MAX_PER_MONTH = int(os.environ.get("AI_FOLLOWUP_MAX_PER_MONTH", "4") or 4)
 
@@ -86,17 +87,21 @@ async def evaluate_order_event(
     Idempotent — replays of the same (order_id, workflow_kind, to_status)
     are no-ops because of uq_followups_idempotency_key.
     """
-    if to_status != "delivered":
+    if to_status not in ("delivered", "confirmed"):
         return {"scheduled": False, "reason": "not_a_delivery"}
 
     allowed, reason = await _engagement_ok(db, company_id=company_id, customer_id=customer_id)
     if not allowed:
         return {"scheduled": False, "reason": reason}
 
-    workflow_kind: WorkflowKind = "post_delivery_feedback"
+    if to_status == "confirmed":
+        workflow_kind: WorkflowKind = "order_confirmed"
+        delay = _ORDER_CONFIRMED_DELAY_SECONDS
+    else:
+        workflow_kind = "post_delivery_feedback"
+        delay = _FEEDBACK_DELAY_SECONDS
     idem = _idempotency_key(order_id, workflow_kind, to_status)
     followup_id = _new_id("fu", f"{order_id}:{workflow_kind}")
-    delay = _FEEDBACK_DELAY_SECONDS
 
     try:
         row = await db.fetchrow(

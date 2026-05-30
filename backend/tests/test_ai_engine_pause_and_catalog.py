@@ -197,9 +197,9 @@ async def test_default_engine_seeding_keeps_only_gemini_25_flash_and_preserves_t
     engine = await ensure_default_llm_engine(db)
 
     assert engine["provider"] == "gemini"
-    assert engine["model_name"] == "gemini-2.5-flash"
+    assert engine["model_name"] == "gemini-2.5-flash-lite"
     global_gemini = [row["model_name"] for row in db.rows if row["company_id"] == "" and row["provider"] == "gemini"]
-    assert global_gemini == ["gemini-2.5-flash"]
+    assert global_gemini == ["gemini-2.5-flash-lite"]
     assert any(row["id"] == "tenant-pro" and row["model_name"] == "gemini-2.5-pro" for row in db.rows)
 
 

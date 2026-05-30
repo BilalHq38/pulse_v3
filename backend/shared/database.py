@@ -90,6 +90,7 @@ _PLATFORM_ADMIN_RLS_TABLES = (
     "sentiment_analyses",
 )
 _PLATFORM_ADMIN_POLICY_LOCK_ID = 90210418
+_TLS_SSLMODES = {"require", "verify-ca", "verify-full"}
 
 
 def _log_background_task_result(task: asyncio.Task) -> None:
@@ -261,6 +262,35 @@ def _allow_insecure_db_role() -> bool:
     return is_truthy(os.environ.get("ALLOW_INSECURE_DB_ROLE"))
 
 
+def _assert_encrypted_database_configuration(url: str) -> None:
+    if not is_production():
+        return
+    configured_sslmode = (
+        os.environ.get("POSTGRES_SSLMODE")
+        or os.environ.get("PGSSLMODE")
+        or os.environ.get("DATABASE_SSLMODE")
+        or ""
+    ).strip().lower()
+    dsn_sslmode = ""
+    if "sslmode=" in url:
+        dsn_sslmode = url.split("sslmode=", 1)[1].split("&", 1)[0].strip().lower()
+    if (dsn_sslmode or configured_sslmode) not in _TLS_SSLMODES:
+        raise RuntimeError("Production PostgreSQL connections require POSTGRES_SSLMODE=require, verify-ca, or verify-full")
+
+
+def _database_url_with_sslmode(url: str) -> str:
+    configured_sslmode = (
+        os.environ.get("POSTGRES_SSLMODE")
+        or os.environ.get("PGSSLMODE")
+        or os.environ.get("DATABASE_SSLMODE")
+        or ""
+    ).strip().lower()
+    if not configured_sslmode or "sslmode=" in url:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}sslmode={configured_sslmode}"
+
+
 async def _validate_database_role_security(conn: asyncpg.Connection, *, app_name: str) -> None:
     role_row = await conn.fetchrow("SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
     if not role_row:
@@ -340,7 +370,7 @@ class Database:
         min_size: int | None = None,
         max_size: int | None = None,
     ) -> None:
-        self._url = url or database_url()
+        self._url = _database_url_with_sslmode(url or database_url())
         self._schema = _normalize_schema(schema or db_schema())
         self._application_name = (application_name or service_name()).strip()
         self._min_size = min_size or db_pool_min_size()
@@ -359,6 +389,7 @@ class Database:
             return self._pool
         async with self._lock:
             if self._pool is None:
+                _assert_encrypted_database_configuration(self._url)
                 logger.info(
                     "Connecting to PostgreSQL for %s using schema %s",
                     self._application_name,

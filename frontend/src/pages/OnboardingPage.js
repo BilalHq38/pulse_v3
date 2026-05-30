@@ -705,7 +705,7 @@ export default function OnboardingPage() {
   const [completing, setCompleting] = useState(false);
   const [channels, setChannels] = useState(draftState?.channels || []);
   const [companyForm, setCompanyForm] = useState(draftState?.companyForm || createDefaultCompanyForm());
-  const [headerAvatar, setHeaderAvatar] = useState(() => normalizeAvatarUrl(localStorage.getItem('pe_avatar') || ''));
+  const [headerAvatar, setHeaderAvatar] = useState(() => normalizeAvatarUrl(sessionStorage.getItem('pe_avatar') || ''));
 
   useEffect(() => {
     if (!user) {
@@ -744,7 +744,7 @@ export default function OnboardingPage() {
   }, [navigate, user]);
 
   useEffect(() => {
-    setHeaderAvatar(normalizeAvatarUrl(user?.avatar || localStorage.getItem('pe_avatar') || ''));
+    setHeaderAvatar(normalizeAvatarUrl(user?.avatar || sessionStorage.getItem('pe_avatar') || ''));
   }, [user?.avatar]);
 
   useEffect(() => {

@@ -9,8 +9,8 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const saveAvatar = useCallback((rawAvatar) => {
     const avatar = normalizeAvatarUrl(rawAvatar || '');
-    if (avatar) localStorage.setItem('pe_avatar', avatar);
-    else localStorage.removeItem('pe_avatar');
+    if (avatar) sessionStorage.setItem('pe_avatar', avatar);
+    else sessionStorage.removeItem('pe_avatar');
     return avatar;
   }, []);
 
@@ -24,11 +24,11 @@ export function AuthProvider({ children }) {
           setAccessToken(refreshed.token);
         }
         if (refreshed?.user) {
-          localStorage.setItem('pe_user', JSON.stringify(refreshed.user));
+          sessionStorage.setItem('pe_user', JSON.stringify(refreshed.user));
           setUser(refreshed.user);
           saveAvatar(refreshed.user.avatar || '');
         }
-        if (refreshed?.user && !localStorage.getItem('pe_avatar')) {
+        if (refreshed?.user && !sessionStorage.getItem('pe_avatar')) {
           api.get('/settings/personal').then(res => {
             const av = res.data?.avatar;
             saveAvatar(av || '');
@@ -37,9 +37,9 @@ export function AuthProvider({ children }) {
       } catch {
         if (cancelled) return;
         clearAccessToken();
-        localStorage.removeItem('pe_user');
-        localStorage.removeItem('pe_avatar');
-        localStorage.removeItem('pe_company_name');
+        sessionStorage.removeItem('pe_user');
+        sessionStorage.removeItem('pe_avatar');
+        sessionStorage.removeItem('pe_company_name');
         setUser(null);
       } finally {
         if (!cancelled) setLoading(false);
@@ -54,7 +54,7 @@ export function AuthProvider({ children }) {
     const res = await api.post('/auth/login', { email, password, workspace });
     const { token, user: userData } = res.data;
     setAccessToken(token);
-    localStorage.setItem('pe_user', JSON.stringify(userData));
+    sessionStorage.setItem('pe_user', JSON.stringify(userData));
     setUser(userData);
     saveAvatar(userData?.avatar || '');
     return userData;
@@ -64,9 +64,9 @@ export function AuthProvider({ children }) {
     const res = await api.post('/admin/login', { email, password });
     const { token, user: userData } = res.data;
     setAccessToken(token);
-    localStorage.setItem('pe_user', JSON.stringify(userData));
+    sessionStorage.setItem('pe_user', JSON.stringify(userData));
     setUser(userData);
-    localStorage.removeItem('pe_avatar');
+    sessionStorage.removeItem('pe_avatar');
     return userData;
   }, []);
 
@@ -77,7 +77,7 @@ export function AuthProvider({ children }) {
     // Accounts requiring email verification should not be treated as signed-in yet.
     if (!email_verification?.required && token && userData) {
       setAccessToken(token);
-      localStorage.setItem('pe_user', JSON.stringify(userData));
+      sessionStorage.setItem('pe_user', JSON.stringify(userData));
       setUser(userData);
     }
 
@@ -86,7 +86,7 @@ export function AuthProvider({ children }) {
 
   const setAuthFromOAuth = useCallback((userData, token) => {
     setAccessToken(token);
-    localStorage.setItem('pe_user', JSON.stringify(userData));
+    sessionStorage.setItem('pe_user', JSON.stringify(userData));
     setUser(userData);
     saveAvatar(userData?.avatar || '');
   }, [saveAvatar]);
@@ -99,7 +99,7 @@ export function AuthProvider({ children }) {
     setUser(prev => {
       if (!prev) return prev;
       const updated = { ...prev, onboarding_completed: true };
-      localStorage.setItem('pe_user', JSON.stringify(updated));
+      sessionStorage.setItem('pe_user', JSON.stringify(updated));
       return updated;
     });
   }, []);
@@ -121,7 +121,7 @@ export function AuthProvider({ children }) {
         setAccessToken(data.token);
       }
       if (data.user) {
-        localStorage.setItem('pe_user', JSON.stringify(data.user));
+        sessionStorage.setItem('pe_user', JSON.stringify(data.user));
         setUser(data.user);
         saveAvatar(data.user.avatar || '');
       }

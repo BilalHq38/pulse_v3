@@ -14,7 +14,6 @@ load_dotenv(PROJECT_ROOT / ".env", override=False)
 DEFAULT_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://qa-finalize.preview.emergentagent.com",
 ]
 LOCAL_FRONTEND_ORIGINS = [
     "http://localhost:3000",
@@ -710,12 +709,15 @@ def gateway_allowed_origins() -> list[str]:
         for origin in raw.split(",")
         if origin.strip()
     ]
-    for origin in [*LOCAL_FRONTEND_ORIGINS, *DEFAULT_ORIGINS, *configured_values]:
+    candidates = configured_values if is_production() else [*LOCAL_FRONTEND_ORIGINS, *DEFAULT_ORIGINS, *configured_values]
+    for origin in candidates:
         candidate = origin.strip()
-        if not candidate or candidate in seen:
+        if not candidate or candidate == "*" or candidate in seen:
             continue
         seen.add(candidate)
         origins.append(candidate)
+    if is_production() and not origins:
+        raise RuntimeError("GATEWAY_ALLOWED_ORIGINS or FRONTEND_URL must define explicit production origins")
     return origins or list(LOCAL_FRONTEND_ORIGINS)
 
 

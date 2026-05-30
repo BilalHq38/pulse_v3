@@ -14,7 +14,7 @@ from typing import Awaitable, Callable
 from fastapi import HTTPException, Request
 
 from shared.config import rate_limit_redis_url
-from shared.utils.rate_limit import RateLimiter, build_rate_limiter
+from shared.utils.rate_limit import InMemoryRateLimiter, RateLimiter, build_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,9 @@ def rate_limit(
             allowed, retry_after = await limiter.allow(ip)
         except Exception as exc:
             logger.warning("rate_limit_check_failed scope=%s ip=%s error=%s", scope, ip, exc)
-            return
+            limiter = InMemoryRateLimiter(max_requests=limit, window_seconds=window_seconds)
+            _LIMITERS[(scope, limit, window_seconds)] = limiter
+            allowed, retry_after = await limiter.allow(ip)
         if not allowed:
             raise HTTPException(
                 status_code=429,

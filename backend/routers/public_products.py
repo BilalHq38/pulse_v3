@@ -291,7 +291,7 @@ async def public_buy_product(
                 # Use the conversation session as conversation_id if available.
                 conversation_id = tracked_session_id or ""
                 # Calculate total price from product price × quantity.
-                unit_price = product_row["price"]
+                unit_price = product_row.get("price")
                 total_price = (float(unit_price) * buy.quantity) if unit_price is not None else None
                 try:
                     await conn.execute(
@@ -300,7 +300,7 @@ async def public_buy_product(
                         "quantity, variant, size, color, customer_name, customer_email, customer_phone, "
                         "delivery_address, notes, status, source_channel, created_by, raw_details, "
                         "missing_fields, idempotency_key, total_price, created_at, updated_at"
-                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'confirmed',$14,'public',"
+                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'pending',$14,'public',"
                         "'{}'::jsonb,'[]'::jsonb,$15,$16,NOW(),NOW())",
                         order_id,
                         company_id,
@@ -419,7 +419,7 @@ async def public_buy_product(
     return {
         "order_id": order_id,
         "order_ref": order_ref,
-        "status": "confirmed",
+        "status": "pending",
         "deduplicated": False,
         "customer_id": resolved_customer_id or None,
         "lead_converted": bool(resolved_lead_id),

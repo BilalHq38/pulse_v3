@@ -318,7 +318,16 @@ _ORDER_DETAIL_TERMS = {
     "sector",
 }
 _ORDER_CONFIRM_TERMS = {"confirm", "confirmed", "yes", "ok", "okay", "done", "proceed", "finalize"}
-_ORDER_CANCEL_PHRASES = ("cancel", "stop order", "do not order", "don't order", "leave it")
+_ORDER_CANCEL_EXACT = {"no", "nope", "reset"}
+_ORDER_CANCEL_PHRASES = (
+    "cancel",
+    "stop order",
+    "do not order",
+    "don't order",
+    "no i don t",
+    "changed my mind",
+    "leave it",
+)
 _NUMBER_SELECTION_WORDS = {
     "first",
     "second",
@@ -668,7 +677,7 @@ def classify_product_order_demand(text: str, context: dict[str, Any] | None = No
         return _intent_result("normal_support", confidence="low", reason="empty_message")
 
     if active_order:
-        if any(phrase in normalized for phrase in _ORDER_CANCEL_PHRASES):
+        if normalized in _ORDER_CANCEL_EXACT or any(phrase in normalized for phrase in _ORDER_CANCEL_PHRASES):
             return _intent_result(
                 "order_continuation",
                 confidence="high",

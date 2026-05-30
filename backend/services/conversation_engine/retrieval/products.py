@@ -82,8 +82,17 @@ async def _rls_fetch(db, company_id: str, sql: str, *args) -> list:
 
 
 async def _rls_fetchrow(db, company_id: str, sql: str, *args):
-    rows = await _rls_fetch(db, company_id, sql, *args)
-    return rows[0] if rows else None
+    try:
+        async with db.acquire() as conn:
+            await _set_tenant(conn, company_id)
+            return await conn.fetchrow(sql, *args)
+    except AttributeError:
+        try:
+            return await db.fetchrow(sql, *args)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 async def _fetch_categories(db, company_id: str) -> list[ContextChunk]:

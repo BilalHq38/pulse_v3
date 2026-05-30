@@ -16,6 +16,31 @@ def normalize_base_url(value: str) -> str:
     return (value or "").strip().rstrip("/")
 
 
+def normalize_public_media_url(value: str) -> str:
+    """Return an externally reachable media URL, or an empty string when none can be built."""
+    media_url = str(value or "").strip()
+    if not media_url:
+        return ""
+    public_base = _first_configured_base_url("PUBLIC_BACKEND_URL", "BACKEND_PUBLIC_URL")
+    try:
+        parsed = urlparse(media_url)
+    except Exception:
+        parsed = None
+    if parsed and parsed.scheme in ("http", "https") and parsed.netloc:
+        hostname = (parsed.hostname or "").strip().lower()
+        if hostname not in {"localhost", "127.0.0.1", "api-gateway", "gateway", "customer"}:
+            return media_url
+        if not public_base:
+            return ""
+        suffix = parsed.path or "/"
+        if parsed.query:
+            suffix = f"{suffix}?{parsed.query}"
+        return f"{public_base}{suffix}"
+    if not public_base:
+        return ""
+    return f"{public_base}/{media_url.lstrip('/')}"
+
+
 def _is_dev_trusted_frontend_host(hostname: str) -> bool:
     """Allow common local / LAN origins for OAuth redirects without FRONTEND_URL set."""
     host = (hostname or "").strip().lower()

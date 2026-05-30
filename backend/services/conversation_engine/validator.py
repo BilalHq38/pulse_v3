@@ -52,13 +52,26 @@ class GroundingContext:
 
 
 def _grounded_product_names(chunks: Iterable[ContextChunk]) -> set[str]:
+    """Return a set of all grounded product names AND their individual significant tokens.
+
+    We add individual tokens (words) so a 2-word product name "Blue Jacket" also
+    makes "Blue" and "Jacket" grounded if they appear alongside other known-good
+    product names. Tokens shorter than 4 chars are excluded to avoid over-grounding
+    with articles and short words.
+    """
     out: set[str] = set()
     for chunk in chunks:
         if chunk.source_type != "product":
             continue
         name = (chunk.metadata or {}).get("name") or chunk.title
-        if name:
-            out.add(str(name).lower())
+        if not name:
+            continue
+        name_lower = str(name).lower()
+        out.add(name_lower)
+        # Also add each word (4+ chars) as a grounded token so partial matches work
+        for token in name_lower.split():
+            if len(token) >= 4:
+                out.add(token)
     return out
 
 
@@ -149,18 +162,31 @@ _GROUNDING_STOPWORDS = {
     "team", "support", "business", "company", "store", "shop", "platform",
     "solutions", "software", "hardware", "digital", "online", "website",
     "collection", "range", "lineup", "inventory",
+    # Common 2-word phrases that are NOT product names
+    "please note", "great choice", "good news", "free shipping", "quick question",
+    "happy help", "feel free", "let know", "best regards", "thank you",
+    "right away", "sure thing", "absolutely right", "totally understand",
+    "delivery time", "shipping time", "business days", "working days",
+    "order now", "buy now", "add cart", "view product", "learn more",
+    "our team", "our store", "our shop", "our products", "our catalog",
+    "your order", "your account", "your cart", "your question",
+    "high quality", "best quality", "great quality", "top quality",
+    "new arrival", "best seller", "top rated", "hot deal", "special offer",
+    "limited stock", "in stock", "out stock",
 }
 
 
 def _looks_like_product_name(candidate: str) -> bool:
     """Conservative heuristic: a candidate is product-name-shaped if it's
-    multi-word with 3+ words, contains a digit, or has internal uppercase
-    (CamelCase). Short two-word phrases are often descriptive terms or context
-    labels rather than product names, so we require 3+ words for multi-word."""
+    multi-word (2+ words), contains a digit, or has internal uppercase (CamelCase).
+
+    Two-word phrases are now included since product names like "Blue Jacket" or
+    "Gold Watch" are commonly 2 words. The stopword list and grounded-name
+    partial-match logic prevent common phrases from false-positiving.
+    """
     if " " in candidate:
-        # Require at least 3 words to reduce false positives on phrases like
-        # "Company Data" or "Product Database" (context section labels).
-        return candidate.count(" ") >= 2
+        # 2+ words — include to catch short product names like "Gold Watch"
+        return True
     if any(ch.isdigit() for ch in candidate):
         return True
     return False

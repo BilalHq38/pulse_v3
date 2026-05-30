@@ -121,7 +121,7 @@ export default function DashboardPage() {
   const [data, setData] = useState(DEFAULT_DATA);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [companyName, setCompanyName] = useState(() => localStorage.getItem('pe_company_name') || '');
+  const [companyName, setCompanyName] = useState(() => sessionStorage.getItem('pe_company_name') || '');
 
   const fetchLive = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true);
@@ -142,7 +142,7 @@ export default function DashboardPage() {
     const onCompanyChanged = (event) => {
       const nextName = String(
         event.type === 'storage'
-          ? localStorage.getItem('pe_company_name') || ''
+          ? sessionStorage.getItem('pe_company_name') || ''
           : event.detail?.company_name || event.detail || '',
       ).trim();
       setCompanyName(nextName);

@@ -159,13 +159,13 @@ async def test_message_reaction_is_idempotent_and_returned_with_message():
 
 
 @pytest.mark.asyncio
-async def test_fetch_messages_recreates_missing_reaction_table_after_stale_ready_flag():
+async def test_fetch_messages_reports_missing_reaction_table_after_stale_ready_flag():
     db = MissingReactionTableDB()
     db_helpers._message_reaction_schema_ready.add("customer_service")
 
     messages = await fetch_messages_with_attachments(db, "convo-1")
 
-    assert db.create_attempts == 1
+    assert db.create_attempts == 0
     assert messages[0]["reactions"] == []
 
 

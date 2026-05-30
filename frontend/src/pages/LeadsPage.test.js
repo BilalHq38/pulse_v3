@@ -538,7 +538,7 @@ test('AI Auto Nurture All generates drafts before Send Message to All sends them
   });
 
   const sendAllButton = await waitForSelector('[data-testid="send-nurture-all-btn"]', container);
-  expect(mockApi.post).toHaveBeenCalledWith('/leads/auto-nurture-all');
+  expect(mockApi.post).toHaveBeenCalledWith('/leads/auto-nurture-all', {}, { timeout: 120000 });
   expect(mockApi.post.mock.calls.filter(([url]) => url.includes('/send'))).toHaveLength(0);
 
   await act(async () => {

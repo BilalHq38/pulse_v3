@@ -3,6 +3,7 @@ WhatsApp and Meta channel message sending helpers.
 """
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -10,6 +11,7 @@ import httpx
 from fastapi import HTTPException
 
 from core.config import WHATSAPP_PHONE_ID, WHATSAPP_TOKEN
+from core.request_helpers import normalize_public_media_url
 from channel_layer.channel_identity import normalize_whatsapp_phone
 from shared.config import (
     messaging_http_connect_timeout_seconds,
@@ -73,6 +75,24 @@ def _bridge_headers(*, company_id: str = "", user_id: str = "") -> dict[str, str
     if scoped_user_id:
         headers["X-Bridge-User-Id"] = scoped_user_id
     return headers
+
+
+def _normalize_outbound_attachments(attachments: list | None) -> list:
+    normalized: list[dict] = []
+    for raw_attachment in attachments or []:
+        attachment = dict(raw_attachment or {})
+        data_url = str(attachment.get("data_url") or "").strip()
+        if data_url.startswith("data:"):
+            normalized.append(attachment)
+            continue
+        original_url = str(attachment.get("url") or "").strip()
+        public_url = normalize_public_media_url(original_url)
+        if not public_url:
+            logger.warning("outbound_media_skipped channel=%s url=%s reason=public_backend_url_missing", "whatsapp", original_url)
+            continue
+        attachment["url"] = public_url
+        normalized.append(attachment)
+    return normalized
 
 
 def _attachment_metadata(attachment: dict | None) -> dict[str, Any]:
@@ -837,8 +857,13 @@ async def _send_via_meta(
         attachment = attachments[0] or {}
         link = str(attachment.get("url") or attachment.get("data_url") or "").strip()
         media_type = _infer_media_type(attachment)
-        # Meta Cloud API requires a publicly accessible URL; skip image sending for
-        # relative/local paths which Meta's servers cannot reach.
+        # Convert relative paths to absolute using the configured public backend URL
+        # so Meta's servers can download the image. If BACKEND_PUBLIC_URL is not set
+        # to a real public domain the image will still fail, but silently dropping it
+        # is worse than trying.
+        if link.startswith("/"):
+            from shared.config import backend_public_url as _bpu
+            link = f"{_bpu()}{link}"
         is_public_url = link.startswith(("http://", "https://"))
         if link and media_type == "image" and is_public_url:
             caption = _product_media_caption(
@@ -1057,6 +1082,11 @@ async def send_whatsapp_message(
     scoped_conversation_id = (conversation_id or "").strip()
     scoped_customer_id = (customer_id or "").strip()
     scoped_idempotency_key = (idempotency_key or "").strip()
+    if (attachments or []) and (
+        str(os.environ.get("PUBLIC_BACKEND_URL") or "").strip()
+        or str(os.environ.get("BACKEND_PUBLIC_URL") or "").strip()
+    ):
+        attachments = _normalize_outbound_attachments(attachments)
     sent = False
     error = ""
     external_message_id = ""

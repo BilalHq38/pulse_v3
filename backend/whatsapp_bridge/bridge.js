@@ -444,7 +444,11 @@ async function attachmentToMedia(attachment) {
     try {
       const absoluteUrl = sourceUrl.startsWith("/") ? `${PYTHON_BACKEND}${sourceUrl}` : sourceUrl;
       if (/^https?:\/\//i.test(absoluteUrl)) {
-        const response = await axios.get(absoluteUrl, { responseType: "arraybuffer", timeout: BRIDGE_FORWARD_TIMEOUT_MS });
+        const response = await axios.get(absoluteUrl, {
+          responseType: "arraybuffer",
+          timeout: BRIDGE_FORWARD_TIMEOUT_MS,
+          headers: { "X-Bridge-Secret": BRIDGE_SECRET },
+        });
         const mimeType = inferAttachmentMimeType(attachment, response.headers["content-type"]);
         if (OUTBOUND_MEDIA_MIME_TYPES.has(mimeType)) {
           parsed = { mimeType, data: Buffer.from(response.data).toString("base64") };

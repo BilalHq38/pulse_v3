@@ -22,12 +22,11 @@ PASSWORD_RESET_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TTL_MINUTES", "1
 ACCOUNT_DELETION_TTL_MINUTES = int(os.environ.get("ACCOUNT_DELETION_TTL_MINUTES", "10"))
 
 # ─── CORS ─────────────────────────────────────────────────────
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")
 CORS_ORIGIN_REGEX = r"http://(localhost|127\.0\.0\.1)(:\d+)?"
 DEFAULT_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://qa-finalize.preview.emergentagent.com",
 ]
 
 # ─── MISC ─────────────────────────────────────────────────────

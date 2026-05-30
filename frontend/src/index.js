@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "@/index.css";
 import App from "@/App";
+import GlobalErrorBoundary from "@/components/GlobalErrorBoundary";
 
 const CHUNK_RECOVERY_FLAG = "pulse_chunk_recovery_once";
 
@@ -69,6 +70,8 @@ installChunkRecoveryHandlers();
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(
   <React.StrictMode>
-    <App />
+    <GlobalErrorBoundary>
+      <App />
+    </GlobalErrorBoundary>
   </React.StrictMode>,
 );

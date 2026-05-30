@@ -282,6 +282,13 @@ export const useIdentityUnificationStore = create((set, get) => ({
   },
 
   refreshAll: async () => {
+    // Sync main-app customers into the identity service first so the profile
+    // list reflects all contacts, not just those registered via webhooks.
+    try {
+      await identityUnificationApi.syncCustomersToIdentity();
+    } catch (_syncErr) {
+      // Non-fatal — continue to refresh profiles and review queue
+    }
     await Promise.all([get().fetchProfiles(), get().fetchReviewQueue()]);
   },
 

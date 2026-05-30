@@ -77,7 +77,7 @@ const COMPOSER_DRAFTS_STORAGE_KEY = 'pulse:inbox-composer-drafts:v1';
 
 function readComposerDrafts() {
   try {
-    const parsed = JSON.parse(localStorage.getItem(COMPOSER_DRAFTS_STORAGE_KEY) || '{}');
+    const parsed = JSON.parse(sessionStorage.getItem(COMPOSER_DRAFTS_STORAGE_KEY) || '{}');
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
@@ -86,7 +86,7 @@ function readComposerDrafts() {
 
 function writeComposerDrafts(drafts) {
   try {
-    localStorage.setItem(COMPOSER_DRAFTS_STORAGE_KEY, JSON.stringify(drafts || {}));
+    sessionStorage.setItem(COMPOSER_DRAFTS_STORAGE_KEY, JSON.stringify(drafts || {}));
   } catch {
     // Ignore storage quota/private-mode failures; composer still works in memory.
   }

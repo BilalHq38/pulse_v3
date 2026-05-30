@@ -43,9 +43,14 @@ _RISKY_INJECTION_PATTERNS = (
     re.compile(r"\[\s*inst\s*\]", re.IGNORECASE),
     re.compile(r"^\s*###\s*system\b", re.IGNORECASE | re.MULTILINE),
     re.compile(r"ignore (the )?previous (instructions|messages)", re.IGNORECASE),
+    re.compile(r"\b(disregard|override|bypass|forget)\b.{0,80}\b(instructions?|rules?|system|prompt)\b", re.IGNORECASE),
+    re.compile(r"\b(system|developer|assistant)\s*:\s*", re.IGNORECASE),
+    re.compile(r"</?\s*(?:user_input|retrieved_context|company_info|product_catalog|knowledge_base)\b", re.IGNORECASE),
+    re.compile(r"\b(reveal|print|show|repeat)\b.{0,80}\b(system prompt|hidden prompt|instructions?)\b", re.IGNORECASE),
 )
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _USER_INPUT_MAX_CHARS = 4000
+_CONTEXT_CHUNK_MAX_CHARS = 8000
 
 
 class InjectionDetected(ValueError):
@@ -68,8 +73,13 @@ def is_chunk_safe(chunk: ContextChunk) -> bool:
     """Chunks that look like injection attacks are silently dropped — they
     came from inside the system (KB articles, FAQs) so we don't want to fail
     the request, but we also don't want to feed them to the LLM."""
-    text = chunk.content or ""
+    text = _CONTROL_CHARS.sub("", chunk.content or "")[:_CONTEXT_CHUNK_MAX_CHARS]
     return not any(pat.search(text) for pat in _RISKY_INJECTION_PATTERNS)
+
+
+def _sanitise_context_text(text: str) -> str:
+    cleaned = _CONTROL_CHARS.sub("", str(text or ""))[:_CONTEXT_CHUNK_MAX_CHARS]
+    return cleaned.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _system_prompt(
@@ -99,6 +109,9 @@ def _system_prompt(
         style_prompt.strip(),
         flags=re.IGNORECASE,
     ).strip()
+    if any(pattern.search(sanitized_style) for pattern in _RISKY_INJECTION_PATTERNS):
+        sanitized_style = ""
+    sanitized_style = _sanitise_context_text(sanitized_style)
 
     return "\n".join(
         line for line in (
@@ -157,9 +170,9 @@ def _context_block(chunks: list[ContextChunk]) -> str:
         tag = _SOURCE_TAG.get(source, source)
         parts.append(f"<{tag}>")
         for chunk in bucket:
-            title = (chunk.title or "").strip()
+            title = _sanitise_context_text(chunk.title).strip()
             header = f"[{title}]" if title else ""
-            body = (chunk.content or "").strip()
+            body = _sanitise_context_text(chunk.content).strip()
             parts.append(f"{header}\n{body}".strip())
         parts.append(f"</{tag}>")
     parts.append("</retrieved_context>")
@@ -167,7 +180,7 @@ def _context_block(chunks: list[ContextChunk]) -> str:
 
 
 def _history_block(history_turns: Iterable[str]) -> str:
-    lines = [h.strip() for h in history_turns if h and h.strip()]
+    lines = [_sanitise_context_text(h).strip() for h in history_turns if h and h.strip()]
     if not lines:
         return ""
     body = "\n".join(lines)

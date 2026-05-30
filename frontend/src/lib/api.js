@@ -37,12 +37,12 @@ function removeContentTypeHeader(headers) {
 }
 
 function clearCachedUser() {
-  localStorage.removeItem('pe_token');
-  localStorage.removeItem('pe_refresh');
-  localStorage.removeItem('pe_user');
-  localStorage.removeItem('pe_avatar');
-  localStorage.removeItem('pe_company_name');
-  localStorage.removeItem('pe_account_status');
+  sessionStorage.removeItem('pe_token');
+  sessionStorage.removeItem('pe_refresh');
+  sessionStorage.removeItem('pe_user');
+  sessionStorage.removeItem('pe_avatar');
+  sessionStorage.removeItem('pe_company_name');
+  sessionStorage.removeItem('pe_account_status');
 }
 
 export function applyAuthResponse(data = {}) {
@@ -50,16 +50,16 @@ export function applyAuthResponse(data = {}) {
     setAccessToken(data.token);
   }
   if (data?.user) {
-    localStorage.removeItem('pe_account_status');
-    localStorage.setItem('pe_user', JSON.stringify(data.user));
+    sessionStorage.removeItem('pe_account_status');
+    sessionStorage.setItem('pe_user', JSON.stringify(data.user));
   }
   return data;
 }
 
 export function setAccessToken(token) {
   accessToken = token || '';
-  localStorage.removeItem('pe_token');
-  localStorage.removeItem('pe_refresh');
+  sessionStorage.removeItem('pe_token');
+  sessionStorage.removeItem('pe_refresh');
   window.dispatchEvent(new CustomEvent('pe-access-token-updated', { detail: { token: accessToken } }));
 }
 
@@ -124,9 +124,9 @@ api.interceptors.response.use(
         };
         if (statusByCode[code]) {
           try {
-            const cached = JSON.parse(localStorage.getItem('pe_user') || '{}');
-            localStorage.setItem('pe_user', JSON.stringify({ ...cached, status: statusByCode[code], account_status: statusByCode[code] }));
-            localStorage.setItem('pe_account_status', statusByCode[code]);
+            const cached = JSON.parse(sessionStorage.getItem('pe_user') || '{}');
+            sessionStorage.setItem('pe_user', JSON.stringify({ ...cached, status: statusByCode[code], account_status: statusByCode[code] }));
+            sessionStorage.setItem('pe_account_status', statusByCode[code]);
           } catch {
             // Ignore malformed local cache.
           }
