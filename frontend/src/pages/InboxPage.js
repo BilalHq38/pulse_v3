@@ -1425,17 +1425,34 @@ export default function InboxPage() {
   return (
     <>
     <div className="flex h-[calc(100vh-3.5rem)]" data-testid="inbox-page">
-      {inboxFilterMeta && (
-        <div className="absolute top-2 right-4 z-20 flex max-w-[calc(100%-2rem)] flex-wrap items-center gap-2 bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
-          <span>
-            Filter: {inboxFilterMeta.label}
-            <button
-              onClick={clearInboxFilter}
-              className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
-            >
-              Clear
-            </button>
-          </span>
+      {(inboxFilterMeta || platformView) && (
+        <div className="absolute top-2 right-4 z-20 flex flex-wrap items-center gap-2 max-w-[calc(100%-2rem)]">
+          {inboxFilterMeta && (
+            <div className="bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
+              <span>
+                Filter: {inboxFilterMeta.label}
+                <button
+                  onClick={clearInboxFilter}
+                  className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
+                >
+                  Clear
+                </button>
+              </span>
+            </div>
+          )}
+          {platformView && (
+            <div className="bg-white border border-slate-200 shadow-sm rounded-xl px-3 py-1.5 text-xs text-slate-600">
+              <span>
+                Channel: {CHANNELS.find(ch => ch.key === platformView)?.label || platformView}
+                <button
+                  onClick={clearPlatformView}
+                  className="ml-2 text-blue-600 hover:text-blue-700 font-medium"
+                >
+                  Clear
+                </button>
+              </span>
+            </div>
+          )}
         </div>
       )}
       {/* Mobile: Channel Tabs + Conversation List */}
