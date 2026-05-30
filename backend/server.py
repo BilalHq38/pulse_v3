@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from shared.config import is_production
 
 from routers.ai import router as ai_router
 from routers.analytics import router as analytics_router
@@ -145,13 +144,6 @@ def _start_embedded_postgres_if_needed() -> None:
 async def bootstrap_sql_schema(db) -> None:
     global _SCHEMA_BOOTSTRAPPED
     if _SCHEMA_BOOTSTRAPPED:
-        return
-
-    if is_production():
-        companies_table = await db.fetchval("SELECT to_regclass('public.companies')")
-        if not companies_table:
-            raise RuntimeError("Production schema is missing. Run `alembic upgrade head` before starting the application.")
-        _SCHEMA_BOOTSTRAPPED = True
         return
 
     schema_path = PROJECT_ROOT / "backend" / "sql_schema.sql"

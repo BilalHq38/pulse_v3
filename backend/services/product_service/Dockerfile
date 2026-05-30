@@ -15,4 +15,4 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY backend /app/backend
 
-CMD ["uvicorn", "services.product_service.main:app", "--host", "0.0.0.0", "--port", "8007"]
+CMD ["uvicorn", "services.product_service.main:app", "--host", "0.0.0.0", "--port", "8007", "--workers", "2", "--timeout-graceful-shutdown", "30"]

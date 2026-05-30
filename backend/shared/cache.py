@@ -119,6 +119,79 @@ class CacheClient:
                 logger.warning("Redis cache delete failed (%s)", exc)
         await self._memory.delete(*storage_keys)
 
+    async def append_to_list(
+        self,
+        key: str,
+        item: Any,
+        *,
+        max_length: int,
+        ttl_seconds: int = 60,
+    ) -> None:
+        """Atomically append an item to a list, cap length, and reset TTL.
+
+        Uses RPUSH+LTRIM+EXPIRE pipeline on Redis for atomic operation.
+        Falls back to read-modify-write on the in-memory cache.
+        """
+        storage_key = self._key(key)
+        item_json = json.dumps(item, ensure_ascii=True, separators=(",", ":"), default=self._json_default)
+        cap = max(1, int(max_length))
+        ttl = max(1, int(ttl_seconds))
+        if self._redis is not None:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    pipe.rpush(storage_key, item_json)
+                    pipe.ltrim(storage_key, -cap, -1)
+                    pipe.expire(storage_key, ttl)
+                    await pipe.execute()
+                return
+            except Exception as exc:
+                logger.warning("Redis append_to_list failed (%s), using in-memory cache", exc)
+        # In-memory fallback: best-effort read-modify-write
+        raw = await self._memory.get(storage_key)
+        try:
+            existing: list = json.loads(raw) if raw else []
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []
+        existing.append(item)
+        if len(existing) > cap:
+            existing = existing[-cap:]
+        await self._memory.set(
+            storage_key,
+            json.dumps(existing, ensure_ascii=True, separators=(",", ":"), default=self._json_default),
+            ttl_seconds=ttl,
+        )
+
+    async def get_list(self, key: str) -> list[Any]:
+        """Read all items from a list stored via append_to_list.
+
+        Uses LRANGE on Redis, with a fallback to in-memory JSON array parsing.
+        """
+        storage_key = self._key(key)
+        if self._redis is not None:
+            try:
+                raw_items = await self._redis.lrange(storage_key, 0, -1)
+                if raw_items is not None:
+                    result = []
+                    for raw in raw_items:
+                        try:
+                            result.append(json.loads(raw))
+                        except Exception:
+                            pass
+                    return result
+            except Exception as exc:
+                logger.warning("Redis get_list failed (%s), using in-memory cache", exc)
+        # In-memory fallback: stored as a JSON array
+        raw = await self._memory.get(storage_key)
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
     async def close(self) -> None:
         if self._redis is not None:
             try:

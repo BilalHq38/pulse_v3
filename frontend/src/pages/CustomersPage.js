@@ -286,7 +286,7 @@ export default function CustomersPage() {
   };
 
   const buildCustomerEmailDraft = (customer) => {
-    const companyName = String(sessionStorage.getItem('pe_company_name') || '').trim();
+    const companyName = String(localStorage.getItem('pe_company_name') || '').trim();
     const senderLabel = companyName || 'our team';
     return {
       subject: `Follow up from ${senderLabel}`,

@@ -4,6 +4,7 @@ import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { postAuthDestination } from '@/lib/auth-gates';
 import { API_BASE_URL } from '@/lib/backend-url';
 import Layout from '@/components/Layout';
+import ErrorBoundary from '@/components/ErrorBoundary';
 import { Toaster } from '@/components/ui/toaster';
 import '@/App.css';
 
@@ -236,6 +237,7 @@ function App() {
     <AuthProvider>
       <BrowserRouter>
         <VisitorTracker />
+        <ErrorBoundary>
         <Suspense fallback={<Spinner />}>
           <Routes>
             <Route path="/" element={<PublicRoute><LandingPage /></PublicRoute>} />
@@ -275,6 +277,7 @@ function App() {
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
         </Suspense>
+        </ErrorBoundary>
         <Toaster />
       </BrowserRouter>
     </AuthProvider>

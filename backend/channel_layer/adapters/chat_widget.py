@@ -206,7 +206,7 @@ class ChatWidgetAdapter(BaseChannelAdapter):
             "yes",
             "on",
         }
-        return not is_production() and allow_unsigned
+        return not is_production() or allow_unsigned
 
     async def health_check(self) -> AdapterHealthStatus:
         """Chat widget is always available as it's server-side."""

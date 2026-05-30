@@ -86,13 +86,7 @@ async def _rls_fetchval(db, company_id: str, sql: str, *args) -> Any:
             return await conn.fetchval(sql, *args)
     except AttributeError:
         try:
-            fetchval = getattr(db, "fetchval", None)
-            if fetchval is not None:
-                return await fetchval(sql, *args)
-            row = await db.fetchrow(sql, *args)
-            if not row:
-                return None
-            return next(iter(dict(row).values()), None)
+            return await db.fetchval(sql, *args)
         except Exception:
             return None
     except Exception:
@@ -198,7 +192,7 @@ async def persist_turn(
         user_message,
         ai_response,
         json.dumps(list(sources_used)),
-        json.dumps([{"product_id": pl.product_id, "url": pl.url} for pl in product_links]),
+        json.dumps([{"product_id": pl.product_id, "url": pl.url, "name": pl.name, "image_url": pl.image_url} for pl in product_links]),
         float(confidence),
         active_template or "",
         json.dumps({"prompt": token_usage.prompt, "completion": token_usage.completion, "total": token_usage.total}),

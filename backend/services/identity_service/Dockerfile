@@ -20,4 +20,4 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY backend /app/backend
 
-CMD ["uvicorn", "services.identity_service.main:app", "--host", "0.0.0.0", "--port", "8010"]
+CMD ["uvicorn", "services.identity_service.main:app", "--host", "0.0.0.0", "--port", "8010", "--workers", "2", "--timeout-graceful-shutdown", "30"]

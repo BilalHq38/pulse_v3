@@ -20,7 +20,8 @@ from services.conversation_engine.schemas import SourceType
 # on purpose: the rule scorer is meant to be cheap. Adding a keyword is one
 # line of code, so we err on the side of curation, not catch-all coverage.
 _PRODUCT_KEYWORDS = {
-    "price", "cost", "buy", "purchase", "stock", "available", "availability",
+    "price", "cost", "buy", "purchase", "order", "ordering", "checkout",
+    "cart", "add to cart", "stock", "available", "availability",
     "in stock", "deliver", "ship", "shipping", "product", "item", "model",
     "variant", "size", "color", "discount", "offer", "sale", "compare",
     # Purchase intent and recommendation
@@ -30,6 +31,9 @@ _PRODUCT_KEYWORDS = {
     "how much", "show me", "can i get", "do you have", "do you sell",
     "any", "list", "catalog", "catalogue", "what products", "what do you sell",
     "image", "images", "photo", "photos", "picture", "pictures", "look like",
+    # Referential phrases — user referring to previously shown/discussed products
+    "both", "these", "those", "that one", "this one", "the one", "them",
+    "all of them", "both of them", "you mentioned", "talked about", "showed",
 }
 _FAQ_KEYWORDS = {
     "policy", "return", "refund", "warranty", "exchange", "hours", "open",

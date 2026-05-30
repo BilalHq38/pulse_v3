@@ -112,3 +112,4 @@ agenthub/agents/youtube/db
 *.pack
 *.deb
 *.dylib
+.claude/

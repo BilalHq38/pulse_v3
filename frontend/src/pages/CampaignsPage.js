@@ -627,7 +627,7 @@ export default function CampaignsPage() {
                   </div>
                   <div className="min-w-0 md:col-span-3">
                     <div className="flex flex-wrap items-center justify-start gap-1.5 md:justify-end">
-                      {(c.status === 'draft' || c.status === 'paused') && (
+                      {!['sending', 'queued'].includes(c.status) && (
                         <button
                           onClick={() => openCampaignEditor(c)}
                           className="inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-500 transition-colors hover:bg-slate-50 focus:outline-none focus:ring-1 focus:ring-slate-200 disabled:cursor-not-allowed disabled:opacity-50"

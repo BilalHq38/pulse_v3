@@ -52,12 +52,13 @@ class GroundingContext:
 
 
 def _grounded_product_names(chunks: Iterable[ContextChunk]) -> set[str]:
-    """Return a set of all grounded product names AND their individual significant tokens.
+    """Return the set of full grounded product names (lower-cased).
 
-    We add individual tokens (words) so a 2-word product name "Blue Jacket" also
-    makes "Blue" and "Jacket" grounded if they appear alongside other known-good
-    product names. Tokens shorter than 4 chars are excluded to avoid over-grounding
-    with articles and short words.
+    Only full names are stored — individual word tokens are intentionally
+    excluded. Adding tokens like "blue" from "Blue Jacket" would cause unrelated
+    product names that share a common word (e.g. "Blue Shoes") to pass the
+    grounding check incorrectly. The substring check in _check_grounding handles
+    partial matches via `name in candidate` comparisons on full product names.
     """
     out: set[str] = set()
     for chunk in chunks:
@@ -66,12 +67,7 @@ def _grounded_product_names(chunks: Iterable[ContextChunk]) -> set[str]:
         name = (chunk.metadata or {}).get("name") or chunk.title
         if not name:
             continue
-        name_lower = str(name).lower()
-        out.add(name_lower)
-        # Also add each word (4+ chars) as a grounded token so partial matches work
-        for token in name_lower.split():
-            if len(token) >= 4:
-                out.add(token)
+        out.add(str(name).lower().strip())
     return out
 
 

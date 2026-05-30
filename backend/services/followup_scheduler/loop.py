@@ -302,8 +302,17 @@ async def _loop_body(db, stop_event: asyncio.Event) -> None:
                 break  # nothing due right now
             try:
                 async with platform_admin_context(db):
-                    await dispatch_one_followup(db, claimed)
+                    await asyncio.wait_for(
+                        dispatch_one_followup(db, claimed),
+                        timeout=45.0,
+                    )
                 dispatched += 1
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "followup_dispatch_timeout followup_id=%s workflow_kind=%s",
+                    claimed.get("id"),
+                    claimed.get("workflow_kind"),
+                )
             except Exception:
                 # Defensive: dispatch_one_followup already swallows its own
                 # errors, but the outer guard keeps the loop alive in case a

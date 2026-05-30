@@ -355,10 +355,10 @@ class EmailAdapter(BaseChannelAdapter):
         from services.email_service import send_tenant_email_async
 
         to_email = message.external_user_id or message.metadata.get("to_email", "")
-        if not to_email:
+        if not to_email or "@" not in to_email:
             return SendResult(
                 success=False,
-                error="Recipient email address is required",
+                error="Valid recipient email address is required",
                 channel_type=ChannelType.EMAIL,
             )
 
@@ -371,6 +371,14 @@ class EmailAdapter(BaseChannelAdapter):
                 channel_type=ChannelType.EMAIL,
             )
 
+        if message.attachments:
+            logger.warning(
+                "email_adapter_attachments_not_sent count=%d to=%s tenant=%s attachment_urls=%s",
+                len(message.attachments),
+                to_email,
+                tenant_id,
+                [a.url for a in message.attachments if a.url],
+            )
         try:
             await send_tenant_email_async(
                 db,

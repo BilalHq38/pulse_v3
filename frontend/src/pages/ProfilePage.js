@@ -36,7 +36,7 @@ export default function ProfilePage() {
     try {
       const res = await api.put('/settings/personal', form);
       setProfile(res.data); setSavedMsg('Profile updated successfully!');
-      if (form.avatar) sessionStorage.setItem('pe_avatar', normalizeAvatarUrl(form.avatar));
+      if (form.avatar) localStorage.setItem('pe_avatar', normalizeAvatarUrl(form.avatar));
       setTimeout(() => setSavedMsg(''), 3000);
     } catch (err) { setError(err.response?.data?.detail || 'Failed to save'); }
     finally { setSaving(false); }

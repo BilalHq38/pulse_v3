@@ -37,11 +37,7 @@ def _sentiment_label(score: float | int | None) -> str:
 def _summary_dedupe_key(item: dict) -> tuple[str, ...]:
     entity_type = str(item.get("entity_type") or "").strip().lower()
     if entity_type == "customer":
-        return (
-            "customer",
-            str(item.get("customer_id") or "").strip(),
-            str(item.get("conversation_id") or "").strip(),
-        )
+        return ("customer", str(item.get("customer_id") or "").strip())
     if entity_type == "lead":
         return ("lead", str(item.get("lead_id") or "").strip())
     return (str(item.get("id") or ""),)

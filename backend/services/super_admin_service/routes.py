@@ -25,6 +25,7 @@ from services.db_helpers import (
     set_public_auth_context,
 )
 from services.billing_helpers import assert_workspace_seat_available
+from services.email_service import send_onboarding_email_async
 from shared.auth.jwt import REFRESH_TOKEN_EXPIRE_DAYS, verify_password
 
 logger = logging.getLogger(__name__)
@@ -500,6 +501,30 @@ async def admin_update_user_status(user_id: str, request: Request) -> dict[str, 
         new_status=status,
         reason=reason,
     )
+    # Fire onboarding email asynchronously — non-blocking, fires only on first approval.
+    if status == "active" and previous_status != "active":
+        _company_id_for_email = str(target.get("company_id") or "")
+        _company_name_for_email = ""
+        if _company_id_for_email:
+            try:
+                _company_name_for_email = str(
+                    await db.fetchval(
+                        "SELECT NULLIF(BTRIM(name), '') FROM companies WHERE id=$1 LIMIT 1",
+                        _company_id_for_email,
+                    )
+                    or ""
+                )
+            except Exception:
+                pass
+        asyncio.create_task(
+            send_onboarding_email_async(
+                db,
+                user_id=str(target.get("id") or ""),
+                user_name=str(target.get("name") or target.get("email") or ""),
+                user_email=str(target.get("email") or ""),
+                company_name=_company_name_for_email,
+            )
+        )
     return {"status": "ok", "user_id": user_id, "new_status": status}
 
 
