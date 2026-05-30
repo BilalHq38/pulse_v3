@@ -280,23 +280,18 @@ class Orchestrator:
         )
 
     def _retriever_for(self, source: SourceType, request: TurnRequest) -> SourceRetriever | None:
-        # Product retrievers are created per-request so they carry the correct
-        # customer_id and session_id for signed ref-token URLs. This ensures
-        # order tracking links back to the customer without exposing internal IDs.
-        if source == "product":
-            if (
-                request.mode == "proactive"
-                and request.workflow_kind == "upsell"
-                and request.order_id
-            ):
-                return OrderRelatedProductRetriever(order_id=request.order_id)
-            configured = self._retrievers.get(source)
-            if configured is not None and not isinstance(configured, ProductRetriever):
-                return configured
-            return ProductRetriever(
-                customer_id=request.customer_id,
-                session_id=request.session_id,
-            )
+        # Proactive upsell turns get a different product retriever: instead of
+        # an open-ended catalog search, pull only products linked to the
+        # purchased item via product_relationships. Falls back to the default
+        # retriever when no order is anchored (so the engine still has *some*
+        # product context to ground its suggestion on).
+        if (
+            source == "product"
+            and request.mode == "proactive"
+            and request.workflow_kind == "upsell"
+            and request.order_id
+        ):
+            return OrderRelatedProductRetriever(order_id=request.order_id)
         return self._retrievers.get(source)
 
     async def _retrieve(

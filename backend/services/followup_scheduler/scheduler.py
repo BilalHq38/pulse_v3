@@ -87,7 +87,7 @@ async def evaluate_order_event(
     Idempotent — replays of the same (order_id, workflow_kind, to_status)
     are no-ops because of uq_followups_idempotency_key.
     """
-    if to_status not in ("delivered", "confirmed"):
+    if to_status != "delivered":
         return {"scheduled": False, "reason": "not_a_delivery"}
 
     allowed, reason = await _engagement_ok(db, company_id=company_id, customer_id=customer_id)
