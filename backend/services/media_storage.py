@@ -15,9 +15,17 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse
 from shared.config import is_production
 
+from shared.config import is_production
+
 logger = logging.getLogger(__name__)
 
 STORAGE_BACKEND = os.environ.get("MEDIA_STORAGE_BACKEND") or os.environ.get("STORAGE_BACKEND", "local")
+
+if is_production() and STORAGE_BACKEND != "s3":
+    raise RuntimeError(
+        f"Production requires STORAGE_BACKEND=s3 (got '{STORAGE_BACKEND}'). "
+        "Set STORAGE_BACKEND=s3 and configure AWS_S3_BUCKET in your environment."
+    )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_UPLOAD_ROOT = PROJECT_ROOT / "uploads"
