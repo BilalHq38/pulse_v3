@@ -1,1021 +1,264 @@
-/* landingPage_v2.js — Pulse Engine Landing Page — v2 */
-/* eslint-disable */
-const { useState, useEffect, useRef, useCallback, memo } = React;
+import { Link } from 'react-router-dom';
+import PlatformLogo from '@/components/PlatformLogo';
+import {
+  Bot, BarChart3, Users, Zap, ArrowRight, Check, Globe, TrendingUp,
+  Clock, Inbox, Target, ChevronDown, Cpu, PieChart, BookOpen, FileText,
+  Mail, HelpCircle, Menu, X, MessageSquare,
+  Sparkles, Shield, Activity, Play, ChevronRight, Star,
+} from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { getLandingPricingPlans } from '@/data/publicPricingPlans';
+import {
+  NavBrandIconWhatsApp,
+  NavBrandIconInstagram,
+  NavBrandIconFacebook,
+  NavBrandIconEmail,
+} from '@/components/landing/ChannelBrandNavIcons';
 
-/* ══════════════════════════════════════════════════════════════
-   0. GLOBAL STYLES — injected once, covers all design tokens,
-      keyframes, class utilities, and responsive breakpoints.
-   ══════════════════════════════════════════════════════════════ */
-function GlobalStyles() {
-  return (
-    <style>{`
-      /* ── Google Fonts ──────────────────────────────────── */
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Syne:wght@700;800&family=Outfit:wght@400;500;600;700&display=swap');
+/* ─────────────────────────────────────────────────────────────────────────────
+   UTILITIES
+───────────────────────────────────────────────────────────────────────────── */
 
-      /* ── Design Tokens (dark — always dark per user request) */
-      :root, [data-theme="dark"] {
-        --bg:          #020817;
-        --bg2:         #070d1a;
-        --fg:          #f1f5f9;
-        --fg2:         #cbd5e1;
-        --fg3:         #64748b;
-        --surface:     #0c1324;
-        --surface2:    #111827;
-        --border:      rgba(255,255,255,0.07);
-        --border2:     rgba(255,255,255,0.14);
-        --accent:      #6366f1;
-        --accent2:     #818cf8;
-        --accent-dim:  rgba(99,102,241,0.12);
-        --blue:        #3b82f6;
-        --glass-bg:    rgba(7,9,22,0.88);
-        --font-d:      'Syne', 'Inter', sans-serif;
-        --font-b:      'Inter', system-ui, sans-serif;
-        --font-m:      'Outfit', 'Inter', monospace;
-        --noise:       url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
-      }
-
-      /* ── Reset & Base ──────────────────────────────────── */
-      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-      html { scroll-behavior: smooth; }
-      body {
-        background: var(--bg);
-        color: var(--fg);
-        font-family: var(--font-b);
-        font-size: 15px;
-        line-height: 1.6;
-        -webkit-font-smoothing: antialiased;
-        -moz-osx-font-smoothing: grayscale;
-        overflow-x: hidden;
-      }
-
-      /* ── Scrollbar ─────────────────────────────────────── */
-      ::-webkit-scrollbar { width: 6px; }
-      ::-webkit-scrollbar-track { background: var(--bg); }
-      ::-webkit-scrollbar-thumb { background: rgba(99,102,241,.4); border-radius: 3px; }
-      ::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,.7); }
-
-      /* ── Typography Utilities ──────────────────────────── */
-      .display {
-        font-family: var(--font-d);
-        font-size: clamp(36px, 5.5vw, 68px);
-        font-weight: 800;
-        line-height: 1.06;
-        letter-spacing: -0.04em;
-        color: var(--fg);
-      }
-      .h2 {
-        font-family: var(--font-d);
-        font-size: clamp(26px, 3.5vw, 44px);
-        font-weight: 800;
-        line-height: 1.1;
-        letter-spacing: -0.03em;
-        color: var(--fg);
-        margin-bottom: 14px;
-      }
-      .h3 {
-        font-family: var(--font-d);
-        font-size: clamp(20px, 2.5vw, 28px);
-        font-weight: 700;
-        line-height: 1.2;
-        letter-spacing: -0.02em;
-        color: var(--fg);
-        margin-bottom: 10px;
-      }
-      .body-lg {
-        font-size: 17px;
-        color: var(--fg2);
-        line-height: 1.7;
-      }
-      .body {
-        font-size: 15px;
-        color: var(--fg2);
-        line-height: 1.65;
-      }
-      .label {
-        display: inline-block;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: var(--accent2);
-        margin-bottom: 10px;
-      }
-
-      /* ── Layout ────────────────────────────────────────── */
-      .container {
-        max-width: 1200px;
-        margin: 0 auto;
-        padding: 0 24px;
-      }
-      .section     { padding: 100px 24px; }
-      .section-sm  { padding: 60px 24px; }
-
-      /* ── Buttons ───────────────────────────────────────── */
-      .btn {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 10px 20px;
-        border-radius: 10px;
-        font-size: 14px;
-        font-weight: 600;
-        font-family: var(--font-b);
-        text-decoration: none;
-        cursor: pointer;
-        transition: all 0.22s cubic-bezier(0.4,0,0.2,1);
-        border: none;
-        position: relative;
-        overflow: hidden;
-        white-space: nowrap;
-      }
-      .btn::after {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,0.14) 50%, transparent 60%);
-        transform: translateX(-100%);
-        transition: transform 0.5s;
-      }
-      .btn:hover::after { transform: translateX(100%); }
-
-      .btn-primary {
-        background: linear-gradient(135deg, #6366f1, #3b82f6);
-        color: #fff;
-        box-shadow: 0 4px 20px rgba(99,102,241,0.4);
-      }
-      .btn-primary:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 32px rgba(99,102,241,0.55);
-      }
-      .btn-ghost {
-        background: transparent;
-        color: var(--fg2);
-        border: 1px solid var(--border2);
-      }
-      .btn-ghost:hover {
-        background: var(--surface);
-        color: var(--fg);
-        border-color: var(--accent);
-      }
-      .btn-lg { padding: 14px 28px; font-size: 15px; border-radius: 12px; }
-      .btn-sm { padding: 7px 14px;  font-size: 13px; border-radius: 8px;  }
-
-      /* ── Badge ─────────────────────────────────────────── */
-      .badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 5px 14px;
-        border-radius: 100px;
-        background: rgba(99,102,241,0.1);
-        border: 1px solid rgba(99,102,241,0.3);
-        color: var(--accent2);
-        font-size: 12.5px;
-        font-weight: 600;
-        font-family: var(--font-b);
-      }
-
-      /* ── Card ──────────────────────────────────────────── */
-      .card {
-        background: var(--surface);
-        border: 1px solid var(--border);
-        border-radius: 20px;
-        padding: 28px;
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
-        transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
-      }
-      .card:hover {
-        border-color: var(--border2);
-        box-shadow: 0 8px 40px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.08);
-        transform: translateY(-2px);
-      }
-
-      /* ── Reveal animation ──────────────────────────────── */
-      .reveal {
-        opacity: 0;
-        transform: translateY(20px);
-        transition: opacity 0.7s cubic-bezier(0.4,0,0.2,1), transform 0.7s cubic-bezier(0.4,0,0.2,1);
-      }
-      .reveal.in {
-        opacity: 1;
-        transform: translateY(0);
-      }
-
-      /* ── Responsive ────────────────────────────────────── */
-      .hide-mobile  { display: flex; }
-      .show-mobile  { display: none; }
-      @media (max-width: 768px) {
-        .hide-mobile { display: none !important; }
-        .show-mobile { display: flex !important; }
-        .section     { padding: 60px 20px; }
-        .section-sm  { padding: 40px 20px; }
-      }
-
-      /* ── Keyframe Animations ───────────────────────────── */
-      @keyframes fadeIn {
-        from { opacity: 0; }
-        to   { opacity: 1; }
-      }
-      @keyframes slideUp {
-        from { opacity: 0; transform: translateY(16px); }
-        to   { opacity: 1; transform: translateY(0);    }
-      }
-      @keyframes slideDown {
-        from { opacity: 1; transform: translateY(0);    }
-        to   { opacity: 0; transform: translateY(10px); }
-      }
-      @keyframes blink {
-        0%, 100% { opacity: 1; }
-        50%       { opacity: 0; }
-      }
-      @keyframes typing {
-        0%, 80%, 100% { transform: translateY(0); }
-        40%            { transform: translateY(-4px); }
-      }
-      @keyframes msg-in {
-        from { opacity: 0; transform: translateY(6px); }
-        to   { opacity: 1; transform: translateY(0);   }
-      }
-      @keyframes marquee {
-        from { transform: translateX(0); }
-        to   { transform: translateX(-50%); }
-      }
-      @keyframes pulseGlow {
-        0%, 100% { box-shadow: 0 4px 14px rgba(99,102,241,.35); }
-        50%       { box-shadow: 0 4px 26px rgba(99,102,241,.65); }
-      }
-      @keyframes heroBlobA {
-        0%, 100% { transform: translate(0, 0) scale(1); }
-        50%       { transform: translate(40px, -30px) scale(1.08); }
-      }
-      @keyframes heroBlobB {
-        0%, 100% { transform: translate(0, 0) scale(1); }
-        50%       { transform: translate(-30px, 20px) scale(1.06); }
-      }
-      @keyframes scrollProg {
-        from { transform: scaleX(0); }
-        to   { transform: scaleX(1); }
-      }
-
-      /* ── Reduced motion ────────────────────────────────── */
-      @media (prefers-reduced-motion: reduce) {
-        *, *::before, *::after {
-          animation-duration: 0.01ms !important;
-          animation-iteration-count: 1 !important;
-          transition-duration: 0.01ms !important;
-        }
-        .reveal { opacity: 1; transform: none; }
-      }
-
-      /* ── Stats grid responsive ─────────────────────────── */
-      #stats .stats-grid {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 2px;
-      }
-      @media (max-width: 640px) {
-        #stats .stats-grid { grid-template-columns: 1fr 1fr; }
-      }
-
-      /* ── Testimonials grid responsive ──────────────────── */
-      .testimonials-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 20px;
-      }
-      @media (max-width: 768px) {
-        .testimonials-grid { grid-template-columns: 1fr; }
-      }
-
-      /* ── Features tab panel responsive ────────────────── */
-      .features-panel-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 48px;
-        align-items: center;
-      }
-      @media (max-width: 1024px) {
-        .features-panel-grid { grid-template-columns: 1fr; }
-      }
-
-      /* ── Footer grid responsive ────────────────────────── */
-      .footer-grid {
-        display: grid;
-        grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
-        gap: 40px;
-        margin-bottom: 48px;
-      }
-      @media (max-width: 1100px) {
-        .footer-grid { grid-template-columns: 1fr 1fr 1fr; }
-      }
-      @media (max-width: 700px) {
-        .footer-grid { grid-template-columns: 1fr 1fr; }
-      }
-
-      /* ── Pricing grid responsive ───────────────────────── */
-      .pricing-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 20px;
-        align-items: stretch;
-      }
-      @media (max-width: 900px) {
-        .pricing-grid { grid-template-columns: 1fr; }
-        .pricing-popular-card { transform: scale(1) !important; }
-      }
-
-      /* ── Globe tag focus visible ───────────────────────── */
-      .globe-tag:focus-visible {
-        outline: 2px solid var(--accent2);
-        outline-offset: 2px;
-      }
-
-      /* ── Noise overlay ─────────────────────────────────── */
-      .noise-overlay {
-        position: absolute;
-        inset: 0;
-        background-image: var(--noise);
-        opacity: 0.035;
-        pointer-events: none;
-        z-index: 0;
-      }
-
-      /* ── Shimmer btn ───────────────────────────────────── */
-      @keyframes shimmer {
-        from { background-position: -200% center; }
-        to   { background-position:  200% center; }
-      }
-    `}</style>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   0b. SCROLL PROGRESS BAR
-   ══════════════════════════════════════════════════════════════ */
-function ScrollProgress() {
-  const [width, setWidth] = useState(0);
+function useInView(options = {}) {
+  const ref = useRef(null);
+  const [isInView, setIsInView] = useState(false);
+  const { once = true, threshold = 0.12 } = options;
   useEffect(() => {
-    const onScroll = () => {
-      const el = document.documentElement;
-      const pct = (el.scrollTop / (el.scrollHeight - el.clientHeight)) * 100;
-      setWidth(Math.min(pct, 100));
-    };
-    window.addEventListener('scroll', onScroll, { passive: true });
-    return () => window.removeEventListener('scroll', onScroll);
-  }, []);
-  return (
-    <div style={{
-      position: 'fixed', top: 0, left: 0, zIndex: 99999,
-      width: `${width}%`, height: 2,
-      background: 'linear-gradient(90deg, #6366f1, #3b82f6, #818cf8)',
-      transition: 'width 0.1s linear',
-      transformOrigin: 'left',
-    }} aria-hidden="true" />
-  );
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) { setIsInView(true); if (once) observer.disconnect(); }
+    }, { threshold });
+    if (ref.current) observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [once, threshold]);
+  return [ref, isInView];
 }
 
-/* ══════════════════════════════════════════════════════════════
-   1. PLATFORM LOGO — kept EXACTLY as original (font, animation)
-   ══════════════════════════════════════════════════════════════ */
-function PlatformLogo({ textColor, imageWidth, fontSize, fontWeight }) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <a href="#"
-       onMouseEnter={() => setHovered(true)}
-       onMouseLeave={() => setHovered(false)}
-       style={{ display: 'flex', alignItems: 'center', gap: 10, textDecoration: 'none', cursor: 'pointer' }}>
-      {/* perspective wrapper fixes the 3-D flip visibility bug */}
-      <div style={{ perspective: 600 }}>
-        <div className="platform-logo-icon" style={{
-          width: imageWidth || 34,
-          height: imageWidth || 34,
-          borderRadius: 10,
-          background: 'linear-gradient(135deg,#2563eb,#6366f1)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          transition: 'transform 0.5s cubic-bezier(.4,0,.2,1)',
-          transform: hovered ? 'rotateY(180deg)' : 'rotateY(0deg)',
-          animation: 'pulseGlow 3s ease infinite',
-          boxShadow: '0 4px 14px rgba(99,102,241,.35)',
-        }}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-          </svg>
-        </div>
-      </div>
-      <span style={{
-        fontSize: fontSize || 17,
-        fontWeight: fontWeight || 800,
-        color: textColor || 'var(--fg)',
-        letterSpacing: '-0.5px',
-        fontFamily: 'var(--font-d)',
-      }}>
-        Pulse Engine
-      </span>
-    </a>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   2. NAVIGATION
-   ══════════════════════════════════════════════════════════════ */
-const MenuIcon = () => (
-  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/>
-  </svg>
-);
-const XIcon = () => (
-  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-  </svg>
-);
-
-function NavLink({ href, children }) {
-  const [hov, setHov] = useState(false);
-  return (
-    <a href={href}
-       onMouseEnter={() => setHov(true)}
-       onMouseLeave={() => setHov(false)}
-       style={{
-         fontSize: 14, color: hov ? 'var(--fg)' : 'var(--fg2)',
-         textDecoration: 'none', fontWeight: 500,
-         padding: '6px 4px', position: 'relative',
-         transition: 'color .2s', letterSpacing: '-.01em',
-       }}>
-      {children}
-      <span style={{
-        position: 'absolute', bottom: 0, left: 0, right: 0,
-        height: 2, borderRadius: 2,
-        background: 'linear-gradient(90deg,#6366f1,#3b82f6)',
-        transform: hov ? 'scaleX(1)' : 'scaleX(0)',
-        transformOrigin: 'left',
-        transition: 'transform 0.25s cubic-bezier(0.4,0,0.2,1)',
-      }} />
-    </a>
-  );
-}
-
-function PulseNav() {
-  const [scrolled, setScrolled] = useState(false);
-  const [mobileOpen, setMobileOpen] = useState(false);
-
-  useEffect(() => {
-    const fn = () => setScrolled(window.scrollY > 24);
-    window.addEventListener('scroll', fn, { passive: true });
-    fn();
-    return () => window.removeEventListener('scroll', fn);
-  }, []);
-
-  useEffect(() => {
-    document.body.style.overflow = mobileOpen ? 'hidden' : '';
-    return () => { document.body.style.overflow = ''; };
-  }, [mobileOpen]);
-
-  const links = [
-    { href: '#features',  label: 'Features'     },
-    { href: '#globe',     label: 'Integrations'  },
-    { href: '#pricing',   label: 'Pricing'       },
-    { href: '#faq',       label: 'FAQ'           },
-  ];
-
-  const closeMobile = () => { setMobileOpen(false); document.body.style.overflow = ''; };
-
-  return (
-    <>
-      <nav
-        className="pe-nav"
-        role="navigation"
-        aria-label="Main navigation"
-        style={{
-          position: 'fixed', top: 0, left: 0, right: 0, zIndex: 9000,
-          height: 68,
-          background: scrolled ? 'var(--glass-bg)' : 'transparent',
-          backdropFilter: scrolled ? 'blur(20px)' : 'none',
-          WebkitBackdropFilter: scrolled ? 'blur(20px)' : 'none',
-          borderBottom: scrolled ? '1px solid var(--border)' : '1px solid transparent',
-          transition: 'all .35s cubic-bezier(.4,0,.2,1)',
-        }}>
-        <div style={{ maxWidth: 1200, margin: '0 auto', padding: '0 24px', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <PlatformLogo fontWeight={800} />
-
-          <div className="hide-mobile" style={{ display: 'flex', alignItems: 'center', gap: 32 }}>
-            {links.map(l => <NavLink key={l.href} href={l.href}>{l.label}</NavLink>)}
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div className="hide-mobile" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <a href="#" style={{
-                fontSize: 13.5, fontWeight: 500, color: 'var(--fg2)',
-                textDecoration: 'none', padding: '8px 14px', borderRadius: 8,
-                border: '1px solid var(--border)', background: 'transparent', transition: 'all .2s',
-              }}
-              onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface)'; e.currentTarget.style.color = 'var(--fg)'; }}
-              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--fg2)'; }}>
-                Sign In
-              </a>
-              <a href="#" className="btn btn-primary btn-sm">Get Started</a>
-            </div>
-
-            <button
-              className="show-mobile"
-              onClick={() => setMobileOpen(!mobileOpen)}
-              aria-expanded={mobileOpen}
-              aria-label={mobileOpen ? 'Close menu' : 'Open menu'}
-              style={{ background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--fg)', borderRadius: 8, padding: 7, cursor: 'pointer', display: 'flex' }}>
-              {mobileOpen ? <XIcon /> : <MenuIcon />}
-            </button>
-          </div>
-        </div>
-      </nav>
-
-      {mobileOpen && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 8999, background: 'var(--bg)', paddingTop: 80, paddingLeft: 24, paddingRight: 24, display: 'flex', flexDirection: 'column', gap: 4, animation: 'fadeIn .2s ease' }}>
-          {links.map(l =>
-            <a key={l.href} href={l.href} onClick={closeMobile}
-               style={{ display: 'block', padding: '14px 16px', fontSize: 18, fontWeight: 600, fontFamily: 'var(--font-d)', color: 'var(--fg)', textDecoration: 'none', borderRadius: 10, borderBottom: '1px solid var(--border)' }}>
-              {l.label}
-            </a>
-          )}
-          <div style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <a href="#" className="btn btn-ghost" style={{ justifyContent: 'center' }} onClick={closeMobile}>Sign In</a>
-            <a href="#" className="btn btn-primary" style={{ justifyContent: 'center' }} onClick={closeMobile}>Get Started Free</a>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   3. HERO SECTION
-   ══════════════════════════════════════════════════════════════ */
-const PHRASES = ['Win More Customers.', 'Close Deals Faster.', 'Delight at Scale.', 'Grow Without Limits.'];
-
-function TypeWriter() {
-  const [idx, setIdx] = useState(0);
-  const [text, setText] = useState('');
-  const [del, setDel] = useState(false);
-  const [pause, setPause] = useState(false);
-
-  useEffect(() => {
-    if (pause) {
-      const t = setTimeout(() => { setPause(false); setDel(true); }, 1800);
-      return () => clearTimeout(t);
-    }
-    const phrase = PHRASES[idx];
-    if (!del) {
-      if (text.length < phrase.length) {
-        const t = setTimeout(() => setText(phrase.slice(0, text.length + 1)), 58);
-        return () => clearTimeout(t);
-      } else { setPause(true); }
-    } else {
-      if (text.length > 0) {
-        const t = setTimeout(() => setText(text.slice(0, -1)), 28);
-        return () => clearTimeout(t);
-      } else {
-        setDel(false);
-        setIdx(i => (i + 1) % PHRASES.length);
-      }
-    }
-  }, [text, del, idx, pause]);
-
-  return (
-    <span style={{ background: 'linear-gradient(135deg,#818cf8,#2563eb)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', display: 'inline-block', minWidth: 8 }}>
-      {text || '\u00A0'}
-      <span style={{ display: 'inline-block', width: 3, height: '0.85em', background: 'var(--accent2)', borderRadius: 2, verticalAlign: 'middle', marginLeft: 2, animation: 'blink 1s step-end infinite' }} aria-hidden="true" />
-    </span>
-  );
-}
-
-const BADGE_STATS = [
-  '★ Rated #1 AI CRM Platform · 2025',
-  '⚡ 70% of queries resolved by AI automatically',
-  '🚀 Trusted by 10,000+ teams worldwide',
-  '💬 WhatsApp · Instagram · Facebook · Email · Web Chat',
-];
-
-function AnimatedBadge() {
-  const [idx, setIdx]   = useState(0);
-  const [fade, setFade] = useState(true);
-  const fading = useRef(false);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (fading.current) return;
-      fading.current = true;
-      setFade(false);
-      const t = setTimeout(() => {
-        setIdx(i => (i + 1) % BADGE_STATS.length);
-        setFade(true);
-        fading.current = false;
-      }, 300);
-      return () => clearTimeout(t);
-    }, 3000);
-    return () => clearInterval(id);
-  }, []);
-
-  return (
-    <span className="badge"
-      style={{ marginBottom: 28, transition: 'opacity .3s ease', opacity: fade ? 1 : 0, display: 'inline-flex', padding: '6px 16px', fontSize: 13, letterSpacing: '.01em' }}>
-      <span style={{ marginRight: 7, fontSize: 11 }} aria-hidden="true">✦</span>
-      {BADGE_STATS[idx]}
-    </span>
-  );
-}
-
-function ChannelIcon({ ch, size = 14 }) {
-  const map = { whatsapp: '#25D366', facebook: '#1877F2', instagram: '#E1306C', email: '#0ea5e9', web_chat: '#8b5cf6' };
-  const letters = { whatsapp: 'W', facebook: 'F', instagram: 'I', email: 'E', web_chat: '💬' };
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: size, height: size, borderRadius: 3, background: map[ch] || '#475569', fontSize: size * 0.55, fontWeight: 700, color: '#fff', flexShrink: 0 }}>
-      {letters[ch]}
-    </span>
-  );
-}
-
-function InboxPreview() {
-  const [msgIdx, setMsgIdx] = useState(0);
-  const [showTyping, setShowTyping] = useState(false);
-  const [msgs, setMsgs] = useState([]);
-  const [started, setStarted] = useState(false);
-
-  const conversation = [
-    { from: 'customer', text: "Hi! My order hasn't arrived yet. Can you check?" },
-    { from: 'ai',       text: "Hi Sarah! Found order #PE-2847 — it shipped May 24th and is arriving today by 8 PM 📦" },
-    { from: 'customer', text: "Amazing, thank you! 🎉" },
-  ];
-
-  /* delay start by 800ms to avoid competing with page render */
-  useEffect(() => {
-    const t = setTimeout(() => setStarted(true), 800);
-    return () => clearTimeout(t);
-  }, []);
-
-  useEffect(() => {
-    if (!started) return;
-    let t;
-    const addNext = () => {
-      if (msgIdx >= conversation.length) {
-        t = setTimeout(() => { setMsgs([]); setMsgIdx(0); setShowTyping(false); }, 3500);
-        return;
-      }
-      const next = conversation[msgIdx];
-      if (next.from === 'ai') {
-        setShowTyping(true);
-        t = setTimeout(() => {
-          setShowTyping(false);
-          setMsgs(p => [...p, next]);
-          setMsgIdx(i => i + 1);
-          setTimeout(addNext, 1600);
-        }, 1500);
-      } else {
-        setMsgs(p => [...p, next]);
-        setMsgIdx(i => i + 1);
-        t = setTimeout(addNext, 1300);
-      }
-    };
-    t = setTimeout(addNext, msgIdx === 0 ? 0 : 0);
-    return () => clearTimeout(t);
-  }, [msgIdx, started]);
-
-  const columns = [
-    { ch: 'whatsapp', label: 'WhatsApp', color: '#25D366', count: 4, convos: [
-      { name: 'Sarah M.',   preview: "My order hasn't arrived", time: '2m',  unread: 2, ai: true,  sentiment: 'positive' },
-      { name: 'James K.',   preview: 'Is the Pro plan right?',  time: '8m',  unread: 1, ai: false, sentiment: 'neutral'  },
-      { name: 'Priya S.',   preview: "Thanks! That worked 🎉",  time: '15m', unread: 0, ai: true,  sentiment: 'positive' },
-    ]},
-    { ch: 'facebook', label: 'Facebook', color: '#1877F2', count: 2, convos: [
-      { name: 'TechCorp',  preview: 'Enterprise pricing?',     time: '10m', unread: 3, ai: true,  sentiment: 'positive' },
-      { name: 'Mike D.',   preview: 'Response time was bad!',  time: '1h',  unread: 0, ai: true,  sentiment: 'negative' },
-    ]},
-    { ch: 'instagram', label: 'Instagram', color: '#E1306C', count: 2, convos: [
-      { name: '@maya_d',   preview: 'Love your platform! 😍',  time: '5m',  unread: 3, ai: true,  sentiment: 'positive' },
-      { name: '@techxyz',  preview: 'API integration help?',   time: '20m', unread: 1, ai: false, sentiment: 'neutral'  },
-    ]},
-  ];
-  const sentColor = { positive: '#22c55e', neutral: '#f59e0b', negative: '#ef4444' };
-
-  return (
-    <div style={{ background: 'rgba(12,19,36,0.85)', borderRadius: 20, border: '1px solid rgba(255,255,255,0.1)', boxShadow: '0 32px 80px rgba(0,0,0,.6), 0 0 0 1px rgba(99,102,241,.12)', overflow: 'hidden', userSelect: 'none', backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 14px', background: 'rgba(7,9,22,0.8)', borderBottom: '1px solid var(--border)' }}>
-        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#ff5f57' }} />
-        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#febc2e' }} />
-        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#28c840' }} />
-        <div style={{ flex: 1, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5, padding: '3px 10px', fontSize: 10.5, color: 'var(--fg3)', marginLeft: 8, fontFamily: 'var(--font-m)' }}>app.pulseengine.io/inbox</div>
-        <div style={{ display: 'flex', gap: 3 }}>
-          {['W','F','I','E'].map((l, i) => (
-            <div key={l} style={{ width: 16, height: 16, borderRadius: 4, background: ['#25D366','#1877F2','#E1306C','#0ea5e9'][i], display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 700, color: '#fff' }}>{l}</div>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', height: 248 }}>
-        {columns.map((col, ci) => (
-          <div key={col.ch} style={{ width: 160, flexShrink: 0, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', background: ci === 0 ? 'rgba(7,9,22,0.6)' : 'var(--surface)' }}>
-            <div style={{ padding: '7px 10px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6, background: 'var(--surface)' }}>
-              <ChannelIcon ch={col.ch} size={14} />
-              <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--fg)', flex: 1 }}>{col.label}</span>
-              <span style={{ fontSize: 9.5, fontWeight: 600, color: 'var(--fg3)', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 4, padding: '0px 5px' }}>{col.count}</span>
-              <div style={{ width: 14, height: 14, borderRadius: 4, border: '1px solid var(--accent)', background: 'var(--accent-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
-                <span style={{ fontSize: 9, color: 'var(--accent2)', lineHeight: 1 }}>+</span>
-              </div>
-            </div>
-            <div style={{ flex: 1, padding: '5px 6px', display: 'flex', flexDirection: 'column', gap: 4, overflow: 'hidden' }}>
-              {col.convos.map((c, i) => (
-                <div key={i} style={{ padding: '7px 8px', borderRadius: 9, background: ci === 0 && i === 0 ? 'var(--accent-dim)' : 'var(--surface)', border: ci === 0 && i === 0 ? '1px solid rgba(99,102,241,.2)' : '1px solid var(--border)', cursor: 'pointer' }}>
-                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                    <div style={{ width: 22, height: 22, borderRadius: '50%', background: col.color, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 700, color: '#fff', flexShrink: 0 }}>{c.name[0]}</div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 1 }}>
-                        <span style={{ fontSize: 10.5, fontWeight: c.unread ? 700 : 500, color: 'var(--fg)', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis', maxWidth: 70 }}>{c.name}</span>
-                        <span style={{ fontSize: 9, color: 'var(--fg3)', flexShrink: 0 }}>{c.time}</span>
-                      </div>
-                      <p style={{ fontSize: 9.5, color: 'var(--fg3)', margin: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{c.preview}</p>
-                      <div style={{ display: 'flex', gap: 3, marginTop: 3 }}>
-                        {c.ai && <span style={{ fontSize: 8.5, padding: '0px 5px', borderRadius: 100, background: 'var(--accent-dim)', color: 'var(--accent2)', border: '1px solid rgba(99,102,241,.2)', fontWeight: 600 }}>AI</span>}
-                        <span style={{ fontSize: 8.5, padding: '0px 5px', borderRadius: 100, background: `${sentColor[c.sentiment]}18`, color: sentColor[c.sentiment], border: `1px solid ${sentColor[c.sentiment]}30` }}>{c.sentiment}</span>
-                      </div>
-                    </div>
-                    {c.unread > 0 && <span style={{ width: 14, height: 14, borderRadius: '50%', background: 'var(--accent)', color: '#fff', fontSize: 8, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>{c.unread}</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <div style={{ padding: '7px 12px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8, background: 'var(--surface)' }}>
-            <div style={{ width: 26, height: 26, borderRadius: '50%', background: '#25D366', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, color: '#fff', flexShrink: 0 }}>S</div>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--fg)' }}>Sarah M.</div>
-              <div style={{ fontSize: 9.5, color: '#25D366', display: 'flex', alignItems: 'center', gap: 3 }}>
-                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#25D366', display: 'inline-block' }} /> WhatsApp
-              </div>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', borderRadius: 20, background: 'var(--accent-dim)', border: '1px solid rgba(99,102,241,.2)' }}>
-              <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#22c55e', display: 'inline-block', animation: 'blink 1.5s ease infinite' }} aria-hidden="true" />
-              <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--accent2)' }}>AI Active</span>
-            </div>
-          </div>
-          <div style={{ flex: 1, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6, justifyContent: 'flex-end', overflow: 'hidden', background: 'rgba(2,8,23,0.6)' }}>
-            {msgs.map((m, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: m.from === 'ai' ? 'flex-start' : 'flex-end', animation: 'msg-in .3s ease' }}>
-                <div style={{ maxWidth: '80%', padding: '7px 10px', borderRadius: m.from === 'ai' ? '12px 12px 12px 3px' : '12px 12px 3px 12px', background: m.from === 'ai' ? 'var(--surface2)' : 'linear-gradient(135deg,var(--accent),var(--blue))', fontSize: 10.5, color: m.from === 'ai' ? 'var(--fg)' : '#fff', lineHeight: 1.45, border: m.from === 'ai' ? '1px solid var(--border)' : 'none' }}>
-                  {m.text}
-                </div>
-              </div>
-            ))}
-            {showTyping && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 5, animation: 'fadeIn .2s ease' }}>
-                <div style={{ display: 'flex', gap: 3, padding: '7px 10px', background: 'var(--surface2)', borderRadius: '12px 12px 12px 3px', border: '1px solid var(--border)' }}>
-                  {[0,1,2].map(i => <span key={i} style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--accent2)', display: 'block', animation: `typing .8s ease ${i*.15}s infinite` }} aria-hidden="true" />)}
-                </div>
-                <span style={{ fontSize: 9.5, color: 'var(--fg3)' }}>AI responding…</span>
-              </div>
-            )}
-          </div>
-          <div style={{ padding: '6px 10px', borderTop: '1px solid var(--border)', background: 'var(--surface)' }}>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center', background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px' }}>
-              <span style={{ flex: 1, fontSize: 10.5, color: 'var(--fg3)' }}>Reply via WhatsApp…</span>
-              <div style={{ width: 22, height: 22, borderRadius: 6, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function HeroSection({ onWatchDemo }) {
-  const [visible, setVisible] = useState(false);
-  useEffect(() => { const t = setTimeout(() => setVisible(true), 80); return () => clearTimeout(t); }, []);
-
-  return (
-    <section style={{ position: 'relative', minHeight: '100vh', display: 'flex', alignItems: 'center', overflow: 'hidden', paddingTop: 120, paddingBottom: 80 }}>
-      <div style={{ position: 'absolute', inset: 0, zIndex: 0, pointerEvents: 'none', overflow: 'hidden' }} aria-hidden="true">
-        <div style={{ position: 'absolute', top: -200, right: -100, width: 700, height: 700, borderRadius: '50%', background: 'radial-gradient(circle,rgba(99,102,241,.16) 0%,transparent 70%)', filter: 'blur(40px)', animation: 'heroBlobA 12s ease infinite' }} />
-        <div style={{ position: 'absolute', top: 100, left: -150, width: 500, height: 500, borderRadius: '50%', background: 'radial-gradient(circle,rgba(37,99,235,.12) 0%,transparent 70%)', filter: 'blur(40px)', animation: 'heroBlobB 16s ease infinite' }} />
-        <div style={{ position: 'absolute', bottom: -100, left: '35%', width: 400, height: 400, borderRadius: '50%', background: 'radial-gradient(circle,rgba(129,140,248,.08) 0%,transparent 70%)', filter: 'blur(40px)' }} />
-        <div style={{ position: 'absolute', inset: 0, backgroundImage: 'linear-gradient(rgba(99,102,241,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,.04) 1px,transparent 1px)', backgroundSize: '60px 60px', opacity: .5 }} />
-        <div className="noise-overlay" />
-      </div>
-
-      <div className="container" style={{ position: 'relative', zIndex: 1, width: '100%' }}>
-        <div style={{ maxWidth: 780, margin: '0 auto', textAlign: 'center', marginBottom: 60 }}>
-          <div style={{ opacity: visible ? 1 : 0, transform: visible ? 'translateY(0)' : 'translateY(20px)', transition: 'all .6s cubic-bezier(.4,0,.2,1)' }}>
-            <AnimatedBadge />
-          </div>
-
-          {/* FIX: Single <h1> wrapping both lines — no more double h1 */}
-          <h1 className="display" style={{ color: 'var(--fg)', marginBottom: 28, opacity: visible ? 1 : 0, transform: visible ? 'translateY(0)' : 'translateY(24px)', transition: 'all .7s cubic-bezier(.4,0,.2,1) .08s' }}>
-            <TypeWriter />
-            <br />
-            <span style={{ color: 'var(--fg)' }}>All From One Inbox.</span>
-          </h1>
-
-          <p className="body-lg" style={{ maxWidth: 560, margin: '0 auto 36px', opacity: visible ? 1 : 0, transform: visible ? 'translateY(0)' : 'translateY(20px)', transition: 'all .7s cubic-bezier(.4,0,.2,1) .16s' }}>
-            Unify WhatsApp, Instagram, Facebook, Email &amp; Web Chat into one AI-powered workspace. Capture leads, automate follow-ups, and close deals — 24/7.
-          </p>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, justifyContent: 'center', marginBottom: 28, opacity: visible ? 1 : 0, transform: visible ? 'translateY(0)' : 'translateY(16px)', transition: 'all .7s cubic-bezier(.4,0,.2,1) .24s' }}>
-            <a href="#" className="btn btn-primary btn-lg">
-              Start Free Trial
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            </a>
-            <button onClick={onWatchDemo} className="btn btn-ghost btn-lg" aria-label="Watch product demo">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              Watch Demo
-            </button>
-          </div>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 22, fontSize: 13, color: 'var(--fg3)', opacity: visible ? 1 : 0, transition: 'all .7s cubic-bezier(.4,0,.2,1) .32s' }}>
-            {['Free 14-day trial','No credit card required','Cancel anytime'].map(t => (
-              <span key={t} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-                {t}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        {/* Floating stat badges */}
-        <div style={{ maxWidth: 820, margin: '0 auto', position: 'relative', opacity: visible ? 1 : 0, transform: visible ? 'translateY(0)' : 'translateY(48px)', transition: 'all 1s cubic-bezier(.4,0,.2,1) .4s' }}>
-          <div style={{ position: 'absolute', top: -18, left: -20, zIndex: 10, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '6px 12px', fontSize: 11, fontWeight: 600, color: 'var(--fg)', boxShadow: '0 8px 24px rgba(0,0,0,.4)', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', animation: 'blink 2s ease infinite' }} aria-hidden="true" />
-            🤖 AI resolved · 2s ago
-          </div>
-          <div style={{ position: 'absolute', top: 30, right: -24, zIndex: 10, background: 'var(--surface)', border: '1px solid rgba(99,102,241,.3)', borderRadius: 10, padding: '6px 12px', fontSize: 11, fontWeight: 600, color: 'var(--accent2)', boxShadow: '0 8px 24px rgba(0,0,0,.4)', whiteSpace: 'nowrap' }}>
-            📈 Lead score: <strong>88</strong>
-          </div>
-          <InboxPreview />
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   4. TRUST BAR (NEW)
-   ══════════════════════════════════════════════════════════════ */
-function TrustBar() {
-  const brands = ['Shopify','Salesforce','HubSpot','Zendesk','Stripe','Intercom','Twilio','Slack'];
-  return (
-    <section style={{ padding: '28px 24px', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)', background: 'var(--bg2)', overflow: 'hidden' }} aria-label="Trusted by">
-      <div className="container">
-        <div style={{ textAlign: 'center', marginBottom: 20 }}>
-          <span style={{ fontSize: 11, color: 'var(--fg3)', letterSpacing: '.12em', textTransform: 'uppercase', fontFamily: 'var(--font-m)' }}>Trusted by teams at</span>
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: '14px 28px' }}>
-          {brands.map(b => (
-            <span key={b} style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--fg3)', letterSpacing: '.02em', opacity: .5, fontFamily: 'var(--font-d)', transition: 'opacity .2s, color .2s', cursor: 'default' }}
-              onMouseEnter={e => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.color = 'var(--fg)'; }}
-              onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; e.currentTarget.style.color = 'var(--fg3)'; }}>
-              {b}
-            </span>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   5. STATS SECTION
-   ══════════════════════════════════════════════════════════════ */
-function Counter({ value, suffix = '', prefix = '', duration = 1800 }) {
+function AnimatedCounter({ value, suffix = '', duration = 2000 }) {
   const [count, setCount] = useState(0);
-  const [visible, setVisible] = useState(false);
-  const ref = useRef(null);
-  const num = parseFloat(String(value).replace(/[^0-9.]/g, '')) || 0;
-  const hasDecimal = String(value).includes('.');
-
+  const [ref, isInView] = useInView();
+  const numericValue = parseFloat(value.replace(/[^0-9.]/g, '')) || 0;
+  const hasDecimal = value.includes('.');
   useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setVisible(true); obs.disconnect(); } }, { threshold: .2 });
-    if (ref.current) obs.observe(ref.current);
-    return () => obs.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (!visible) return;
-    let start = 0, frame;
-    const step = () => {
-      start += num / (duration / 16);
-      if (start >= num) { setCount(num); return; }
-      setCount(hasDecimal ? Math.round(start * 10) / 10 : Math.floor(start));
-      frame = requestAnimationFrame(step);
-    };
-    frame = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(frame);
-  }, [visible, num, duration, hasDecimal]);
-
-  return <span ref={ref}>{prefix}{hasDecimal ? count.toFixed(1) : count}{suffix}</span>;
+    if (!isInView) return;
+    let start = 0;
+    const increment = numericValue / (duration / 16);
+    const timer = setInterval(() => {
+      start += increment;
+      if (start >= numericValue) { setCount(numericValue); clearInterval(timer); }
+      else setCount(hasDecimal ? Math.round(start * 10) / 10 : Math.floor(start));
+    }, 16);
+    return () => clearInterval(timer);
+  }, [isInView, numericValue, duration, hasDecimal]);
+  return <span ref={ref}>{hasDecimal ? count.toFixed(1) : count}{suffix}</span>;
 }
 
-function StatsSection() {
-  const stats = [
-    { value: '70', suffix: '%', label: 'AI Resolution Rate',   sub: 'Queries resolved without human'  },
-    { value: '3',  suffix: '×', label: 'Faster Response Time', sub: 'vs. manual handling'             },
-    { value: '40', suffix: '%', label: 'More Leads Captured',  sub: 'From inbound conversations'      },
-    { value: '4.9',suffix: '/5',label: 'Average CSAT Score',   sub: 'Industry avg: 3.8'               },
-  ];
-  const accentColors = ['#6366f1','#3b82f6','#22c55e','#f59e0b'];
+/* ─────────────────────────────────────────────────────────────────────────────
+   FAQ ITEM
+───────────────────────────────────────────────────────────────────────────── */
+function FaqItem({ q, a, dark = false }) {
+  const [open, setOpen] = useState(false);
+  const borderColor = dark ? 'rgba(255,255,255,0.08)' : '#e8ecf0';
+  const bgOpen = dark ? 'rgba(255,255,255,0.04)' : '#f8fafc';
+  const bgClosed = dark ? 'transparent' : '#fff';
+  const questionColor = dark ? '#f1f5f9' : '#0f172a';
+  const answerColor = dark ? '#94a3b8' : '#64748b';
   return (
-    <section id="stats" className="section-sm" style={{ background: 'var(--bg2)', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }}>
-      <div className="container">
-        <div className="stats-grid">
-          {stats.map((s, i) => (
-            <div key={s.label} style={{ padding: '24px 16px', textAlign: 'center', borderRight: i < 3 ? '1px solid var(--border)' : 'none' }}>
-              <div style={{ fontFamily: 'var(--font-d)', fontSize: 'clamp(28px,3.5vw,44px)', fontWeight: 800, color: accentColors[i], lineHeight: 1, marginBottom: 6, textShadow: `0 0 40px ${accentColors[i]}55` }}>
-                <Counter value={s.value} suffix={s.suffix} duration={1800 + i * 150} />
-              </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--fg)', marginBottom: 3 }}>{s.label}</div>
-              <div style={{ fontSize: 11.5, color: 'var(--fg3)' }}>{s.sub}</div>
+    <div style={{ border: `1px solid ${borderColor}`, borderRadius: 14, overflow: 'hidden', marginBottom: 8 }}>
+      <button onClick={() => setOpen(!open)}
+        style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', background: open ? bgOpen : bgClosed, cursor: 'pointer', border: 'none', textAlign: 'left', transition: 'background 0.2s' }}>
+        <span style={{ fontSize: 14.5, fontWeight: 600, color: questionColor, lineHeight: 1.4 }}>{q}</span>
+        <span style={{ color: open ? '#3b82f6' : (dark ? '#475569' : '#94a3b8'), transition: 'transform 0.3s', transform: open ? 'rotate(45deg)' : 'rotate(0deg)', fontSize: 22, flexShrink: 0, lineHeight: 1, marginLeft: 16 }}>+</span>
+      </button>
+      <div style={{ maxHeight: open ? 220 : 0, overflow: 'hidden', transition: 'max-height 0.4s cubic-bezier(0.4,0,0.2,1)' }}>
+        <p style={{ padding: '0 24px 20px', fontSize: 14, color: answerColor, lineHeight: 1.75, margin: 0 }}>{a}</p>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   NAV DROPDOWN
+───────────────────────────────────────────────────────────────────────────── */
+function NavDropdown({ label, items, dark }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const labelColor = dark ? (open ? '#fff' : 'rgba(255,255,255,0.7)') : (open ? '#0f172a' : '#64748b');
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}
+      onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <button style={{
+        display: 'flex', alignItems: 'center', gap: 4, fontSize: 14,
+        color: labelColor, background: 'none', border: 'none', cursor: 'pointer',
+        padding: '6px 2px', fontWeight: open ? 600 : 400, transition: 'color 0.2s', position: 'relative',
+      }}>
+        <span style={{ position: 'relative' }}>
+          {label}
+          <span style={{ position: 'absolute', bottom: -2, left: 0, right: 0, height: 2, background: 'linear-gradient(90deg,#2563eb,#6366f1)', borderRadius: 2, transform: open ? 'scaleX(1)' : 'scaleX(0)', transformOrigin: 'left', transition: 'transform 0.25s cubic-bezier(0.4,0,0.2,1)' }} />
+        </span>
+        <ChevronDown size={13} style={{ transition: 'transform 0.25s', transform: open ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+      </button>
+      <div style={{
+        position: 'absolute', top: 'calc(100% + 10px)', left: '50%',
+        transform: open ? 'translateX(-50%) translateY(0) scale(1)' : 'translateX(-50%) translateY(-8px) scale(0.96)',
+        opacity: open ? 1 : 0, pointerEvents: open ? 'all' : 'none',
+        transition: 'all 0.22s cubic-bezier(0.4,0,0.2,1)',
+        background: '#fff', border: '1px solid #e8ecf0',
+        borderRadius: 16, boxShadow: '0 20px 50px rgba(0,0,0,0.14)', padding: '8px',
+        minWidth: 248, zIndex: 100,
+      }}>
+        <div style={{ position: 'absolute', top: -5, left: '50%', transform: 'translateX(-50%)', width: 10, height: 10, background: '#fff', border: '1px solid #e8ecf0', borderRight: 'none', borderBottom: 'none', rotate: '45deg' }} />
+        {items.map((item, i) => (
+          <a key={i} href={item.href}
+            style={{ display: 'flex', alignItems: 'flex-start', gap: 11, padding: '10px 12px', borderRadius: 10, textDecoration: 'none', color: 'inherit', transition: 'background 0.15s', cursor: 'pointer' }}
+            onMouseEnter={e => e.currentTarget.style.background = '#f5f7fa'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+            <div style={{ width: 34, height: 34, borderRadius: 9, display: 'flex', alignItems: 'center', justifyContent: 'center', background: item.color || '#eff6ff', flexShrink: 0, marginTop: 1 }}>
+              {item.icon}
             </div>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a' }}>{item.label}</div>
+              {item.desc && <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 1 }}>{item.desc}</div>}
+            </div>
+          </a>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function NavLink({ href, children, dark }) {
+  const [hovered, setHovered] = useState(false);
+  const color = dark ? (hovered ? '#fff' : 'rgba(255,255,255,0.7)') : (hovered ? '#0f172a' : '#64748b');
+  return (
+    <a href={href} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
+      style={{ position: 'relative', fontSize: 14, color, textDecoration: 'none', fontWeight: hovered ? 600 : 400, padding: '6px 2px', transition: 'color 0.2s' }}>
+      {children}
+      <span style={{ position: 'absolute', bottom: -2, left: 0, right: 0, height: 2, background: 'linear-gradient(90deg,#2563eb,#6366f1)', borderRadius: 2, transform: hovered ? 'scaleX(1)' : 'scaleX(0)', transformOrigin: 'left', transition: 'transform 0.25s cubic-bezier(0.4,0,0.2,1)' }} />
+    </a>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   HERO — INTERACTIVE CRM PIPELINE VISUALIZATION
+───────────────────────────────────────────────────────────────────────────── */
+function PipelineVisualization() {
+  const [activeStage, setActiveStage] = useState(1);
+  const [pulseCard, setPulseCard] = useState(null);
+
+  const stages = [
+    { id: 0, label: 'New', count: 12, color: '#64748b', bg: '#f1f5f9' },
+    { id: 1, label: 'Qualified', count: 8, color: '#2563eb', bg: '#eff6ff' },
+    { id: 2, label: 'Proposal', count: 5, color: '#7c3aed', bg: '#f5f3ff' },
+    { id: 3, label: 'Closing', count: 3, color: '#059669', bg: '#ecfdf5' },
+  ];
+
+  const leads = [
+    { name: 'Aisha Rahman', channel: 'wa', score: 87, stage: 1, value: '$4,200', tag: 'Hot' },
+    { name: 'Marcus Chen', channel: 'ig', score: 72, stage: 1, value: '$1,800', tag: 'Warm' },
+    { name: 'Sofia Kowalski', channel: 'email', score: 91, stage: 2, value: '$8,500', tag: 'Hot' },
+    { name: 'James Okonkwo', channel: 'wa', score: 64, stage: 0, value: '$950', tag: 'New' },
+    { name: 'Lena Müller', channel: 'ig', score: 95, stage: 3, value: '$12,000', tag: 'Won' },
+  ];
+
+  const channelColors = { wa: '#25D366', ig: '#E1306C', email: '#2563eb', fb: '#1877F2' };
+  const channelLabels = { wa: 'WA', ig: 'IG', email: 'EM', fb: 'FB' };
+  const tagColors = {
+    Hot: { bg: '#fef3c7', color: '#92400e' },
+    Warm: { bg: '#dbeafe', color: '#1e40af' },
+    New: { bg: '#f1f5f9', color: '#475569' },
+    Won: { bg: '#d1fae5', color: '#065f46' },
+  };
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setActiveStage(s => (s + 1) % 4);
+      setPulseCard(Math.floor(Math.random() * leads.length));
+      setTimeout(() => setPulseCard(null), 800);
+    }, 2400);
+    return () => clearInterval(t);
+  }, [leads.length]);
+
+  return (
+    <div style={{ background: '#fff', borderRadius: 20, border: '1px solid #e8ecf0', boxShadow: '0 24px 64px rgba(15,23,42,0.10)', overflow: 'hidden' }}>
+      {/* Browser chrome */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '11px 16px', background: '#f8fafc', borderBottom: '1px solid #f1f5f9' }}>
+        <div style={{ width: 11, height: 11, borderRadius: '50%', background: '#fc5c57' }} />
+        <div style={{ width: 11, height: 11, borderRadius: '50%', background: '#fdbc2c' }} />
+        <div style={{ width: 11, height: 11, borderRadius: '50%', background: '#34c84a' }} />
+        <div style={{ marginLeft: 12, flex: 1, background: '#fff', border: '1px solid #e8ecf0', borderRadius: 6, padding: '4px 12px', fontSize: 11, color: '#94a3b8', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e' }} />
+          app.pulseengine.io/pipeline
+        </div>
+        <div style={{ display: 'flex', gap: 6, marginLeft: 12 }}>
+          {['AI', 'Live'].map(t => (
+            <span key={t} style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 5, background: t === 'AI' ? '#eff6ff' : '#ecfdf5', color: t === 'AI' ? '#2563eb' : '#059669' }}>{t}</span>
           ))}
         </div>
       </div>
-    </section>
-  );
-}
 
-/* ══════════════════════════════════════════════════════════════
-   6. FEATURES SECTION
-   ══════════════════════════════════════════════════════════════ */
-function FeaturesChIcon({ ch, size = 22 }) {
-  const cfg = {
-    whatsapp:  { bg: '#25D366',   svg: <path fill="white" d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/> },
-    facebook:  { bg: '#1877F2',   svg: <path fill="white" d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/> },
-    instagram: { bg: 'radial-gradient(circle at 30% 107%,#fdf497 0%,#fd5949 45%,#d6249f 60%,#285AEB 90%)', svg: <path fill="white" d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/> },
-    email:     { bg: 'linear-gradient(135deg,#0ea5e9,#0284c7)', svg: <><path fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" points="22,6 12,13 2,6"/></> },
-    web_chat:  { bg: '#1e293b',   svg: <path fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/> },
-  };
-  const c = cfg[ch] || cfg.web_chat;
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: size, height: size, borderRadius: size * 0.22, background: c.bg, flexShrink: 0 }}>
-      <svg viewBox="0 0 24 24" width={size*.68} height={size*.68}>{c.svg}</svg>
-    </span>
-  );
-}
-
-function InboxPreviewUI() {
-  const cols = [
-    { ch: 'whatsapp', label: 'WhatsApp', count: 2 },
-    { ch: 'facebook', label: 'Facebook', count: 0 },
-    { ch: 'instagram', label: 'Instagram', count: 0 },
-  ];
-  /* FIX: replaced test names "Ali Bhi"/"M Bilal Zong" with professional personas */
-  const convos = [
-    { name: 'Sarah Mitchell', initials: 'S', bg: '#10b981', time: '10:11 AM', score: 88, unread: 2,
-      msg: "Hi, I need help with my recent order — it hasn't arrived yet.",
-      reply: "Hi Sarah! Order #PE-2847 shipped May 24th and arrives today by 8 PM 📦", ai: true },
-    { name: 'James Torres',   initials: 'J', bg: '#6366f1', time: '09:43 AM', score: 64, unread: 1,
-      msg: 'What is the difference between your Pro and Enterprise plans?',
-      reply: 'Great question! Pro is great for growing teams. Enterprise adds SSO, custom AI agents and dedicated support.', ai: true },
-    { name: 'Priya Sharma',   initials: 'P', bg: '#f59e0b', time: '09:12 AM', score: 52, unread: 0,
-      msg: "Thanks! That worked perfectly 🎉",
-      reply: "Wonderful! Let me know if you need anything else.", ai: true },
-  ];
-
-  return (
-    <div style={{ background: 'var(--surface)', borderRadius: 14, border: '1px solid var(--border)', overflow: 'hidden', minHeight: 320 }}>
-      <div style={{ display: 'flex', gap: 0 }}>
-        <div style={{ width: 80, background: 'var(--bg2)', borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 4, padding: '10px 6px' }}>
-          {cols.map(c => (
-            <div key={c.ch} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, padding: '8px 4px', borderRadius: 10, cursor: 'pointer', position: 'relative' }}>
-              <FeaturesChIcon ch={c.ch} size={24} />
-              <span style={{ fontSize: 8.5, fontWeight: 600, color: 'var(--fg3)' }}>{c.label}</span>
-              {c.count > 0 && <span style={{ position: 'absolute', top: 4, right: 4, width: 14, height: 14, borderRadius: '50%', background: 'var(--accent)', color: '#fff', fontSize: 8, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{c.count}</span>}
+      {/* Pipeline board */}
+      <div style={{ padding: '16px 16px 14px' }}>
+        {/* Stage headers */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 10 }}>
+          {stages.map(s => (
+            <div key={s.id} style={{ textAlign: 'center', padding: '7px 8px', borderRadius: 10, background: activeStage === s.id ? s.bg : '#fafafa', border: `1px solid ${activeStage === s.id ? s.color + '30' : '#f1f5f9'}`, transition: 'all 0.5s ease' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: activeStage === s.id ? s.color : '#94a3b8', transition: 'color 0.5s' }}>{s.label}</div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: activeStage === s.id ? s.color : '#cbd5e1', transition: 'color 0.5s' }}>{s.count}</div>
             </div>
           ))}
         </div>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-          <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--border)', fontSize: 11, fontWeight: 700, color: 'var(--fg)', background: 'var(--surface)' }}>All Conversations</div>
-          <div style={{ flex: 1, overflow: 'hidden' }}>
-            {convos.map((c, i) => (
-              <div key={i} style={{ padding: '10px 12px', borderBottom: '1px solid var(--border)', background: i === 0 ? 'var(--accent-dim)' : 'transparent', cursor: 'pointer' }}>
-                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                  <div style={{ width: 32, height: 32, borderRadius: '50%', background: c.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#fff', flexShrink: 0, position: 'relative' }}>
-                    {c.initials}
-                    {c.ai && <span style={{ position: 'absolute', bottom: -2, right: -2, width: 12, height: 12, borderRadius: '50%', background: 'var(--accent)', border: '2px solid var(--surface)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span style={{ fontSize: 6, color: '#fff', fontWeight: 800 }}>AI</span></span>}
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-                      <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--fg)' }}>{c.name}</span>
-                      <span style={{ fontSize: 10, color: 'var(--fg3)' }}>{c.time}</span>
-                    </div>
-                    <p style={{ fontSize: 11, color: 'var(--fg3)', margin: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{c.msg}</p>
-                    <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
-                      <span style={{ fontSize: 9, padding: '1px 7px', borderRadius: 100, background: 'var(--accent-dim)', color: 'var(--accent2)', border: '1px solid rgba(99,102,241,.2)', fontWeight: 600 }}>AI handled</span>
-                      <span style={{ fontSize: 9, padding: '1px 7px', borderRadius: 100, background: 'rgba(34,197,94,.1)', color: '#22c55e', fontWeight: 600 }}>Score: {c.score}</span>
-                    </div>
-                  </div>
-                  {c.unread > 0 && <span style={{ width: 16, height: 16, borderRadius: '50%', background: 'var(--accent)', color: '#fff', fontSize: 9, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>{c.unread}</span>}
+
+        {/* Lead cards */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {leads.map((lead, i) => {
+            const tag = tagColors[lead.tag];
+            const isPulsing = pulseCard === i;
+            return (
+              <div key={lead.name} style={{
+                display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px',
+                background: isPulsing ? '#f8fafc' : '#fff',
+                borderRadius: 11, border: `1px solid ${isPulsing ? '#2563eb30' : '#f1f5f9'}`,
+                transition: 'all 0.4s ease',
+                transform: isPulsing ? 'translateX(3px)' : 'translateX(0)',
+              }}>
+                {/* Channel dot */}
+                <div style={{ width: 28, height: 28, borderRadius: 8, background: channelColors[lead.channel] + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <span style={{ fontSize: 9, fontWeight: 800, color: channelColors[lead.channel] }}>{channelLabels[lead.channel]}</span>
+                </div>
+                {/* Name */}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: '#0f172a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{lead.name}</div>
+                  <div style={{ fontSize: 10.5, color: '#94a3b8' }}>{lead.value}</div>
+                </div>
+                {/* Score */}
+                <div style={{ fontSize: 11, fontWeight: 700, color: lead.score >= 80 ? '#059669' : lead.score >= 65 ? '#2563eb' : '#94a3b8', background: lead.score >= 80 ? '#ecfdf5' : lead.score >= 65 ? '#eff6ff' : '#f8fafc', padding: '2px 7px', borderRadius: 6 }}>
+                  {lead.score}
+                </div>
+                {/* Tag */}
+                <div style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 6, background: tag.bg, color: tag.color, flexShrink: 0 }}>
+                  {lead.tag}
                 </div>
               </div>
+            );
+          })}
+        </div>
+
+        {/* AI activity bar */}
+        <div style={{ marginTop: 10, padding: '8px 12px', background: 'linear-gradient(90deg, #eff6ff, #f5f3ff)', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 20, height: 20, borderRadius: 6, background: 'linear-gradient(135deg,#2563eb,#6366f1)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <Bot size={11} color="#fff" />
+          </div>
+          <span style={{ fontSize: 11, color: '#475569', fontWeight: 500 }}>AI qualified 3 leads & sent 2 follow-ups in the last hour</span>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 3 }}>
+            {[0, 1, 2].map(j => (
+              <div key={j} style={{ width: 4, height: 4, borderRadius: '50%', background: '#2563eb', animation: `pulse-dot 1.4s ease-in-out ${j * 0.2}s infinite` }} />
             ))}
           </div>
         </div>
@@ -1024,990 +267,1280 @@ function InboxPreviewUI() {
   );
 }
 
-function AutomationPreviewUI() {
-  const nodes = [
-    { type: 'Trigger',   label: 'New WhatsApp message received',      ico: '⚡', color: '#f59e0b' },
-    { type: 'Condition', label: 'AI: Is it a product enquiry?',        ico: '🤖', color: '#818cf8' },
-    { type: 'Action',    label: 'Send product catalogue reply',         ico: '📨', color: '#22c55e' },
-    { type: 'Action',    label: 'Score lead & update CRM pipeline',     ico: '🎯', color: '#3b82f6' },
-    { type: 'Condition', label: 'Lead score ≥ 70?',                    ico: '📊', color: '#ec4899' },
-    { type: 'Action',    label: 'Assign to sales agent + send Slack',   ico: '👤', color: '#f97316' },
-  ];
-  return (
-    <div style={{ background: 'var(--surface)', borderRadius: 14, border: '1px solid var(--border)', padding: 16 }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--fg)', marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span>⚙️ Lead Qualification Flow</span>
-        <span style={{ fontSize: 10, padding: '2px 8px', borderRadius: 100, background: 'rgba(34,197,94,.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,.2)' }}>● Active</span>
-      </div>
-      {nodes.map((n, i) => (
-        <React.Fragment key={i}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--surface2)', cursor: 'pointer', transition: 'border-color .2s' }}
-            onMouseEnter={e => { e.currentTarget.style.borderColor = n.color; }}
-            onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; }}>
-            <span style={{ fontSize: 14, flexShrink: 0 }}>{n.ico}</span>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 9.5, fontWeight: 700, color: n.color, letterSpacing: '.08em', textTransform: 'uppercase' }}>{n.type}</div>
-              <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--fg)', marginTop: 1 }}>{n.label}</div>
-            </div>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--fg3)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
-          </div>
-          {i < nodes.length - 1 && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingLeft: 22, height: 18 }}>
-              <div style={{ width: 2, height: 18, background: 'var(--border)', borderRadius: 2 }} />
-            </div>
-          )}
-        </React.Fragment>
-      ))}
-      <div style={{ display: 'flex', gap: 6, marginTop: 14 }}>
-        <button style={{ fontSize: 11, padding: '5px 12px', borderRadius: 7, border: '1px dashed var(--border2)', background: 'transparent', color: 'var(--fg3)', cursor: 'pointer', fontFamily: 'var(--font-b)' }}>+ Add Step</button>
-        <button style={{ fontSize: 11, padding: '5px 12px', borderRadius: 7, border: '1px dashed var(--border2)', background: 'transparent', color: 'var(--fg3)', cursor: 'pointer', fontFamily: 'var(--font-b)' }}>+ Add Branch</button>
-        <button style={{ fontSize: 11, padding: '5px 12px', borderRadius: 7, border: 'none', background: 'var(--accent)', color: '#fff', cursor: 'pointer', fontFamily: 'var(--font-b)', marginLeft: 'auto' }}>Save</button>
-      </div>
-    </div>
-  );
-}
-
-function LeadsPreviewUI() {
-  const leads = [
-    { name: 'Sarah Mitchell', initials: 'S', bg: '#2563eb',  grade: 'hot',  score: 88, status: 'Qualified', ch: 'whatsapp', company: 'Northstar Labs' },
-    { name: 'James Torres',   initials: 'J', bg: '#8b5cf6',  grade: 'warm', score: 64, status: 'Contacted', ch: 'instagram', company: 'TechVentures' },
-    { name: 'Priya Sharma',   initials: 'P', bg: '#10b981',  grade: 'warm', score: 52, status: 'New',       ch: 'email',     company: 'GrowthCo' },
-    { name: 'Marcus Webb',    initials: 'M', bg: '#f59e0b',  grade: 'cold', score: 31, status: 'New',       ch: 'facebook',  company: 'Startup XYZ' },
-  ];
-  const gradeStyle = { hot: 'rgba(239,68,68,.12)', warm: 'rgba(245,158,11,.12)', cold: 'rgba(59,130,246,.12)' };
-  const gradeColor = { hot: '#ef4444', warm: '#d97706', cold: '#2563eb' };
-  const statusStyle = { Qualified: 'rgba(16,185,129,.12)', Contacted: 'rgba(6,182,212,.12)', New: 'rgba(37,99,235,.12)' };
-  const statusColor = { Qualified: '#10b981', Contacted: '#0891b2', New: '#2563eb' };
-  return (
-    <div style={{ background: 'var(--surface)', borderRadius: 14, border: '1px solid var(--border)', overflow: 'hidden', minHeight: 320 }}>
-      <div style={{ padding: '10px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--fg)' }}>Leads Pipeline</span>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <span style={{ fontSize: 10.5, padding: '2px 8px', borderRadius: 100, background: 'rgba(239,68,68,.12)', color: '#ef4444', border: '1px solid rgba(239,68,68,.25)', fontWeight: 600 }}>🔥 Hot: 1</span>
-          <span style={{ fontSize: 10.5, padding: '2px 8px', borderRadius: 100, background: 'rgba(245,158,11,.12)', color: '#d97706', border: '1px solid rgba(245,158,11,.25)', fontWeight: 600 }}>☀️ Warm: 2</span>
-        </div>
-      </div>
-      <div style={{ padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {leads.map((l, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 10px', borderRadius: 10, background: 'var(--surface2)', border: '1px solid var(--border)', cursor: 'pointer' }}>
-            <div style={{ width: 32, height: 32, borderRadius: '50%', background: l.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#fff', flexShrink: 0 }}>{l.initials}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-                <span style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--fg)', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{l.name}</span>
-                <span style={{ fontSize: 9.5, padding: '1px 7px', borderRadius: 100, background: gradeStyle[l.grade], color: gradeColor[l.grade], border: `1px solid ${gradeColor[l.grade]}44`, fontWeight: 600 }}>{l.grade}</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                <span style={{ fontSize: 10.5, color: 'var(--fg3)', flex: 1 }}>{l.company}</span>
-                <FeaturesChIcon ch={l.ch} size={13} />
-              </div>
-            </div>
-            <div style={{ textAlign: 'right', flexShrink: 0 }}>
-              <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--accent2)', fontFamily: 'var(--font-d)' }}>{l.score}</div>
-              <span style={{ fontSize: 9.5, padding: '1px 7px', borderRadius: 4, background: statusStyle[l.status] || 'var(--surface)', color: statusColor[l.status] || 'var(--fg3)', fontWeight: 600 }}>{l.status}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function AnalyticsPreviewUI() {
-  const bars = [38,52,44,71,63,88,74];
-  const days = ['M','T','W','T','F','S','S'];
-  return (
-    <div style={{ background: 'var(--surface)', borderRadius: 14, border: '1px solid var(--border)', padding: 14, minHeight: 320 }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
-        {[['47,832','Total Messages','↑ 32%','var(--accent2)'],['72%','AI Resolution','auto-resolved','#22c55e'],['1m 24s','Avg Response','↓ 45s faster','#0ea5e9'],['4.9/5','CSAT Score','↑ from 4.2','#f59e0b']].map(([v,l,s,c]) => (
-          <div key={l} style={{ padding: '10px 11px', background: 'var(--surface2)', borderRadius: 10, border: '1px solid var(--border)' }}>
-            <div style={{ fontSize: 17, fontWeight: 800, color: c, fontFamily: 'var(--font-d)', lineHeight: 1 }}>{v}</div>
-            <div style={{ fontSize: 10.5, fontWeight: 600, color: 'var(--fg)', marginTop: 3 }}>{l}</div>
-            <div style={{ fontSize: 10, color: '#22c55e', marginTop: 2 }}>{s}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ background: 'var(--surface2)', borderRadius: 10, border: '1px solid var(--border)', padding: '10px 12px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--fg)' }}>Message Volume · Last 7 Days</span>
-          <span style={{ fontSize: 10, color: 'var(--fg3)' }}>↑ 18% vs last week</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 5, height: 70 }}>
-          {bars.map((v, i) => (
-            <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
-              <div style={{ width: '100%', borderRadius: '3px 3px 0 0', background: i === 5 ? 'var(--accent)' : 'var(--border2)', height: `${v}%`, minHeight: 4, transition: 'height .3s ease' }} />
-              <span style={{ fontSize: 9, color: 'var(--fg3)' }}>{days[i]}</span>
-            </div>
-          ))}
-        </div>
-        <div style={{ display: 'flex', gap: 4, marginTop: 10, alignItems: 'center' }}>
-          <span style={{ fontSize: 10, color: 'var(--fg3)' }}>Sentiment:</span>
-          {[['Positive','#22c55e',65],['Neutral','#94a3b8',22],['Negative','#ef4444',13]].map(([l,c,p]) => (
-            <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <div style={{ width: 8, height: 8, borderRadius: '50%', background: c }} />
-              <span style={{ fontSize: 10, color: 'var(--fg2)' }}>{l} {p}%</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-const TABS = [
-  { id: 'inbox',     label: 'AI Inbox',          icon: '💬', accent: '#6366f1',
-    headline: 'Every Channel. One Inbox. Zero Chaos.',
-    body: 'WhatsApp, Instagram, Facebook, Email, and Web Chat — all in one blazing-fast inbox. AI routes conversations, detects collisions, and unifies customer identities across channels.',
-    bullets: ['Real-time collision detection prevents duplicate replies','Identity unification across all channels & sessions','Multi-agent AI orchestration with instant human handoff','Smart routing by skill, team, or AI confidence score'],
-    Preview: InboxPreviewUI },
-  { id: 'auto',      label: 'Automation',         icon: '⚡', accent: '#f59e0b',
-    headline: 'Build Powerful Workflows Without Writing Code.',
-    body: 'Visual drag-and-drop workflow builder with AI agents, smart triggers, and multi-step CRM journeys. From lead capture to closed deal — fully automated.',
-    bullets: ['50+ trigger types: message, form, webhook, schedule, CRM event','AI agents for qualification, support, sales & escalation','BANT scoring, lead routing, and pipeline automation','7-step drip sequences, broadcast campaigns & A/B tests'],
-    Preview: AutomationPreviewUI },
-  { id: 'leads',     label: 'Lead Intelligence',  icon: '🎯', accent: '#22c55e',
-    headline: 'Turn Every Message Into a Qualified Lead.',
-    body: 'Pulse Engine captures contact data automatically, scores leads using BANT criteria, and feeds your CRM pipeline — so nothing falls through the cracks.',
-    bullets: ['Auto-capture leads from all incoming conversations','AI-powered BANT scoring updates in real time','Hot/warm/cold grading with smart deduplication','CRM sync with Salesforce, HubSpot & more'],
-    Preview: LeadsPreviewUI },
-  { id: 'analytics', label: 'Analytics',           icon: '📊', accent: '#0ea5e9',
-    headline: "Know Exactly What's Working — and What Isn't.",
-    body: 'Real-time dashboards surface conversation volume, response times, CSAT, and conversion funnels. Share reports with stakeholders in one click.',
-    bullets: ['Live dashboards updating every 30 seconds','Channel-by-channel breakdown & comparison','AI performance vs. human response quality','Exportable reports for any time range'],
-    Preview: AnalyticsPreviewUI },
-];
-
-function FeaturesSection() {
-  const [activeTab, setActiveTab] = useState('inbox');
-  const [visible, setVisible] = useState(false);
-  const ref = useRef(null);
-
+/* ─────────────────────────────────────────────────────────────────────────────
+   ROTATING TEXT SECTION
+───────────────────────────────────────────────────────────────────────────── */
+function RotatingWord({ words }) {
+  const [idx, setIdx] = useState(0);
+  const [visible, setVisible] = useState(true);
   useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) setVisible(true); }, { threshold: .1 });
-    if (ref.current) obs.observe(ref.current);
-    return () => obs.disconnect();
-  }, []);
-
-  const tab = TABS.find(t => t.id === activeTab) || TABS[0];
-
+    const cycle = setInterval(() => {
+      setVisible(false);
+      setTimeout(() => {
+        setIdx(i => (i + 1) % words.length);
+        setVisible(true);
+      }, 350);
+    }, 2500);
+    return () => clearInterval(cycle);
+  }, [words.length]);
   return (
-    <section id="features" ref={ref} className="section" style={{ background: 'var(--bg)' }}>
-      <div className="container">
-        <div style={{ textAlign: 'center', marginBottom: 52, opacity: visible ? 1 : 0, transition: 'opacity .7s cubic-bezier(.4,0,.2,1)' }}>
-          <span className="label" style={{ display: 'block', marginBottom: 10 }}>Platform Features</span>
-          <h2 className="h2" style={{ color: 'var(--fg)', marginBottom: 14 }}>Everything You Need to<br />Scale Customer Conversations</h2>
-          <p className="body-lg" style={{ maxWidth: 480, margin: '0 auto' }}>Built for speed, designed for scale — four pillars that turn every message into an opportunity.</p>
-        </div>
-
-        <div role="tablist" aria-label="Feature tabs" style={{ display: 'flex', overflowX: 'auto', gap: 4, marginBottom: 40, padding: '4px 4px 0', borderBottom: '1px solid var(--border)', scrollbarWidth: 'none' }}>
-          {TABS.map(t => (
-            <button key={t.id}
-              role="tab"
-              aria-selected={activeTab === t.id}
-              aria-controls={`panel-${t.id}`}
-              id={`tab-${t.id}`}
-              onClick={() => setActiveTab(t.id)}
-              style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '10px 18px', borderRadius: '10px 10px 0 0', fontSize: 13.5, fontWeight: 600, fontFamily: 'var(--font-b)', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .2s', borderBottom: activeTab === t.id ? `2px solid ${t.accent}` : '2px solid transparent', boxShadow: activeTab === t.id ? `0 2px 8px ${t.accent}55` : 'none', background: activeTab === t.id ? 'var(--surface2)' : 'transparent', color: activeTab === t.id ? 'var(--fg)' : 'var(--fg2)', marginBottom: -1 }}>
-              <span aria-hidden="true">{t.icon}</span>{t.label}
-            </button>
-          ))}
-        </div>
-
-        <div id={`panel-${tab.id}`} role="tabpanel" aria-labelledby={`tab-${tab.id}`} className="features-panel-grid" style={{ opacity: visible ? 1 : 0, transition: 'opacity .5s ease' }}>
-          <div key={activeTab} style={{ animation: 'slideUp .35s ease' }}>
-            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 12px', borderRadius: 100, background: `${tab.accent}18`, border: `1px solid ${tab.accent}44`, fontSize: 12, fontWeight: 600, color: tab.accent, marginBottom: 18 }}>
-              {tab.icon} {tab.label}
-            </div>
-            <h3 className="h3" style={{ color: 'var(--fg)', marginBottom: 16, lineHeight: 1.2 }}>{tab.headline}</h3>
-            <p className="body" style={{ marginBottom: 24, lineHeight: 1.7 }}>{tab.body}</p>
-            <ul style={{ listStyle: 'none', padding: 0, display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {tab.bullets.map(b => (
-                <li key={b} style={{ display: 'flex', gap: 10, fontSize: 14, color: 'var(--fg2)', alignItems: 'flex-start' }}>
-                  <span style={{ width: 18, height: 18, borderRadius: '50%', background: `${tab.accent}1a`, border: `1px solid ${tab.accent}44`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 2 }}>
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={tab.accent} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-                  </span>
-                  {b}
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div key={activeTab + 'p'} style={{ animation: 'slideUp .35s ease .1s backwards' }}>
-            <tab.Preview />
-          </div>
-        </div>
-      </div>
-    </section>
+    <span style={{
+      display: 'inline-block',
+      background: 'linear-gradient(135deg,#2563eb,#6366f1)',
+      WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+      backgroundClip: 'text',
+      opacity: visible ? 1 : 0,
+      transform: visible ? 'translateY(0)' : 'translateY(8px)',
+      transition: 'opacity 0.35s ease, transform 0.35s ease',
+      minWidth: 180,
+    }}>
+      {words[idx]}
+    </span>
   );
 }
 
-/* ══════════════════════════════════════════════════════════════
-   7. GLOBE SECTION
-   ══════════════════════════════════════════════════════════════ */
-const TAGS = [
-  { id: 'wa',   label: 'WhatsApp',         color: '#25D366', orbit: 1.22, inc:  0.30, phase: 0,                desc: 'WhatsApp Business API — 2-way messaging & automation' },
-  { id: 'ig',   label: 'Instagram',         color: '#E1306C', orbit: 1.22, inc: -0.28, phase: Math.PI * .70,  desc: 'Instagram DM & story reply automation' },
-  { id: 'fb',   label: 'Facebook',          color: '#1877F2', orbit: 1.22, inc:  0.48, phase: Math.PI * 1.40, desc: 'Facebook Messenger & Page inbox' },
-  { id: 'wc',   label: 'Web Chat',          color: '#8b5cf6', orbit: 1.22, inc: -0.12, phase: Math.PI * 1.05, desc: 'Embeddable live chat widget for your website' },
-  { id: 'ai1',  label: 'AI Auto-Reply',     color: '#818cf8', orbit: 1.48, inc:  0.55, phase: Math.PI * .15,  desc: 'AI generates & sends contextual replies automatically' },
-  { id: 'ai2',  label: 'Lead Scoring',      color: '#f59e0b', orbit: 1.48, inc: -0.42, phase: Math.PI * .85,  desc: 'BANT-powered lead qualification in real time' },
-  { id: 'ai3',  label: 'Smart Routing',     color: '#22c55e', orbit: 1.48, inc:  0.18, phase: Math.PI * 1.55, desc: 'Routes conversations by skill, team & workload' },
-  { id: 'ai4',  label: 'Sentiment AI',      color: '#ec4899', orbit: 1.48, inc: -0.60, phase: Math.PI * .40,  desc: 'Real-time sentiment scoring on every message' },
-  { id: 'ai5',  label: 'Workflow Builder',  color: '#6366f1', orbit: 1.48, inc:  0.65, phase: Math.PI * 1.20, desc: 'Visual no-code automation editor — trigger, condition, action' },
-  { id: 'ai6',  label: 'Follow-up Drip',   color: '#0ea5e9', orbit: 1.72, inc:  0.22, phase: Math.PI * .30,  desc: 'Multi-step AI follow-up sequences on autopilot' },
-  { id: 'ai7',  label: 'Broadcasting',      color: '#f97316', orbit: 1.72, inc: -0.48, phase: Math.PI * 1.00, desc: 'Bulk broadcast campaigns with AI personalization' },
-  { id: 'ai8',  label: 'Knowledge Base',    color: '#14b8a6', orbit: 1.72, inc:  0.68, phase: Math.PI * 1.70, desc: 'AI answers customer questions from your knowledge base' },
-  { id: 'ai9',  label: 'Identity Unify',    color: '#a78bfa', orbit: 1.72, inc: -0.32, phase: Math.PI * .60,  desc: 'Merges customer profiles across all channels' },
-  { id: 'ai10', label: 'Analytics AI',      color: '#fb923c', orbit: 1.72, inc:  0.38, phase: Math.PI * 1.35, desc: 'Automated reporting & AI-driven conversation insights' },
-  { id: 'ai11', label: 'Escalation AI',     color: '#38bdf8', orbit: 1.72, inc: -0.58, phase: Math.PI * .08,  desc: 'Smart escalation to human agents at the right moment' },
-  { id: 'ai12', label: 'Multi-Agent AI',    color: '#c084fc', orbit: 1.96, inc:  0.15, phase: Math.PI * .50,  desc: 'Multiple specialized AI agents collaborate on each conversation' },
-  { id: 'ai13', label: 'Live Handoff',      color: '#34d399', orbit: 1.96, inc: -0.45, phase: Math.PI * 1.25, desc: 'Seamless AI-to-human handoff with full context preserved' },
-  { id: 'ai14', label: 'Auto Lead Capture', color: '#fbbf24', orbit: 1.96, inc:  0.60, phase: Math.PI * 1.85, desc: 'Captures and qualifies leads automatically from every message' },
-  { id: 'ai15', label: 'CRM Sync',          color: '#60a5fa', orbit: 1.96, inc: -0.25, phase: Math.PI * .72,  desc: 'Bi-directional sync keeps contacts & pipeline always up to date' },
-  { id: 'ai16', label: 'Template AI',       color: '#f472b6', orbit: 1.96, inc:  0.42, phase: Math.PI * 1.12, desc: 'AI-powered reply templates that match your brand voice' },
-  { id: 'ai17', label: 'Convo Memory',      color: '#a3e635', orbit: 1.96, inc: -0.65, phase: Math.PI * .35,  desc: 'Short & long-term memory across every conversation and channel' },
-];
-
-const CITIES = [
-  [40.7,-74],[51.5,0],[35.7,139.7],[25.2,55.3],[-33.9,151.2],
-  [-23.5,-46.6],[1.4,103.8],[43.7,-79.4],[48.9,2.3],[19.1,72.9],
-  [55.8,37.6],[31.2,121.5],[4.0,-74.1],[-26.2,28.0],
-];
-const TILT = 0.22;
-
-function projectPoint(x3, y3, z3, cx, cy, R) {
-  const y2 = y3 * Math.cos(TILT) - z3 * Math.sin(TILT);
-  const z2 = y3 * Math.sin(TILT) + z3 * Math.cos(TILT);
-  return { x: cx + x3 * R, y: cy + y2 * R, z: z2 };
-}
-
-function drawGlobe(ctx, cx, cy, R, rotY) {
-  /* FIX: removed the partial clearRect — frame() handles full clear */
-
-  /* outer glow */
-  const glow = ctx.createRadialGradient(cx, cy, R * .6, cx, cy, R * 1.6);
-  glow.addColorStop(0, 'rgba(99,102,241,0.0)');
-  glow.addColorStop(.5, 'rgba(99,102,241,0.08)');
-  glow.addColorStop(1, 'rgba(99,102,241,0.0)');
-  ctx.beginPath(); ctx.arc(cx, cy, R * 1.6, 0, Math.PI * 2);
-  ctx.fillStyle = glow; ctx.fill();
-
-  /* globe body — rich dark gradient */
-  const grad = ctx.createRadialGradient(cx - R * .25, cy - R * .3, R * .05, cx, cy, R);
-  grad.addColorStop(0,   'rgba(99,102,241,0.18)');
-  grad.addColorStop(.35, 'rgba(20,25,45,0.85)');
-  grad.addColorStop(1,   'rgba(2,8,23,0.96)');
-  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2);
-  ctx.fillStyle = grad; ctx.fill();
-
-  /* border ring with gradient stroke */
-  const ringGrad = ctx.createLinearGradient(cx-R, cy-R, cx+R, cy+R);
-  ringGrad.addColorStop(0,   'rgba(99,102,241,0.55)');
-  ringGrad.addColorStop(0.5, 'rgba(129,140,248,0.9)');
-  ringGrad.addColorStop(1,   'rgba(59,130,246,0.55)');
-  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2);
-  ctx.strokeStyle = ringGrad; ctx.lineWidth = 1.5; ctx.stroke();
-
-  /* grid lines — more visible neon-indigo */
-  const lineColor = 'rgba(99,102,241,0.22)';
-  ctx.lineWidth = .65;
-
-  for (let lat = -75; lat <= 75; lat += 25) {
-    const phi  = (90 - lat) * Math.PI / 180;
-    const sinP = Math.sin(phi), cosP = Math.cos(phi);
-    ctx.beginPath(); let first = true;
-    for (let lon = 0; lon <= 360; lon += 3) {
-      const theta = lon * Math.PI / 180 + rotY;
-      const p = projectPoint(sinP * Math.cos(theta), cosP, sinP * Math.sin(theta), cx, cy, R);
-      if (first) { ctx.moveTo(p.x, p.y); first = false; }
-      else if (p.z > -.8) ctx.lineTo(p.x, p.y);
-      else { ctx.strokeStyle = lineColor; ctx.stroke(); ctx.beginPath(); first = true; }
-    }
-    ctx.strokeStyle = lineColor; ctx.stroke();
-  }
-  for (let lon = 0; lon < 180; lon += 25) {
-    const theta0 = lon * Math.PI / 180 + rotY;
-    for (const theta of [theta0, theta0 + Math.PI]) {
-      ctx.beginPath(); let first = true;
-      for (let lat = -88; lat <= 88; lat += 3) {
-        const phi  = (90 - lat) * Math.PI / 180;
-        const sinP = Math.sin(phi), cosP = Math.cos(phi);
-        const p = projectPoint(sinP * Math.cos(theta), cosP, sinP * Math.sin(theta), cx, cy, R);
-        if (first) { ctx.moveTo(p.x, p.y); first = false; }
-        else if (p.z > -.8) ctx.lineTo(p.x, p.y);
-        else { ctx.strokeStyle = lineColor; ctx.stroke(); ctx.beginPath(); first = true; }
-      }
-      ctx.strokeStyle = lineColor; ctx.stroke();
-    }
-  }
-
-  /* city dots — two-pass: ambient halo + bright core */
-  CITIES.forEach(([lat, lon]) => {
-    const phi   = (90 - lat) * Math.PI / 180;
-    const theta = lon * Math.PI / 180 + rotY;
-    const p = projectPoint(Math.sin(phi)*Math.cos(theta), Math.cos(phi), Math.sin(phi)*Math.sin(theta), cx, cy, R);
-    if (p.z < -.1) return;
-    const alpha = .25 + .55 * ((p.z + 1) / 2);
-    const size  = 1.5 + p.z * 1.2;
-    /* halo */
-    ctx.beginPath(); ctx.arc(p.x, p.y, size * 2.8, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(99,102,241,${alpha * 0.25})`; ctx.fill();
-    /* bright core */
-    ctx.beginPath(); ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(200,210,255,${alpha})`; ctx.fill();
-  });
-}
-
-function GlobeSection() {
-  const canvasRef  = useRef(null);
-  const wrapRef    = useRef(null);
-  const rotY       = useRef(0);
-  const drag       = useRef({ active: false, lastX: 0, vel: 0 });
-  const raf        = useRef(null);
-  const inView     = useRef(false);
-  const [positions, setPositions] = useState([]);
-  const [active,    setActive]    = useState(null);
-
-  /* IntersectionObserver to PAUSE RAF when off-screen (perf fix) */
-  useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => { inView.current = e.isIntersecting; }, { threshold: 0.05 });
-    if (wrapRef.current) obs.observe(wrapRef.current);
-    return () => obs.disconnect();
-  }, []);
+/* ─────────────────────────────────────────────────────────────────────────────
+   GLOBE SECTION
+───────────────────────────────────────────────────────────────────────────── */
+function GlobeVisualization() {
+  const canvasRef = useRef(null);
+  const animRef = useRef(null);
+  const timeRef = useRef(0);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    const wrap   = wrapRef.current;
-    if (!canvas || !wrap) return;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+    const cx = W / 2;
+    const cy = H / 2;
+    const R = Math.min(W, H) * 0.38;
 
-    const dpr = window.devicePixelRatio || 1;
+    // Connection points on globe surface (lat/lon pairs)
+    const points = [
+      { lat: 40.7, lon: -74 },   // New York
+      { lat: 51.5, lon: -0.1 },  // London
+      { lat: 48.8, lon: 2.3 },   // Paris
+      { lat: 25.2, lon: 55.3 },  // Dubai
+      { lat: 1.3, lon: 103.8 },  // Singapore
+      { lat: 35.7, lon: 139.7 }, // Tokyo
+      { lat: -23.5, lon: -46.6 },// Sao Paulo
+      { lat: 19.4, lon: -99.1 }, // Mexico City
+      { lat: -33.9, lon: 18.4 }, // Cape Town
+      { lat: 55.7, lon: 37.6 },  // Moscow
+    ];
 
-    function resize() {
-      const w = wrap.clientWidth;
-      const h = Math.min(w * .72, 540);
-      canvas.width  = w  * dpr;
-      canvas.height = h  * dpr;
-      canvas.style.width  = w  + 'px';
-      canvas.style.height = h  + 'px';
-      const ctx = canvas.getContext('2d');
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const connections = [
+      [0, 1], [1, 2], [0, 6], [1, 3], [3, 4], [4, 5], [0, 7], [2, 9], [3, 8],
+    ];
+
+    const pulses = connections.map(([a, b]) => ({
+      from: a, to: b, t: Math.random(), speed: 0.003 + Math.random() * 0.002,
+    }));
+
+    function latLonTo3D(lat, lon, rot) {
+      const phi = (90 - lat) * Math.PI / 180;
+      const theta = (lon + rot) * Math.PI / 180;
+      return {
+        x: R * Math.sin(phi) * Math.cos(theta),
+        y: -R * Math.cos(phi),
+        z: R * Math.sin(phi) * Math.sin(theta),
+      };
     }
-    resize();
-    const ro = new ResizeObserver(resize);
-    ro.observe(wrap);
 
-    function calcTagPos() {
-      const w  = canvas.width  / dpr;
-      const h  = canvas.height / dpr;
-      const cx = w / 2, cy = h / 2;
-      const R  = Math.min(w, h) * .33;
-      return TAGS.map(tag => {
-        const angle = tag.phase + rotY.current;
-        const cosA = Math.cos(angle), sinA = Math.sin(angle);
-        const cosI = Math.cos(tag.inc), sinI = Math.sin(tag.inc);
-        const x3 = tag.orbit * cosA;
-        const y3 = tag.orbit * sinA * sinI;
-        const z3 = tag.orbit * sinA * cosI;
-        const p     = projectPoint(x3, y3, z3, cx, cy, R);
-        const depth = (p.z + tag.orbit) / (2 * tag.orbit);
-        return { ...tag, px: p.x, py: p.y, depth, opacity: .35 + .65 * depth, scale: .72 + .32 * depth };
-      }).sort((a, b) => a.depth - b.depth);
+    function project(p3d) {
+      const scale = (R * 2.2) / (R * 2.2 + p3d.z * 0.3);
+      return { x: cx + p3d.x * scale, y: cy + p3d.y * scale, visible: p3d.z > -R * 0.3 };
     }
 
-    function frame() {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      if (!inView.current) { raf.current = requestAnimationFrame(frame); return; }
-      const ctx = canvas.getContext('2d');
-      const w   = canvas.width  / dpr;
-      const h   = canvas.height / dpr;
-      const cx  = w / 2, cy = h / 2;
-      const R   = Math.min(w, h) * .33;
-      ctx.clearRect(0, 0, w, h);
-      drawGlobe(ctx, cx, cy, R, rotY.current);
+    function lerp3D(a, b, t) {
+      // Great circle interpolation simplified via lerp + normalize
+      return {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        z: a.z + (b.z - a.z) * t,
+      };
+    }
 
-      if (!drag.current.active) {
-        rotY.current += .003;
-        drag.current.vel *= .92;
-        rotY.current += drag.current.vel * .01;
-      } else {
-        rotY.current += drag.current.vel * .01;
-        drag.current.vel *= .85;
+    function draw(time) {
+      timeRef.current = time;
+      const rot = (time * 0.012) % 360;
+      ctx.clearRect(0, 0, W, H);
+
+      // Globe circle
+      const grd = ctx.createRadialGradient(cx - R * 0.3, cy - R * 0.3, R * 0.1, cx, cy, R);
+      grd.addColorStop(0, 'rgba(37,99,235,0.08)');
+      grd.addColorStop(1, 'rgba(99,102,241,0.04)');
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, Math.PI * 2);
+      ctx.fillStyle = grd;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(37,99,235,0.12)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // Latitude lines
+      for (let lat = -60; lat <= 60; lat += 30) {
+        ctx.beginPath();
+        let first = true;
+        for (let lon = -180; lon <= 180; lon += 5) {
+          const p = project(latLonTo3D(lat, lon, rot));
+          if (!p.visible) { first = true; continue; }
+          if (first) { ctx.moveTo(p.x, p.y); first = false; }
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.strokeStyle = 'rgba(99,102,241,0.08)';
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
       }
-      setPositions(calcTagPos());
-      raf.current = requestAnimationFrame(frame);
+
+      // Longitude lines
+      for (let lon = 0; lon < 180; lon += 30) {
+        ctx.beginPath();
+        let first = true;
+        for (let lat = -85; lat <= 85; lat += 5) {
+          const p = project(latLonTo3D(lat, lon, rot));
+          if (!p.visible) { first = true; continue; }
+          if (first) { ctx.moveTo(p.x, p.y); first = false; }
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.strokeStyle = 'rgba(99,102,241,0.08)';
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+      }
+
+      // Compute projected points
+      const projected = points.map(p => {
+        const p3d = latLonTo3D(p.lat, p.lon, rot);
+        const pr = project(p3d);
+        return { ...pr, p3d };
+      });
+
+      // Connection lines
+      connections.forEach(([ai, bi]) => {
+        const a = projected[ai], b = projected[bi];
+        if (!a.visible || !b.visible) return;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.strokeStyle = 'rgba(37,99,235,0.18)';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      });
+
+      // Pulse dots
+      pulses.forEach(pulse => {
+        const a = projected[pulse.from], b = projected[pulse.to];
+        if (!a.visible || !b.visible) return;
+        const t = pulse.t;
+        const px = a.x + (b.x - a.x) * t;
+        const py = a.y + (b.y - a.y) * t;
+        ctx.beginPath();
+        ctx.arc(px, py, 3, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(37,99,235,0.9)';
+        ctx.fill();
+        pulse.t += pulse.speed;
+        if (pulse.t > 1) pulse.t = 0;
+      });
+
+      // City dots
+      projected.forEach(p => {
+        if (!p.visible) return;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
+        ctx.fillStyle = '#2563eb';
+        ctx.fill();
+      });
+
+      animRef.current = requestAnimationFrame(draw);
     }
-    frame();
 
-    const el = wrap;
-    const onDown = e => { drag.current.active = true; drag.current.lastX = e.clientX || e.touches?.[0]?.clientX || 0; };
-    const onMove = e => { if (!drag.current.active) return; const x = e.clientX || e.touches?.[0]?.clientX || 0; drag.current.vel = x - drag.current.lastX; drag.current.lastX = x; };
-    const onUp   = () => { drag.current.active = false; };
-    el.addEventListener('mousedown', onDown); el.addEventListener('mousemove', onMove); el.addEventListener('mouseup', onUp); el.addEventListener('mouseleave', onUp);
-    el.addEventListener('touchstart', onDown, { passive: true }); el.addEventListener('touchmove', onMove, { passive: true }); el.addEventListener('touchend', onUp);
-
-    /* close tooltip on outside click */
-    const onDocClick = e => { if (!el.contains(e.target)) setActive(null); };
-    document.addEventListener('click', onDocClick);
-
-    return () => {
-      ro.disconnect(); cancelAnimationFrame(raf.current);
-      el.removeEventListener('mousedown', onDown); el.removeEventListener('mousemove', onMove); el.removeEventListener('mouseup', onUp); el.removeEventListener('mouseleave', onUp);
-      el.removeEventListener('touchstart', onDown); el.removeEventListener('touchmove', onMove); el.removeEventListener('touchend', onUp);
-      document.removeEventListener('click', onDocClick);
-    };
+    animRef.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(animRef.current);
   }, []);
 
-  /* FIX: tooltip position uses tag coords, not dead-center */
-  const getTooltipStyle = tag => {
-    const wrap = wrapRef.current;
-    if (!wrap) return { left: '50%', top: '50%' };
-    const W = wrap.clientWidth, H = wrap.clientHeight;
-    const padX = 130, padY = 90;
-    const x = Math.max(padX, Math.min(W - padX, tag.px));
-    const y = Math.max(padY, Math.min(H - padY, tag.py));
-    return { left: x, top: y };
-  };
+  return <canvas ref={canvasRef} width={500} height={500} style={{ width: '100%', maxWidth: 460, height: 'auto', display: 'block', margin: '0 auto' }} />;
+}
 
-  return (
-    <section id="globe" className="section" style={{ position: 'relative', overflow: 'hidden', background: 'var(--bg2)' }}>
-      <div className="container">
-        <div style={{ textAlign: 'center', marginBottom: 56 }}>
-          <span className="label" style={{ marginBottom: 10, display: 'block' }}>AI Platform</span>
-          <h2 className="h2" style={{ color: 'var(--fg)', marginBottom: 16 }}>Channels &amp; AI Automation<br />Working Together</h2>
-          <p className="body-lg" style={{ maxWidth: 500, margin: '0 auto', color: 'var(--fg2)' }}>Connect your channels and let AI automation handle the rest — click any element to learn more.</p>
-        </div>
-        <div ref={wrapRef} style={{ position: 'relative', maxWidth: 700, margin: '0 auto', cursor: 'grab' }}>
-          <canvas ref={canvasRef} style={{ width: '100%', display: 'block' }} aria-label="Interactive globe showing AI integrations" />
-          {/* soft vignette overlay */}
-          <div style={{ position: 'absolute', inset: 0, background: 'radial-gradient(ellipse at center, transparent 50%, var(--bg2) 90%)', pointerEvents: 'none', zIndex: 1 }} aria-hidden="true" />
-          {positions.map(tag => (
-            <button key={tag.id}
-              className="globe-tag"
-              onClick={e => { e.stopPropagation(); setActive(prev => prev?.id === tag.id ? null : tag); }}
-              aria-pressed={active?.id === tag.id}
-              aria-label={`${tag.label}: ${tag.desc}`}
-              style={{ position: 'absolute', left: tag.px, top: tag.py, transform: `translate(-50%,-50%) scale(${tag.scale})`, opacity: tag.opacity, background: active?.id === tag.id ? tag.color : 'rgba(12,19,36,0.75)', border: `1px solid ${tag.color}66`, borderRadius: 100, padding: '5px 13px', fontSize: 11.5, fontWeight: 600, color: active?.id === tag.id ? '#fff' : tag.color, cursor: 'pointer', fontFamily: 'var(--font-b)', whiteSpace: 'nowrap', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', zIndex: Math.round(tag.depth * 20) + 2, transition: 'background .2s, color .2s, box-shadow .2s', boxShadow: active?.id === tag.id ? `0 0 20px ${tag.color}66` : 'none' }}>
-              {tag.label}
-            </button>
-          ))}
-          {active && (
-            <div style={{ position: 'absolute', ...getTooltipStyle(active), transform: 'translate(-50%,-50%)', background: 'rgba(12,19,36,0.95)', border: `1px solid ${active.color}55`, borderRadius: 16, padding: '16px 20px', textAlign: 'center', zIndex: 100, boxShadow: `0 20px 50px rgba(0,0,0,.5), 0 0 30px ${active.color}22`, minWidth: 190, maxWidth: 240, animation: 'slideUp .2s ease', backdropFilter: 'blur(16px)' }}>
-              <button onClick={() => setActive(null)} aria-label="Close tooltip" style={{ position: 'absolute', top: 8, right: 10, background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--fg3)', lineHeight: 1, padding: 2 }}>✕</button>
-              <div style={{ width: 8, height: 8, borderRadius: '50%', background: active.color, margin: '0 auto 10px', boxShadow: `0 0 12px ${active.color}` }} aria-hidden="true" />
-              <div style={{ fontSize: 15, fontWeight: 700, color: active.color, marginBottom: 8 }}>{active.label}</div>
-              <div style={{ fontSize: 12.5, color: 'var(--fg2)', lineHeight: 1.55 }}>{active.desc}</div>
+/* ─────────────────────────────────────────────────────────────────────────────
+   FEATURE TABS SHOWCASE
+───────────────────────────────────────────────────────────────────────────── */
+const FEATURE_TABS = [
+  {
+    id: 'ai-sales',
+    label: 'AI Sales',
+    icon: Target,
+    color: '#2563eb',
+    bg: '#eff6ff',
+    title: 'AI Sales Automation',
+    subtitle: 'Qualify, follow up, and close — on autopilot.',
+    bullets: [
+      'Automatic BANT lead qualification from every conversation',
+      'AI follow-up sequences triggered by behavior signals',
+      'Pipeline stage movement with zero manual updates',
+      'Revenue prediction and opportunity scoring',
+    ],
+    visual: 'sales',
+  },
+  {
+    id: 'inbox',
+    label: 'Inbox',
+    icon: Inbox,
+    color: '#7c3aed',
+    bg: '#f5f3ff',
+    title: 'Omnichannel Inbox',
+    subtitle: 'Every channel. One inbox. Zero chaos.',
+    bullets: [
+      'WhatsApp, Instagram, Facebook, Email & Web Chat unified',
+      'Real-time collision detection — no duplicate replies',
+      'Identity unification across all channels automatically',
+      'Smart routing by team, skill, or language',
+    ],
+    visual: 'inbox',
+  },
+  {
+    id: 'agents',
+    label: 'AI Agents',
+    icon: Bot,
+    color: '#059669',
+    bg: '#ecfdf5',
+    title: 'Specialized AI Agents',
+    subtitle: 'Agents that work together so you don\'t have to.',
+    bullets: [
+      'Support agent resolves up to 70% of queries without humans',
+      'Sales agent qualifies and nurtures inbound leads 24/7',
+      'Sentiment-aware escalation with full conversation context',
+      'Continuous learning from every interaction',
+    ],
+    visual: 'agents',
+  },
+  {
+    id: 'crm',
+    label: 'CRM',
+    icon: Users,
+    color: '#dc2626',
+    bg: '#fef2f2',
+    title: 'CRM Intelligence',
+    subtitle: 'Know every customer. Miss nothing.',
+    bullets: [
+      'Unified customer profiles across every touchpoint',
+      'Lead scoring, segmentation, and lifecycle tracking',
+      'Full conversation history with context at a glance',
+      'Custom fields, tags, and pipeline stages',
+    ],
+    visual: 'crm',
+  },
+  {
+    id: 'automation',
+    label: 'Automation',
+    icon: Zap,
+    color: '#d97706',
+    bg: '#fffbeb',
+    title: 'Automation Engine',
+    subtitle: 'Build workflows that run while you sleep.',
+    bullets: [
+      'Visual workflow builder with 40+ trigger types',
+      'Multi-step sequences for follow-ups and nurture',
+      'Condition-based branching and time delays',
+      'Native integrations with CRMs and Zapier',
+    ],
+    visual: 'automation',
+  },
+  {
+    id: 'analytics',
+    label: 'Analytics',
+    icon: BarChart3,
+    color: '#0284c7',
+    bg: '#f0f9ff',
+    title: 'Revenue Analytics',
+    subtitle: 'See exactly what\'s driving growth.',
+    bullets: [
+      'Live dashboards updated every 30 seconds',
+      'CSAT scores, response times & resolution rates',
+      'Channel-by-channel conversion breakdown',
+      'Exportable reports for any date range',
+    ],
+    visual: 'analytics',
+  },
+];
+
+function FeatureVisual({ type, color, bg }) {
+  if (type === 'sales') return (
+    <div style={{ height: '100%', padding: 24, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', letterSpacing: 1, textTransform: 'uppercase' }}>AI Pipeline · Live</div>
+      {[
+        { name: 'Aisha Rahman', stage: 'Qualifying', score: 87, bar: 87 },
+        { name: 'Marcus Chen', stage: 'Follow-up sent', score: 72, bar: 72 },
+        { name: 'Sofia K.', stage: 'Proposal ready', score: 91, bar: 91 },
+        { name: 'James O.', stage: 'New inquiry', score: 55, bar: 55 },
+      ].map((lead, i) => (
+        <div key={lead.name} style={{ background: '#fff', borderRadius: 12, padding: '10px 14px', border: '1px solid #f1f5f9', animation: `slideInRow 0.5s ease ${i * 80}ms both` }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 7 }}>
+            <div>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: '#0f172a' }}>{lead.name}</div>
+              <div style={{ fontSize: 11, color: '#94a3b8' }}>{lead.stage}</div>
             </div>
-          )}
-        </div>
-        <p style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'var(--fg3)' }}>Drag to rotate · Click any tag to learn more</p>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   8. INTEGRATIONS MARQUEE (fixed double-track)
-   ══════════════════════════════════════════════════════════════ */
-function IntegrationsMarquee() {
-  const items = ['WhatsApp','Facebook','Instagram','Web Chat','Gmail','AI Auto-Reply','Lead Scoring','Smart Routing','BANT Analysis','Follow-up Drip','Workflow Builder','Sentiment AI','Broadcasting','Knowledge Base','Identity Unify','Analytics AI','Escalation AI'];
-  const trackStyle = { display: 'flex', gap: 12, animation: 'marquee 28s linear infinite', whiteSpace: 'nowrap', flexShrink: 0 };
-  const pill = (name, i) => (
-    <div key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '8px 18px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 100, fontSize: 13, fontWeight: 500, color: 'var(--fg2)', whiteSpace: 'nowrap', flexShrink: 0 }}>
-      <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--accent)', opacity: .7 }} aria-hidden="true" />
-      {name}
-    </div>
-  );
-  return (
-    <section style={{ padding: '40px 0', background: 'var(--bg2)', borderTop: '1px solid var(--border)', overflow: 'hidden' }} aria-label="Integrations">
-      <div style={{ textAlign: 'center', marginBottom: 20 }}>
-        <span style={{ fontSize: 12, color: 'var(--fg3)', letterSpacing: '.1em', textTransform: 'uppercase', fontFamily: 'var(--font-m)' }}>Connects with 40+ tools your team already uses</span>
-      </div>
-      {/* two identical tracks → seamless loop */}
-      <div style={{ display: 'flex', overflow: 'hidden' }}>
-        <div style={trackStyle}>{items.map((n,i) => pill(n,i))}</div>
-        <div style={trackStyle} aria-hidden="true">{items.map((n,i) => pill(n,i+'b'))}</div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   9. TESTIMONIALS
-   ══════════════════════════════════════════════════════════════ */
-function TestimonialsSection() {
-  const quotes = [
-    { text: 'Pulse Engine cut our response time from hours to under 2 minutes. The AI handles 70% of queries automatically — our team finally has time for actual sales work.', name: 'Sarah M.',  role: 'VP Sales',      company: 'TechCorp',  avatar: 'S' },
-    { text: "The multi-channel inbox is game-changing. WhatsApp, Instagram, Email — all in one place with AI routing. We've doubled our lead conversion rate in 60 days.",      name: 'James K.',  role: 'Head of Growth', company: 'Finova',    avatar: 'J' },
-    { text: "Best investment we've made this year. The AI agents are incredibly smart and the workflow automation saved us 40 hours a week of manual work.",                      name: 'Priya S.',  role: 'CEO',            company: 'LaunchPad', avatar: 'P' },
-  ];
-  return (
-    <section className="section" style={{ background: 'var(--bg2)', borderTop: '1px solid var(--border)' }}>
-      <div className="container">
-        <div style={{ textAlign: 'center', marginBottom: 48 }}>
-          <span className="label" style={{ display: 'block', marginBottom: 10 }}>Customer Stories</span>
-          <h2 className="h2" style={{ color: 'var(--fg)' }}>Loved by Teams Worldwide</h2>
-        </div>
-        <div className="testimonials-grid">
-          {quotes.map((q, i) => (
-            <div key={i} className="card" style={{ display: 'flex', flexDirection: 'column' }}>
-              <div style={{ display: 'flex', gap: 2, marginBottom: 14 }}>
-                {[1,2,3,4,5].map(s => <svg key={s} width="14" height="14" viewBox="0 0 24 24" fill="#f59e0b" stroke="none" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>)}
-              </div>
-              <p style={{ fontSize: 14, color: 'var(--fg2)', lineHeight: 1.7, flex: 1, marginBottom: 20, fontStyle: 'italic' }}>"{q.text}"</p>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                {/* improved avatar — pravatar for demo */}
-                <img
-                  src={`https://i.pravatar.cc/80?u=${q.name}`}
-                  alt={q.name}
-                  width={38} height={38}
-                  style={{ borderRadius: '50%', border: '2px solid var(--border2)', flexShrink: 0 }}
-                  onError={e => { e.currentTarget.style.display='none'; }}
-                />
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--fg)' }}>{q.name}</div>
-                  <div style={{ fontSize: 11.5, color: 'var(--fg3)' }}>{q.role}, {q.company}</div>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   10. TEAM SECTION (RESTORED)
-   ══════════════════════════════════════════════════════════════ */
-function TeamSection() {
-  const team = [
-    { name: 'Amir Hassan',    role: 'CEO & Co-Founder',         bio: 'Ex-Salesforce. Building the future of AI-powered CRM.',     initials: 'AH', color: '#6366f1' },
-    { name: 'Lena Müller',    role: 'CTO & Co-Founder',         bio: '10 years in conversational AI and distributed systems.',    initials: 'LM', color: '#3b82f6' },
-    { name: 'Rohan Desai',    role: 'Head of AI',               bio: 'PhD in NLP. Trained models that power our smart routing.', initials: 'RD', color: '#22c55e' },
-    { name: 'Sofia Reyes',    role: 'Head of Product',          bio: 'Former PM at Intercom. Obsessed with inbox zero.',          initials: 'SR', color: '#f59e0b' },
-    { name: 'Marcus Webb',    role: 'Head of Sales',            bio: 'Closed $50M ARR in previous roles. Customer-first always.', initials: 'MW', color: '#ec4899' },
-    { name: 'Priya Sharma',   role: 'Head of Customer Success', bio: 'Scaled CS at 3 startups from 0 to enterprise.',             initials: 'PS', color: '#14b8a6' },
-  ];
-
-  return (
-    <section id="team" className="section" style={{ background: 'var(--bg)' }}>
-      <div className="container">
-        <div style={{ textAlign: 'center', marginBottom: 52 }}>
-          <span className="label" style={{ display: 'block', marginBottom: 10 }}>Our Team</span>
-          <h2 className="h2" style={{ color: 'var(--fg)', marginBottom: 14 }}>The People Behind Pulse Engine</h2>
-          <p className="body-lg" style={{ maxWidth: 480, margin: '0 auto' }}>A team obsessed with making customer conversations smarter.</p>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20 }}>
-          {team.map((m, i) => (
-            <div key={i} className="card" style={{ textAlign: 'center', padding: 28 }}>
-              <div style={{ width: 68, height: 68, borderRadius: '50%', background: `${m.color}22`, border: `2px solid ${m.color}44`, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px', fontSize: 22, fontWeight: 800, color: m.color, fontFamily: 'var(--font-d)' }}>
-                {m.initials}
-              </div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--fg)', marginBottom: 4 }}>{m.name}</div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: m.color, marginBottom: 10 }}>{m.role}</div>
-              <p style={{ fontSize: 12.5, color: 'var(--fg3)', lineHeight: 1.55 }}>{m.bio}</p>
-              <a href="#" aria-label={`${m.name} on LinkedIn`} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginTop: 14, fontSize: 11.5, fontWeight: 600, color: 'var(--fg3)', textDecoration: 'none', transition: 'color .2s' }}
-                onMouseEnter={e => e.currentTarget.style.color = 'var(--accent2)'}
-                onMouseLeave={e => e.currentTarget.style.color = 'var(--fg3)'}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M16 8a6 6 0 016 6v7h-4v-7a2 2 0 00-2-2 2 2 0 00-2 2v7h-4v-7a6 6 0 016-6z"/>
-                  <rect x="2" y="9" width="4" height="12"/>
-                  <circle cx="4" cy="4" r="2"/>
-                </svg>
-                LinkedIn
-              </a>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   11. PRICING SECTION
-   ══════════════════════════════════════════════════════════════ */
-function PricingSection() {
-  const [annual,  setAnnual]  = useState(true);
-  const [visible, setVisible] = useState(false);
-  const ref = useRef(null);
-
-  useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) setVisible(true); }, { threshold: .1 });
-    if (ref.current) obs.observe(ref.current);
-    return () => obs.disconnect();
-  }, []);
-
-  /* kept exactly as original — per Part 8 */
-  const plans = [
-    { name: 'Starter',      monthly: 0,   annual: 0,   color: 'var(--fg)',    cta: 'Get Started Free',  popular: false,
-      features: ['Up to 3 team members','500 conversations/mo','2 channels (WhatsApp + 1)','Basic AI auto-replies','Email support'] },
-    { name: 'Professional', monthly: 49,  annual: 39,  color: 'var(--accent2)', cta: 'Start Free Trial', popular: true,
-      features: ['Up to 15 team members','5,000 conversations/mo','All 5 channels','Advanced AI agents','Workflow automation','Lead scoring + CRM sync','Priority support'] },
-    { name: 'Enterprise',   monthly: 129, annual: 99,  color: '#22c55e',      cta: 'Contact Sales',     popular: false,
-      features: ['Unlimited team members','Unlimited conversations','All channels + custom','Custom AI agents','White-label options','SSO + advanced security','Dedicated account manager'] },
-  ];
-
-  return (
-    <section id="pricing" ref={ref} className="section" style={{ background: 'var(--bg)' }}>
-      <div className="container">
-        <div style={{ textAlign: 'center', marginBottom: 52, opacity: visible ? 1 : 0, transform: visible ? 'translateY(0)' : 'translateY(24px)', transition: 'all .7s cubic-bezier(.4,0,.2,1)' }}>
-          <span className="label" style={{ display: 'block', marginBottom: 10 }}>Pricing</span>
-          <h2 className="h2" style={{ color: 'var(--fg)', marginBottom: 14 }}>Pricing That Scales With You</h2>
-          <p className="body-lg" style={{ maxWidth: 440, margin: '0 auto 28px' }}>Start free, upgrade when you need it. All plans include a 14-day trial of Professional.</p>
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12, padding: '6px 8px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12 }}>
-            <button onClick={() => setAnnual(false)} style={{ padding: '7px 16px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600, background: !annual ? 'var(--accent)' : 'transparent', color: !annual ? '#fff' : 'var(--fg2)', transition: 'all .2s', fontFamily: 'var(--font-b)' }} aria-pressed={!annual}>Monthly</button>
-            <button onClick={() => setAnnual(true)}  style={{ padding: '7px 16px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600, background: annual ? 'var(--accent)' : 'transparent', color: annual ? '#fff' : 'var(--fg2)', transition: 'all .2s', fontFamily: 'var(--font-b)' }} aria-pressed={annual}>Annual <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 100, background: 'rgba(34,197,94,.2)', color: '#22c55e', marginLeft: 4 }}>-20%</span></button>
+            <div style={{ fontSize: 13, fontWeight: 800, color: lead.score >= 80 ? '#059669' : '#2563eb' }}>{lead.score}</div>
+          </div>
+          <div style={{ height: 4, background: '#f1f5f9', borderRadius: 2, overflow: 'hidden' }}>
+            <div style={{ height: '100%', width: `${lead.bar}%`, background: `linear-gradient(90deg, ${color}, ${color}cc)`, borderRadius: 2 }} />
           </div>
         </div>
+      ))}
+    </div>
+  );
 
-        <div className="pricing-grid" style={{ opacity: visible ? 1 : 0, transition: 'opacity .8s .2s' }}>
-          {plans.map((p, i) => (
-            <div key={p.name}
-              className={p.popular ? 'pricing-popular-card' : ''}
-              style={{ background: 'var(--surface)', border: `1px solid ${p.popular ? 'var(--accent)' : 'var(--border)'}`, borderRadius: 20, padding: 28, display: 'flex', flexDirection: 'column', position: 'relative', transform: p.popular ? 'scale(1.03)' : 'scale(1)', boxShadow: p.popular ? '0 0 40px rgba(99,102,241,.2), inset 0 1px 0 rgba(255,255,255,.08)' : 'inset 0 1px 0 rgba(255,255,255,.04)', transition: 'transform .2s, box-shadow .2s' }}
-              onMouseEnter={e => { if (!p.popular) { e.currentTarget.style.borderColor = 'var(--border2)'; e.currentTarget.style.transform = 'translateY(-4px)'; } }}
-              onMouseLeave={e => { if (!p.popular) { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.transform = 'translateY(0)'; } }}>
-              {p.popular && <div style={{ position: 'absolute', top: -13, left: '50%', transform: 'translateX(-50%)', background: 'linear-gradient(135deg,var(--accent),var(--blue))', color: '#fff', fontSize: 11, fontWeight: 700, padding: '4px 14px', borderRadius: 100, whiteSpace: 'nowrap', letterSpacing: '.04em' }}>MOST POPULAR</div>}
-              <div style={{ marginBottom: 20 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--fg3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '.08em' }}>{p.name}</div>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, minHeight: 54 }}>
-                  {/* FIX: show $0/mo for Starter to keep baseline aligned */}
-                  <span style={{ fontFamily: 'var(--font-d)', fontSize: 42, fontWeight: 800, color: p.color, lineHeight: 1 }}>
-                    {annual && p.annual > 0 ? `$${p.annual}` : p.monthly === 0 ? '$0' : `$${p.monthly}`}
-                  </span>
-                  <span style={{ fontSize: 14, color: 'var(--fg3)' }}>/mo</span>
-                </div>
-                {annual && p.annual > 0 && <div style={{ fontSize: 11.5, color: 'var(--fg3)', marginTop: 4 }}>billed annually</div>}
-              </div>
-              <ul style={{ listStyle: 'none', padding: 0, display: 'flex', flexDirection: 'column', gap: 9, flex: 1, marginBottom: 24 }}>
-                {p.features.map(f => (
-                  <li key={f} style={{ display: 'flex', alignItems: 'flex-start', gap: 9, fontSize: 13.5, color: 'var(--fg2)' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={p.popular ? 'var(--accent2)' : '#22c55e'} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: 2 }} aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-                    {f}
-                  </li>
-                ))}
-              </ul>
-              <button style={{ width: '100%', padding: '12px', borderRadius: 10, border: `1px solid ${p.popular ? 'var(--accent)' : 'var(--border2)'}`, background: p.popular ? 'var(--accent)' : 'transparent', color: p.popular ? '#fff' : 'var(--fg2)', fontSize: 13.5, fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font-b)', transition: 'all .2s' }}
-                onMouseEnter={e => { if (!p.popular) { e.currentTarget.style.background = 'var(--surface2)'; e.currentTarget.style.color = 'var(--fg)'; } else { e.currentTarget.style.filter = 'brightness(1.1)'; } }}
-                onMouseLeave={e => { if (!p.popular) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--fg2)'; } else { e.currentTarget.style.filter = 'none'; } }}>
-                {p.cta}
-              </button>
+  if (type === 'inbox') return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #f1f5f9', display: 'flex', gap: 8 }}>
+        {[{ label: 'All', count: 32, active: true }, { label: 'WhatsApp', count: 12 }, { label: 'Instagram', count: 9 }, { label: 'Email', count: 11 }].map(tab => (
+          <div key={tab.label} style={{ fontSize: 11, fontWeight: 600, padding: '4px 10px', borderRadius: 7, background: tab.active ? color : '#f8fafc', color: tab.active ? '#fff' : '#64748b', cursor: 'pointer' }}>
+            {tab.label} <span style={{ opacity: 0.7 }}>{tab.count}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{ flex: 1, overflow: 'hidden', padding: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {[
+          { name: 'Priya S.', msg: 'I need help with my order…', time: '2m', ch: '#25D366', unread: true },
+          { name: 'Carlos M.', msg: 'Is this available in blue?', time: '5m', ch: '#E1306C', unread: true },
+          { name: 'Emma W.', msg: 'Thanks! That worked 🙌', time: '12m', ch: '#2563eb', unread: false },
+          { name: 'Li Wei', msg: 'Can I get a discount for bulk?', time: '18m', ch: '#7c3aed', unread: false },
+        ].map(conv => (
+          <div key={conv.name} style={{ display: 'flex', gap: 10, padding: '9px 10px', borderRadius: 10, background: conv.unread ? '#fafbff' : '#fff', border: `1px solid ${conv.unread ? '#e0e7ff' : '#f5f5f5'}`, alignItems: 'center' }}>
+            <div style={{ width: 32, height: 32, borderRadius: 10, background: conv.ch + '22', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: conv.ch }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: conv.unread ? 700 : 500, color: '#0f172a' }}>{conv.name}</div>
+              <div style={{ fontSize: 11, color: '#94a3b8', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{conv.msg}</div>
+            </div>
+            <div style={{ fontSize: 10, color: '#cbd5e1', flexShrink: 0 }}>{conv.time}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  if (type === 'agents') return (
+    <div style={{ height: '100%', padding: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>Agent Collaboration</div>
+      {[
+        { agent: 'Support Agent', action: 'Resolved billing inquiry', time: '4s', icon: Shield },
+        { agent: 'Sales Agent', action: 'Qualified lead — BANT score 84', time: '12s', icon: Target },
+        { agent: 'Support Agent', action: 'Escalated to human (sentiment)', time: '28s', icon: MessageSquare },
+        { agent: 'Sales Agent', action: 'Sent follow-up proposal link', time: '1m', icon: Zap },
+      ].map((item, i) => (
+        <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '10px 12px', background: '#fff', borderRadius: 11, border: '1px solid #f1f5f9' }}>
+          <div style={{ width: 28, height: 28, borderRadius: 8, background: color + '18', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 1 }}>
+            <item.icon size={13} color={color} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: color }}>{item.agent}</div>
+            <div style={{ fontSize: 12, color: '#475569' }}>{item.action}</div>
+          </div>
+          <div style={{ fontSize: 10, color: '#94a3b8', flexShrink: 0 }}>{item.time} ago</div>
+        </div>
+      ))}
+      <div style={{ padding: '8px 12px', background: color + '10', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ width: 6, height: 6, borderRadius: '50%', background: color, animation: 'pulse-dot 1.5s infinite' }} />
+        <span style={{ fontSize: 11, color: color, fontWeight: 600 }}>3 agents active · 47 conversations handled today</span>
+      </div>
+    </div>
+  );
+
+  if (type === 'crm') return (
+    <div style={{ height: '100%', padding: 20, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #f1f5f9', padding: '14px 16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+          <div style={{ width: 38, height: 38, borderRadius: 11, background: 'linear-gradient(135deg,#2563eb,#6366f1)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14, fontWeight: 800 }}>A</div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>Aisha Rahman</div>
+            <div style={{ fontSize: 11, color: '#94a3b8' }}>Enterprise · Dubai, UAE</div>
+          </div>
+          <div style={{ marginLeft: 'auto', fontSize: 11, fontWeight: 700, padding: '3px 9px', borderRadius: 7, background: '#d1fae5', color: '#065f46' }}>Score 91</div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          {[['Conversations', '24'], ['Open Deals', '$8,500'], ['Last Active', '2h ago'], ['Channels', 'WA, IG, EM']].map(([k, v]) => (
+            <div key={k} style={{ padding: '8px 10px', background: '#fafafa', borderRadius: 9, border: '1px solid #f1f5f9' }}>
+              <div style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 }}>{k}</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a', marginTop: 2 }}>{v}</div>
             </div>
           ))}
         </div>
       </div>
-    </section>
+      <div style={{ flex: 1, background: '#fff', borderRadius: 14, border: '1px solid #f1f5f9', padding: '12px 14px' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 8 }}>Activity Timeline</div>
+        {['WhatsApp conversation — 12 min', 'Lead score updated to 91', 'Follow-up email sent by AI'].map((item, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <div style={{ width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }} />
+            <span style={{ fontSize: 11.5, color: '#475569' }}>{item}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  if (type === 'automation') return (
+    <div style={{ height: '100%', padding: 20, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>Workflow · Lead Nurture</div>
+      {[
+        { step: 'Trigger', label: 'New WhatsApp message received', icon: MessageSquare, active: true },
+        { step: 'Action', label: 'AI qualifies lead via BANT', icon: Bot, active: true },
+        { step: 'Condition', label: 'Score ≥ 70?', icon: ChevronRight, active: false },
+        { step: 'Action', label: 'Send personalized follow-up', icon: Mail, active: false },
+        { step: 'Wait', label: '2 days · if no reply → escalate', icon: Clock, active: false },
+      ].map((step, i) => (
+        <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          {i > 0 && (
+            <div style={{ position: 'absolute', width: 1, height: 12, background: '#f1f5f9', left: 34, marginTop: -16 }} />
+          )}
+          <div style={{ width: 30, height: 30, borderRadius: 9, background: step.active ? color + '18' : '#f8fafc', border: `1px solid ${step.active ? color + '30' : '#f1f5f9'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <step.icon size={13} color={step.active ? color : '#94a3b8'} />
+          </div>
+          <div style={{ flex: 1, padding: '8px 12px', background: step.active ? color + '08' : '#fff', borderRadius: 10, border: `1px solid ${step.active ? color + '20' : '#f1f5f9'}` }}>
+            <div style={{ fontSize: 9.5, fontWeight: 700, color: step.active ? color : '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.5 }}>{step.step}</div>
+            <div style={{ fontSize: 12, color: '#0f172a', fontWeight: 500 }}>{step.label}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
+  // analytics
+  return (
+    <div style={{ height: '100%', padding: 20, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        {[
+          { label: 'Conversations', value: '2,847', change: '+18%', up: true },
+          { label: 'Resolution Rate', value: '73%', change: '+5pt', up: true },
+          { label: 'Avg Response', value: '4.2s', change: '-1.8s', up: true },
+          { label: 'CSAT Score', value: '4.9/5', change: '+0.3', up: true },
+        ].map(m => (
+          <div key={m.label} style={{ background: '#fff', borderRadius: 12, padding: '12px 14px', border: '1px solid #f1f5f9' }}>
+            <div style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 }}>{m.label}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: '#0f172a', lineHeight: 1.2, marginTop: 3 }}>{m.value}</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#059669', marginTop: 3 }}>{m.change}</div>
+          </div>
+        ))}
+      </div>
+      {/* Simple bar chart */}
+      <div style={{ background: '#fff', borderRadius: 12, padding: '12px 14px', border: '1px solid #f1f5f9', flex: 1 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}>Weekly Conversations</div>
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 60 }}>
+          {[55, 72, 61, 88, 94, 80, 99].map((v, i) => (
+            <div key={i} style={{ flex: 1, background: `linear-gradient(to top, ${color}, ${color}88)`, borderRadius: '3px 3px 0 0', height: `${v}%`, transition: 'height 0.5s ease' }} />
+          ))}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+          {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((d, i) => (
+            <span key={i} style={{ fontSize: 9, color: '#94a3b8', flex: 1, textAlign: 'center' }}>{d}</span>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
-/* ══════════════════════════════════════════════════════════════
-   12. FAQ SECTION
-   ══════════════════════════════════════════════════════════════ */
-function FAQSection() {
-  const [open, setOpen] = useState(null);
-  const answerRefs = useRef({});
+function FeatureTabs() {
+  const [active, setActive] = useState(0);
+  const tab = FEATURE_TABS[active];
+
+  return (
+    <div style={{ display: 'flex', gap: 0, minHeight: 480 }}>
+      {/* Tab list */}
+      <div style={{ width: 200, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 2, paddingRight: 20 }}>
+        {FEATURE_TABS.map((t, i) => (
+          <button key={t.id} onClick={() => setActive(i)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px',
+              borderRadius: 11, border: 'none', cursor: 'pointer', textAlign: 'left',
+              background: active === i ? t.color : 'transparent',
+              color: active === i ? '#fff' : '#64748b',
+              transition: 'all 0.25s ease',
+              fontWeight: active === i ? 600 : 400,
+            }}>
+            <t.icon size={16} />
+            <span style={{ fontSize: 13.5 }}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Content */}
+      <div style={{ flex: 1, display: 'flex', gap: 32, alignItems: 'flex-start' }}>
+        {/* Text */}
+        <div style={{ flex: '0 0 auto', width: '42%', paddingTop: 8 }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '5px 12px', borderRadius: 100, background: tab.bg, color: tab.color, fontSize: 12, fontWeight: 700, marginBottom: 16 }}>
+            <tab.icon size={13} />
+            {tab.label}
+          </div>
+          <h3 style={{ fontSize: 24, fontWeight: 800, color: '#0f172a', marginBottom: 10, letterSpacing: '-0.3px', lineHeight: 1.2 }}>{tab.title}</h3>
+          <p style={{ fontSize: 14.5, color: '#64748b', marginBottom: 20, lineHeight: 1.65 }}>{tab.subtitle}</p>
+          <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {tab.bullets.map(b => (
+              <li key={b} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, fontSize: 13.5, color: '#334155', lineHeight: 1.5 }}>
+                <span style={{ width: 20, height: 20, borderRadius: '50%', background: tab.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 1 }}>
+                  <Check size={11} color={tab.color} />
+                </span>
+                {b}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {/* Visual */}
+        <div style={{ flex: 1, background: tab.bg, borderRadius: 20, border: `1px solid ${tab.color}18`, overflow: 'hidden', minHeight: 380, position: 'relative' }}>
+          <FeatureVisual type={tab.visual} color={tab.color} bg={tab.bg} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   MAIN COMPONENT
+───────────────────────────────────────────────────────────────────────────── */
+export default function LandingPage() {
+  const [scrolled, setScrolled] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' ? window.innerWidth < 768 : false);
+  const [isTablet, setIsTablet] = useState(() => typeof window !== 'undefined' ? window.innerWidth < 1024 : false);
+
+  const [heroRef, heroInView] = useInView({ threshold: 0.05 });
+  const [metricsRef, metricsInView] = useInView();
+  const [featuresRef, featuresInView] = useInView({ threshold: 0.05 });
+  const [globeRef, globeInView] = useInView({ threshold: 0.15 });
+  const [pricingRef, pricingInView] = useInView({ threshold: 0.05 });
+  const [ctaRef, ctaInView] = useInView({ threshold: 0.2 });
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 40);
+    window.addEventListener('scroll', onScroll);
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      setIsMobile(window.innerWidth < 768);
+      setIsTablet(window.innerWidth < 1024);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const pricingPlans = getLandingPricingPlans();
+
+  const featuresDropdown = [
+    { label: 'AI Inbox', desc: 'Unified multi-channel inbox', href: '#features', icon: <Inbox size={15} color="#2563eb" />, color: '#eff6ff' },
+    { label: 'AI Automation', desc: 'Auto-resolve & smart routing', href: '#features', icon: <Cpu size={15} color="#7c3aed" />, color: '#f5f3ff' },
+    { label: 'Lead Scoring', desc: 'BANT-powered pipeline', href: '#features', icon: <Target size={15} color="#059669" />, color: '#ecfdf5' },
+    { label: 'Analytics', desc: 'Real-time dashboards', href: '#features', icon: <PieChart size={15} color="#0284c7" />, color: '#f0f9ff' },
+  ];
+  const channelsDropdown = [
+    { label: 'WhatsApp', desc: 'Business API integration', href: '#channels', icon: <NavBrandIconWhatsApp />, color: '#f0fdf4' },
+    { label: 'Instagram', desc: 'DM & story replies', href: '#channels', icon: <NavBrandIconInstagram />, color: '#fdf4ff' },
+    { label: 'Facebook', desc: 'Messenger & page inbox', href: '#channels', icon: <NavBrandIconFacebook />, color: '#eff6ff' },
+    { label: 'Email', desc: 'Send/Receive Emails', href: '#channels', icon: <NavBrandIconEmail />, color: '#f1f5f9' },
+    { label: 'Web Chat', desc: 'Embeddable widget', href: '#channels', icon: <Globe size={16} color="#64748b" strokeWidth={1.75} />, color: '#f8fafc' },
+  ];
+  const resourcesDropdown = [
+    { label: 'Documentation', desc: 'Guides & API reference', href: '#', icon: <BookOpen size={15} color="#2563eb" />, color: '#eff6ff' },
+    { label: 'Blog', desc: 'Tips & best practices', href: '#', icon: <FileText size={15} color="#7c3aed" />, color: '#f5f3ff' },
+    { label: 'Help Center', desc: 'Answers to common questions', href: '#faq', icon: <HelpCircle size={15} color="#0284c7" />, color: '#f0f9ff' },
+    { label: 'Contact Us', desc: 'Talk to our team', href: '#', icon: <Mail size={15} color="#059669" />, color: '#ecfdf5' },
+  ];
 
   const faqs = [
-    { q: 'Which channels does Pulse Engine support?',        a: 'WhatsApp Business API, Facebook Messenger, Instagram DM, Email (IMAP/SMTP), and an embeddable Web Chat widget. Additional channels are available via webhooks.' },
-    { q: 'How does the AI know when to escalate to a human?',a: 'Our AI monitors sentiment, detects frustration signals, and recognises intent patterns beyond its confidence threshold. It hands off seamlessly with full conversation context attached.' },
-    { q: 'Can multiple agents work on the same inbox?',      a: 'Yes. The shared inbox has real-time collision detection so two agents never respond to the same conversation simultaneously. You can set routing rules by team, skill, or workload.' },
-    { q: 'Is there a free trial?',                           a: 'Every new account gets a 14-day Professional trial, no credit card required. After the trial you can continue on the free Starter plan or upgrade anytime.' },
-    { q: 'How is my data secured?',                          a: 'All data is encrypted at rest (AES-256) and in transit (TLS 1.3). We support JWT authentication, role-based access control, and are fully GDPR compliant. Enterprise plans support on-premise deployment.' },
-    { q: 'Can I export my data?',                            a: 'Absolutely. You can export conversations, contacts, and analytics in CSV or JSON at any time. Your data is yours — always.' },
+    { q: 'Which channels does Pulse Engine support?', a: 'Pulse Engine supports WhatsApp Business API, Facebook Messenger, Instagram Direct, Email (IMAP + SMTP/Brevo), and an embeddable Web Chat widget out of the box. Additional channels can be added via webhooks.' },
+    { q: 'What is included in the free Starter plan?', a: 'The Starter plan is permanently free. It includes up to 500 conversations per month, WhatsApp & Web Chat integration, basic AI-assisted replies (50/month), and a shared inbox for 1 user. No credit card required.' },
+    { q: 'How does the AI know when to escalate to a human?', a: 'The AI monitors sentiment signals, detects frustration patterns, and recognises intent that falls outside its confidence threshold. It hands off seamlessly with full conversation context so your agent can pick up instantly.' },
+    { q: 'Can multiple agents work on the same inbox?', a: 'Yes. The shared inbox includes real-time collision detection so two agents never reply to the same conversation simultaneously. You can also set routing rules by team, skill, or language.' },
+    { q: 'Is there a free trial on paid plans?', a: 'Yes — all new accounts receive a 30-day trial of Pro features. After the trial, you can continue on the free Starter plan or upgrade to Pro ($29/mo) or Enterprise ($99/mo) with no commitment.' },
+    { q: 'How is my data secured?', a: 'All data is encrypted at rest and in transit. We provide JWT-based authentication, role-based access control, and are fully GDPR-compliant. Enterprise plans support on-premise deployment.' },
   ];
 
-  return (
-    <section id="faq" className="section" style={{ background: 'var(--bg)' }}>
-      <div className="container" style={{ maxWidth: 720 }}>
-        <div style={{ textAlign: 'center', marginBottom: 48 }}>
-          <span className="label" style={{ display: 'block', marginBottom: 10 }}>FAQ</span>
-          <h2 className="h2" style={{ color: 'var(--fg)' }}>Frequently Asked Questions</h2>
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {faqs.map((f, i) => (
-            <div key={i} style={{ background: 'var(--surface)', border: `1px solid ${open === i ? 'var(--accent)' : 'var(--border)'}`, borderRadius: 14, overflow: 'hidden', transition: 'border-color .2s' }}>
-              <button
-                onClick={() => setOpen(open === i ? null : i)}
-                aria-expanded={open === i}
-                aria-controls={`faq-answer-${i}`}
-                id={`faq-btn-${i}`}
-                style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 22px', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left', gap: 16 }}>
-                {/* FIX: removed invalid fontSpread property */}
-                <span style={{ fontSize: 14.5, fontWeight: 600, color: 'var(--fg)', fontFamily: 'var(--font-b)' }}>{f.q}</span>
-                <span style={{ flexShrink: 0, width: 22, height: 22, borderRadius: '50%', background: open === i ? 'var(--accent-dim)' : 'var(--surface2)', border: `1px solid ${open === i ? 'var(--accent)' : 'var(--border)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all .2s' }} aria-hidden="true">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={open === i ? 'var(--accent2)' : 'var(--fg3)'} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transition: 'transform .3s', transform: open === i ? 'rotate(45deg)' : 'rotate(0deg)' }}>
-                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-                  </svg>
-                </span>
-              </button>
-              {/* FIX: use 999px instead of 300px to avoid clipping long answers */}
-              <div id={`faq-answer-${i}`} role="region" aria-labelledby={`faq-btn-${i}`} style={{ maxHeight: open === i ? 999 : 0, overflow: 'hidden', transition: 'max-height .45s cubic-bezier(.4,0,.2,1)' }}>
-                <p style={{ padding: '0 22px 20px', fontSize: 14, color: 'var(--fg2)', lineHeight: 1.7, margin: 0 }}>{f.a}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   13. CTA BANNER
-   ══════════════════════════════════════════════════════════════ */
-function CTABanner() {
-  return (
-    <section style={{ padding: '80px 24px', background: 'linear-gradient(135deg,#020817 0%,#0a0f2e 40%,#0d1635 100%)', position: 'relative', overflow: 'hidden' }}>
-      <div style={{ position: 'absolute', top: -80, right: -80, width: 500, height: 500, borderRadius: '50%', background: 'radial-gradient(circle,rgba(99,102,241,.18) 0%,transparent 70%)', pointerEvents: 'none' }} aria-hidden="true" />
-      <div style={{ position: 'absolute', bottom: -60, left: -60, width: 380, height: 380, borderRadius: '50%', background: 'radial-gradient(circle,rgba(37,99,235,.14) 0%,transparent 70%)', pointerEvents: 'none' }} aria-hidden="true" />
-      {/* subtle animated grid */}
-      <div style={{ position: 'absolute', inset: 0, backgroundImage: 'linear-gradient(rgba(99,102,241,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,.05) 1px,transparent 1px)', backgroundSize: '50px 50px', opacity: .4 }} aria-hidden="true" />
-      <div className="noise-overlay" aria-hidden="true" />
-      <div className="container" style={{ maxWidth: 680, textAlign: 'center', position: 'relative', zIndex: 1 }}>
-        <h2 style={{ fontFamily: 'var(--font-d)', fontSize: 'clamp(28px,4vw,48px)', fontWeight: 800, color: '#fff', marginBottom: 16, lineHeight: 1.1, letterSpacing: '-.03em' }}>
-          Ready to Transform Your<br />Customer Conversations?
-        </h2>
-        <p style={{ fontSize: 17, color: 'rgba(255,255,255,.65)', marginBottom: 36, lineHeight: 1.6 }}>
-          Start for free — no credit card, no setup fees. Your AI workforce is ready in minutes.
-        </p>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, justifyContent: 'center' }}>
-          <a href="#" className="btn btn-primary btn-lg"
-            onMouseEnter={e => { e.currentTarget.style.transform='translateY(-2px)'; }}
-            onMouseLeave={e => { e.currentTarget.style.transform='translateY(0)'; }}>
-            Start Free Trial
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-          </a>
-          <a href="#" style={{ display:'inline-flex', alignItems:'center', gap:8, padding:'14px 24px', background:'rgba(255,255,255,.08)', border:'1px solid rgba(255,255,255,.2)', color:'rgba(255,255,255,.9)', borderRadius:12, fontWeight:600, fontSize:15, textDecoration:'none', transition:'all .2s' }}
-            onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,.14)'}
-            onMouseLeave={e=>e.currentTarget.style.background='rgba(255,255,255,.08)'}>
-            Book a Demo
-          </a>
-        </div>
-        <div style={{ display:'flex', flexWrap:'wrap', justifyContent:'center', gap:24, marginTop:28, fontSize:12.5, color:'rgba(255,255,255,.4)' }}>
-          {['Free 14-day trial','No credit card','Cancel anytime','Setup in 5 minutes'].map(t => (
-            <span key={t} style={{ display:'flex', alignItems:'center', gap:5 }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-              {t}
-            </span>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   14. FOOTER
-   ══════════════════════════════════════════════════════════════ */
-function PulseFooter() {
-  const cols = [
-    { heading: 'Product',   links: ['AI Inbox','Automation','Lead Intelligence','Analytics','API & Webhooks','Changelog'] },
-    { heading: 'Solutions', links: ['Sales Teams','Support Teams','Marketing','E-commerce','Agencies','Enterprise'] },
-    { heading: 'Resources', links: ['Documentation','Help Center','Blog','Webinars','Case Studies','Status'] },
-    { heading: 'Company',   links: ['About Us','Careers','Press','Partners','Contact','Security'] },
-  ];
-
-  /* FIX: dynamic copyright year */
-  const year = new Date().getFullYear();
+  const heroNavDark = !scrolled;
 
   return (
-    <footer style={{ background: 'var(--bg2)', borderTop: '1px solid var(--border)', padding: '60px 24px 32px' }}>
-      <div className="container">
-        <div className="footer-grid">
-          <div>
-            <div style={{ marginBottom: 16 }}>
-              <PlatformLogo textColor="var(--fg)" imageWidth={30} fontSize={16} fontWeight={800} />
-            </div>
-            <p style={{ fontSize: 13.5, color: 'var(--fg3)', lineHeight: 1.65, marginBottom: 20, maxWidth: 220 }}>AI-powered CRM for modern teams that want to grow faster and work smarter.</p>
-            <div style={{ display: 'flex', gap: 8 }}>
-              {/* X/Twitter */}
-              <a href="#" aria-label="Pulse Engine on X / Twitter" style={{ width:32, height:32, borderRadius:8, border:'1px solid var(--border)', background:'var(--surface)', display:'flex', alignItems:'center', justifyContent:'center', color:'var(--fg3)', textDecoration:'none', transition:'all .2s' }}
-                onMouseEnter={e=>{e.currentTarget.style.borderColor='var(--accent)';e.currentTarget.style.color='var(--accent2)';}}
-                onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.color='var(--fg3)';}}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M23 3a10.9 10.9 0 01-3.14 1.53 4.48 4.48 0 00-7.86 3v1A10.66 10.66 0 013 4s-4 9 5 13a11.64 11.64 0 01-7 2c9 5 20 0 20-11.5a4.5 4.5 0 00-.08-.83A7.72 7.72 0 0023 3z"/></svg>
-              </a>
-              {/* LinkedIn — FIX: split into two path elements for correct rendering */}
-              <a href="#" aria-label="Pulse Engine on LinkedIn" style={{ width:32, height:32, borderRadius:8, border:'1px solid var(--border)', background:'var(--surface)', display:'flex', alignItems:'center', justifyContent:'center', color:'var(--fg3)', textDecoration:'none', transition:'all .2s' }}
-                onMouseEnter={e=>{e.currentTarget.style.borderColor='var(--accent)';e.currentTarget.style.color='var(--accent2)';}}
-                onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.color='var(--fg3)';}}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M16 8a6 6 0 016 6v7h-4v-7a2 2 0 00-2-2 2 2 0 00-2 2v7h-4v-7a6 6 0 016-6z"/>
-                  <rect x="2" y="9" width="4" height="12"/>
-                  <circle cx="4" cy="4" r="2"/>
-                </svg>
-              </a>
+    <div className="lp-root" style={{ minHeight: '100vh', background: '#fff', fontFamily: '"Inter", "DM Sans", system-ui, sans-serif' }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+        .lp-root, .lp-root * {
+          box-sizing: border-box;
+        }
+
+        @keyframes pulse-dot {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.4; transform: scale(0.8); }
+        }
+
+        @keyframes slideInRow {
+          from { opacity: 0; transform: translateX(-12px); }
+          to { opacity: 1; transform: translateX(0); }
+        }
+
+        @keyframes float-gentle {
+          0%, 100% { transform: translateY(0px); }
+          50% { transform: translateY(-8px); }
+        }
+
+        @keyframes spin-slow {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+
+        .lp-nav-link {
+          position: relative;
+          font-size: 14px;
+          text-decoration: none;
+          padding: 6px 2px;
+          transition: color 0.2s;
+          font-weight: 400;
+        }
+        .lp-nav-link:hover { font-weight: 600; }
+
+        .ch-card-hover {
+          transition: transform 0.35s cubic-bezier(.34,1.56,.64,1), box-shadow 0.35s ease;
+        }
+        .ch-card-hover:hover {
+          transform: translateY(-8px) scale(1.02);
+          box-shadow: 0 20px 48px rgba(0,0,0,0.10) !important;
+        }
+
+        .lp-pricing-grid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 20px;
+          max-width: 1100px;
+          margin: 0 auto;
+        }
+        @media (max-width: 860px) {
+          .lp-pricing-grid { grid-template-columns: 1fr; max-width: 440px; }
+        }
+
+        .lp-footer-grid {
+          display: grid;
+          grid-template-columns: 2fr 1fr 1fr 1fr;
+          gap: 40px;
+        }
+        @media (max-width: 768px) {
+          .lp-footer-grid { grid-template-columns: 1fr 1fr; gap: 28px; }
+        }
+        @media (max-width: 480px) {
+          .lp-footer-grid { grid-template-columns: 1fr; }
+        }
+
+        .lp-hero-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 60px;
+          align-items: center;
+        }
+        @media (max-width: 900px) {
+          .lp-hero-grid { grid-template-columns: 1fr; gap: 40px; }
+        }
+
+        .lp-channels-grid {
+          display: grid;
+          grid-template-columns: repeat(5, 1fr);
+          gap: 16px;
+        }
+        @media (max-width: 900px) {
+          .lp-channels-grid { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (max-width: 560px) {
+          .lp-channels-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        .lp-metrics-grid {
+          display: grid;
+          grid-template-columns: repeat(4, 1fr);
+          gap: 20px;
+        }
+        @media (max-width: 900px) {
+          .lp-metrics-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 500px) {
+          .lp-metrics-grid { grid-template-columns: 1fr 1fr; }
+        }
+
+        .lp-feat-tabs-wrap {
+          display: flex;
+          gap: 0;
+          min-height: 480px;
+        }
+        @media (max-width: 900px) {
+          .lp-feat-tabs-wrap { flex-direction: column; gap: 20px; }
+          .lp-feat-tab-list { width: 100% !important; flex-direction: row !important; flex-wrap: wrap; padding-right: 0 !important; gap: 6px !important; }
+          .lp-feat-tab-content { flex-direction: column !important; }
+          .lp-feat-tab-text { width: 100% !important; }
+          .lp-feat-visual { min-height: 280px !important; }
+        }
+
+        .lp-globe-wrap {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 60px;
+          align-items: center;
+        }
+        @media (max-width: 800px) {
+          .lp-globe-wrap { grid-template-columns: 1fr; }
+        }
+
+        .lp-mob-nav { display: none; }
+        @media (max-width: 768px) {
+          .lp-desk-nav { display: none !important; }
+          .lp-mob-nav { display: flex; }
+        }
+
+        .lp-mob-menu {
+          position: fixed;
+          top: 64px;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background: rgba(15,23,42,0.97);
+          backdrop-filter: blur(16px);
+          z-index: 49;
+          padding: 28px 24px;
+          overflow-y: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+        .lp-mob-menu-link {
+          display: block;
+          padding: 14px 0;
+          font-size: 18px;
+          font-weight: 600;
+          color: #fff;
+          text-decoration: none;
+          border-bottom: 1px solid rgba(255,255,255,0.06);
+          transition: color 0.2s;
+        }
+        .lp-mob-menu-link:hover { color: #3b82f6; }
+      `}</style>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          HEADER
+      ══════════════════════════════════════════════════════════════════ */}
+      <header style={{
+        position: 'fixed', top: 0, left: 0, right: 0, zIndex: 50,
+        transition: 'all 0.35s cubic-bezier(0.4,0,0.2,1)',
+        background: scrolled ? 'rgba(255,255,255,0.94)' : 'transparent',
+        backdropFilter: scrolled ? 'blur(20px) saturate(1.3)' : 'none',
+        borderBottom: scrolled ? '1px solid #f1f5f9' : '1px solid transparent',
+        boxShadow: scrolled ? '0 2px 24px rgba(0,0,0,0.07)' : 'none',
+      }}>
+        <div style={{ maxWidth: 1280, margin: '0 auto', padding: '0 28px', height: 64, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <PlatformLogo fontWeight={800} textColor={scrolled ? '#0f172a' : '#0f172a'} />
+
+          {/* Desktop nav */}
+          <nav className="lp-desk-nav" style={{ display: 'flex', alignItems: 'center', gap: 28 }}>
+            <NavDropdown label="Features" items={featuresDropdown} dark={false} />
+            <NavDropdown label="Channels" items={channelsDropdown} dark={false} />
+            <NavLink href="#pricing" dark={false}>Pricing</NavLink>
+            <NavDropdown label="Resources" items={resourcesDropdown} dark={false} />
+          </nav>
+
+          <div className="lp-desk-nav" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Link to="/signin" style={{ fontSize: 13.5, fontWeight: 500, color: '#475569', textDecoration: 'none', padding: '7px 16px', borderRadius: 9, transition: 'all 0.2s' }}
+              onMouseEnter={e => { e.currentTarget.style.background = '#f1f5f9'; e.currentTarget.style.color = '#0f172a'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = '#475569'; }}>
+              Sign In
+            </Link>
+            <Link to="/signup" style={{ fontSize: 13.5, fontWeight: 700, color: '#fff', background: 'linear-gradient(135deg,#2563eb,#4f46e5)', padding: '8px 20px', borderRadius: 10, textDecoration: 'none', boxShadow: '0 4px 16px rgba(37,99,235,0.32)', transition: 'all 0.2s' }}
+              onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(37,99,235,0.42)'; }}
+              onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 4px 16px rgba(37,99,235,0.32)'; }}>
+              Start Free Trial
+            </Link>
+          </div>
+
+          {/* Mobile menu button */}
+          <button className="lp-mob-nav" onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 8, color: '#0f172a', display: 'flex', alignItems: 'center' }}>
+            {mobileMenuOpen ? <X size={22} /> : <Menu size={22} />}
+          </button>
+        </div>
+
+        {/* Mobile menu */}
+        {mobileMenuOpen && (
+          <div className="lp-mob-menu">
+            {['Features', 'Channels', 'Pricing', 'Resources'].map(item => (
+              <a key={item} href={`#${item.toLowerCase()}`} className="lp-mob-menu-link" onClick={() => setMobileMenuOpen(false)}>{item}</a>
+            ))}
+            <div style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <Link to="/signin" style={{ display: 'block', padding: '14px 20px', background: 'rgba(255,255,255,0.06)', color: '#fff', textDecoration: 'none', borderRadius: 12, textAlign: 'center', fontSize: 15, fontWeight: 600 }}>Sign In</Link>
+              <Link to="/signup" style={{ display: 'block', padding: '14px 20px', background: 'linear-gradient(135deg,#2563eb,#4f46e5)', color: '#fff', textDecoration: 'none', borderRadius: 12, textAlign: 'center', fontSize: 15, fontWeight: 700 }}>Start Free Trial →</Link>
             </div>
           </div>
-          {cols.map(col => (
-            <div key={col.heading}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--fg3)', textTransform: 'uppercase', letterSpacing: '.12em', marginBottom: 14 }}>{col.heading}</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-                {col.links.map(l => (
-                  <a key={l} href="#" style={{ fontSize: 13.5, color: 'var(--fg3)', textDecoration: 'none', transition: 'color .15s' }}
-                    onMouseEnter={e=>e.currentTarget.style.color='var(--fg)'}
-                    onMouseLeave={e=>e.currentTarget.style.color='var(--fg3)'}>{l}</a>
+        )}
+      </header>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          HERO
+      ══════════════════════════════════════════════════════════════════ */}
+      <section ref={heroRef} style={{ position: 'relative', paddingTop: 104, paddingBottom: 80, paddingLeft: 28, paddingRight: 28, overflow: 'hidden', background: '#fff' }}>
+        {/* Subtle background gradient */}
+        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', top: -200, right: -200, width: 700, height: 700, background: 'radial-gradient(circle, rgba(99,102,241,0.07) 0%, transparent 70%)', borderRadius: '50%' }} />
+          <div style={{ position: 'absolute', top: 100, left: -100, width: 500, height: 500, background: 'radial-gradient(circle, rgba(37,99,235,0.06) 0%, transparent 70%)', borderRadius: '50%' }} />
+        </div>
+
+        <div style={{ maxWidth: 1200, margin: '0 auto', position: 'relative', zIndex: 1 }}>
+          <div className="lp-hero-grid">
+            {/* Left: Copy */}
+            <div style={{ opacity: heroInView ? 1 : 0, transform: heroInView ? 'translateX(0)' : 'translateX(-24px)', transition: 'all 0.8s cubic-bezier(0.4,0,0.2,1) 0.1s' }}>
+              {/* Eyebrow */}
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '6px 14px', borderRadius: 100, background: '#eff6ff', border: '1px solid #bfdbfe', marginBottom: 24 }}>
+                <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#2563eb', animation: 'pulse-dot 2s infinite' }} />
+                <span style={{ fontSize: 12.5, fontWeight: 700, color: '#1d4ed8', letterSpacing: 0.3 }}>AI-First CRM · Now Available</span>
+              </div>
+
+              <h1 style={{ fontSize: 'clamp(32px, 4.4vw, 56px)', fontWeight: 900, color: '#0a0f1e', lineHeight: 1.06, letterSpacing: '-2px', marginBottom: 22 }}>
+                AI runs your{' '}
+                <span style={{ background: 'linear-gradient(135deg,#2563eb 0%,#4f46e5 50%,#7c3aed 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>
+                  customer operations.
+                </span>
+              </h1>
+
+              <p style={{ fontSize: 17, color: '#64748b', lineHeight: 1.7, marginBottom: 32, maxWidth: 480 }}>
+                Unify WhatsApp, Instagram, Facebook, Email, and Web Chat into one intelligent inbox. Qualify leads, resolve queries, and close deals — automatically.
+              </p>
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 32 }}>
+                <Link to="/signup" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '14px 28px', background: 'linear-gradient(135deg,#2563eb,#4f46e5)', color: '#fff', borderRadius: 12, fontWeight: 700, fontSize: 15, textDecoration: 'none', boxShadow: '0 8px 28px rgba(37,99,235,0.32)', transition: 'all 0.2s' }}
+                  onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 14px 36px rgba(37,99,235,0.44)'; }}
+                  onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 8px 28px rgba(37,99,235,0.32)'; }}>
+                  Start Free — No Card Needed <ArrowRight size={17} />
+                </Link>
+                <Link to="/contact" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '14px 24px', background: '#fff', color: '#0f172a', border: '1.5px solid #e2e8f0', borderRadius: 12, fontWeight: 600, fontSize: 15, textDecoration: 'none', transition: 'all 0.2s' }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = '#cbd5e1'; e.currentTarget.style.background = '#f8fafc'; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.background = '#fff'; }}>
+                  <Play size={14} style={{ fill: '#0f172a' }} /> Watch Demo
+                </Link>
+              </div>
+
+              {/* Trust signals */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 18, fontSize: 13, color: '#94a3b8' }}>
+                {['Free 30-day trial', 'No credit card required', 'Cancel anytime'].map(t => (
+                  <span key={t} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Check size={13} color="#22c55e" strokeWidth={2.5} /> {t}
+                  </span>
                 ))}
               </div>
             </div>
-          ))}
+
+            {/* Right: Interactive visualization */}
+            <div style={{ opacity: heroInView ? 1 : 0, transform: heroInView ? 'translateY(0)' : 'translateY(32px)', transition: 'all 1s cubic-bezier(0.4,0,0.2,1) 0.3s' }}>
+              <PipelineVisualization />
+            </div>
+          </div>
         </div>
-        <div style={{ paddingTop: 24, borderTop: '1px solid var(--border)', display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
-          {/* FIX: dynamic year */}
-          <span style={{ fontSize: 12.5, color: 'var(--fg3)' }}>© {year} Pulse Engine. All rights reserved.</span>
-          <div style={{ display: 'flex', gap: 20 }}>
-            {['Privacy Policy','Terms of Service','Cookie Settings'].map(t => (
-              <a key={t} href="#" style={{ fontSize: 12.5, color: 'var(--fg3)', textDecoration: 'none', transition: 'color .15s' }}
-                onMouseEnter={e=>e.currentTarget.style.color='var(--fg)'}
-                onMouseLeave={e=>e.currentTarget.style.color='var(--fg3)'}>{t}</a>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          SOCIAL PROOF STRIP
+      ══════════════════════════════════════════════════════════════════ */}
+      <section style={{ padding: '32px 28px', borderTop: '1px solid #f1f5f9', borderBottom: '1px solid #f1f5f9', background: '#fafbff' }}>
+        <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+          <p style={{ textAlign: 'center', fontSize: 12, fontWeight: 700, color: '#94a3b8', letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 20 }}>Trusted by customer-obsessed teams</p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: 40 }}>
+            {['Meridian Group', 'Nexora Retail', 'PrimeShift', 'Atlus Commerce', 'Vanta Solutions', 'CoreBridge'].map(name => (
+              <span key={name} style={{ fontSize: 14, fontWeight: 700, color: '#cbd5e1', letterSpacing: '-0.3px', fontFamily: 'Inter' }}>{name}</span>
             ))}
           </div>
         </div>
-      </div>
-    </footer>
-  );
-}
+      </section>
 
-/* ══════════════════════════════════════════════════════════════
-   15. DEMO MODAL (bugs fixed)
-   ══════════════════════════════════════════════════════════════ */
-function DemoModal({ open, onClose }) {
-  useEffect(() => {
-    document.body.style.overflow = open ? 'hidden' : '';
-    return () => { document.body.style.overflow = ''; };
-  }, [open]);
-
-  if (!open) return null;
-  return (
-    <div onClick={onClose} role="dialog" aria-modal="true" aria-label="Platform demo" style={{ position: 'fixed', inset: 0, zIndex: 99999, background: 'rgba(0,0,0,.88)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, backdropFilter: 'blur(8px)', animation: 'fadeIn .25s ease' }}>
-      <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 900, background: 'var(--surface)', borderRadius: 20, border: '1px solid var(--border)', overflow: 'hidden', boxShadow: '0 40px 120px rgba(0,0,0,.7)', position: 'relative' }}>
-        {/* FIX: removed invalid justifySpread property */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid var(--border)', background: 'var(--bg2)' }}>
-          <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--fg)', fontFamily: 'var(--font-d)' }}>Pulse Engine — Platform Demo</span>
-          <button onClick={onClose} aria-label="Close demo" style={{ background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--fg2)', borderRadius: 8, width: 30, height: 30, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 }}>×</button>
-        </div>
-        {/* FIX: iframe replaced with branded placeholder — no 404 local file */}
-        <div style={{ padding: 0, background: '#020817', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '60vh', gap: 16 }}>
-          <div style={{ width: 72, height: 72, borderRadius: 20, background: 'linear-gradient(135deg,#6366f1,#3b82f6)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 40px rgba(99,102,241,.5)' }}>
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      {/* ═══════════════════════════════════════════════════════════════
+          METRICS
+      ══════════════════════════════════════════════════════════════════ */}
+      <section ref={metricsRef} style={{ padding: '88px 28px', background: '#fff' }}>
+        <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+          <div style={{ textAlign: 'center', marginBottom: 56, opacity: metricsInView ? 1 : 0, transform: metricsInView ? 'translateY(0)' : 'translateY(20px)', transition: 'all 0.7s' }}>
+            <h2 style={{ fontSize: 'clamp(24px, 3vw, 38px)', fontWeight: 800, color: '#0a0f1e', marginBottom: 10, letterSpacing: '-1px' }}>Results teams see in 90 days</h2>
+            <p style={{ fontSize: 15.5, color: '#64748b', maxWidth: 440, margin: '0 auto' }}>Aggregated across businesses running Pulse Engine for 90+ days.</p>
           </div>
-          <p style={{ color: 'var(--fg2)', fontSize: 16, fontWeight: 600 }}>Demo video coming soon</p>
-          <p style={{ color: 'var(--fg3)', fontSize: 13 }}>Book a live walkthrough with our team instead →</p>
-          <a href="mailto:demo@pulseengine.io" className="btn btn-primary" style={{ marginTop: 8 }}>Book Live Demo</a>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ══════════════════════════════════════════════════════════════
-   16. TWEAKS PANEL (accent cascade + no theme toggle)
-   ══════════════════════════════════════════════════════════════ */
-const TweaksPanel = memo(function TweaksPanel({ visible, onClose }) {
-  if (!visible) return null;
-
-  /* FIX: update all three accent tokens together */
-  const setAccent = (base, light, dim) => {
-    const root = document.documentElement;
-    root.style.setProperty('--accent',     base);
-    root.style.setProperty('--accent2',    light);
-    root.style.setProperty('--accent-dim', dim);
-  };
-
-  const accents = [
-    { color: '#6366f1', light: '#818cf8', dim: 'rgba(99,102,241,0.12)',  name: 'Indigo'  },
-    { color: '#0ea5e9', light: '#38bdf8', dim: 'rgba(14,165,233,0.12)',  name: 'Cyan'    },
-    { color: '#22c55e', light: '#4ade80', dim: 'rgba(34,197,94,0.12)',   name: 'Emerald' },
-  ];
-
-  return (
-    <div style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 9998, background: 'var(--surface)', border: '1px solid var(--border2)', borderRadius: 16, padding: 20, minWidth: 240, boxShadow: '0 20px 60px rgba(0,0,0,.5)', animation: 'slideUp .25s ease' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-        <span style={{ fontFamily: 'var(--font-d)', fontWeight: 700, fontSize: 13, color: 'var(--fg)' }}>Tweaks</span>
-        <button onClick={onClose} aria-label="Close tweaks panel" style={{ background: 'none', border: 'none', color: 'var(--fg3)', cursor: 'pointer', fontSize: 18, padding: 0, lineHeight: 1 }}>×</button>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <div>
-          <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--fg3)', letterSpacing: '.08em', textTransform: 'uppercase', marginBottom: 8 }}>Accent Color</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            {accents.map(a => (
-              <button key={a.color} onClick={() => setAccent(a.color, a.light, a.dim)} title={a.name} aria-label={`Set ${a.name} accent`}
-                style={{ flex: 1, height: 28, borderRadius: 6, background: a.color, border: '2px solid rgba(255,255,255,.15)', cursor: 'pointer', transition: 'transform .15s' }}
-                onMouseEnter={e=>e.currentTarget.style.transform='scale(1.08)'}
-                onMouseLeave={e=>e.currentTarget.style.transform='scale(1)'} />
+          <div className="lp-metrics-grid">
+            {[
+              { icon: Bot, value: '70', suffix: '%', label: 'AI Resolution Rate', sub: 'queries resolved without human involvement', color: '#2563eb', bg: '#eff6ff' },
+              { icon: Clock, value: '3', suffix: 'x', label: 'Faster Response', sub: 'compared to manual handling workflows', color: '#7c3aed', bg: '#f5f3ff' },
+              { icon: TrendingUp, value: '40', suffix: '%', label: 'More Leads Captured', sub: 'from inbound conversations automatically', color: '#059669', bg: '#ecfdf5' },
+              { icon: Star, value: '4.9', suffix: '/5', label: 'Average CSAT', sub: 'up from industry average of 3.8', color: '#d97706', bg: '#fffbeb' },
+            ].map((m, i) => (
+              <div key={m.label} style={{
+                background: '#fff', border: '1px solid #f1f5f9', borderRadius: 22, padding: '32px 24px', textAlign: 'center',
+                boxShadow: '0 2px 16px rgba(0,0,0,0.04)',
+                opacity: metricsInView ? 1 : 0, transform: metricsInView ? 'translateY(0)' : 'translateY(28px)',
+                transition: `all 0.7s cubic-bezier(0.4,0,0.2,1) ${i * 100}ms`,
+              }}
+                onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-6px)'; e.currentTarget.style.boxShadow = '0 20px 48px rgba(0,0,0,0.08)'; }}
+                onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 2px 16px rgba(0,0,0,0.04)'; }}>
+                <div style={{ width: 48, height: 48, background: m.bg, borderRadius: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 18px' }}>
+                  <m.icon size={22} color={m.color} />
+                </div>
+                <p style={{ fontSize: 48, fontWeight: 900, color: m.color, marginBottom: 6, letterSpacing: '-2px', lineHeight: 1 }}>
+                  <AnimatedCounter value={m.value} suffix={m.suffix} duration={1800 + i * 200} />
+                </p>
+                <p style={{ fontSize: 14, fontWeight: 700, color: '#0f172a', marginBottom: 5 }}>{m.label}</p>
+                <p style={{ fontSize: 12.5, color: '#94a3b8', lineHeight: 1.5 }}>{m.sub}</p>
+              </div>
             ))}
           </div>
         </div>
-        {/* FIX: local Inbox.html replaced with real route */}
-        <a href="/inbox" style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:6, padding:'9px', borderRadius:9, border:'1px solid var(--border)', background:'var(--surface2)', color:'var(--fg2)', textDecoration:'none', fontSize:12.5, fontWeight:600, transition:'all .2s' }}
-          onMouseEnter={e=>{e.currentTarget.style.borderColor='var(--accent)';e.currentTarget.style.color='var(--fg)';}}
-          onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.color='var(--fg2)';}}>
-          💬 Open Inbox →
-        </a>
-      </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          FEATURE TABS SHOWCASE
+      ══════════════════════════════════════════════════════════════════ */}
+      <section id="features" ref={featuresRef} style={{ padding: '88px 28px', background: '#fafbff', borderTop: '1px solid #f1f5f9' }}>
+        <div style={{ maxWidth: 1200, margin: '0 auto' }}>
+          <div style={{ textAlign: 'center', marginBottom: 56, opacity: featuresInView ? 1 : 0, transform: featuresInView ? 'translateY(0)' : 'translateY(20px)', transition: 'all 0.7s' }}>
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '5px 14px', borderRadius: 100, background: '#eff6ff', color: '#2563eb', fontSize: 12.5, fontWeight: 700, marginBottom: 16 }}>
+              <Sparkles size={13} />
+              Enterprise Capabilities
+            </div>
+            <h2 style={{ fontSize: 'clamp(24px, 3vw, 40px)', fontWeight: 800, color: '#0a0f1e', marginBottom: 12, letterSpacing: '-1px' }}>Built for scale. Designed for humans.</h2>
+            <p style={{ fontSize: 16, color: '#64748b', maxWidth: 520, margin: '0 auto', lineHeight: 1.65 }}>
+              Six pillars that turn every message — from any channel — into intelligent, automated, revenue-generating action.
+            </p>
+          </div>
+          <div style={{ opacity: featuresInView ? 1 : 0, transform: featuresInView ? 'translateY(0)' : 'translateY(28px)', transition: 'all 0.8s cubic-bezier(0.4,0,0.2,1) 0.2s' }}>
+            {/* Desktop: tabbed layout */}
+            {!isTablet ? <FeatureTabs /> : (
+              /* Mobile/Tablet: stacked cards */
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {FEATURE_TABS.map(tab => (
+                  <div key={tab.id} style={{ background: '#fff', borderRadius: 20, border: '1px solid #f1f5f9', padding: '28px 24px', boxShadow: '0 2px 12px rgba(0,0,0,0.04)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+                      <div style={{ width: 40, height: 40, borderRadius: 12, background: tab.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <tab.icon size={20} color={tab.color} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{tab.title}</div>
+                        <div style={{ fontSize: 12.5, color: '#94a3b8' }}>{tab.subtitle}</div>
+                      </div>
+                    </div>
+                    <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 9 }}>
+                      {tab.bullets.map(b => (
+                        <li key={b} style={{ display: 'flex', alignItems: 'flex-start', gap: 9, fontSize: 13.5, color: '#334155', lineHeight: 1.5 }}>
+                          <span style={{ width: 18, height: 18, borderRadius: '50%', background: tab.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 2 }}>
+                            <Check size={10} color={tab.color} />
+                          </span>
+                          {b}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          CHANNELS
+      ══════════════════════════════════════════════════════════════════ */}
+      <section id="channels" style={{ padding: '88px 28px', background: '#fff' }}>
+        <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+          <div style={{ textAlign: 'center', marginBottom: 52 }}>
+            <h2 style={{ fontSize: 'clamp(24px, 3vw, 40px)', fontWeight: 800, color: '#0a0f1e', marginBottom: 12, letterSpacing: '-1px' }}>One platform. Every channel.</h2>
+            <p style={{ fontSize: 16, color: '#64748b', maxWidth: 440, margin: '0 auto' }}>Your customers are everywhere. Meet them where they are — without switching tabs.</p>
+          </div>
+          <div className="lp-channels-grid">
+            {[
+              { name: 'WhatsApp', sub: 'Business API · 2B+ users', borderColor: '#bbf7d0', shadowColor: 'rgba(37,211,102,0.08)', icon: (
+                <div style={{ width: 60, height: 60, background: '#25D366', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg viewBox="0 0 24 24" style={{ width: 32, height: 32, fill: '#fff' }}><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+                </div>
+              )},
+              { name: 'Instagram', sub: 'DM & story replies', borderColor: '#fbcfe8', shadowColor: 'rgba(214,36,159,0.07)', icon: (
+                <div style={{ width: 60, height: 60, borderRadius: 18, background: 'radial-gradient(circle at 30% 107%, #fdf497 0%, #fd5949 45%, #d6249f 60%, #285AEB 90%)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg viewBox="0 0 24 24" style={{ width: 32, height: 32, fill: '#fff' }}><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+                </div>
+              )},
+              { name: 'Facebook', sub: 'Messenger & Pages', borderColor: '#bfdbfe', shadowColor: 'rgba(24,119,242,0.07)', icon: (
+                <div style={{ width: 60, height: 60, background: '#1877F2', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg viewBox="0 0 24 24" style={{ width: 32, height: 32, fill: '#fff' }}><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
+                </div>
+              )},
+              { name: 'Email', sub: 'IMAP · SMTP · Brevo', borderColor: '#bae6fd', shadowColor: 'rgba(2,132,199,0.07)', icon: (
+                <div style={{ width: 60, height: 60, background: 'linear-gradient(135deg,#0ea5e9,#0284c7)', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Mail size={30} color="#fff" />
+                </div>
+              )},
+              { name: 'Web Chat', sub: 'Embeddable widget', borderColor: '#e2e8f0', shadowColor: 'rgba(100,116,139,0.07)', icon: (
+                <div style={{ width: 60, height: 60, background: '#1e293b', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <MessageSquare size={28} color="#fff" />
+                </div>
+              )},
+            ].map(ch => (
+              <div key={ch.name} className="ch-card-hover" style={{ background: '#fff', border: `1px solid ${ch.borderColor}`, borderRadius: 22, padding: '28px 16px', textAlign: 'center', cursor: 'pointer', boxShadow: `0 2px 14px ${ch.shadowColor}` }}>
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 16 }}>{ch.icon}</div>
+                <p style={{ fontSize: 14, fontWeight: 700, color: '#0f172a', marginBottom: 4 }}>{ch.name}</p>
+                <p style={{ fontSize: 12, color: '#94a3b8' }}>{ch.sub}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          GLOBE SECTION
+      ══════════════════════════════════════════════════════════════════ */}
+      <section ref={globeRef} style={{ padding: '88px 28px', background: '#0a0f1e', overflow: 'hidden' }}>
+        <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+          <div className="lp-globe-wrap">
+            {/* Left: Copy */}
+            <div style={{ opacity: globeInView ? 1 : 0, transform: globeInView ? 'translateX(0)' : 'translateX(-24px)', transition: 'all 0.9s cubic-bezier(0.4,0,0.2,1) 0.1s' }}>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '5px 14px', borderRadius: 100, background: 'rgba(37,99,235,0.15)', border: '1px solid rgba(37,99,235,0.25)', color: '#60a5fa', fontSize: 12.5, fontWeight: 700, marginBottom: 24 }}>
+                <Globe size={13} /> Global Reach
+              </div>
+              <h2 style={{ fontSize: 'clamp(26px, 3.2vw, 42px)', fontWeight: 800, color: '#fff', marginBottom: 18, letterSpacing: '-1px', lineHeight: 1.12 }}>
+                Serve customers across{' '}
+                <span style={{ background: 'linear-gradient(135deg,#60a5fa,#a78bfa)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>
+                  150+ countries.
+                </span>
+              </h2>
+              <p style={{ fontSize: 16, color: 'rgba(255,255,255,0.6)', lineHeight: 1.7, marginBottom: 36, maxWidth: 400 }}>
+                Pulse Engine routes conversations intelligently across time zones, languages, and channels. Your AI agents never sleep.
+              </p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                {[
+                  { icon: Activity, label: '99.9% uptime SLA', sub: 'Enterprise-grade reliability' },
+                  { icon: Shield, label: 'GDPR & SOC2 compliant', sub: 'Your data stays yours' },
+                  { icon: Zap, label: 'Sub-second AI responses', sub: 'WebSocket-powered infrastructure' },
+                ].map(item => (
+                  <div key={item.label} style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
+                    <div style={{ width: 38, height: 38, borderRadius: 11, background: 'rgba(37,99,235,0.15)', border: '1px solid rgba(37,99,235,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <item.icon size={17} color="#60a5fa" />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: '#f1f5f9' }}>{item.label}</div>
+                      <div style={{ fontSize: 12.5, color: 'rgba(255,255,255,0.4)' }}>{item.sub}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Right: Globe */}
+            <div style={{ opacity: globeInView ? 1 : 0, transform: globeInView ? 'scale(1)' : 'scale(0.9)', transition: 'all 1s cubic-bezier(0.4,0,0.2,1) 0.2s' }}>
+              <GlobeVisualization />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          ROTATING TEXT / BRAND STATEMENT
+      ══════════════════════════════════════════════════════════════════ */}
+      <section style={{ padding: '100px 28px', background: '#fff', textAlign: 'center' }}>
+        <div style={{ maxWidth: 800, margin: '0 auto' }}>
+          <p style={{ fontSize: 13, fontWeight: 700, color: '#94a3b8', letterSpacing: 2, textTransform: 'uppercase', marginBottom: 28 }}>What Pulse Engine powers</p>
+          <div style={{ fontSize: 'clamp(28px, 4.5vw, 54px)', fontWeight: 900, color: '#0a0f1e', lineHeight: 1.12, letterSpacing: '-1.5px' }}>
+            The future of{' '}
+            <RotatingWord words={['Sales Automation', 'Customer Support', 'Lead Nurturing', 'Revenue Growth', 'Team Efficiency']} />
+          </div>
+          <p style={{ fontSize: 17, color: '#64748b', marginTop: 24, lineHeight: 1.7, maxWidth: 560, margin: '24px auto 0' }}>
+            One platform that learns from every conversation, automates the repetitive, and puts your team in control of the moments that matter.
+          </p>
+          <Link to="/signup" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginTop: 36, padding: '13px 28px', background: '#0a0f1e', color: '#fff', borderRadius: 12, fontWeight: 700, fontSize: 14.5, textDecoration: 'none', transition: 'all 0.2s' }}
+            onMouseEnter={e => { e.currentTarget.style.background = '#1e293b'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#0a0f1e'; e.currentTarget.style.transform = 'translateY(0)'; }}>
+            See it in action <ArrowRight size={16} />
+          </Link>
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          PRICING
+      ══════════════════════════════════════════════════════════════════ */}
+      <section id="pricing" ref={pricingRef} style={{ padding: '88px 28px', background: '#fafbff', borderTop: '1px solid #f1f5f9' }}>
+        <div style={{ maxWidth: 1180, margin: '0 auto' }}>
+          <div style={{ textAlign: 'center', marginBottom: 56, opacity: pricingInView ? 1 : 0, transform: pricingInView ? 'translateY(0)' : 'translateY(20px)', transition: 'all 0.7s' }}>
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '5px 14px', borderRadius: 100, background: '#ecfdf5', color: '#059669', fontSize: 12.5, fontWeight: 700, marginBottom: 16 }}>
+              <Check size={13} strokeWidth={2.5} /> 30-Day Free Trial on All Plans
+            </div>
+            <h2 style={{ fontSize: 'clamp(24px, 3vw, 40px)', fontWeight: 800, color: '#0a0f1e', marginBottom: 12, letterSpacing: '-1px' }}>Pricing that scales with you</h2>
+            <p style={{ fontSize: 16, color: '#64748b', maxWidth: 480, margin: '0 auto' }}>
+              Start free forever, upgrade when you're ready. No contracts, cancel anytime.
+            </p>
+          </div>
+
+          <div className="lp-pricing-grid">
+            {pricingPlans.map((plan, i) => {
+              const isEnterprise = plan.code === 'enterprise';
+              const isPro = plan.code === 'pro';
+              return (
+                <div key={plan.code} style={{
+                  position: 'relative',
+                  borderRadius: 24,
+                  padding: isPro ? '40px 32px' : '36px 28px',
+                  background: isEnterprise ? 'linear-gradient(160deg, #0a0f1e 0%, #0f172a 40%, #1e1b4b 100%)' : isPro ? '#fff' : '#fff',
+                  border: isEnterprise ? 'none' : isPro ? '2px solid #2563eb' : '1.5px solid #e8ecf0',
+                  boxShadow: isEnterprise ? '0 32px 80px rgba(0,0,0,0.25)' : isPro ? '0 28px 64px rgba(37,99,235,0.18)' : '0 2px 16px rgba(0,0,0,0.04)',
+                  transform: isPro ? 'scale(1.04)' : 'scale(1)',
+                  opacity: pricingInView ? 1 : 0,
+                  transition: `all 0.7s cubic-bezier(0.4,0,0.2,1) ${i * 130}ms`,
+                }}>
+                  {/* Enterprise shimmer border */}
+                  {isEnterprise && (
+                    <div style={{ position: 'absolute', inset: 0, borderRadius: 24, border: '1px solid rgba(255,255,255,0.08)', pointerEvents: 'none' }} />
+                  )}
+
+                  {isPro && (
+                    <div style={{ position: 'absolute', top: -15, left: '50%', transform: 'translateX(-50%)', padding: '5px 18px', background: 'linear-gradient(135deg,#2563eb,#4f46e5)', color: '#fff', fontSize: 11, fontWeight: 800, borderRadius: 100, whiteSpace: 'nowrap', letterSpacing: 0.5, boxShadow: '0 4px 12px rgba(37,99,235,0.4)' }}>
+                      ✦ MOST POPULAR
+                    </div>
+                  )}
+
+                  {isEnterprise && (
+                    <div style={{ position: 'absolute', top: -15, left: '50%', transform: 'translateX(-50%)', padding: '5px 18px', background: 'linear-gradient(135deg,#7c3aed,#4f46e5)', color: '#fff', fontSize: 11, fontWeight: 800, borderRadius: 100, whiteSpace: 'nowrap', letterSpacing: 0.5 }}>
+                      ✦ ENTERPRISE
+                    </div>
+                  )}
+
+                  <div style={{ marginBottom: 20 }}>
+                    <h3 style={{ fontSize: 20, fontWeight: 800, color: isEnterprise ? '#fff' : '#0a0f1e', marginBottom: 6 }}>{plan.name}</h3>
+                    <p style={{ fontSize: 13, color: isEnterprise ? 'rgba(255,255,255,0.5)' : '#94a3b8', lineHeight: 1.5 }}>{plan.description}</p>
+                  </div>
+
+                  <div style={{ marginBottom: 28, display: 'flex', alignItems: 'flex-end', gap: 4 }}>
+                    <span style={{ fontSize: 50, fontWeight: 900, color: isEnterprise ? '#fff' : isPro ? '#2563eb' : '#0a0f1e', letterSpacing: '-2px', lineHeight: 1 }}>{plan.price}</span>
+                    {plan.period && <span style={{ fontSize: 14, color: isEnterprise ? 'rgba(255,255,255,0.45)' : '#94a3b8', paddingBottom: 6 }}>{plan.period}</span>}
+                  </div>
+
+                  <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 28px', display: 'flex', flexDirection: 'column', gap: 9 }}>
+                    {plan.features.map((f, fi) => (
+                      <li key={fi} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, fontSize: 13, lineHeight: 1.5, color: isEnterprise ? 'rgba(255,255,255,0.75)' : '#475569' }}>
+                        <Check size={14} color={isEnterprise ? '#a78bfa' : isPro ? '#2563eb' : '#22c55e'} style={{ flexShrink: 0, marginTop: 2 }} /> {f}
+                      </li>
+                    ))}
+                  </ul>
+
+                  <Link to={plan.href} style={{
+                    display: 'block', textAlign: 'center', padding: '14px 0',
+                    background: isEnterprise ? 'linear-gradient(135deg,#6d28d9,#4f46e5)' : isPro ? 'linear-gradient(135deg,#2563eb,#4f46e5)' : '#fff',
+                    color: isEnterprise ? '#fff' : isPro ? '#fff' : '#0a0f1e',
+                    border: isEnterprise ? 'none' : isPro ? 'none' : '1.5px solid #e2e8f0',
+                    borderRadius: 12, fontWeight: 700, fontSize: 14, textDecoration: 'none',
+                    boxShadow: isEnterprise ? '0 4px 20px rgba(109,40,217,0.4)' : isPro ? '0 4px 16px rgba(37,99,235,0.32)' : 'none',
+                    transition: 'all 0.2s',
+                  }}
+                    onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.opacity = '0.9'; }}
+                    onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.opacity = '1'; }}>
+                    {plan.cta}
+                  </Link>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Comparison note */}
+          <p style={{ textAlign: 'center', marginTop: 36, fontSize: 13, color: '#94a3b8' }}>
+            All plans include a 30-day free trial · No credit card required · Cancel anytime
+          </p>
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          FAQ
+      ══════════════════════════════════════════════════════════════════ */}
+      <section id="faq" style={{ padding: '88px 28px', background: '#0a0f1e' }}>
+        <div style={{ maxWidth: 720, margin: '0 auto' }}>
+          <div style={{ textAlign: 'center', marginBottom: 48 }}>
+            <h2 style={{ fontSize: 'clamp(24px, 3vw, 38px)', fontWeight: 800, color: '#fff', marginBottom: 10, letterSpacing: '-1px' }}>Frequently Asked Questions</h2>
+            <p style={{ fontSize: 15.5, color: 'rgba(255,255,255,0.5)' }}>Everything you need to know before getting started.</p>
+          </div>
+          {faqs.map(f => <FaqItem key={f.q} q={f.q} a={f.a} dark />)}
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          FINAL CTA
+      ══════════════════════════════════════════════════════════════════ */}
+      <section ref={ctaRef} style={{ position: 'relative', padding: '100px 28px', background: 'linear-gradient(135deg, #1e3a8a 0%, #1d4ed8 40%, #4f46e5 70%, #6d28d9 100%)', overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
+          <div style={{ position: 'absolute', top: -100, right: -80, width: 400, height: 400, background: 'rgba(255,255,255,0.06)', borderRadius: '50%' }} />
+          <div style={{ position: 'absolute', bottom: -120, left: -60, width: 360, height: 360, background: 'rgba(255,255,255,0.04)', borderRadius: '50%' }} />
+          <div style={{ position: 'absolute', top: '40%', left: '50%', transform: 'translate(-50%,-50%)', width: 600, height: 600, background: 'radial-gradient(circle, rgba(255,255,255,0.04) 0%, transparent 70%)' }} />
+        </div>
+        <div style={{ maxWidth: 680, margin: '0 auto', textAlign: 'center', position: 'relative', zIndex: 1 }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '5px 14px', borderRadius: 100, background: 'rgba(255,255,255,0.12)', color: 'rgba(255,255,255,0.9)', fontSize: 12.5, fontWeight: 700, marginBottom: 24 }}>
+            <Sparkles size={13} /> Launch-ready in minutes
+          </div>
+          <h2 style={{ fontSize: 'clamp(30px, 5vw, 52px)', fontWeight: 900, color: '#fff', marginBottom: 16, letterSpacing: '-1.5px', lineHeight: 1.08, opacity: ctaInView ? 1 : 0, transform: ctaInView ? 'translateY(0)' : 'translateY(20px)', transition: 'all 0.8s ease 0.1s' }}>
+            The inbox that runs your business.
+          </h2>
+          <p style={{ fontSize: 17, color: 'rgba(255,255,255,0.72)', marginBottom: 40, maxWidth: 480, margin: '0 auto 40px', lineHeight: 1.7, opacity: ctaInView ? 1 : 0, transition: 'all 0.8s ease 0.2s' }}>
+            Join thousands of teams using Pulse Engine to turn conversations into customers — automatically.
+          </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 14, opacity: ctaInView ? 1 : 0, transition: 'all 0.8s ease 0.3s' }}>
+            <Link to="/signup" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, padding: '15px 32px', background: '#fff', color: '#2563eb', borderRadius: 13, fontWeight: 800, fontSize: 15, textDecoration: 'none', boxShadow: '0 8px 28px rgba(0,0,0,0.2)', transition: 'all 0.2s' }}
+              onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 14px 36px rgba(0,0,0,0.28)'; }}
+              onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 8px 28px rgba(0,0,0,0.2)'; }}>
+              Start Free Trial <ArrowRight size={17} />
+            </Link>
+            <Link to="/contact" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, padding: '15px 28px', border: '1.5px solid rgba(255,255,255,0.3)', color: '#fff', borderRadius: 13, fontWeight: 700, fontSize: 15, textDecoration: 'none', transition: 'all 0.2s' }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.1)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.5)'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.3)'; }}>
+              Schedule a Demo
+            </Link>
+          </div>
+          <p style={{ fontSize: 12.5, color: 'rgba(255,255,255,0.38)', marginTop: 24 }}>No credit card · 30-day free trial · Cancel anytime</p>
+        </div>
+      </section>
+
+      {/* ═══════════════════════════════════════════════════════════════
+          FOOTER
+      ══════════════════════════════════════════════════════════════════ */}
+      <footer style={{ padding: '64px 28px 36px', background: '#060b14', color: '#64748b' }}>
+        <div style={{ maxWidth: 1280, margin: '0 auto' }}>
+          <div className="lp-footer-grid" style={{ marginBottom: 52 }}>
+            <div>
+              <div style={{ marginBottom: 18 }}>
+                <PlatformLogo textColor="#f1f5f9" imageWidth={34} fontSize={17} fontWeight={800} />
+              </div>
+              <p style={{ fontSize: 13.5, lineHeight: 1.7, maxWidth: 240, color: '#475569' }}>AI-powered customer engagement for modern teams. Unify every channel in one intelligent inbox.</p>
+              <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
+                {['TW', 'LI', 'GH'].map(s => (
+                  <a key={s} href="#" style={{ width: 34, height: 34, borderRadius: 9, background: '#0f172a', border: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, color: '#475569', textDecoration: 'none', transition: 'all 0.2s' }}
+                    onMouseEnter={e => { e.currentTarget.style.background = '#1e293b'; e.currentTarget.style.color = '#94a3b8'; }}
+                    onMouseLeave={e => { e.currentTarget.style.background = '#0f172a'; e.currentTarget.style.color = '#475569'; }}>
+                    {s}
+                  </a>
+                ))}
+              </div>
+            </div>
+            {[
+              { title: 'Product', links: [['Features', '#features'], ['Channels', '#channels'], ['Pricing', '#pricing'], ['FAQ', '#faq']] },
+              { title: 'Resources', links: [['Documentation', '#'], ['Blog', '#'], ['Help Center', '#faq'], ['Status Page', '#']] },
+              { title: 'Company', links: [['Privacy Policy', '/privacy'], ['Terms of Service', '/terms'], ['Contact Us', '/contact'], ['Sign In', '/signin']] },
+            ].map(col => (
+              <div key={col.title}>
+                <p style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 1.2, marginBottom: 18 }}>{col.title}</p>
+                <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 11 }}>
+                  {col.links.map(([label, href]) => (
+                    <li key={label}><a href={href} style={{ fontSize: 13.5, color: '#475569', textDecoration: 'none', transition: 'color 0.2s' }} onMouseEnter={e => e.target.style.color = '#94a3b8'} onMouseLeave={e => e.target.style.color = '#475569'}>{label}</a></li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+          <div style={{ borderTop: '1px solid #0f172a', paddingTop: 28, display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+            <p style={{ fontSize: 13, color: '#334155' }}>© 2026 Pulse Engine. All rights reserved.</p>
+            <p style={{ fontSize: 12.5, color: '#1e293b' }}>Built to power 100,000+ customer conversations.</p>
+          </div>
+        </div>
+      </footer>
     </div>
   );
-});
-
-/* ══════════════════════════════════════════════════════════════
-   17. APP — main composition
-   ══════════════════════════════════════════════════════════════ */
-function App() {
-  /* FIX: localStorage SSR guard */
-  const [demoOpen,   setDemoOpen]   = useState(false);
-  const [tweaksOpen, setTweaksOpen] = useState(false);
-
-  /* Always enforce dark theme on mount */
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', 'dark');
-  }, []);
-
-  useEffect(() => {
-    const els = () => document.querySelectorAll('.reveal');
-    const obs = new IntersectionObserver(entries => {
-      entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
-    }, { threshold: .1 });
-    const timer = setTimeout(() => { els().forEach(el => obs.observe(el)); }, 300);
-    return () => { clearTimeout(timer); obs.disconnect(); };
-  }, []);
-
-  useEffect(() => {
-    const handler = e => {
-      if (e.data?.type === '__activate_edit_mode')   setTweaksOpen(true);
-      if (e.data?.type === '__deactivate_edit_mode') setTweaksOpen(false);
-    };
-    window.addEventListener('message', handler);
-    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
-    return () => window.removeEventListener('message', handler);
-  }, []);
-
-  return (
-    <>
-      <GlobalStyles />
-      <ScrollProgress />
-      {/* Dark theme is always active — no theme toggle per user request */}
-      <PulseNav />
-      <main>
-        <HeroSection         onWatchDemo={() => setDemoOpen(true)} />
-        <TrustBar />
-        <StatsSection />
-        <FeaturesSection />
-        <GlobeSection />
-        <IntegrationsMarquee />
-        <TestimonialsSection />
-        <TeamSection />
-        <PricingSection />
-        <FAQSection />
-        <CTABanner />
-      </main>
-      <PulseFooter />
-      <DemoModal  open={demoOpen}   onClose={() => setDemoOpen(false)} />
-      <TweaksPanel visible={tweaksOpen} onClose={() => { setTweaksOpen(false); window.parent.postMessage({ type: '__edit_mode_dismissed' }, '*'); }} />
-    </>
-  );
 }
-
-/* ══════════════════════════════════════════════════════════════
-   RENDER
-   ══════════════════════════════════════════════════════════════ */
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
