@@ -6,6 +6,8 @@ import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { useSocket } from '@/lib/useSocket';
+import { useAuth } from '@/contexts/AuthContext';
+import PageSkeleton from '@/components/ui/PageSkeleton';
 import {
   Send,
   Bot,
@@ -491,7 +493,25 @@ function getSentimentMeta(rawScore, label = '', emotion = '') {
   };
 }
 
+const MSG_CACHE_KEY_PREFIX = 'pe:inbox:msgs:';
+const MSG_CACHE_MAX = 20;
+
+function getCachedMessages(convoId) {
+  try {
+    const raw = sessionStorage.getItem(MSG_CACHE_KEY_PREFIX + convoId);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function setCachedMessages(convoId, messages) {
+  try {
+    sessionStorage.setItem(MSG_CACHE_KEY_PREFIX + convoId, JSON.stringify(messages.slice(-MSG_CACHE_MAX)));
+  } catch {}
+}
+
 export default function InboxPage() {
+  const { user, loading: authLoading } = useAuth();
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const navigate = useNavigate();
   const [conversations, setConversations] = useState([]);
@@ -533,20 +553,24 @@ export default function InboxPage() {
   const [imagePreviewFailed, setImagePreviewFailed] = useState(false);
   const [videoPreview, setVideoPreview] = useState(null);
   const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
+  const [convoLoading, setConvoLoading] = useState(true);
+  const firstConvoLoadRef = useRef(true);
   const messagesEndRef = useRef(null);
   const composerFileRef = useRef(null);
   const customerSidebarRef = useRef(null);
   const selectedConvoIdRef = useRef('');
+  const loadConversationsRef = useRef(null);
   const skipNextDraftSaveRef = useRef('');
   const [searchParams, setSearchParams] = useSearchParams();
   const inboxFilter = normalizeInboxFilter(searchParams.get('inbox_filter') || searchParams.get('filter'));
 
-  const loadConversations = useCallback(async ({ selectConversationId = '', filterOverride } = {}) => {
+  const loadConversations = useCallback(async ({ selectConversationId = '', filterOverride, _isRetry = false } = {}) => {
     try {
       const effectiveFilter = filterOverride === undefined ? inboxFilter : normalizeInboxFilter(filterOverride);
       const params = effectiveFilter ? { inbox_filter: effectiveFilter } : undefined;
       const res = await api.get('/conversations', params ? { params } : undefined);
       const items = Array.isArray(res.data) ? res.data : [];
+      firstConvoLoadRef.current = false;
       setConversations(items);
       setSelectedConvo(prev => {
         const targetId = selectConversationId || prev?.id || '';
@@ -556,13 +580,26 @@ export default function InboxPage() {
       });
     } catch (err) {
       console.error(err);
+      // On the very first load, suppress the error toast and retry once after 1s
+      if (firstConvoLoadRef.current && !_isRetry) {
+        firstConvoLoadRef.current = false;
+        setTimeout(() => {
+          loadConversationsRef.current?.({ selectConversationId, filterOverride, _isRetry: true });
+        }, 1000);
+        return;
+      }
       showToast({
         type: 'error',
         title: 'Inbox Unavailable',
         message: 'Conversations could not be loaded. Refresh the page or contact support if this continues.',
       });
+    } finally {
+      setConvoLoading(false);
     }
   }, [inboxFilter]);
+
+  // Keep a stable ref so socket handlers always call the latest version
+  loadConversationsRef.current = loadConversations;
 
   const loadNotificationSettings = useCallback(async () => {
     try {
@@ -690,9 +727,31 @@ export default function InboxPage() {
   const { joinConversation } = useSocket(handleSocketEvent, { conversationId: selectedConvo?.id || '' });
 
   useEffect(() => {
+    if (!user || authLoading) return;
     loadConversations();
     loadNotificationSettings();
-  }, [loadConversations, loadNotificationSettings]);
+  }, [user, authLoading, loadConversations, loadNotificationSettings]);
+
+  // 15-second background poll for missed socket events; skips hidden tabs
+  useEffect(() => {
+    if (!user || authLoading) return;
+    const id = setInterval(() => {
+      if (document.visibilityState !== 'hidden') {
+        loadConversationsRef.current?.();
+      }
+    }, 15000);
+    return () => clearInterval(id);
+  }, [user, authLoading]);
+
+  // Refresh on tab focus to catch updates missed while backgrounded
+  useEffect(() => {
+    if (!user || authLoading) return;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') loadConversationsRef.current?.();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [user, authLoading]);
 
   useEffect(() => {
     const platform = searchParams.get('platform');
@@ -770,6 +829,42 @@ export default function InboxPage() {
     bootstrapConversation();
   }, [loadConversations, searchParams, setSearchParams]);
 
+  const loadMessagesAbortRef = useRef(null);
+
+  const loadMessages = useCallback(async (convoId) => {
+    if (loadMessagesAbortRef.current) {
+      loadMessagesAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    loadMessagesAbortRef.current = controller;
+
+    // Show cached messages immediately while fresh fetch runs
+    const cached = getCachedMessages(convoId);
+    if (cached?.length) {
+      setMessages(cached.map(normalizeMessage));
+    }
+
+    try {
+      const res = await api.get(`/conversations/${convoId}/messages`, {
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      const loadedMessages = extractMessagesPayload(res.data);
+      if (!loadedMessages) throw new Error('Unexpected messages response shape');
+      const normalized = loadedMessages.map(normalizeMessage);
+      setMessages(normalized);
+      setCachedMessages(convoId, normalized);
+    } catch (err) {
+      if (err?.name === 'AbortError' || err?.code === 'ERR_CANCELED') return;
+      console.error(err);
+      showToast({
+        type: 'error',
+        title: 'Messages Unavailable',
+        message: 'This conversation could not be loaded right now. Refresh and try again.',
+      });
+    }
+  }, []);
+
   useEffect(() => {
     const convoId = selectedConvo?.id;
     const customerId = selectedConvo?.customer_id;
@@ -792,7 +887,7 @@ export default function InboxPage() {
     }
     joinConversation(convoId);
     return () => { cancelled = true; };
-  }, [selectedConvo?.id, selectedConvo?.customer_id, joinConversation]);
+  }, [selectedConvo?.id, selectedConvo?.customer_id, joinConversation, loadMessages]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
@@ -908,25 +1003,6 @@ export default function InboxPage() {
       });
     } finally {
       setOutboundSubmitting(false);
-    }
-  };
-
-  const loadMessages = async (convoId) => {
-    try {
-      const res = await api.get(`/conversations/${convoId}/messages`);
-      const loadedMessages = extractMessagesPayload(res.data);
-      if (!loadedMessages) {
-        throw new Error('Unexpected messages response shape');
-      }
-      setMessages(loadedMessages.map(normalizeMessage));
-    }
-    catch (err) {
-      console.error(err);
-      showToast({
-        type: 'error',
-        title: 'Messages Unavailable',
-        message: 'This conversation could not be loaded right now. Refresh and try again.',
-      });
     }
   };
 
@@ -1421,6 +1497,10 @@ export default function InboxPage() {
     nextParams.delete('filter');
     setSearchParams(nextParams, { replace: true });
   };
+
+  if (convoLoading) {
+    return <PageSkeleton variant="inbox" />;
+  }
 
   return (
     <>

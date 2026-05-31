@@ -34,12 +34,20 @@ CREATE TABLE IF NOT EXISTS companies (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     deleted_at TIMESTAMPTZ,
-    enterprise_team_gate_met BOOLEAN NOT NULL DEFAULT FALSE
+    enterprise_team_gate_met BOOLEAN NOT NULL DEFAULT FALSE,
+    plan TEXT NOT NULL DEFAULT 'free',
+    subscription_status TEXT NOT NULL DEFAULT 'inactive',
+    billing_status TEXT NOT NULL DEFAULT 'inactive',
+    stripe_subscription_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_companies_active ON companies(is_active);
 CREATE INDEX IF NOT EXISTS idx_companies_created_at ON companies(created_at);
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS enterprise_team_gate_met BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS slug TEXT NOT NULL DEFAULT '';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'inactive';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS billing_status TEXT NOT NULL DEFAULT 'inactive';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_slug ON companies(slug) WHERE BTRIM(slug) <> '';
 
 CREATE TABLE IF NOT EXISTS deleted_companies (

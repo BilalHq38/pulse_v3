@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import api, { refreshAuthSession } from '@/lib/api';
-import { postAuthDestination } from '@/lib/auth-gates';
+import { postAuthDestination, shouldRedirectToBilling } from '@/lib/auth-gates';
 import { normalizeAvatarUrl, displayNameInitial } from '@/lib/avatar';
 import {
   PHONE_COUNTRIES,
@@ -727,12 +727,12 @@ export default function OnboardingPage() {
       setStep(4);
       return;
     }
-    if (user.onboarding_completed === true && user.plan_selected === false) {
+    if (user.onboarding_completed === true && shouldRedirectToBilling(user)) {
       clearOnboardingDraft();
       navigate('/billing', { replace: true });
       return;
     }
-    if (user.onboarding_completed === true && user.plan_selected !== false) {
+    if (user.onboarding_completed === true && !shouldRedirectToBilling(user)) {
       clearOnboardingDraft();
       const status = user.account_status || user.status || 'active';
       if (status === 'pending_approval' || status === 'rejected' || status === 'blocked' || status === 'paused') {

@@ -5,7 +5,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from shared.schemas.contracts import CombinedResponse
-from agent_orchestrator.agents import capture_agent, support_agent
+from agent_orchestrator.agents import capture_agent
 from agent_orchestrator.schemas import MessageWorkflowRequest
 from agent_orchestrator.workflows.workflow_manager import WorkflowManager
 from services.ai_service.unified_ai_prompt import UnifiedMessageAIResult
@@ -303,7 +303,8 @@ async def test_nurture_prompt_uses_safe_lead_context(monkeypatch):
         company_id="company-1",
     )
 
-    payload = json.loads(captured["prompt"].split("\nlead:\n", 1)[1])
+    payload_text = captured["prompt"].split("--- Lead Profile ---\n", 1)[1].split("\n\nStrict rules:", 1)[0]
+    payload = json.loads(payload_text)
     assert payload["name"] == "Avery"
     assert payload["customer_company_name"] == "Northstar"
     assert payload["next_action"] == "Schedule a quick call"
@@ -328,11 +329,6 @@ def test_embedding_cache_hits_do_not_need_budget_reservation():
 
     assert snapshot["embedding_call_count"] == 1
     assert snapshot["total_ai_api_call_count"] == 1
-
-
-def test_support_budget_fallback_is_removed():
-    assert not hasattr(support_agent, "_deterministic_budget_fallback")
-
 
 def test_combined_response_preserves_degraded_metadata():
     payload = CombinedResponse(

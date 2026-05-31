@@ -40,6 +40,7 @@ from services.bootstrap import (
     bootstrap_signup_primitives,
     bootstrap_super_admin,
 )
+from agent_orchestrator.bootstrap import bootstrap_agent_orchestrator
 from services.super_admin_service.routes import router as super_admin_router
 from shared.app_factory import create_service_app
 
@@ -216,6 +217,7 @@ app = create_service_app(
         bootstrap_demo_accounts,
         bootstrap_ai_runtime,
         bootstrap_data_pipeline,
+        bootstrap_agent_orchestrator,
     ),
 )
 app.state.allow_direct_jwt_auth = True

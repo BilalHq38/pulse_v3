@@ -217,6 +217,45 @@ async def _email_verification_status_for_user(db, user: dict) -> dict[str, Any]:
     }
 
 
+async def _try_finalize_paid_signup_from_stripe(
+    db,
+    request: Request,
+    pending_signup: dict[str, Any],
+    session_id: str,
+) -> None:
+    if not pending_signup or str(pending_signup.get("user_id") or "").strip():
+        return
+    if not stripe_configured() or not stripe_enabled_for_app():
+        return
+    if not session_id or session_id == str(pending_signup.get("id") or "").strip():
+        return
+    try:
+        assert_stripe_ready()
+        checkout_session = await asyncio.to_thread(stripe.checkout.Session.retrieve, session_id)
+    except Exception as exc:
+        logger.warning("signup status Stripe retrieve skipped session_id=%s error=%s", session_id, _stringify_error(exc))
+        return
+
+    payment_status = str(_stripe_value(checkout_session, "payment_status", "") or "").strip().lower()
+    checkout_status = str(_stripe_value(checkout_session, "status", "") or "").strip().lower()
+    if payment_status != "paid" and checkout_status != "complete":
+        return
+    try:
+        await finalize_public_registration_from_checkout(
+            db,
+            request,
+            checkout_session,
+            stripe_event_id=f"status_poll:{session_id}",
+        )
+    except Exception as exc:
+        logger.exception(
+            "signup status fallback finalize failed pending_signup_id=%s session_id=%s error=%s",
+            pending_signup.get("id", ""),
+            session_id,
+            _stringify_error(exc),
+        )
+
+
 async def prepare_public_registration(
     db,
     request: Request,
@@ -240,9 +279,6 @@ async def prepare_public_registration(
         raise HTTPException(400, "Email is required")
     if not name:
         raise HTTPException(400, "Name is required")
-    if plan["code"] == "free":
-        raise HTTPException(400, "A paid plan is required before workspace creation")
-
     is_valid, errors = validate_password(password)
     if not is_valid:
         raise HTTPException(400, "; ".join(errors))
@@ -295,6 +331,27 @@ async def prepare_public_registration(
         expires_at,
     )
 
+    if plan["code"] == "free":
+        created = await finalize_public_registration_free_plan(
+            db,
+            request,
+            pending_signup_id,
+            background_tasks=background_tasks,
+        )
+        return {
+            "status": created.get("status") or "account_created",
+            "billing_mode": "free",
+            "message": "Your Starter workspace is ready. Verify your email to continue.",
+            "checkout_url": "",
+            "session_id": pending_signup_id,
+            "plan": plan,
+            "email": email,
+            "email_verification": created.get("email_verification") or {},
+            "verification_error": created.get("verification_error") or "",
+            "company_id": created.get("company_id", ""),
+            "user_id": created.get("user_id", ""),
+        }
+
     _raw_stripe_env = (os.environ.get("STRIPE_ENABLED", "auto") or "auto").strip().lower()
     _stripe_explicit_on = _raw_stripe_env in ("true", "1", "yes", "on", "enabled")
     if _stripe_explicit_on and not stripe_configured() and not relaxed_billing_env():
@@ -308,7 +365,12 @@ async def prepare_public_registration(
             stripe_configured(),
             pending_signup_id,
         )
-        created = await finalize_public_registration_offline_trial(db, request, pending_signup_id)
+        created = await finalize_public_registration_offline_trial(
+            db,
+            request,
+            pending_signup_id,
+            background_tasks=background_tasks,
+        )
         ev = created.get("email_verification") or {}
         relaxed = relaxed_billing_env()
         return {
@@ -395,6 +457,10 @@ async def get_public_registration_status(db, session_id: str) -> dict[str, Any]:
     if not pending_signup:
         raise HTTPException(404, "Signup session not found")
 
+    if not str(pending_signup.get("user_id") or "").strip():
+        await _try_finalize_paid_signup_from_stripe(db, request, pending_signup, session_id)
+        pending_signup = await _pending_signup_by_session(db, session_id) or pending_signup
+
     response = {
         "status": pending_signup.get("status") or "pending_payment",
         "payment_status": pending_signup.get("payment_status") or "pending",
@@ -432,6 +498,7 @@ async def _complete_pending_signup_workspace(
     pending_signup_final_payment_status: str,
     auth_event_name: str,
     system_log_event: str,
+    background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     """
     Create or attach workspace after payment (Stripe) or offline trial.
@@ -462,6 +529,12 @@ async def _complete_pending_signup_workspace(
             current_period_start=current_period_start,
             current_period_end=current_period_end,
         )
+        await db.execute(
+            "UPDATE users SET status='active',onboarding_completed=TRUE,plan_selected=TRUE,billing_status='active',updated_at=NOW() "
+            "WHERE id=$1",
+            existing_user["id"],
+        )
+        existing_user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", existing_user["id"])) or existing_user
         await invalidate_billing_cache(str(existing_user.get("company_id", "")).strip())
         if not existing_user.get("email_verified"):
             verification_error = ""
@@ -533,7 +606,7 @@ async def _complete_pending_signup_workspace(
     user_id = make_id()
     await db.execute(
         "INSERT INTO users(id,email,password_hash,name,role,role_id,sub_role,status,avatar,company_id,phone,onboarding_completed,plan_selected,billing_status,auth_provider,email_verified,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$2,$3,$4,'admin',$5,'','pending_approval','',$6,'',FALSE,FALSE,'active','email',FALSE,NOW(),NOW())",
+        "VALUES($1,$2,$3,$4,'admin',$5,'','active','',$6,'',TRUE,TRUE,'active','email',FALSE,NOW(),NOW())",
         user_id,
         (pending_signup["email"] or "").strip().lower(),
         pending_signup["password_hash"],
@@ -562,12 +635,12 @@ async def _complete_pending_signup_workspace(
         },
     )
     logger.info(
-        "user_pending_approval_created actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        "public_signup_user_activated actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
         user_id,
         user_id,
         company_id,
         "",
-        "pending_approval",
+        "active",
         "public_signup",
     )
 
@@ -632,6 +705,8 @@ async def finalize_public_registration_offline_trial(
     db,
     request: Request,
     pending_signup_id: str,
+    *,
+    background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     """Provision workspace without Stripe when checkout is disabled (non-demo deployments)."""
     await ensure_pending_signup_primitives(db)
@@ -689,8 +764,68 @@ async def finalize_public_registration_offline_trial(
         pending_signup_final_payment_status="trial",
         auth_event_name="register_offline_trial",
         system_log_event="register_offline_trial",
+        background_tasks=background_tasks,
     )
     return {**result, "trial_ends_at": period_end.isoformat()}
+
+
+async def finalize_public_registration_free_plan(
+    db,
+    request: Request,
+    pending_signup_id: str,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    await ensure_pending_signup_primitives(db)
+    pending_signup = await _pending_signup_by_id(db, pending_signup_id)
+    if not pending_signup:
+        raise HTTPException(404, "Signup session not found")
+    st = str(pending_signup.get("status") or "").strip().lower()
+    if st == "account_created" and str(pending_signup.get("user_id") or "").strip():
+        user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", pending_signup["user_id"]))
+        if user and not user.get("email_verified"):
+            return {
+                "status": "account_created",
+                "company_id": user.get("company_id", ""),
+                "user_id": user["id"],
+                "email_verification": await _email_verification_status_for_user(db, user),
+            }
+        return {
+            "status": "account_created",
+            "company_id": pending_signup.get("company_id", ""),
+            "user_id": pending_signup.get("user_id", ""),
+        }
+    if st not in ("pending_payment", "checkout_created"):
+        raise HTTPException(
+            409,
+            "This signup cannot be completed. Start again or sign in if you already have an account.",
+        )
+
+    await db.execute(
+        "UPDATE public.pending_signups "
+        "SET status='payment_succeeded',payment_status='free',stripe_checkout_session_id=$1,"
+        "stripe_customer_id=NULL,stripe_subscription_id=NULL,stripe_event_id=NULL,updated_at=NOW() "
+        "WHERE id=$1",
+        pending_signup["id"],
+    )
+    pending_signup = await _pending_signup_by_id(db, pending_signup_id)
+    if not pending_signup:
+        raise HTTPException(500, "Pending signup lost after update")
+    return await _complete_pending_signup_workspace(
+        db,
+        request,
+        pending_signup,
+        stripe_customer_id="",
+        stripe_subscription_id="",
+        billing_payment_status="active",
+        subscription_status="active",
+        current_period_start=_utc_now(),
+        current_period_end=None,
+        pending_signup_final_payment_status="free",
+        auth_event_name="register_free",
+        system_log_event="register_free",
+        background_tasks=background_tasks,
+    )
 
 
 async def finalize_public_registration_from_checkout(
@@ -713,6 +848,14 @@ async def finalize_public_registration_from_checkout(
     ) or await _pending_signup_by_session(db, checkout_session_id)
     if not pending_signup:
         return {"status": "ignored", "reason": "pending_signup_not_found"}
+    if str(pending_signup.get("status") or "").strip().lower() == "account_created" and str(
+        pending_signup.get("user_id") or ""
+    ).strip():
+        return {
+            "status": "account_created",
+            "company_id": pending_signup.get("company_id", ""),
+            "user_id": pending_signup.get("user_id", ""),
+        }
 
     await db.execute(
         "UPDATE public.pending_signups "

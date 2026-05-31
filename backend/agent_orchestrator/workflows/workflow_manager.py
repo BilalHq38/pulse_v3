@@ -461,34 +461,55 @@ class WorkflowManager:
         *,
         route=None,
     ) -> WorkflowResponse:
-        agent = self.registry.get(agent_name)
         set_current_agent(agent_name.value)
         started = time.perf_counter()
         result: AgentRunResult
         try:
+            agent = self.registry.get(agent_name)
+        except KeyError:
+            logger.warning(
+                "agent_not_registered_skip workflow_id=%s company_id=%s workflow_kind=%s agent_name=%s route_reason=%s",
+                context.workflow_id,
+                context.company_id,
+                context.workflow_kind.value,
+                agent_name.value,
+                str(getattr(route, "reason", "") or ""),
+            )
             increment_counter(
-                "agent_orchestrator.agent.started",
+                "agent_orchestrator.agent.skipped",
                 labels={"agent": agent_name.value, "workflow_kind": context.workflow_kind.value},
             )
-            with timed_metric(
-                "agent_orchestrator.agent.duration_ms",
-                labels={"agent": agent_name.value, "workflow_kind": context.workflow_kind.value},
-            ):
-                result = await agent.execute(context)
-        except Exception as exc:
-            increment_counter(
-                "agent_orchestrator.agent.error",
-                labels={"agent": agent_name.value, "workflow_kind": context.workflow_kind.value},
+            result = AgentRunResult(
+                agent_name=agent_name,
+                status="skipped",
+                payload={},
+                warnings=["agent_not_registered"],
             )
-            fallback = await agent.fallback(context, exc)
-            if fallback is None:
-                await self.state_store.fail_workflow(
-                    workflow_id=context.workflow_id,
-                    error=str(exc),
+        else:
+            try:
+                increment_counter(
+                    "agent_orchestrator.agent.started",
+                    labels={"agent": agent_name.value, "workflow_kind": context.workflow_kind.value},
                 )
-                raise
-            result = fallback
-            result.error = str(exc)
+                with timed_metric(
+                    "agent_orchestrator.agent.duration_ms",
+                    labels={"agent": agent_name.value, "workflow_kind": context.workflow_kind.value},
+                ):
+                    result = await agent.execute(context)
+            except Exception as exc:
+                increment_counter(
+                    "agent_orchestrator.agent.error",
+                    labels={"agent": agent_name.value, "workflow_kind": context.workflow_kind.value},
+                )
+                fallback = await agent.fallback(context, exc)
+                if fallback is None:
+                    await self.state_store.fail_workflow(
+                        workflow_id=context.workflow_id,
+                        error=str(exc),
+                    )
+                    raise
+                result = fallback
+                result.error = str(exc)
         result.duration_ms = round((time.perf_counter() - started) * 1000.0, 2)
         setattr(context.agent_outputs, agent_name.value, dict(result.payload or {}))
         await self.memory_store.save_agent_memory(

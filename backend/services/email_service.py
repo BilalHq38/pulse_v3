@@ -290,8 +290,10 @@ def send_email(to_email: str, subject: str, body: str, html_body: str = "") -> N
     }
     with preview_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(preview_entry, ensure_ascii=True) + "\n")
-    logger.warning(
-        "Email provider is not configured; wrote preview email to %s",
+    logger.error(
+        "No email provider configured — email NOT sent to %s. "
+        "Set BREVO_API_KEY or SMTP_HOST to enable email delivery. Preview written to %s.",
+        to_email,
         preview_path,
     )
 

@@ -5,6 +5,8 @@ import { resolveMediaUrl } from '@/lib/backend-url';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import BulkUploadModal from '@/components/BulkUploadModal';
+import { useSocket } from '@/lib/useSocket';
+import { useAuth } from '@/contexts/AuthContext';
 import {
   Target,
   Search,
@@ -113,6 +115,7 @@ function LeadCardSkeleton() {
 }
 
 export default function LeadsPage() {
+  const { user, loading: authLoading } = useAuth();
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [leads, setLeads] = useState([]);
   const [leadStatuses, setLeadStatuses] = useState([]);
@@ -211,17 +214,29 @@ export default function LeadsPage() {
     }
   }, []);
 
-  useEffect(() => { loadLeads(); }, [loadLeads]);
-  useEffect(() => { loadReferenceData(); }, [loadReferenceData]);
+  useEffect(() => { if (user && !authLoading) loadLeads(); }, [user, authLoading, loadLeads]);
+  useEffect(() => { if (user && !authLoading) loadReferenceData(); }, [user, authLoading, loadReferenceData]);
+  // Socket-based real-time updates — fired by backend on lead CRUD
+  const handleLeadSocketEvent = useCallback((eventName) => {
+    if (['lead_created', 'lead_updated', 'lead_deleted'].includes(eventName)) {
+      loadLeads();
+    }
+  }, [loadLeads]);
+  useSocket(handleLeadSocketEvent);
   useEffect(() => {
-    // Near-real-time refresh for incoming widget/WhatsApp leads.
-    // Silent background reloads; skipped while the tab is hidden to avoid
-    // wasted network on backgrounded tabs.
+    // Fallback poll every 30s for tab-backgrounded or missed socket events.
+    // Skipped when tab is hidden to avoid wasted network requests.
     const intervalId = setInterval(() => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       loadLeads();
-    }, 20000);
+    }, 30000);
     return () => clearInterval(intervalId);
+  }, [loadLeads]);
+  // Refresh immediately when tab becomes visible after being backgrounded
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') loadLeads(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
   }, [loadLeads]);
   useEffect(() => {
     const onKeyDown = (event) => {

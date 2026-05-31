@@ -3,6 +3,8 @@
 import asyncio
 import logging
 from typing import Optional
+
+from shared.database import _request_conn as _db_request_conn
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from agent_orchestrator.schemas import LeadWorkflowRequest
 from channel_layer.channel_identity import company_default_phone_region
@@ -790,7 +792,7 @@ async def create_lead(request: Request):
         cu["sub"],
         cu.get("name", ""),
     )
-    from core.socket import sio, connected_users
+    from core.socket import sio, connected_users, emit_company_event
 
     await create_notification(
         db,
@@ -808,6 +810,7 @@ async def create_lead(request: Request):
         source=source,
         action="lead_created",
     )
+    await emit_company_event(cid, "lead_created", {"lead_id": lead_id, "lead": _serialize_lead(dict(created or {}))})
     return _serialize_lead(created)
 
 
@@ -892,6 +895,8 @@ async def update_lead(lead_id: str, request: Request):
         action="lead_updated",
     )
     detailed = await _load_lead_details(db, lead_id, cid)
+    from core.socket import emit_company_event
+    await emit_company_event(cid, "lead_updated", {"lead_id": lead_id})
     return detailed or _serialize_lead(updated)
 
 
@@ -901,6 +906,8 @@ async def delete_lead(lead_id: str, request: Request):
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
     await db.execute("DELETE FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)
+    from core.socket import emit_company_event
+    await emit_company_event(cid, "lead_deleted", {"lead_id": lead_id})
     return {"status": "deleted"}
 
 
@@ -1281,10 +1288,9 @@ async def auto_score_lead(lead_id: str, request: Request):
         db=db,
     )
     qualification = workflow.agent_outputs.qualification
-    support = workflow.agent_outputs.support
     result = {
         **qualification,
-        "nurture_message": str(support.get("response") or ""),
+        "nurture_message": str(qualification.get("nurture_message") or ""),
     }
     await db.execute(
         "UPDATE leads SET score=$1,grade=$2,phase=$3,scoring_reason=$4,next_action=$5,updated_at=NOW() WHERE id=$6",
@@ -1538,19 +1544,36 @@ async def convert_lead_to_customer(lead_id: str, request: Request):
                 *duplicate_args,
             )
         )
-    transition = await transition_lead_stage(
-        db,
-        lead,
-        "converted",
-        reason="Converted manually by user",
-        source="conversion",
-        confidence=1.0,
-        changed_by_user_id=cu.get("sub", ""),
-        event_id=f"conversion:{lead_id}",
-        automatic=True,
-    )
-    lead = transition.get("lead") or r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)) or lead
-    customer = await convert_lead_to_customer_state(db, lead, cu)
+    _req_conn = _db_request_conn.get()
+    if _req_conn is not None:
+        async with _req_conn.transaction():
+            transition = await transition_lead_stage(
+                db,
+                lead,
+                "converted",
+                reason="Converted manually by user",
+                source="conversion",
+                confidence=1.0,
+                changed_by_user_id=cu.get("sub", ""),
+                event_id=f"conversion:{lead_id}",
+                automatic=True,
+            )
+            lead = transition.get("lead") or r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)) or lead
+            customer = await convert_lead_to_customer_state(db, lead, cu)
+    else:
+        transition = await transition_lead_stage(
+            db,
+            lead,
+            "converted",
+            reason="Converted manually by user",
+            source="conversion",
+            confidence=1.0,
+            changed_by_user_id=cu.get("sub", ""),
+            event_id=f"conversion:{lead_id}",
+            automatic=True,
+        )
+        lead = transition.get("lead") or r(await db.fetchrow("SELECT * FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)) or lead
+        customer = await convert_lead_to_customer_state(db, lead, cu)
     from core.socket import sio, connected_users
 
     await create_notification(

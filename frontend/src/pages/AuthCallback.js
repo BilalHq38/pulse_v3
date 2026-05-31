@@ -59,7 +59,7 @@ export default function AuthCallback() {
             });
             resolvedToken = sessionRes.data?.token || resolvedToken;
             if (sessionRes.data?.user) {
-              user = { ...user, ...sessionRes.data.user };
+              user = sessionRes.data.user;
             }
           }
           if (!user.email || !user.company_id) {

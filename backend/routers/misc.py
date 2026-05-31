@@ -395,7 +395,7 @@ async def security_overview(request: Request):
     uid = cu["sub"]
     cid = cu.get("company_id", "")
     return {
-        "total_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE company_id=$1", cid) or 0 if cid else 1,
+        "total_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE company_id=$1 AND role != 'super_admin'", cid) or 0 if cid else 1,
         "active_sessions": await db.fetchval(
             "SELECT COUNT(*) FROM sessions WHERE user_id=$1 AND company_id=$2 AND is_active=TRUE AND expires_at>NOW()",
             uid,

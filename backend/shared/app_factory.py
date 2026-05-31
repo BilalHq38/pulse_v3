@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -146,9 +147,32 @@ def _register_security_handlers(app: FastAPI) -> None:
             "http.exceptions.unhandled",
             labels={"service": request.app.state.service_name},
         )
-        logger.exception("service=%s unhandled_error path=%s", request.app.state.service_name, request.url.path)
         trace = current_trace_context()
         trace_id = trace.trace_id if trace else ""
+        if isinstance(exc, asyncio.TimeoutError):
+            logger.warning(
+                "service=%s request_timeout path=%s", request.app.state.service_name, request.url.path
+            )
+            return _apply_security_headers(
+                JSONResponse(
+                    status_code=504,
+                    content={"success": False, "error": "Request timed out", "data": None, "trace_id": trace_id},
+                )
+            )
+        if isinstance(exc, RuntimeError) and "schema" in str(exc).lower():
+            logger.error(
+                "service=%s schema_not_ready path=%s error=%s",
+                request.app.state.service_name,
+                request.url.path,
+                exc,
+            )
+            return _apply_security_headers(
+                JSONResponse(
+                    status_code=503,
+                    content={"success": False, "error": "Service temporarily unavailable", "data": None, "trace_id": trace_id},
+                )
+            )
+        logger.exception("service=%s unhandled_error path=%s", request.app.state.service_name, request.url.path)
         if request.app.state.service_name == "ai-service":
             return _apply_security_headers(
                 JSONResponse(
@@ -321,6 +345,14 @@ def create_service_app(
                     app.state.background_queue_handles.append(provider_handle)
                     logger.info("Started provider-isolated background worker label=%s", provider_label)
             app.state.background_queue_handle = primary_handle
+            from shared.background_queue import get_background_queue
+            queue = get_background_queue(service_label=service_name)
+            if queue is not None:
+                try:
+                    await queue.ensure_ready()
+                    logger.info("Background queue consumer group warmed for %s", service_name)
+                except Exception as warm_exc:
+                    logger.warning("Background queue warm-up skipped for %s: %s", service_name, warm_exc)
         except Exception as exc:
             logger.warning("background queue startup skipped for %s: %s", service_name, exc)
             app.state.background_queue_handle = None

@@ -2,6 +2,7 @@ import pytest
 from fastapi import HTTPException
 
 from services import public_signup_service
+from services.billing_helpers import get_plan
 from services.db_helpers import build_user_payload
 from routers import misc as misc_router_module
 from shared.billing_guard import check_user_status_active
@@ -96,9 +97,13 @@ def test_auth_payload_exposes_account_status_for_frontend_routing():
     assert payload["account_status"] == "pending_approval"
 
 
-def test_public_signup_creates_pending_approval_user():
+def test_public_signup_creates_active_user():
     source = public_signup_service._complete_pending_signup_workspace.__code__.co_consts
-    assert any("pending_approval" in str(item) for item in source)
+    assert any("public_signup_user_activated" in str(item) for item in source)
+
+
+def test_starter_plan_alias_maps_to_free_plan():
+    assert get_plan("starter")["code"] == "free"
 
 
 def test_conversation_limit_error_is_structured():

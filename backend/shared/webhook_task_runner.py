@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import traceback
@@ -12,19 +13,15 @@ from shared.database import create_detached_task
 logger = logging.getLogger(__name__)
 
 _DLQ_SCHEMA_READY = False
-_DLQ_SCHEMA_LOCK = None
+_DLQ_SCHEMA_LOCK = asyncio.Lock()
 _SAFE_TASK_FUNCTION = "_run_safe_task"
 DEPLOYMENT_SCHEMA_MIGRATION = "backend/sql_migrations/011_deployment_runtime_schema_hardening.sql"
 
 
 async def _ensure_dead_letter_queue_table(db) -> None:
-    global _DLQ_SCHEMA_READY, _DLQ_SCHEMA_LOCK
+    global _DLQ_SCHEMA_READY
     if _DLQ_SCHEMA_READY:
         return
-    if _DLQ_SCHEMA_LOCK is None:
-        import asyncio
-
-        _DLQ_SCHEMA_LOCK = asyncio.Lock()
     async with _DLQ_SCHEMA_LOCK:
         if _DLQ_SCHEMA_READY:
             return

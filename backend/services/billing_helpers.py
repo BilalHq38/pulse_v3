@@ -103,6 +103,10 @@ PLAN_CATALOG = {
     },
 }
 
+PLAN_CODE_ALIASES = {
+    "starter": "free",
+}
+
 
 def _looks_placeholder(value: str) -> bool:
     lowered = (value or "").strip().lower()
@@ -196,8 +200,15 @@ def require_stripe_webhook_secret() -> str:
     return STRIPE_WEBHOOK_SECRET
 
 
+def normalize_plan_code(plan_code: str, default: str = "") -> str:
+    candidate = (plan_code or "").strip().lower()
+    if not candidate:
+        return default
+    return PLAN_CODE_ALIASES.get(candidate, candidate)
+
+
 def get_plan(plan_code: str) -> dict[str, Any]:
-    plan = PLAN_CATALOG.get((plan_code or "").strip().lower())
+    plan = PLAN_CATALOG.get(normalize_plan_code(plan_code))
     if not plan:
         raise HTTPException(400, "Invalid plan")
     return dict(plan)
@@ -205,7 +216,7 @@ def get_plan(plan_code: str) -> dict[str, Any]:
 
 def effective_monthly_conversation_limit(sub_row: dict[str, Any] | None) -> int:
     """Resolve stored override or plan-catalog default (monthly messages across all channels)."""
-    code = str((sub_row or {}).get("plan_code") or "free").strip().lower()
+    code = normalize_plan_code(str((sub_row or {}).get("plan_code") or "free"))
     plan = PLAN_CATALOG.get(code, PLAN_CATALOG["free"])
     stored = int((sub_row or {}).get("monthly_conversation_limit") or 0)
     if stored > 0:
@@ -214,7 +225,7 @@ def effective_monthly_conversation_limit(sub_row: dict[str, Any] | None) -> int:
 
 
 def effective_max_users(sub_row: dict[str, Any] | None) -> int:
-    code = str((sub_row or {}).get("plan_code") or "free").strip().lower()
+    code = normalize_plan_code(str((sub_row or {}).get("plan_code") or "free"))
     plan = PLAN_CATALOG.get(code, PLAN_CATALOG["free"])
     stored = int((sub_row or {}).get("max_users") or 0)
     if stored > 0:
@@ -280,7 +291,7 @@ async def assert_workspace_seat_available(db, company_id: str) -> None:
 
 
 def get_public_signup_plans() -> list[dict[str, Any]]:
-    return [dict(plan) for code, plan in PLAN_CATALOG.items() if code != "free"]
+    return [dict(plan) for plan in PLAN_CATALOG.values()]
 
 
 def stripe_price_id(plan_code: str) -> str:
@@ -296,10 +307,41 @@ def uses_local_billing_customer_id(stripe_customer_id: str) -> bool:
 
 
 def normalize_plan_code_from_lookup_key(value: str, default: str = "pro") -> str:
-    candidate = (value or "").strip().lower()
+    candidate = normalize_plan_code(value)
     if candidate in PLAN_CATALOG:
         return candidate
     return default
+
+
+async def update_company_billing_summary(
+    db,
+    company_id: str,
+    *,
+    plan_code: str | None = None,
+    subscription_status: str | None = None,
+    billing_status: str | None = None,
+    stripe_subscription_id: str | None = None,
+) -> None:
+    company_id = (company_id or "").strip()
+    if not company_id:
+        return
+    normalized_plan = normalize_plan_code(plan_code or "") if plan_code is not None else None
+    if normalized_plan and normalized_plan not in PLAN_CATALOG:
+        normalized_plan = "free"
+    await db.execute(
+        "UPDATE companies SET "
+        "plan=COALESCE($1, plan), "
+        "subscription_status=COALESCE($2, subscription_status), "
+        "billing_status=COALESCE($3, billing_status), "
+        "stripe_subscription_id=COALESCE($4, stripe_subscription_id), "
+        "updated_at=NOW() "
+        "WHERE id=$5",
+        normalized_plan,
+        subscription_status.strip().lower() if isinstance(subscription_status, str) else None,
+        billing_status.strip().lower() if isinstance(billing_status, str) else None,
+        stripe_subscription_id.strip() if isinstance(stripe_subscription_id, str) else None,
+        company_id,
+    )
 
 
 async def get_or_create_billing_customer(
@@ -371,6 +413,7 @@ async def update_billing_customer_status(
         payment_status,
         billing_customer["id"],
     )
+    await update_company_billing_summary(db, company_id, billing_status=payment_status)
     return r(
         await db.fetchrow(
             "SELECT * FROM billing_customers WHERE id=$1",
@@ -422,6 +465,13 @@ async def upsert_subscription(
             existing,
             company_id,
         )
+        await update_company_billing_summary(
+            db,
+            company_id,
+            plan_code=plan["code"],
+            subscription_status=status,
+            stripe_subscription_id=normalized_stripe_subscription_id,
+        )
         return r(await db.fetchrow("SELECT * FROM subscriptions WHERE id=$1", existing))
     subscription_id = make_id()
     await db.execute(
@@ -441,5 +491,12 @@ async def upsert_subscription(
         current_period_start,
         current_period_end,
         canceled_at,
+    )
+    await update_company_billing_summary(
+        db,
+        company_id,
+        plan_code=plan["code"],
+        subscription_status=status,
+        stripe_subscription_id=normalized_stripe_subscription_id,
     )
     return r(await db.fetchrow("SELECT * FROM subscriptions WHERE id=$1", subscription_id))

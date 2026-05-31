@@ -21,6 +21,8 @@ from channel_layer.schemas import ChannelType
 
 from services.ai_service.facade import build_sentiment_gate, summarize_conversation
 from services.agent_orchestrator.facade import orchestrate_message_workflow
+from services.conversation_engine import TurnRequest, run_turn as engine_run_turn
+from services.conversation_engine.history_format import format_messages_as_dialogue
 from core.socket import emit_message_deleted, emit_message_updated, emit_new_message
 from core.utils import make_id, now_ts
 from shared.tracing import current_trace_context
@@ -1143,6 +1145,7 @@ async def send_message(convo_id: str, request: Request):
                         conversation_context=msgs_history,
                         customer=cust_full or {},
                         metadata={"source": "send_message", "trace_id": trace_id},
+                        suppress_response_generation=True,
                     ),
                     authorization=request.headers.get("authorization") or request.headers.get("Authorization", ""),
                     db=db,
@@ -1156,11 +1159,31 @@ async def send_message(convo_id: str, request: Request):
                     trace_id,
                 )
                 capture = workflow.agent_outputs.capture
-                support_plan = workflow.agent_outputs.support
                 sentiment = dict(capture.get("sentiment") or {})
                 conversation_sentiment = dict(capture.get("conversation_sentiment") or {})
                 intent = dict(capture.get("intent") or {})
                 sentiment_gate = dict(capture.get("sentiment_gate") or {}) or build_sentiment_gate(content, sentiment)
+                engine_result = await engine_run_turn(
+                    db,
+                    TurnRequest(
+                        session_id=convo_id,
+                        company_id=company_id,
+                        customer_id=str(convo.get("customer_id") or ""),
+                        user_message=content,
+                        extra_history=format_messages_as_dialogue(msgs_history),
+                    ),
+                )
+                engine_payload = _engine_turn_result_payload(engine_result, manual_draft_nonce="")
+                should_escalate = sentiment_gate.get("ai_response_allowed") is False
+                support_plan = {
+                    **engine_payload,
+                    "deliver_response": bool(engine_payload.get("response")) and not should_escalate,
+                    "escalate": should_escalate,
+                    "escalation_reason": str(sentiment_gate.get("recommended_action") or "")
+                    if should_escalate
+                    else "",
+                    "next_action": "manual_review" if should_escalate else "conversation_engine_reply",
+                }
                 sent_score = _float_or_none(sentiment.get("score"))
                 sent_emotion = str(sentiment.get("emotion", "neutral"))
                 sent_conf = _float_or_none(sentiment.get("confidence"))
@@ -1877,6 +1900,48 @@ def _build_manual_ai_draft_payload(result: dict, convo_id: str, threshold: float
     }
 
 
+def _engine_turn_result_payload(engine_result, *, manual_draft_nonce: str) -> dict:
+    product_links = [
+        {
+            "product_id": pl.product_id,
+            "url": pl.url,
+            "name": getattr(pl, "name", ""),
+            "image_url": getattr(pl, "image_url", ""),
+        }
+        for pl in (engine_result.product_links or [])
+    ]
+    product_images = [
+        {
+            "type": "image",
+            "url": str(item.get("image_url") or ""),
+            "name": str(item.get("name") or ""),
+            "product_id": str(item.get("product_id") or ""),
+        }
+        for item in product_links
+        if str(item.get("image_url") or "").strip()
+    ]
+    error = str(engine_result.error or "").strip()
+    return {
+        "response": engine_result.answer,
+        "confidence": float(engine_result.confidence or 0.0),
+        "confidence_threshold": 0.7,
+        "attachments": product_images,
+        "product_images": product_images,
+        "product_links": product_links,
+        "provider": "conversation_engine",
+        "model_name": "",
+        "llm_id": str(engine_result.turn_id or ""),
+        "api_error": False,
+        "error_type": error,
+        "error_reason": error,
+        "fallback_used": bool(error),
+        "fallback_reason": error,
+        "requires_review": bool(error),
+        "review_reason": error,
+        "manual_draft_nonce": manual_draft_nonce,
+    }
+
+
 async def _process_manual_ai_response_background(
     db,
     *,
@@ -2037,32 +2102,17 @@ async def _run_manual_ai_response_workflow(
         sender_contact,
         sender_contact,
     )
-    workflow = await orchestrate_message_workflow(
-        MessageWorkflowRequest(
-            trace_id=trace_id,
+    engine_result = await engine_run_turn(
+        db,
+        TurnRequest(
+            session_id=convo_id,
             company_id=company_id,
-            conversation_id=convo_id,
-            customer_id=convo.get("customer_id", ""),
-            message_id=manual_idempotency_key,
-            external_message_id="",
-            provider_event_id=manual_idempotency_key,
-            idempotency_key=manual_idempotency_key,
-            channel=str(convo.get("channel") or "web_chat"),
-            source="manual_ai_respond",
-            message_text=last_cust_msg,
-            sender_name=str((cust or {}).get("name") or convo.get("customer_name") or ""),
-            sender_contact=sender_contact,
-            actor_user_id=cu.get("sub", ""),
-            actor_user_role=cu.get("role", ""),
-            conversation_context=msgs_history,
-            customer=cust or {},
-            metadata=request_metadata,
+            customer_id=str(convo.get("customer_id") or ""),
+            user_message=last_cust_msg,
+            extra_history=format_messages_as_dialogue(msgs_history),
         ),
-        authorization=authorization,
-        db=db,
     )
-    result = dict(workflow.agent_outputs.support or {})
-    result["manual_draft_nonce"] = manual_draft_nonce
+    result = _engine_turn_result_payload(engine_result, manual_draft_nonce=manual_draft_nonce)
     if (
         result.get("api_error")
         and not result.get("static_fallback_served")

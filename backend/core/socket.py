@@ -295,3 +295,14 @@ async def emit_message_reaction_updated(conversation_id: str, reaction: dict):
             )
     except Exception as e:
         logger.error("Socket emit error: %s", e)
+
+
+async def emit_company_event(company_id: str, event_name: str, payload: dict):
+    """Emit a generic event to all sockets in a company room."""
+    try:
+        cid = str(company_id or "").strip()
+        if not cid:
+            return
+        await sio.emit(event_name, _json_safe(payload), room=f"company_{cid}")
+    except Exception as e:
+        logger.error("Socket emit_company_event error event=%s company_id=%s: %s", event_name, company_id, e)

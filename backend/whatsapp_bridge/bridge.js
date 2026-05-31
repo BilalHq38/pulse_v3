@@ -237,6 +237,36 @@ function logBridgeEvent(level, event, data = {}) {
   }
 }
 
+function formatProcessError(reason) {
+  if (!reason) return "";
+  if (reason && reason.stack) return trimText(reason.stack, 1200);
+  if (reason && reason.message) return trimText(reason.message, 1200);
+  return trimText(String(reason), 1200);
+}
+
+function isTransientBridgeProcessError(reason) {
+  const text = `${reason && reason.name ? reason.name : ""} ${reason && reason.message ? reason.message : reason || ""}`;
+  return /TargetCloseError|Target closed|Protocol error|Session closed|Execution context was destroyed/i.test(text);
+}
+
+process.on("unhandledRejection", (reason) => {
+  logBridgeEvent(isTransientBridgeProcessError(reason) ? "warn" : "error", "whatsapp.bridge.unhandled_rejection", {
+    transient: isTransientBridgeProcessError(reason),
+    error: formatProcessError(reason),
+  });
+});
+
+process.on("uncaughtException", (err) => {
+  const transient = isTransientBridgeProcessError(err);
+  logBridgeEvent(transient ? "warn" : "error", "whatsapp.bridge.uncaught_exception", {
+    transient,
+    error: formatProcessError(err),
+  });
+  if (!transient) {
+    process.exit(1);
+  }
+});
+
 function bridgeTraceId(req) {
   return String(
     (req && req.headers && (req.headers["x-trace-id"] || req.headers["x-request-id"])) || "",

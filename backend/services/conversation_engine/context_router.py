@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from services.ai_service.routing_guards import is_low_value_message
 from services.conversation_engine.schemas import SourceType
 
 
@@ -48,6 +49,15 @@ _COMPANY_KEYWORDS = {
     "you", "your company", "who are you", "about you", "your business",
     "your team", "where are you", "your hours",
 }
+_SMALL_TALK_EXACT = {
+    "how are you",
+    "how r u",
+    "how are u",
+    "how you doing",
+    "how are you doing",
+    "how is it going",
+    "how's it going",
+}
 
 # Sources scoring below this floor are skipped entirely (saves a round trip).
 _INCLUSION_FLOOR = 0.15
@@ -61,6 +71,7 @@ class RoutingDecision:
     sources: list[SourceType]
     scores: dict[SourceType, float]
     ambiguous: bool
+    low_value: bool = False
 
 
 def _normalise(text: str) -> str:
@@ -76,8 +87,28 @@ def _score_keywords(text: str, keywords: set[str]) -> float:
     return min(1.0, 0.25 + 0.18 * hits)
 
 
+def is_conversational_message(query: str) -> bool:
+    text = _normalise(query)
+    plain = re.sub(r"[^a-z0-9\s']", " ", text)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return bool(text and (is_low_value_message(text) or plain in _SMALL_TALK_EXACT))
+
+
 def score(query: str) -> RoutingDecision:
     text = _normalise(query)
+    if is_conversational_message(text):
+        return RoutingDecision(
+            sources=[],
+            scores={
+                "company_data": 0.0,
+                "product": 0.0,
+                "faq": 0.0,
+                "knowledge_base": 0.0,
+            },
+            ambiguous=False,
+            low_value=True,
+        )
+
     scores: dict[SourceType, float] = {
         "company_data": _score_keywords(text, _COMPANY_KEYWORDS),
         "product": _score_keywords(text, _PRODUCT_KEYWORDS),

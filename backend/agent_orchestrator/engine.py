@@ -5,7 +5,6 @@ from agent_orchestrator.agents import (
     AnalyticsAgent,
     CaptureAgent,
     QualificationAgent,
-    SupportAgent,
 )
 from agent_orchestrator.memory.store import MemoryStore
 from agent_orchestrator.router.agent_router import AgentRouter
@@ -27,7 +26,6 @@ class OrchestratorEngine:
         self.registry = AgentRegistry()
         self.registry.register(CaptureAgent())
         self.registry.register(QualificationAgent())
-        self.registry.register(SupportAgent())
         self.registry.register(AnalyticsAgent())
         self.router = AgentRouter()
         self.manager = WorkflowManager(

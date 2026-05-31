@@ -1,4 +1,4 @@
-"""Structured onboarding flow for SupportAgent.
+"""Structured onboarding flow helpers.
 
 Runs a small, deterministic step machine for customers whose
 ``lifecycle_stage = 'new_customer'`` before falling back to RAG or LLM
@@ -143,7 +143,7 @@ async def advance_onboarding(
     Returns a dict with:
         step:        the current step label
         response:    the agent's reply to send to the customer
-        complete:    True once the flow finishes (then SupportAgent can fall through)
+        complete:    True once the flow finishes and the caller can fall through
     """
     state = await _load_onboarding_state(db, customer_id)
     current_step = str(state.get("step") or "").strip().lower()

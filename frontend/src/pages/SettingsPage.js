@@ -13,6 +13,7 @@ import {
 } from '@/lib/whatsappBridgeStatus';
 import AiSettingsTab from '@/components/settings/AiSettingsTab';
 import UnificationTab from '@/components/settings/UnificationTab';
+import PageSkeleton from '@/components/ui/PageSkeleton';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
@@ -471,7 +472,7 @@ function AiResponseTemplatesSection({ isAdmin }) {
 }
 
 export default function SettingsPage() {
-  const { user, logout, refreshUser } = useAuth();
+  const { user, loading: authLoading, logout, refreshUser } = useAuth();
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const location = useLocation();
   const navigate = useNavigate();
@@ -483,6 +484,7 @@ export default function SettingsPage() {
   const setActiveTab = (tab) => {
     if (standaloneUnification) return;
     setSearchParams({ tab }, { replace: true });
+    setMobileSidebarOpen(false);
   };
   const [channels, setChannels] = useState([]);
   const [company, setCompany] = useState(null);
@@ -606,6 +608,8 @@ export default function SettingsPage() {
   const [mcpPresetSaving, setMcpPresetSaving] = useState('');
   const [editingSocialPlatform, setEditingSocialPlatform] = useState(null);
   const [socialDraft, setSocialDraft] = useState({});
+
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   const waChannelRow = channels.find((c) => c.channel === 'whatsapp');
   const waMetaBlocksQr = !!(
@@ -904,7 +908,7 @@ export default function SettingsPage() {
     }
   }, [activeTab, onboardingInviteMode, user]);
 
-  useEffect(() => { loadSettings(); }, [loadSettings]);
+  useEffect(() => { if (user && !authLoading) loadSettings(); }, [user, authLoading, loadSettings]);
 
   useEffect(() => {
     if (!onboardingInviteMode || !isAdmin || searchParams.get('invite') !== '1') return;
@@ -1969,12 +1973,43 @@ export default function SettingsPage() {
 
   return (
     <>
-    <div className="p-6 lg:p-8" data-testid="settings-page">
-      <h1 className="text-2xl font-bold text-slate-900 mb-6">{standaloneUnification ? 'Unification' : 'Settings'}</h1>
+    <div className="p-4 sm:p-6 lg:p-8" data-testid="settings-page">
+      <div className="flex items-center gap-3 mb-6">
+        {!standaloneUnification && (
+          <button
+            type="button"
+            onClick={() => setMobileSidebarOpen(true)}
+            className="lg:hidden p-2 rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-blue-50 hover:text-blue-600 transition-colors shadow-sm"
+            aria-label="Open settings navigation"
+          >
+            <ChevronRight size={18} />
+          </button>
+        )}
+        <h1 className="text-2xl font-bold text-slate-900">{standaloneUnification ? 'Unification' : 'Settings'}</h1>
+      </div>
+
+      {/* Mobile sidebar drawer backdrop */}
+      {mobileSidebarOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 z-40 lg:hidden"
+          onClick={() => setMobileSidebarOpen(false)}
+        />
+      )}
 
       <div className={`flex ${standaloneUnification ? '' : 'gap-8'} h-[calc(100vh-8rem)] overflow-hidden`}>
         {!standaloneUnification && (
-          <div ref={settingsSidebarRef} className="h-full w-48 flex-shrink-0 space-y-0.5 overflow-y-auto pr-1">
+          <div
+            ref={settingsSidebarRef}
+            className={`
+              fixed lg:relative inset-y-0 left-0 z-50 lg:z-auto
+              h-full w-56 lg:w-48 flex-shrink-0
+              bg-white lg:bg-transparent
+              border-r border-slate-100 lg:border-0
+              space-y-0.5 overflow-y-auto p-3 lg:p-0 lg:pr-1
+              transform transition-transform duration-300 ease-in-out
+              ${mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
+            `}
+          >
             {tabs.map(tab => (
               <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className={`group w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-200 hover:translate-x-1 active:scale-95 ${
@@ -1998,9 +2033,7 @@ export default function SettingsPage() {
               <h2 className="text-lg font-semibold text-slate-900">Personal Profile</h2>
 
               {!personalSettings && (
-                <div className="bg-white border border-slate-100 rounded-xl p-6 text-sm text-slate-500">
-                  Loading personal settings...
-                </div>
+                <PageSkeleton variant="settings" />
               )}
 
               {personalSettings && (
@@ -2438,6 +2471,7 @@ export default function SettingsPage() {
           )}
 
           {/* === COMPANY === */}
+          {activeTab === 'company' && !company && <PageSkeleton variant="settings" />}
           {activeTab === 'company' && company && (
             <div className="space-y-6">
               <h2 className="text-lg font-semibold text-slate-900">Company Profile</h2>

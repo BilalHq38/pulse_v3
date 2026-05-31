@@ -1065,12 +1065,18 @@ function GlobeSection() {
   const drag       = useRef({ active: false, lastX: 0, vel: 0 });
   const raf        = useRef(null);
   const inView     = useRef(false);
+  const frameRef   = useRef(null);
   const [positions, setPositions] = useState([]);
   const [active,    setActive]    = useState(null);
 
-  /* IntersectionObserver to PAUSE RAF when off-screen (perf fix) */
+  /* IntersectionObserver — fully stop RAF when off-screen, restart on entry */
   useEffect(() => {
-    const obs = new IntersectionObserver(([e]) => { inView.current = e.isIntersecting; }, { threshold: 0.05 });
+    const obs = new IntersectionObserver(([e]) => {
+      inView.current = e.isIntersecting;
+      if (e.isIntersecting && !raf.current && frameRef.current) {
+        raf.current = requestAnimationFrame(frameRef.current);
+      }
+    }, { threshold: 0.05 });
     if (wrapRef.current) obs.observe(wrapRef.current);
     return () => obs.disconnect();
   }, []);
@@ -1095,7 +1101,9 @@ function GlobeSection() {
       }
     }
     resize();
-    const ro = new ResizeObserver(resize);
+    const ro = new ResizeObserver(() => {
+      window.requestAnimationFrame(resize);
+    });
     ro.observe(wrap);
 
     function calcTagPos() {
@@ -1118,10 +1126,11 @@ function GlobeSection() {
 
     function frame() {
       const canvas = canvasRef.current;
-      if (!canvas) return;
-      if (!inView.current) { raf.current = requestAnimationFrame(frame); return; }
+      if (!canvas) { raf.current = null; return; }
+      // Fully stop the loop when off-screen; IntersectionObserver will restart it
+      if (!inView.current) { raf.current = null; return; }
       const ctx = canvas.getContext('2d');
-      if (!ctx) { raf.current = requestAnimationFrame(frame); return; }
+      if (!ctx) { raf.current = null; return; }
       const w   = canvas.width  / dpr;
       const h   = canvas.height / dpr;
       const cx  = w / 2, cy = h / 2;
@@ -1140,6 +1149,7 @@ function GlobeSection() {
       setPositions(calcTagPos());
       raf.current = requestAnimationFrame(frame);
     }
+    frameRef.current = frame;
     frame();
 
     const el = wrap;
@@ -1198,6 +1208,9 @@ function GlobeSection() {
             color: active?.id === tag.id ? '#fff' : tag.color,
             cursor: 'pointer',
             fontFamily: 'var(--font-b)',
+            maxWidth: 'calc(100vw - 32px)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
             backdropFilter: 'blur(8px)',
             WebkitBackdropFilter: 'blur(8px)',
@@ -1238,9 +1251,13 @@ function GlobeSection() {
   );
 }
 
+const isMobileUA = () =>
+  typeof navigator !== 'undefined' && /Mobi|Android|iPhone/i.test(navigator.userAgent);
+
 export default function LandingPage() {
   const pageRef = useRef(null);
   const lenisRef = useRef(null);
+  const isMobile = isMobileUA();
 
   const [scrolled, setScrolled] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -1266,14 +1283,14 @@ export default function LandingPage() {
 
     onScroll();
 
-    window.addEventListener('scroll', onScroll);
+    window.addEventListener('scroll', onScroll, { passive: true });
     return () => {
       window.removeEventListener('scroll', onScroll);
     };
   }, []);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return undefined;
+    if (typeof window === 'undefined' || isMobile) return undefined;
 
     const lenis = new Lenis({
       duration: 1.15,
@@ -1297,10 +1314,10 @@ export default function LandingPage() {
       lenis.destroy();
       lenisRef.current = null;
     };
-  }, []);
+  }, [isMobile]);
 
   useEffect(() => {
-    if (reducedMotion || !pageRef.current) return undefined;
+    if (reducedMotion || isMobile || !pageRef.current) return undefined;
 
     const context = gsap.context(() => {
       gsap.to('[data-float-layer]', {
@@ -1334,7 +1351,7 @@ export default function LandingPage() {
     }, pageRef);
 
     return () => context.revert();
-  }, [reducedMotion]);
+  }, [reducedMotion, isMobile]);
 
   const handleAnchorClick = (event, href) => {
     event.preventDefault();
@@ -1375,41 +1392,11 @@ export default function LandingPage() {
             linear-gradient(180deg, #f7fbff 0%, #ffffff 16%, #ffffff 100%);
         }
         .hero-visual-wrapper {
-          width: 680px;
+          width: min(680px, 94vw);
+          max-width: 680px;
           flex-shrink: 0;
           transform-origin: center;
           transition: all 0.3s ease;
-          transform: scale(0.44);
-          margin-top: -190px;
-          margin-bottom: -190px;
-        }
-        @media (min-width: 380px) {
-          .hero-visual-wrapper {
-            transform: scale(0.53);
-            margin-top: -150px;
-            margin-bottom: -150px;
-          }
-        }
-        @media (min-width: 480px) {
-          .hero-visual-wrapper {
-            transform: scale(0.66);
-            margin-top: -100px;
-            margin-bottom: -100px;
-          }
-        }
-        @media (min-width: 640px) {
-          .hero-visual-wrapper {
-            transform: scale(0.85);
-            margin-top: -40px;
-            margin-bottom: -40px;
-          }
-        }
-        @media (min-width: 768px) {
-          .hero-visual-wrapper {
-            transform: scale(1);
-            margin-top: 0;
-            margin-bottom: 0;
-          }
         }
         .landing-shell::before {
           content: '';

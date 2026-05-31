@@ -83,9 +83,9 @@ async def analytics_overview(request: Request):
     hot_leads = await db.fetchval(
         "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot' AND status != 'converted'", cid
     )
-    # Count all customers — lifecycle_stage='customer' was unreliable for web_chat
-    # visitors so the old filter caused severe under-counting.
-    total_customers = await db.fetchval("SELECT COUNT(*) FROM customers WHERE company_id=$1", cid)
+    total_customers = await db.fetchval(
+        "SELECT COUNT(*) FROM customers WHERE company_id=$1 AND lifecycle_stage != 'lead'", cid
+    )
     total_products = await db.fetchval("SELECT COUNT(*) FROM company_products WHERE company_id=$1", cid)
     total_tickets = await db.fetchval("SELECT COUNT(*) FROM tickets WHERE company_id=$1", cid)
     open_tickets = await db.fetchval("SELECT COUNT(*) FROM tickets WHERE company_id=$1 AND status='open'", cid)

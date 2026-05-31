@@ -142,8 +142,9 @@ export default function SignUpPage() {
 
   useEffect(() => {
     const p = (searchParams.get('plan') || '').trim().toLowerCase();
-    if (p !== 'enterprise' && p !== 'pro') return;
-    setForm((prev) => (prev.plan_code === p ? prev : { ...prev, plan_code: p }));
+    if (!['starter', 'free', 'enterprise', 'pro'].includes(p)) return;
+    const planCode = p === 'free' ? 'starter' : p;
+    setForm((prev) => (prev.plan_code === planCode ? prev : { ...prev, plan_code: planCode }));
   }, [searchParams]);
 
   const startOAuth = (provider) => startOAuthLoginRedirect(backendBaseUrl, provider);
@@ -206,7 +207,7 @@ export default function SignUpPage() {
       }
       if (
         response?.status === 'account_created' &&
-        (response?.billing_mode === 'trial_no_payment' || response?.billing_mode === 'trial_relaxed') &&
+        ['free', 'trial_no_payment', 'trial_relaxed'].includes(response?.billing_mode) &&
         !response?.email_verification?.required
       ) {
         setError(

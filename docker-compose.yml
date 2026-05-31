@@ -1,4 +1,6 @@
 x-common-env: &common-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  APP_ENV: ${APP_ENV:-development}
   JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
   # Local dev: set POSTGRES_SSLMODE=disable in .env if your postgres container has no certs
@@ -56,6 +58,9 @@ x-common-env: &common-env
   WHATSAPP_MODE: ${WHATSAPP_MODE:-bridge}
   WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
   UPLOAD_STORAGE_DIR: ${UPLOAD_STORAGE_DIR:-/app/uploads}
+  STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+  MEDIA_STORAGE_BACKEND: ${MEDIA_STORAGE_BACKEND:-${STORAGE_BACKEND:-local}}
+  GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/app/secrets/gcp-vertex-sa.json}
 
 x-service-defaults: &service-defaults
   env_file:
@@ -87,10 +92,11 @@ services:
     command: ["postgres", "-c", "max_connections=300"]
     expose:
       - "5432"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5435}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./backend/sql_schema.sql:/docker-entrypoint-initdb.d/10-monolith-schema.sql:ro
-      - ./backend/shared/db/bootstrap_microservices.sql:/docker-entrypoint-initdb.d/20-microservices.sql:ro
+      - ./database_complete.sql:/docker-entrypoint-initdb.d/10-database-complete.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pulse_engine_app} -d ${POSTGRES_DB:-pulse_engine}"]
       interval: 10s
@@ -201,7 +207,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8001/health || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()\""]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -230,7 +236,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8002/health || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3).read()\""]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -265,15 +271,17 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8003/health || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3).read()\""]
       interval: 15s
       timeout: 5s
       retries: 10
     expose:
       - "8003"
+    ports:
+      - "${CUSTOMER_HOST_PORT:-8003}:8003"
     volumes:
       - uploads-data:/app/uploads
-      - ./backend/secrets:/app/secrets:ro
+      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     logging: *default-logging
     deploy:
       resources:
@@ -329,7 +337,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets:/app/secrets:ro
+      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
       interval: 15s
@@ -361,7 +369,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets:/app/secrets:ro
+      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
       interval: 15s
@@ -393,7 +401,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets:/app/secrets:ro
+      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
       - fastembed-cache:/root/.cache/fastembed
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
@@ -595,7 +603,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend/secrets:/app/secrets:ro
+      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).read()\""]
       interval: 15s

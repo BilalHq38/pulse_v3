@@ -80,11 +80,11 @@ async def resolve_oauth_login_user(
     email: str,
     provider_user_id: str,
 ) -> dict | None:
-    """Case A: return user only when (provider, provider_user_id) is already linked. Case C: None.
+    """Resolve OAuth by linked subject first, then by a unique existing email.
 
-    Case B (email exists but subject not linked): raises HTTPException 409 with OAUTH_ACCOUNT_LINK_REQUIRED.
-
-    Ambiguous multi-tenant email without a unique linked subject: raises 409 with workspace message.
+    Existing users who start OAuth from signup/signin are login attempts, not
+    new workspace registrations. Ambiguous multi-tenant emails still require
+    explicit workspace selection/linking.
     """
     norm = email.strip().lower()
     if not norm:
@@ -132,7 +132,7 @@ async def resolve_oauth_login_user(
     # pid present but no global (provider, provider_id) row — never match by email alone.
     if len(matches) > 1:
         raise _multi_workspace
-    raise HTTPException(409, OAUTH_ACCOUNT_LINK_REQUIRED)
+    return matches[0]
 
 
 async def find_existing_oauth_login_user(

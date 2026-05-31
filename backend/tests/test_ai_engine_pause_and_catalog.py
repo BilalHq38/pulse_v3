@@ -1,12 +1,13 @@
 import pytest
-from types import SimpleNamespace
 
-import agent_orchestrator.agents.support_agent as support_agent
 import services.db_helpers as db_helpers
-from agent_orchestrator.agents.support_agent import SupportAgent
-from agent_orchestrator.schemas import WorkflowKind
 from services.ai_service import llm_client
-from services.ai_service.model_catalog import is_supported_model, model_capabilities, supported_model_catalog
+from services.ai_service.model_catalog import (
+    DEFAULT_GEMINI_MODEL,
+    is_supported_model,
+    model_capabilities,
+    supported_model_catalog,
+)
 from services.db_helpers import (
     AI_API_EXHAUSTED_MANUAL_MESSAGE,
     auto_disable_ai_after_failure_fallback,
@@ -197,9 +198,9 @@ async def test_default_engine_seeding_keeps_only_gemini_25_flash_and_preserves_t
     engine = await ensure_default_llm_engine(db)
 
     assert engine["provider"] == "gemini"
-    assert engine["model_name"] == "gemini-2.5-flash"
+    assert engine["model_name"] == DEFAULT_GEMINI_MODEL
     global_gemini = [row["model_name"] for row in db.rows if row["company_id"] == "" and row["provider"] == "gemini"]
-    assert global_gemini == ["gemini-2.5-flash"]
+    assert global_gemini == [DEFAULT_GEMINI_MODEL]
     assert any(row["id"] == "tenant-pro" and row["model_name"] == "gemini-2.5-pro" for row in db.rows)
 
 
@@ -415,101 +416,3 @@ async def test_escalation_pauses_ai_auto_response():
     assert "conversation_escalated" in update_sql
     assert update_args[0] == "Customer asked for a human"
     assert any("Conversation escalated" in msg["content"] for msg in db.messages.values())
-
-
-@pytest.mark.asyncio
-async def test_support_agent_provider_failure_returns_static_fallback(monkeypatch):
-    async def threshold(*_args, **_kwargs):
-        return 0.6
-
-    monkeypatch.setattr(support_agent, "fetch_company_ai_threshold", threshold)
-
-    context = SimpleNamespace(
-        workflow_kind=WorkflowKind.MESSAGE,
-        workflow_id="wf-1",
-        company_id="co-1",
-        db=None,
-        request=SimpleNamespace(
-            message_text="What products do you have?",
-            conversation_id="convo-1",
-            customer_id="cust-1",
-            message_id="msg-1",
-            conversation_context=[],
-            knowledge_context="",
-            channel="web_chat",
-        ),
-        global_memory=SimpleNamespace(conversation_history=[]),
-        agent_outputs=SimpleNamespace(
-            capture={
-                "customer": {"id": "cust-1", "name": "Customer"},
-                "sentiment": {"emotion": "neutral", "score": 0},
-                "intent": {"intent": "product_recommendation"},
-                "sentiment_gate": {"ai_response_allowed": True},
-                "prefetched_support_response": {
-                    "response": "I can help with products.",
-                    "confidence": 0.9,
-                    "api_error": True,
-                    "error_type": "quota_exhausted",
-                    "error_reason": "quota_exhausted",
-                    "provider": "gemini",
-                    "model_name": "gemini-2.5-flash",
-                    "provider_error": {"error_type": "quota_exhausted"},
-                },
-            },
-            qualification={},
-        ),
-    )
-
-    result = await SupportAgent().execute(context)
-    payload = result.payload
-
-    assert payload["provider"] == "static_fallback"
-    assert payload["deliver_response"] is True
-    assert "having trouble connecting" in payload["response"]
-
-
-@pytest.mark.asyncio
-async def test_support_agent_low_confidence_does_not_auto_escalate(monkeypatch):
-    async def threshold(*_args, **_kwargs):
-        return 0.8
-
-    monkeypatch.setattr(support_agent, "fetch_company_ai_threshold", threshold)
-
-    context = SimpleNamespace(
-        workflow_kind=WorkflowKind.MESSAGE,
-        workflow_id="wf-low-confidence",
-        company_id="co-1",
-        db=None,
-        request=SimpleNamespace(
-            message_text="Can you help me pick one?",
-            conversation_id="convo-1",
-            customer_id="cust-1",
-            message_id="msg-1",
-            conversation_context=[],
-            knowledge_context="",
-            channel="web_chat",
-        ),
-        global_memory=SimpleNamespace(conversation_history=[]),
-        agent_outputs=SimpleNamespace(
-            capture={
-                "customer": {"id": "cust-1", "name": "Customer"},
-                "sentiment": {"emotion": "neutral", "score": 0},
-                "intent": {"intent": "product_recommendation"},
-                "sentiment_gate": {"ai_response_allowed": True},
-                "prefetched_support_response": {
-                    "response": "I can help you compare the available options.",
-                    "confidence": 0.3,
-                    "api_error": False,
-                    "provider": "gemini",
-                    "model_name": "gemini-2.5-flash-lite",
-                },
-            },
-            qualification={},
-        ),
-    )
-
-    payload = (await SupportAgent().execute(context)).payload
-
-    assert payload["requires_review"] is True
-    assert payload["escalate"] is False
-    assert payload["deliver_response"] is True

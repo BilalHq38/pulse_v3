@@ -1,8 +1,16 @@
-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import api, { clearAuthSession, clearAccessToken, refreshAuthSession, setAccessToken } from '@/lib/api';
 import { normalizeAvatarUrl } from '@/lib/avatar';
+import { startActivityTracking, stopActivityTracking, isSessionExpiredByInactivity, resetActivity } from '@/lib/activityTracker';
 
 const AuthContext = createContext(null);
+
+// Statuses that should NOT retain an authenticated session after refresh
+const BLOCKED_STATUSES = ['pending_approval', 'rejected', 'blocked'];
+
+// Silent background refresh every 55 minutes (access tokens expire in 15 min,
+// cookie-backed refresh token lasts 30 days — this keeps the access token alive).
+const REFRESH_INTERVAL_MS = 55 * 60 * 1000;
 
 function safeUserForStorage(user) {
   if (!user) return null;
@@ -19,6 +27,8 @@ function safeUserForStorage(user) {
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const refreshTimerRef = useRef(null);
+
   const saveAvatar = useCallback((rawAvatar) => {
     const avatar = normalizeAvatarUrl(rawAvatar || '');
     if (avatar) localStorage.setItem('pe_avatar', avatar);
@@ -26,22 +36,75 @@ export function AuthProvider({ children }) {
     return avatar;
   }, []);
 
+  const _clearLocalAuth = useCallback(() => {
+    clearAccessToken();
+    localStorage.removeItem('pe_user');
+    localStorage.removeItem('pe_avatar');
+    localStorage.removeItem('pe_company_name');
+    stopActivityTracking();
+    if (refreshTimerRef.current) {
+      clearInterval(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    }
+  }, []);
+
+  const _setAuthenticatedUser = useCallback((userData, token) => {
+    if (token) setAccessToken(token);
+    localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(userData)));
+    setUser(userData);
+    saveAvatar(userData?.avatar || '');
+  }, [saveAvatar]);
+
+  const _startSilentRefreshTimer = useCallback(() => {
+    if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
+    refreshTimerRef.current = setInterval(async () => {
+      // Do not refresh if user has been inactive for 6 hours
+      if (isSessionExpiredByInactivity()) return;
+      try {
+        const refreshed = await refreshAuthSession();
+        if (refreshed?.token) setAccessToken(refreshed.token);
+        if (refreshed?.user) {
+          localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(refreshed.user)));
+          setUser(refreshed.user);
+          saveAvatar(refreshed.user.avatar || '');
+        }
+      } catch {
+        // Silently ignore — interceptor will handle 401 on next request
+      }
+    }, REFRESH_INTERVAL_MS);
+  }, [saveAvatar]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         // Full user state is fetched from the server here — the localStorage copy
         // stores only display-safe fields and must NOT be used for sensitive decisions.
-        // TODO: Fetch full user state from /auth/me on init if refreshAuthSession is unavailable.
         const refreshed = await refreshAuthSession();
         if (cancelled) return;
-        if (refreshed?.token) {
-          setAccessToken(refreshed.token);
+
+        // Guard: if the account is pending approval, blocked, or rejected,
+        // sign out immediately — do not persist the session.
+        const accountStatus = refreshed?.user?.account_status || refreshed?.user?.status || '';
+        if (refreshed?.user && BLOCKED_STATUSES.includes(accountStatus)) {
+          _clearLocalAuth();
+          setUser(null);
+          setLoading(false);
+          return;
         }
+
+        if (refreshed?.token) setAccessToken(refreshed.token);
         if (refreshed?.user) {
           localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(refreshed.user)));
           setUser(refreshed.user);
           saveAvatar(refreshed.user.avatar || '');
+          // Start inactivity tracking and silent background refresh
+          startActivityTracking(() => {
+            // 6-hour inactivity: sign out
+            _clearLocalAuth();
+            setUser(null);
+          });
+          _startSilentRefreshTimer();
         }
         if (refreshed?.user && !localStorage.getItem('pe_avatar')) {
           api.get('/settings/personal').then(res => {
@@ -51,10 +114,7 @@ export function AuthProvider({ children }) {
         }
       } catch {
         if (cancelled) return;
-        clearAccessToken();
-        localStorage.removeItem('pe_user');
-        localStorage.removeItem('pe_avatar');
-        localStorage.removeItem('pe_company_name');
+        _clearLocalAuth();
         setUser(null);
       } finally {
         if (!cancelled) setLoading(false);
@@ -63,17 +123,37 @@ export function AuthProvider({ children }) {
     return () => {
       cancelled = true;
     };
-  }, [saveAvatar]);
+  }, [saveAvatar, _clearLocalAuth, _startSilentRefreshTimer]);
+
+  // While authenticated, wire resetActivity() to interaction events so the
+  // 6-hour idle clock resets on any real user action (mousemove included here
+  // in addition to the events tracked inside activityTracker itself).
+  useEffect(() => {
+    if (!user) return;
+    const handler = () => resetActivity();
+    const events = ['mousemove', 'keydown', 'click'];
+    events.forEach(evt => window.addEventListener(evt, handler, { passive: true }));
+    return () => events.forEach(evt => window.removeEventListener(evt, handler));
+  }, [user]);
+
+  // Cleanup refresh timer on unmount
+  useEffect(() => {
+    return () => {
+      if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
+    };
+  }, []);
 
   const login = useCallback(async (email, password, workspace = '') => {
     const res = await api.post('/auth/login', { email, password, workspace });
     const { token, user: userData } = res.data;
-    setAccessToken(token);
-    localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(userData)));
-    setUser(userData);
-    saveAvatar(userData?.avatar || '');
+    _setAuthenticatedUser(userData, token);
+    startActivityTracking(() => {
+      _clearLocalAuth();
+      setUser(null);
+    });
+    _startSilentRefreshTimer();
     return userData;
-  }, [saveAvatar]);
+  }, [_setAuthenticatedUser, _clearLocalAuth, _startSilentRefreshTimer]);
 
   const adminLogin = useCallback(async (email, password) => {
     const res = await api.post('/admin/login', { email, password });
@@ -91,20 +171,20 @@ export function AuthProvider({ children }) {
 
     // Accounts requiring email verification should not be treated as signed-in yet.
     if (!email_verification?.required && token && userData) {
-      setAccessToken(token);
-      localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(userData)));
-      setUser(userData);
+      _setAuthenticatedUser(userData, token);
     }
 
     return res.data;
-  }, []);
+  }, [_setAuthenticatedUser]);
 
   const setAuthFromOAuth = useCallback((userData, token) => {
-    setAccessToken(token);
-    localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(userData)));
-    setUser(userData);
-    saveAvatar(userData?.avatar || '');
-  }, [saveAvatar]);
+    _setAuthenticatedUser(userData, token);
+    startActivityTracking(() => {
+      _clearLocalAuth();
+      setUser(null);
+    });
+    _startSilentRefreshTimer();
+  }, [_setAuthenticatedUser, _clearLocalAuth, _startSilentRefreshTimer]);
 
   const setAuthFromGoogle = useCallback((userData, token) => {
     setAuthFromOAuth(userData, token);
@@ -125,16 +205,15 @@ export function AuthProvider({ children }) {
     } catch {
       /* clearAuthSession already clears local state */
     }
+    _clearLocalAuth();
     setUser(null);
-  }, []);
+  }, [_clearLocalAuth]);
 
   const refreshUser = useCallback(async () => {
     try {
       const res = await api.post('/auth/session', {});
       const data = res.data || {};
-      if (data.token) {
-        setAccessToken(data.token);
-      }
+      if (data.token) setAccessToken(data.token);
       if (data.user) {
         localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(data.user)));
         setUser(data.user);
@@ -143,7 +222,6 @@ export function AuthProvider({ children }) {
       return data.user || null;
     } catch {
       return null;
-      /* ignore */
     }
   }, [saveAvatar]);
 

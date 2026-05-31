@@ -108,8 +108,8 @@ async def _ensure_company_settings_exists(db, company_id: str) -> Optional[str]:
         return row["id"]
     settings_id = make_id()
     await db.execute(
-        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$2,TRUE,0.70,TRUE,'',NOW(),NOW()) "
+        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_use_conversation_engine,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) "  # noqa: E501
+        "VALUES($1,$2,TRUE,TRUE,0.70,TRUE,'',NOW(),NOW()) "
         "ON CONFLICT (company_id) DO NOTHING",
         settings_id,
         company_id,
@@ -173,6 +173,7 @@ ALLOWED_COMPANY_SETTINGS_FIELDS = {
     "bh_end",
     "bh_days",
     "ai_enabled",
+    "ai_use_conversation_engine",
     "ai_confidence_threshold",
     "ai_static_fallback_message",
     "auto_assign",
@@ -302,6 +303,7 @@ class CompanySettingsUpdate(BaseModel):
     date_format: Optional[str] = Field(default=None, max_length=50)
     currency: Optional[str] = Field(default=None, max_length=10)
     ai_enabled: Optional[bool] = None
+    ai_use_conversation_engine: Optional[bool] = None
     ai_confidence_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     ai_static_fallback_message: Optional[str] = Field(default=None, max_length=1000)
     auto_assign: Optional[bool] = None

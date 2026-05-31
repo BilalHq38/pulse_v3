@@ -34,6 +34,7 @@ from services.billing_helpers import (
     count_workspace_seats_used,
     effective_max_users,
     get_or_create_billing_customer,
+    normalize_plan_code,
     relaxed_billing_env,
     stripe_configured,
     stripe_enabled_for_app,
@@ -188,16 +189,24 @@ def _refresh_cookie_secure(request: Request) -> bool:
     return forwarded_proto == "https"
 
 
-def _set_refresh_cookie(response: JSONResponse, request: Request, refresh_token: str) -> None:
-    response.set_cookie(
+def _set_refresh_cookie(
+    response: JSONResponse,
+    request: Request,
+    refresh_token: str,
+    *,
+    is_super_admin: bool = False,
+) -> None:
+    kwargs = dict(
         key=REFRESH_COOKIE_NAME,
         value=refresh_token,
         httponly=True,
         secure=_refresh_cookie_secure(request),
         samesite="lax",
         path="/api",
-        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
+    if not is_super_admin:
+        kwargs["max_age"] = REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+    response.set_cookie(**kwargs)
 
 
 def _clear_refresh_cookie(response: JSONResponse, request: Request) -> None:
@@ -213,10 +222,11 @@ def _clear_refresh_cookie(response: JSONResponse, request: Request) -> None:
 def _auth_response(payload: dict, request: Request, status_code: int = 200) -> JSONResponse:
     content = dict(payload)
     refresh_token = str(content.pop("refresh_token", "") or "").strip()
+    is_sa = str((content.get("user") or {}).get("role") or "").lower() == "super_admin"
     response = JSONResponse(status_code=status_code, content=content)
     response.headers["Cache-Control"] = "no-store"
     if refresh_token:
-        _set_refresh_cookie(response, request, refresh_token)
+        _set_refresh_cookie(response, request, refresh_token, is_super_admin=is_sa)
     return response
 
 
@@ -1468,7 +1478,7 @@ async def select_billing_plan(request: Request):
         raise HTTPException(400, "Company context is required before selecting a plan")
 
     subscription = r(await db.fetchrow("SELECT * FROM subscriptions WHERE company_id=$1 LIMIT 1", company_id))
-    plan_code = str((subscription or {}).get("plan_code") or "pro").strip().lower()
+    plan_code = normalize_plan_code(str((subscription or {}).get("plan_code") or "pro").strip())
     if plan_code not in PLAN_CATALOG or plan_code == "free":
         plan_code = "pro"
 

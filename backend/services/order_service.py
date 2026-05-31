@@ -1988,7 +1988,7 @@ async def _maybe_enqueue_followup_evaluation(
     """Fire-and-forget call into the follow-up scheduler.
 
     The scheduler decides whether the lifecycle transition warrants a
-    proactive follow-up (currently: only 'delivered'). We isolate the import
+    proactive follow-up. We isolate the import
     here to keep services/order_service.py free of follow-up dependencies at
     module-import time (avoids circular imports during service startup).
     """

@@ -431,32 +431,56 @@ class Database:
         if conn is not None:
             return await conn.fetch(query, *args)
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *args)
+        for attempt in range(2):
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.fetch(query, *args)
+            except asyncpg.PostgresConnectionError:
+                if attempt == 0:
+                    continue
+                raise
 
     async def fetchrow(self, query: str, *args):
         conn = _request_conn.get()
         if conn is not None:
             return await conn.fetchrow(query, *args)
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
+        for attempt in range(2):
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.fetchrow(query, *args)
+            except asyncpg.PostgresConnectionError:
+                if attempt == 0:
+                    continue
+                raise
 
     async def fetchval(self, query: str, *args):
         conn = _request_conn.get()
         if conn is not None:
             return await conn.fetchval(query, *args)
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetchval(query, *args)
+        for attempt in range(2):
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.fetchval(query, *args)
+            except asyncpg.PostgresConnectionError:
+                if attempt == 0:
+                    continue
+                raise
 
     async def execute(self, query: str, *args):
         conn = _request_conn.get()
         if conn is not None:
             return await conn.execute(query, *args)
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            return await conn.execute(query, *args)
+        for attempt in range(2):
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.execute(query, *args)
+            except asyncpg.PostgresConnectionError:
+                if attempt == 0:
+                    continue
+                raise
 
     async def executemany(self, query: str, args_list: list):
         conn = _request_conn.get()

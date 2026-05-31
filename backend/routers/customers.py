@@ -156,7 +156,7 @@ async def _fetch_customers(
         "SELECT c.*, "
         "ARRAY(SELECT tag FROM customer_tags WHERE customer_id=c.id) AS tags, "
         "ARRAY(SELECT channel FROM customer_channels WHERE customer_id=c.id) AS channels "
-        "FROM customers c WHERE c.company_id=$1"
+        "FROM customers c WHERE c.company_id=$1 AND c.lifecycle_stage != 'lead'"
     )
     args = [company_id]
     if segment:
@@ -297,7 +297,7 @@ async def create_customer(request: Request):
         cust["social_profiles"] = await _load_social_profiles(db, cust_id)
         _serialize_customer(cust)
     await ensure_customer_profile(db, cust)
-    from core.socket import connected_users, sio
+    from core.socket import connected_users, emit_company_event, sio
 
     await create_notification(
         db,
@@ -308,6 +308,7 @@ async def create_customer(request: Request):
         f"{body.get('name', '')} was created",
         "customer",
     )
+    await emit_company_event(cid, "customer_created", {"customer_id": cust_id})
     return cust
 
 
@@ -376,6 +377,8 @@ async def update_customer(customer_id: str, request: Request):
     if customer:
         customer["social_profiles"] = await _load_social_profiles(db, customer_id)
         _serialize_customer(customer)
+    from core.socket import emit_company_event
+    await emit_company_event(cid, "customer_updated", {"customer_id": customer_id})
     return customer
 
 
@@ -385,6 +388,8 @@ async def delete_customer(customer_id: str, request: Request):
     cu = await get_current_user_flexible(request)
     cid = cu.get("company_id", "")
     await db.execute("DELETE FROM customers WHERE id=$1 AND company_id=$2", customer_id, cid)
+    from core.socket import emit_company_event
+    await emit_company_event(cid, "customer_deleted", {"customer_id": customer_id})
     return {"status": "deleted"}
 
 

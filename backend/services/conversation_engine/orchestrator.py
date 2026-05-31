@@ -62,10 +62,7 @@ _VALIDATION_RETRY_DIRECTIVE_TEMPLATE = (
     "\n\nYour previous draft mentioned: {offences}. "
     "Do not mention any product or price that is not in the provided context."
 )
-_STATIC_FALLBACK = (
-    "I'm not sure I have that information at hand. Would you like me to connect "
-    "you with our team for a complete answer?"
-)
+_STATIC_FALLBACK = "I don't have that information right now. Would you like me to connect you with our team?"
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
@@ -143,7 +140,12 @@ class Orchestrator:
         started_at = time.monotonic()
         decision = context_router.score(request.user_message)
 
-        retrieval_results = await self._retrieve(db, request, decision.sources)
+        retrieval_results = await self._retrieve(
+            db,
+            request,
+            decision.sources,
+            low_value=decision.low_value,
+        )
         chunks: list[ContextChunk] = []
         for result in retrieval_results:
             chunks.extend(result.chunks)
@@ -152,7 +154,7 @@ class Orchestrator:
         # responses that reference products from earlier turns in the conversation.
         # Without this, the AI sees products in history but the validator fails because
         # those products aren't in the CURRENT turn's retrieval results.
-        if request.customer_id and request.session_id:
+        if request.customer_id and request.session_id and not decision.low_value:
             shown_chunks = await self._fetch_shown_product_chunks(db, request, existing_chunks=chunks)
             chunks.extend(shown_chunks)
 
@@ -396,6 +398,9 @@ class Orchestrator:
                 and request.order_id
             ):
                 return OrderRelatedProductRetriever(order_id=request.order_id)
+            configured = self._retrievers.get("product")
+            if configured is not None and not isinstance(configured, ProductRetriever):
+                return configured
             return ProductRetriever(
                 customer_id=request.customer_id,
                 session_id=request.session_id,
@@ -407,6 +412,8 @@ class Orchestrator:
         db,
         request: TurnRequest,
         sources: list[SourceType],
+        *,
+        low_value: bool = False,
     ) -> list[RetrievalResult]:
         async def _run(source: SourceType) -> RetrievalResult:
             retriever = self._retriever_for(source, request)
@@ -426,12 +433,12 @@ class Orchestrator:
                 return RetrievalResult(source_type=source, chunks=[], error=type(exc).__name__)
 
         # Always include company_data — it's tiny and almost always relevant.
-        effective_sources: list[SourceType] = list(sources)
-        if "company_data" not in effective_sources:
+        effective_sources: list[SourceType] = [] if low_value else list(sources)
+        if not low_value and "company_data" not in effective_sources:
             effective_sources.append("company_data")
         # Faq retriever also returns the active template; include it so the
         # style_prompt makes it through even when faq scored below threshold.
-        if "faq" not in effective_sources:
+        if not low_value and "faq" not in effective_sources:
             effective_sources.append("faq")
         # Proactive upsell turns must consult the product source even if the
         # directive's keywords didn't trip the rule scorer's product bucket.
@@ -455,7 +462,11 @@ class Orchestrator:
         lines: list[str] = []
         if rolling:
             lines.append(f"[summary of earlier conversation] {rolling}")
-        lines.extend(memory_module.history_as_dialogue(turns))
+        engine_lines = memory_module.history_as_dialogue(turns)
+        lines.extend(engine_lines)
+        extra_lines = [str(line).strip() for line in (request.extra_history or []) if str(line).strip()]
+        if extra_lines and not engine_lines:
+            lines.extend(extra_lines[-24:])
         return lines
 
     async def _refresh_rolling_summary(

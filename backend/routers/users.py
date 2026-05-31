@@ -76,7 +76,7 @@ async def list_users(request: Request):
     rows = (
         await db.fetch("SELECT * FROM users WHERE company_id=$1 ORDER BY created_at DESC", cid)
         if cid
-        else await db.fetch("SELECT * FROM users ORDER BY created_at DESC LIMIT 500")
+        else await db.fetch("SELECT * FROM users WHERE role != 'super_admin' ORDER BY created_at DESC LIMIT 500")
     )
     return [_strip_pw(dict(r)) for r in rows]
 
@@ -206,19 +206,19 @@ async def super_admin_overview(request: Request):
     db = _db(request)
     await require_roles(request, ["super_admin"])
     return {
-        "total_users": await db.fetchval("SELECT COUNT(*) FROM users") or 0,
-        "total_agents": await db.fetchval("SELECT COUNT(*) FROM users WHERE role='company_agent'") or 0,
-        "active_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='active'") or 0,
-        "paused_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='paused'") or 0,
-        "blocked_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='blocked'") or 0,
-        "pending_approval_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='pending_approval'") or 0,
-        "rejected_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='rejected'") or 0,
-        "inactive_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='inactive'") or 0,
-        "total_leads": await db.fetchval("SELECT COUNT(*) FROM leads") or 0,
-        "total_customers": await db.fetchval("SELECT COUNT(*) FROM customers") or 0,
-        "total_conversations": await db.fetchval("SELECT COUNT(*) FROM conversations") or 0,
-        "total_tickets": await db.fetchval("SELECT COUNT(*) FROM tickets") or 0,
-        "total_products": await db.fetchval("SELECT COUNT(*) FROM company_products") or 0,
+        "total_users":            await db.fetchval("SELECT COUNT(*) FROM users WHERE role != 'super_admin'") or 0,
+        "total_agents":           await db.fetchval("SELECT COUNT(*) FROM users WHERE role='company_agent'") or 0,
+        "active_users":           await db.fetchval("SELECT COUNT(*) FROM users WHERE status='active' AND role != 'super_admin'") or 0,
+        "paused_users":           await db.fetchval("SELECT COUNT(*) FROM users WHERE status='paused' AND role != 'super_admin'") or 0,
+        "blocked_users":          await db.fetchval("SELECT COUNT(*) FROM users WHERE status='blocked' AND role != 'super_admin'") or 0,
+        "pending_approval_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='pending_approval' AND role != 'super_admin'") or 0,
+        "rejected_users":         await db.fetchval("SELECT COUNT(*) FROM users WHERE status='rejected' AND role != 'super_admin'") or 0,
+        "inactive_users":         await db.fetchval("SELECT COUNT(*) FROM users WHERE status='inactive' AND role != 'super_admin'") or 0,
+        "total_leads":            await db.fetchval("SELECT COUNT(*) FROM leads") or 0,
+        "total_customers":        await db.fetchval("SELECT COUNT(*) FROM customers") or 0,
+        "total_conversations":    await db.fetchval("SELECT COUNT(*) FROM conversations") or 0,
+        "total_tickets":          await db.fetchval("SELECT COUNT(*) FROM tickets") or 0,
+        "total_products":         await db.fetchval("SELECT COUNT(*) FROM company_products") or 0,
     }
 
 
@@ -226,7 +226,7 @@ async def super_admin_overview(request: Request):
 async def super_admin_list_users(request: Request):
     db = _db(request)
     await require_roles(request, ["super_admin"])
-    users = rs(await db.fetch("SELECT * FROM users ORDER BY created_at DESC LIMIT 1000"))
+    users = rs(await db.fetch("SELECT * FROM users WHERE role != 'super_admin' ORDER BY created_at DESC LIMIT 1000"))
     for u in users:
         u.pop("password_hash", None)
         cid = u.get("company_id", "")

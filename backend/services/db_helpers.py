@@ -76,7 +76,8 @@ ACCOUNT_BLOCKED_MESSAGE = "Your account has been blocked. Please contact your ad
 ACCOUNT_PAUSED_MESSAGE = "Your account has been paused. Please contact your administrator."
 ACCOUNT_INACTIVE_MESSAGE = "Your account is inactive. Please contact your administrator."
 ACCOUNT_RESTRICTED_STATUSES = {"pending_approval", "rejected", "blocked", "paused", "inactive"}
-ACCOUNT_LOGIN_BLOCKED_STATUSES = {"blocked", "paused", "inactive"}
+ACCOUNT_LOGIN_BLOCKED_STATUSES = {"blocked", "paused", "inactive", "pending_approval", "rejected"}
+ACCOUNT_REFRESH_BLOCKED_STATUSES = {"blocked", "paused", "inactive", "pending_approval", "rejected"}
 
 
 def normalize_account_status(status: str | None) -> str:
@@ -367,6 +368,10 @@ def build_user_payload(user: dict) -> dict:
     if bs not in ("trial", "active", "unpaid"):
         bs = "unpaid"
     plan_code = str(user.get("subscription_plan_code") or "free").strip().lower() or "free"
+    company_name = str(user.get("company_name") or "").strip()
+    subscription_status = str(user.get("subscription_status") or "inactive").strip().lower() or "inactive"
+    company_billing_status = str(user.get("company_billing_status") or "inactive").strip().lower() or "inactive"
+    stripe_subscription_id = str(user.get("stripe_subscription_id") or "").strip()
     oauth_providers = user.get("oauth_providers")
     if not isinstance(oauth_providers, list):
         oauth_providers = []
@@ -386,6 +391,18 @@ def build_user_payload(user: dict) -> dict:
         "auth_provider": user.get("auth_provider", "email"),
         "email_verified": bool(user.get("email_verified")),
         "subscription_plan_code": plan_code,
+        "subscription_status": subscription_status,
+        "company_billing_status": company_billing_status,
+        "stripe_subscription_id": stripe_subscription_id,
+        "company_name": company_name,
+        "company": {
+            "id": company_id,
+            "name": company_name,
+            "plan": plan_code,
+            "subscription_status": subscription_status,
+            "billing_status": company_billing_status,
+            "stripe_subscription_id": stripe_subscription_id,
+        },
         "enterprise_invite_gate_pending": bool(user.get("enterprise_invite_gate_pending")),
         "oauth_providers": oauth_providers,
     }
@@ -430,6 +447,10 @@ async def enrich_user_session_fields(db, user: dict) -> dict:
     company_id = str(u.get("company_id") or "").strip()
     u["email_verified"] = bool(u.get("email_verified"))
     u["subscription_plan_code"] = "free"
+    u["subscription_status"] = "inactive"
+    u["company_billing_status"] = "inactive"
+    u["stripe_subscription_id"] = ""
+    u["company_name"] = ""
     u["enterprise_invite_gate_pending"] = False
     u["enterprise_invite_satisfied"] = True
     uid = str(u.get("id") or "").strip()
@@ -457,9 +478,15 @@ async def enrich_user_session_fields(db, user: dict) -> dict:
     except Exception:
         pass
     row = await db.fetchrow(
-        "SELECT COALESCE(s.plan_code, 'free') AS plan_code, COALESCE(c.enterprise_team_gate_met, FALSE) AS enterprise_team_gate_met "
+        "SELECT COALESCE(s.plan_code, NULLIF(c.plan, ''), 'free') AS plan_code, "
+        "COALESCE(s.status, NULLIF(c.subscription_status, ''), 'inactive') AS subscription_status, "
+        "COALESCE(bc.payment_status, NULLIF(c.billing_status, ''), 'inactive') AS company_billing_status, "
+        "COALESCE(s.stripe_subscription_id, NULLIF(c.stripe_subscription_id, ''), '') AS stripe_subscription_id, "
+        "COALESCE(c.name, '') AS company_name, "
+        "COALESCE(c.enterprise_team_gate_met, FALSE) AS enterprise_team_gate_met "
         "FROM companies c "
         "LEFT JOIN subscriptions s ON s.company_id = c.id "
+        "LEFT JOIN billing_customers bc ON bc.company_id = c.id "
         "WHERE c.id = $1 "
         "LIMIT 1",
         company_id,
@@ -467,8 +494,14 @@ async def enrich_user_session_fields(db, user: dict) -> dict:
     if not row:
         return u
     plan_code = str(row.get("plan_code") or "free").strip().lower() or "free"
+    subscription_status = str(row.get("subscription_status") or "inactive").strip().lower() or "inactive"
+    company_billing_status = str(row.get("company_billing_status") or "inactive").strip().lower() or "inactive"
     gate_met = bool(row.get("enterprise_team_gate_met"))
     u["subscription_plan_code"] = plan_code
+    u["subscription_status"] = subscription_status
+    u["company_billing_status"] = company_billing_status
+    u["stripe_subscription_id"] = str(row.get("stripe_subscription_id") or "").strip()
+    u["company_name"] = str(row.get("company_name") or "").strip()
     pending = (
         plan_code == "enterprise"
         and role == "admin"
@@ -637,8 +670,8 @@ async def ensure_super_admin_user(db) -> Optional[dict]:
         "Pulse Engine Platform",
     )
     await db.execute(
-        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$1,TRUE,0.70,TRUE,'',NOW(),NOW()) "
+        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_use_conversation_engine,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) "  # noqa: E501
+        "VALUES($1,$1,TRUE,TRUE,0.70,TRUE,'',NOW(),NOW()) "
         "ON CONFLICT (company_id) DO NOTHING",
         company_id,
     )
@@ -718,7 +751,12 @@ async def _issue_refresh_token(db, user: dict, request: Optional[Request], rotat
     await ensure_auth_security_primitives(db)
     refresh_id = make_id()
     token = create_refresh_token(build_minimal_token_data(user), token_id=refresh_id)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    ttl = (
+        timedelta(hours=1)
+        if user.get("role") == "super_admin"
+        else timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    expires_at = datetime.now(timezone.utc) + ttl
     token_hash = hash_token(token)
     await db.execute(
         "INSERT INTO refresh_tokens(id,company_id,user_id,token_hash,token_version,user_agent,ip_address,expires_at,created_at) "  # noqa: E501
@@ -772,7 +810,7 @@ async def resolve_refresh_token_rotation(db, refresh_token: str, request: Option
     user = await ensure_user_company_assignment(db, user)
     user = await enrich_user_session_fields(db, user)
     account_status = normalize_account_status(user.get("status"))
-    if account_status in ACCOUNT_LOGIN_BLOCKED_STATUSES:
+    if account_status in ACCOUNT_REFRESH_BLOCKED_STATUSES:
         raise unauthorized_exception()
     if _token_version(user) != int(payload.get("token_version", 0) or 0):
         raise unauthorized_exception()
@@ -1205,8 +1243,8 @@ async def ensure_company_settings_row(db, company_id: str = "") -> dict:
         return dict(row)
     settings_id = make_id()
     await db.execute(
-        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$2,TRUE,0.70,TRUE,'',NOW(),NOW())",
+        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_use_conversation_engine,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) "  # noqa: E501
+        "VALUES($1,$2,TRUE,TRUE,0.70,TRUE,'',NOW(),NOW())",
         settings_id,
         company_id or "",
     )
@@ -2725,7 +2763,7 @@ async def create_email_verification_record(db, user: dict, request: Request) -> 
         token_hash,
         expires,
     )
-    link = f"{resolve_frontend_base_url(request)}/verify-email#{urlencode({'token': token})}"
+    link = f"{resolve_frontend_base_url(request)}/verify-email?{urlencode({'token': token})}"
     return {
         "token": token,
         "expires_at": expires.isoformat(),
@@ -2859,7 +2897,7 @@ async def ensure_company_defaults_for_oauth(db, email: str) -> str:
         name,
     )
     await db.execute(
-        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) VALUES($1,$1,TRUE,0.70,TRUE,'',NOW(),NOW())",  # noqa: E501
+        "INSERT INTO company_settings(id,company_id,ai_enabled,ai_use_conversation_engine,ai_confidence_threshold,auto_assign,active_llm_engine_id,created_at,updated_at) VALUES($1,$1,TRUE,TRUE,0.70,TRUE,'',NOW(),NOW())",  # noqa: E501
         cid,
     )
     return cid

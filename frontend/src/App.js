@@ -1,11 +1,12 @@
 import { Suspense, lazy, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useSearchParams } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
-import { postAuthDestination } from '@/lib/auth-gates';
+import { postAuthDestination, shouldRedirectToBilling } from '@/lib/auth-gates';
 import { API_BASE_URL } from '@/lib/backend-url';
 import Layout from '@/components/Layout';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { Toaster } from '@/components/ui/toaster';
+import BrandedLoader from '@/components/ui/BrandedLoader';
 import '@/App.css';
 
 const LandingPage = lazy(() => import('@/pages/LandingPage'));
@@ -48,7 +49,7 @@ function defaultRouteForUser(user) {
 }
 
 function Spinner() {
-  return <div className="min-h-screen bg-slate-50 flex items-center justify-center"><div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div></div>;
+  return <BrandedLoader />;
 }
 
 const VISITOR_COOKIE = 'pulse_visitor_session';
@@ -178,7 +179,7 @@ function ProtectedRoute({ children }) {
   if (user.role !== 'super_admin' && user.enterprise_invite_gate_pending) {
     return <Navigate to="/onboarding" replace />;
   }
-  if (user.role !== 'super_admin' && user.plan_selected === false && !isOnboardingInviteRoute) {
+  if (shouldRedirectToBilling(user) && !isOnboardingInviteRoute) {
     return <Navigate to="/billing" replace />;
   }
   if (user.role !== 'super_admin' && status === 'pending_approval') return <Navigate to="/account-status" replace />;
@@ -199,7 +200,7 @@ function RoleRoute({ children, allowedRoles }) {
   }
   if (user.onboarding_completed === false) return <Navigate to="/onboarding" replace />;
   if (user.enterprise_invite_gate_pending) return <Navigate to="/onboarding" replace />;
-  if (user.plan_selected === false) return <Navigate to="/billing" replace />;
+  if (shouldRedirectToBilling(user)) return <Navigate to="/billing" replace />;
   if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout>{children}</Layout>;
 }
@@ -227,9 +228,24 @@ function DashboardWithAuthCheck() {
   }
   if (user.onboarding_completed === false) return <Navigate to="/onboarding" replace />;
   if (user.enterprise_invite_gate_pending) return <Navigate to="/onboarding" replace />;
-  if (user.plan_selected === false) return <Navigate to="/billing" replace />;
+  if (shouldRedirectToBilling(user)) return <Navigate to="/billing" replace />;
   if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout><DashboardPage /></Layout>;
+}
+
+function PrefetchRoutes() {
+  useEffect(() => {
+    const id = (window.requestIdleCallback || window.setTimeout)(
+      () => {
+        import('@/pages/InboxPage');
+        import('@/pages/LeadsPage');
+        import('@/pages/SettingsPage');
+      },
+      { timeout: 3000 },
+    );
+    return () => (window.cancelIdleCallback || window.clearTimeout)(id);
+  }, []);
+  return null;
 }
 
 function App() {
@@ -237,6 +253,7 @@ function App() {
     <AuthProvider>
       <BrowserRouter>
         <VisitorTracker />
+        <PrefetchRoutes />
         <ErrorBoundary>
         <Suspense fallback={<Spinner />}>
           <Routes>

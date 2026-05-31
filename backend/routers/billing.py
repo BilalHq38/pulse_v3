@@ -15,13 +15,16 @@ from core.utils import make_id
 from services.billing_helpers import (
     PLAN_CATALOG,
     assert_stripe_ready,
+    get_plan,
     get_or_create_billing_customer,
+    normalize_plan_code,
     normalize_plan_code_from_lookup_key,
     require_stripe_webhook_secret,
     stripe_configured,
     stripe_enabled_for_app,
     stripe_price_id,
     stripe_webhook_configured,
+    update_company_billing_summary,
     upsert_subscription,
     uses_local_billing_customer_id,
 )
@@ -154,10 +157,9 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
     db = _db(request)
     current_user = await require_roles(request, ["admin", "super_admin"])
     company_id = (current_user.get("company_id", "") or "").strip()
-    plan = PLAN_CATALOG.get(payload.plan_code)
-    if not plan:
-        raise HTTPException(400, "Invalid plan")
-    if payload.plan_code == "free":
+    plan_code = normalize_plan_code(payload.plan_code)
+    get_plan(plan_code)
+    if plan_code == "free":
         subscription = await _upsert_subscription(
             db,
             company_id,
@@ -173,9 +175,9 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
             "Use the free plan, set STRIPE_ENABLED=auto (default), or enable Stripe in your environment.",
         )
     assert_stripe_ready()
-    price_id = _stripe_price_id(payload.plan_code)
+    price_id = _stripe_price_id(plan_code)
     if not price_id:
-        raise HTTPException(501, f"Stripe price is not configured for plan {payload.plan_code}")
+        raise HTTPException(501, f"Stripe price is not configured for plan {plan_code}")
     billing_customer = await _get_or_create_billing_customer(db, company_id, current_user)
     billing_customer = await _create_stripe_customer_record(billing_customer)
     await db.execute(
@@ -190,15 +192,15 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
         line_items=[{"price": price_id, "quantity": 1}],
         success_url=(payload.success_url or f"{FRONTEND_BASE_URL}/settings?tab=billing&checkout=success").strip(),
         cancel_url=(payload.cancel_url or f"{FRONTEND_BASE_URL}/pricing?checkout=cancelled").strip(),
-        metadata={"company_id": company_id, "plan_code": payload.plan_code},
-        subscription_data={"metadata": {"company_id": company_id, "plan_code": payload.plan_code}},
+        metadata={"company_id": company_id, "plan_code": plan_code},
+        subscription_data={"metadata": {"company_id": company_id, "plan_code": plan_code}},
         allow_promotion_codes=True,
     )
     await _upsert_subscription(
         db,
         company_id,
         billing_customer_id=billing_customer["id"],
-        plan_code=payload.plan_code,
+        plan_code=plan_code,
         status="pending",
     )
     return {"ok": True, "checkout_url": session.url, "session_id": session.id}
@@ -301,32 +303,43 @@ async def stripe_webhook(request: Request):
             company_id = str(result.get("company_id") or company_id).strip()
         else:
             company_id = str(metadata.get("company_id") or company_id).strip()
-            plan_code = str(metadata.get("plan_code") or "pro").strip()
+            plan_code = normalize_plan_code_from_lookup_key(str(metadata.get("plan_code") or "pro").strip())
             customer_id = str(event_object.get("customer") or "").strip()
             subscription_id = str(event_object.get("subscription") or "").strip()
             if company_id:
-                billing_customer = await db.fetchval(
-                    "SELECT id FROM billing_customers WHERE company_id=$1 LIMIT 1",
-                    company_id,
-                )
-                if billing_customer:
-                    await db.execute(
-                        "UPDATE billing_customers SET stripe_customer_id=$1,payment_status='active',updated_at=NOW() WHERE id=$2",  # noqa: E501
-                        customer_id,
-                        billing_customer,
+                async with db.transaction() as conn:
+                    billing_customer = await conn.fetchval(
+                        "SELECT id FROM billing_customers WHERE company_id=$1 LIMIT 1",
+                        company_id,
                     )
-                await _upsert_subscription(
-                    db,
-                    company_id,
-                    billing_customer_id=billing_customer,
-                    plan_code=plan_code,
-                    status="active",
-                    stripe_subscription_id=subscription_id,
-                )
-                await db.execute(
-                    "UPDATE users SET plan_selected=TRUE,billing_status='active',updated_at=NOW() WHERE company_id=$1",
-                    company_id,
-                )
+                    if billing_customer:
+                        await conn.execute(
+                            "UPDATE billing_customers SET stripe_customer_id=$1,payment_status='active',updated_at=NOW() WHERE id=$2",  # noqa: E501
+                            customer_id,
+                            billing_customer,
+                        )
+                        await update_company_billing_summary(conn, company_id, billing_status="active")
+                    await _upsert_subscription(
+                        conn,
+                        company_id,
+                        billing_customer_id=billing_customer,
+                        plan_code=plan_code,
+                        status="active",
+                        stripe_subscription_id=subscription_id,
+                    )
+                    await conn.execute(
+                        "UPDATE users SET status='active',plan_selected=TRUE,billing_status='active',updated_at=NOW() WHERE company_id=$1",
+                        company_id,
+                    )
+                try:
+                    from core.socket import emit_company_event
+                    await emit_company_event(
+                        company_id,
+                        "plan_updated",
+                        {"plan_code": plan_code, "status": "active"},
+                    )
+                except Exception:
+                    pass  # Non-fatal — polling fallback handles this
 
     if event_type.startswith("customer.subscription."):
         subscription_id = str(event_object.get("id") or "").strip()
@@ -372,15 +385,33 @@ async def stripe_webhook(request: Request):
                 if event_object.get("canceled_at")
                 else None,
             )
+            status = str(event_object.get("status") or "active").strip().lower()
+            if status in {"active", "trialing"}:
+                await db.execute(
+                    "UPDATE users SET plan_selected=TRUE,billing_status=$1,updated_at=NOW() WHERE company_id=$2",
+                    "trial" if status == "trialing" else "active",
+                    company_id,
+                )
 
     if event_type in {"invoice.payment_failed", "invoice.payment_succeeded"}:
         customer_id = str(event_object.get("customer") or "").strip()
         if customer_id:
+            payment_status = "failed" if event_type == "invoice.payment_failed" else "active"
             await db.execute(
                 "UPDATE billing_customers SET payment_status=$1,updated_at=NOW() WHERE stripe_customer_id=$2",
-                "failed" if event_type == "invoice.payment_failed" else "active",
+                payment_status,
                 customer_id,
             )
+            invoice_company_id = str(
+                await db.fetchval(
+                    "SELECT company_id FROM billing_customers WHERE stripe_customer_id=$1 LIMIT 1",
+                    customer_id,
+                )
+                or ""
+            ).strip()
+            if invoice_company_id:
+                company_id = company_id or invoice_company_id
+                await update_company_billing_summary(db, invoice_company_id, billing_status=payment_status)
 
     await db.execute(
         "UPDATE stripe_webhook_events SET processed=TRUE,processed_at=NOW() WHERE stripe_event_id=$1",

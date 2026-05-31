@@ -1,19 +1,18 @@
-"""Wave 3b — web-chat conversation-engine override.
-
-Covers the two integration points the override touches:
-1. The support agent honours `suppress_response_generation` and returns a
-   metadata-only payload (no live LLM call) when set.
-2. The webhook helper that synthesises a support_plan from the engine result
-   preserves the legacy sentiment-gate escalation decision.
-"""
+"""Wave 3b - web-chat conversation-engine override helpers."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 
-from agent_orchestrator.agents.support_agent import SupportAgent
-from agent_orchestrator.schemas import AgentName, WorkflowKind
+from agent_orchestrator.schemas import (
+    AgentName,
+    GlobalMemory,
+    MessageWorkflowRequest,
+    WorkflowKind,
+    WorkflowOutputs,
+    WorkflowRouteDecision,
+)
+from agent_orchestrator.workflows.workflow_manager import WorkflowManager, WorkflowRuntimeContext
 from services.conversation_engine.schemas import ProductLink
 from services.conversation_engine_webchat import (
     apply_engine_response_to_support_plan,
@@ -21,47 +20,102 @@ from services.conversation_engine_webchat import (
 )
 
 
-@dataclass
-class _FakeAgentOutputs:
-    capture: dict
-    qualification: dict
+class _MissingRegistry:
+    def get(self, agent_name):
+        raise KeyError(agent_name)
 
 
-@dataclass
-class _FakeContext:
-    workflow_kind: WorkflowKind
-    request: object
-    agent_outputs: _FakeAgentOutputs
-    workflow_id: str = "wf-1"
-    db: object = None
+class _FakeMemoryStore:
+    def __init__(self):
+        self.agent_memory = []
+        self.global_memory_saved = False
+
+    async def save_agent_memory(self, **kwargs):
+        self.agent_memory.append(kwargs)
+
+    async def save_global_memory(self, global_memory):
+        self.global_memory_saved = True
 
 
-class _FakeRequest:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+class _FakeStateStore:
+    def __init__(self):
+        self.execution = None
+        self.transition = None
+        self.updated = None
+
+    async def append_execution(self, **kwargs):
+        self.execution = kwargs["result"]
+
+    async def update_after_agent(self, **kwargs):
+        self.updated = kwargs
+
+    async def append_transition(self, **kwargs):
+        self.transition = kwargs
+
+    async def get_record(self, workflow_id):
+        return {"id": workflow_id, "status": "running"}
+
+    async def build_response(self, **kwargs):
+        return kwargs
 
 
-def test_support_agent_skips_response_when_suppression_flag_is_set():
-    agent = SupportAgent()
-    request = _FakeRequest(
-        suppress_response_generation=True,
-        message_id="m1",
-        message_text="anything",
-        company_id="co1",
-        conversation_id="c1",
-        customer_id="cu1",
+class _FakeRouter:
+    def next_agent(self, context, previous_agent):
+        return WorkflowRouteDecision(
+            current_agent=previous_agent.value,
+            next_agent="",
+            decision_mode="rule_based",
+            reason="test completed",
+        )
+
+
+def test_missing_agent_skip_is_logged_and_persisted(caplog):
+    state_store = _FakeStateStore()
+    memory_store = _FakeMemoryStore()
+    router = _FakeRouter()
+    registry = _MissingRegistry()
+    manager = WorkflowManager(
+        db=None,
+        state_store=state_store,
+        memory_store=memory_store,
+        registry=registry,
+        router=router,
     )
-    context = _FakeContext(
+    context = WorkflowRuntimeContext(
+        db=None,
+        state_store=state_store,
+        memory_store=memory_store,
+        registry=registry,
+        router=router,
+        workflow_id="wf-1",
+        trace_id="trace-1",
+        company_id="co-1",
         workflow_kind=WorkflowKind.MESSAGE,
-        request=request,
-        agent_outputs=_FakeAgentOutputs(capture={}, qualification={}),
+        request=MessageWorkflowRequest(
+            company_id="co-1",
+            conversation_id="c1",
+            sender_contact="customer-1",
+            message_text="hello",
+        ),
+        global_memory=GlobalMemory(company_id="co-1"),
+        agent_outputs=WorkflowOutputs(),
     )
-    result = asyncio.run(agent.execute(context))
-    assert result.agent_name == AgentName.SUPPORT
-    assert result.status == "skipped"
-    assert result.payload["response"] == ""
-    assert result.payload["deliver_response"] is False
-    assert result.payload["next_action"] == "conversation_engine_override"
+
+    caplog.set_level("WARNING", logger="agent_orchestrator.workflows.workflow_manager")
+    asyncio.run(
+        manager._execute_agent_by_name(
+            context,
+            AgentName.SUPPORT,
+            route=WorkflowRouteDecision(current_agent="qualification", next_agent="support", reason="legacy route"),
+        )
+    )
+
+    assert "agent_not_registered_skip" in caplog.text
+    assert state_store.execution.agent_name == AgentName.SUPPORT
+    assert state_store.execution.status == "skipped"
+    assert state_store.execution.warnings == ["agent_not_registered"]
+    assert memory_store.agent_memory[0]["agent_name"] == "support"
+    assert context.agent_outputs.support == {}
 
 
 def test_engine_override_helper_delivers_when_sentiment_gate_allows():
@@ -80,7 +134,9 @@ def test_engine_override_helper_delivers_when_sentiment_gate_allows():
     assert merged["confidence"] == 0.82
     assert merged["next_action"] == "conversation_engine_reply"
     assert merged["engine_turn_id"] == "t_abc"
-    assert merged["product_links"] == [{"product_id": "p1", "url": "https://example.com/p1"}]
+    assert merged["product_links"] == [
+        {"product_id": "p1", "url": "https://example.com/p1", "name": "", "image_url": ""}
+    ]
 
 
 def test_engine_override_helper_escalates_when_sentiment_gate_blocks():
@@ -105,8 +161,6 @@ def test_engine_override_helper_escalates_when_sentiment_gate_blocks():
 
 
 def test_engine_override_helper_handles_missing_sentiment_gate():
-    # Without a sentiment_gate, ai_response_allowed is None — the helper should
-    # default to "deliver" (only an explicit False blocks delivery).
     merged = apply_engine_response_to_support_plan(
         support_plan={"existing_field": "kept"},
         capture={},
@@ -117,7 +171,6 @@ def test_engine_override_helper_handles_missing_sentiment_gate():
     )
     assert merged["deliver_response"] is True
     assert merged["escalate"] is False
-    # Existing support_plan fields survive the merge.
     assert merged["existing_field"] == "kept"
 
 

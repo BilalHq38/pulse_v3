@@ -46,6 +46,13 @@ def test_router_always_includes_company_data():
     assert "company_data" in decision.sources
 
 
+def test_router_skips_retrieval_for_conversational_messages():
+    for text in ("Hello", "How are you?", "ok", "yes", "no", "sure"):
+        decision = context_router.score(text)
+        assert decision.low_value is True
+        assert decision.sources == []
+
+
 def test_router_flags_ambiguity_when_two_sources_tie():
     decision = context_router.score("return policy price refund")
     top_two = sorted(decision.scores.values(), reverse=True)[:2]
@@ -231,8 +238,10 @@ class FakeRetriever:
     def __init__(self, source_type, chunks):
         self.source_type = source_type
         self._chunks = chunks
+        self.calls = 0
 
     async def fetch(self, db, *, company_id, query, top_k):
+        self.calls += 1
         return list(self._chunks)
 
 
@@ -297,6 +306,24 @@ def test_orchestrator_end_to_end_with_fakes():
     assert result.tokens_used.completion > 0
 
 
+def test_orchestrator_skips_retrieval_for_conversational_messages():
+    retrievers = {
+        "company_data": FakeRetriever("company_data", [_chunk("company_data", "c1", "Company facts.")]),
+        "product": FakeRetriever("product", [_chunk("product", "p1", "Product facts.")]),
+        "faq": FakeRetriever("faq", [_chunk("faq", "f1", "FAQ facts.")]),
+        "knowledge_base": FakeRetriever("knowledge_base", [_chunk("knowledge_base", "kb1", "KB facts.")]),
+    }
+    gateway = FakeGateway(response="Hello! How can I help?")
+    orch = Orchestrator(retrievers=retrievers, gateway=gateway)
+    request = TurnRequest(session_id="s_test", company_id="co_1", user_message="Hello")
+
+    result = asyncio.run(orch.run_turn(FakeDb(), request))
+
+    assert result.sources_used == []
+    assert gateway.calls == 1
+    assert all(retriever.calls == 0 for retriever in retrievers.values())
+
+
 def test_orchestrator_returns_fallback_on_validation_failure_twice():
     retrievers = {
         "company_data": FakeRetriever("company_data", []),
@@ -315,7 +342,7 @@ def test_orchestrator_returns_fallback_on_validation_failure_twice():
 
     result = asyncio.run(orch.run_turn(FakeDb(), request))
     assert result.error == "validation_failed"
-    assert "connect you" in result.answer.lower() or "team" in result.answer.lower()
+    assert result.answer == "I don't have that information right now. Would you like me to connect you with our team?"
 
 
 def test_extract_product_links_matches_slug():

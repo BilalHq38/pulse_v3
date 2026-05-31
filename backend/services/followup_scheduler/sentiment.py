@@ -79,6 +79,9 @@ def classify_sentiment(text: str) -> Sentiment:
     even if the model is unavailable.
     Negative always wins ties in the keyword fallback.
     """
+    if not _normalise(text):
+        return "neutral"
+
     # MiniLM primary
     try:
         from services.ai_service.local_ml import classify_sentiment as _ml  # noqa: PLC0415
@@ -91,8 +94,6 @@ def classify_sentiment(text: str) -> Sentiment:
 
     # Keyword fallback
     normalised = _normalise(text)
-    if not normalised:
-        return "neutral"
     if _any_keyword(normalised, NEGATIVE_SIGNALS):
         return "negative"
     if _any_keyword(normalised, POSITIVE_SIGNALS):

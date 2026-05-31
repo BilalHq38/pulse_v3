@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -729,7 +730,9 @@ async def proxy(path: str, request: Request):
                 headers=forwarded_headers,
                 timeout=60.0,
             )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        status_code = 504 if isinstance(exc, asyncio.TimeoutError) else 502
+        error_msg = "Gateway Timeout" if isinstance(exc, asyncio.TimeoutError) else "Bad Gateway"
         logger.error(
             "gateway upstream error service=%s path=%s target=%s error=%s detail=%s",
             service_name,
@@ -738,7 +741,7 @@ async def proxy(path: str, request: Request):
             exc.__class__.__name__,
             str(exc) or repr(exc),
         )
-        return _apply_security_headers(JSONResponse(status_code=502, content=_error_body("Bad Gateway")))
+        return _apply_security_headers(JSONResponse(status_code=status_code, content=_error_body(error_msg)))
 
     response_headers = {
         key: value

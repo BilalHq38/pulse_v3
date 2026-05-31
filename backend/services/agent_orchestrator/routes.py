@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+logger = logging.getLogger(__name__)
 
 from agent_orchestrator.bootstrap import bootstrap_agent_orchestrator
 from agent_orchestrator.engine import build_orchestrator_engine
@@ -36,7 +39,11 @@ async def list_workflow_executions(
 ):
     """Recent rule-based agent steps for the tenant (workflow_executions)."""
     db = request.app.state.db
-    await bootstrap_agent_orchestrator(db)
+    try:
+        await bootstrap_agent_orchestrator(db)
+    except RuntimeError as exc:
+        logger.error("orchestrator_schema_not_ready: %s", exc)
+        return {"executions": [], "warning": str(exc)}
     cid = str(current_user.get("company_id") or "").strip()
     role = str(current_user.get("role") or "").strip().lower()
     if role != "super_admin" and not cid:
@@ -48,8 +55,8 @@ async def list_workflow_executions(
         SELECT e.id, e.workflow_id, e.trace_id, e.agent_name, e.status, e.routing_decision, e.output_payload,
                e.error, e.duration_ms, e.started_at, e.completed_at,
                w.workflow_kind, w.status AS workflow_status
-        FROM workflow_executions e
-        LEFT JOIN workflows w ON w.id = e.workflow_id
+        FROM agent_orchestrator.workflow_executions e
+        LEFT JOIN agent_orchestrator.workflows w ON w.id = e.workflow_id
         WHERE e.company_id = $1
         ORDER BY e.started_at DESC
         LIMIT $2

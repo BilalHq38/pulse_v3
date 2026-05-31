@@ -15,6 +15,10 @@ ALTER TABLE company_products
     CHECK (link_source IN ('auto', 'manual'));
 
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS slug TEXT NOT NULL DEFAULT '';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'inactive';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS billing_status TEXT NOT NULL DEFAULT 'inactive';
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
 

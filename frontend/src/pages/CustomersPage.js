@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useDeferredValue, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import { resolveMediaUrl } from '@/lib/backend-url';
 import { getErrorMessage, showToast } from '@/hooks/use-toast';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import BulkUploadModal from '@/components/BulkUploadModal';
+import { useSocket } from '@/lib/useSocket';
 import {
   Search,
   Plus,
@@ -71,6 +73,7 @@ function CustomerCardSkeleton() {
 // buildCustomerMethods and related utils are now imported from @/lib/channelUtils.
 
 export default function CustomersPage() {
+  const { user, loading: authLoading } = useAuth();
   const { requestConfirmation, confirmDialog } = useConfirmDialog();
   const [customers, setCustomers] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -161,7 +164,31 @@ export default function CustomersPage() {
     }
   }, [deferredSearch, filterSeg]);
 
-  useEffect(() => { loadCustomers(); }, [loadCustomers]);
+  useEffect(() => { if (user && !authLoading) loadCustomers(); }, [user, authLoading, loadCustomers]);
+
+  // Socket-based real-time updates — fired by backend on customer CRUD
+  const handleCustomerSocketEvent = useCallback((eventName) => {
+    if (['customer_created', 'customer_updated', 'customer_deleted'].includes(eventName)) {
+      loadCustomers();
+    }
+  }, [loadCustomers]);
+  useSocket(handleCustomerSocketEvent);
+
+  // Fallback poll every 30s for missed socket events or backgrounded tabs
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      loadCustomers();
+    }, 30000);
+    return () => clearInterval(intervalId);
+  }, [loadCustomers]);
+  // Refresh immediately when tab becomes visible after being backgrounded
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') loadCustomers(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [loadCustomers]);
+
   useEffect(() => {
     const onKeyDown = (event) => {
       if (event.key === 'Escape') {
@@ -171,6 +198,7 @@ export default function CustomersPage() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [closeCustomerDetail]);
+
 
   const selectCustomer = useCallback(async (cust) => {
     dismissedCustomerParamRef.current = '';

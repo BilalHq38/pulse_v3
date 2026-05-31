@@ -26,13 +26,11 @@ class AgentRouter:
             WorkflowKind.MESSAGE: [
                 AgentName.CAPTURE,
                 AgentName.QUALIFICATION,
-                AgentName.SUPPORT,
                 AgentName.ANALYTICS,
             ],
             WorkflowKind.LEAD: [
                 AgentName.CAPTURE,
                 AgentName.QUALIFICATION,
-                AgentName.SUPPORT,
                 AgentName.ANALYTICS,
             ],
         }
@@ -71,39 +69,14 @@ class AgentRouter:
                 decision_mode="rule_based",
                 reason="Workflow sequence completed.",
             ))
-        if candidate == AgentName.SUPPORT:
-            qualification = dict(getattr(context.agent_outputs, "qualification", {}) or {})
-            capture = dict(getattr(context.agent_outputs, "capture", {}) or {})
-            route_to_support = bool(
-                qualification.get("route_to_support") or context.workflow_kind == WorkflowKind.MESSAGE
-            )
-            if not route_to_support:
-                candidate = AgentName.ANALYTICS
-            return _log_route(context, WorkflowRouteDecision(
-                current_agent=previous_agent.value,
-                next_agent=candidate.value,
-                decision_mode="hybrid",
-                reason=(
-                    f"Intent={((capture.get('intent') or {}).get('intent') or 'unknown')} "
-                    f"classification={qualification.get('classification', 'unknown')}"
-                ),
-                qualifiers=[
-                    str((capture.get("intent") or {}).get("intent") or ""),
-                    str(qualification.get("classification") or ""),
-                ],
-            ))
         if candidate == AgentName.ANALYTICS:
-            support = dict(getattr(context.agent_outputs, "support", {}) or {})
+            qualification = dict(getattr(context.agent_outputs, "qualification", {}) or {})
             return _log_route(context, WorkflowRouteDecision(
                 current_agent=previous_agent.value,
                 next_agent=candidate.value,
                 decision_mode="hybrid",
-                reason=(
-                    "Workflow routed to analytics after support."
-                    if previous_agent == AgentName.SUPPORT
-                    else f"Lead status={support.get('next_action', 'analytics')}"
-                ),
-                qualifiers=[str(support.get("next_action") or "")],
+                reason="Workflow routed to analytics after qualification.",
+                qualifiers=[str(qualification.get("classification") or "")],
             ))
         return _log_route(context, WorkflowRouteDecision(
             current_agent=previous_agent.value,

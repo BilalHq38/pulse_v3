@@ -151,15 +151,27 @@ class _FakeDb:
             }
 
 
-def test_evaluate_order_event_schedules_only_on_delivered():
+def test_evaluate_order_event_schedules_delivery_completion_aliases():
     db = _FakeDb()
     result = asyncio.run(scheduler_module.evaluate_order_event(
         db, company_id="c1", order_id="o1", customer_id="cu1", session_id="s1",
         to_status="shipped",
     ))
     assert result["scheduled"] is False
-    assert result["reason"] == "not_a_delivery"
+    assert result["reason"] == "not_a_followup_status"
     assert not db.followups
+
+    for index, status in enumerate(("delivered", "completed", "delivery_completed", "order_completed")):
+        result = asyncio.run(scheduler_module.evaluate_order_event(
+            db,
+            company_id="c1",
+            order_id=f"o-delivery-{index}",
+            customer_id="cu1",
+            session_id="s1",
+            to_status=status,
+        ))
+        assert result["scheduled"] is True
+        assert result["workflow_kind"] == "post_delivery_feedback"
 
 
 def test_evaluate_order_event_skips_when_customer_opted_out():

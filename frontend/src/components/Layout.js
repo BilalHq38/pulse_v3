@@ -269,6 +269,8 @@ export default function Layout({ children }) {
     finally { setProfileSaving(false); }
   };
 
+  // Fetch personal settings once on mount (not on every route change).
+  // Avatar/company updates are broadcast via 'pe-company-changed' CustomEvent.
   useEffect(() => {
     api.get('/settings/personal')
       .then(res => {
@@ -276,7 +278,7 @@ export default function Layout({ children }) {
         if (res.data?.avatar) saveUserAvatar(res.data.avatar);
       })
       .catch(() => {});
-  }, [location.pathname, saveUserAvatar]);
+  }, [saveUserAvatar]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleLogout = async () => {
     await logout();

@@ -87,13 +87,11 @@ _PENDING_APPROVAL_ALLOWED_PREFIXES = (
     "/api/auth/onboarding",
     "/api/auth/billing/plan",
     "/api/auth/session",
-    "/api/auth/refresh",
     "/api/auth/logout",
     "/api/settings/company",
 )
 _REJECTED_ALLOWED_PREFIXES = (
     "/api/auth/session",
-    "/api/auth/refresh",
     "/api/auth/logout",
 )
 _BLOCKED_ALLOWED_PREFIXES = ("/api/auth/logout",)

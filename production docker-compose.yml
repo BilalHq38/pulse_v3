@@ -1,0 +1,494 @@
+name: pulse-engine-prod
+
+x-common-env: &common-env
+  ENVIRONMENT: production
+  APP_ENV: production
+  NODE_ENV: production
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+  INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET is required}
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must point to the RDS PostgreSQL database}
+  POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-require}
+  PGSSLMODE: ${POSTGRES_SSLMODE:-require}
+  REDIS_URL: ${REDIS_URL:?REDIS_URL must point to ElastiCache Redis/Valkey}
+  CACHE_REDIS_URL: ${CACHE_REDIS_URL:?CACHE_REDIS_URL must point to ElastiCache Redis/Valkey}
+  RATE_LIMIT_REDIS_URL: ${RATE_LIMIT_REDIS_URL:?RATE_LIMIT_REDIS_URL must point to ElastiCache Redis/Valkey}
+  BACKGROUND_QUEUE_URL: ${BACKGROUND_QUEUE_URL:?BACKGROUND_QUEUE_URL must point to ElastiCache Redis/Valkey}
+  BACKGROUND_QUEUE_ENABLED: ${BACKGROUND_QUEUE_ENABLED:-true}
+  BACKGROUND_QUEUE_MAX_RETRIES: ${BACKGROUND_QUEUE_MAX_RETRIES:-5}
+  BACKGROUND_QUEUE_VISIBILITY_TIMEOUT: ${BACKGROUND_QUEUE_VISIBILITY_TIMEOUT:-300}
+  BACKGROUND_QUEUE_JOB_TIMEOUT_SECONDS: ${BACKGROUND_QUEUE_JOB_TIMEOUT_SECONDS:-600}
+  BACKGROUND_QUEUE_JOB_TTL_SECONDS: ${BACKGROUND_QUEUE_JOB_TTL_SECONDS:-86400}
+  FRONTEND_URL: ${FRONTEND_URL:?Set FRONTEND_URL to your HTTPS app domain}
+  APP_URL: ${APP_URL:-${FRONTEND_URL}}
+  BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL:?Set BACKEND_PUBLIC_URL to your HTTPS app/API domain}
+  PUBLIC_BACKEND_URL: ${PUBLIC_BACKEND_URL:-${BACKEND_PUBLIC_URL}}
+  CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS explicitly in production}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS explicitly in production}
+  GATEWAY_ALLOWED_ORIGINS: ${GATEWAY_ALLOWED_ORIGINS:?Set GATEWAY_ALLOWED_ORIGINS explicitly in production}
+  AUTH_SERVICE_URL: http://auth:8001
+  USER_SERVICE_URL: http://user:8002
+  CUSTOMER_SERVICE_URL: http://customer:8003
+  LEAD_SERVICE_URL: http://lead:8004
+  EMAIL_CAMPAIGN_SERVICE_URL: http://email-campaign:8013
+  AI_SERVICE_URL: http://ai:8005
+  ORCHESTRATOR_SERVICE_URL: http://agent-orchestrator:8009
+  ANALYTICS_SERVICE_URL: http://analytics:8006
+  DATA_PIPELINE_SERVICE_URL: http://data-pipeline:8012
+  PRODUCT_SERVICE_URL: http://product:8007
+  NOTIFICATION_SERVICE_URL: http://notification:8008
+  IDENTITY_SERVICE_URL: http://identity:8010
+  SUPER_ADMIN_SERVICE_URL: http://super-admin:8011
+  DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:?DEFAULT_TENANT_ID is required}
+  DEFAULT_TENANT_API_KEY: ${DEFAULT_TENANT_API_KEY:?DEFAULT_TENANT_API_KEY is required}
+  DEFAULT_TENANT_SALT: ${DEFAULT_TENANT_SALT:?DEFAULT_TENANT_SALT is required}
+  TENANT_API_KEYS: ${TENANT_API_KEYS:-}
+  TENANT_SALTS: ${TENANT_SALTS:?TENANT_SALTS is required}
+  IDENTITY_ADMIN_EMAIL: ${IDENTITY_ADMIN_EMAIL:?IDENTITY_ADMIN_EMAIL is required}
+  IDENTITY_ADMIN_PASSWORD: ${IDENTITY_ADMIN_PASSWORD:?IDENTITY_ADMIN_PASSWORD is required}
+  TENANT_RATE_LIMIT_PER_MINUTE: ${TENANT_RATE_LIMIT_PER_MINUTE:-1000}
+  META_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
+  WEB_CHAT_WEBHOOK_SECRET: ${WEB_CHAT_WEBHOOK_SECRET:?WEB_CHAT_WEBHOOK_SECRET is required}
+  EXTERNAL_WEBHOOK_SECRET: ${EXTERNAL_WEBHOOK_SECRET:?EXTERNAL_WEBHOOK_SECRET is required}
+  META_CREDENTIALS_ENCRYPTION_KEY: ${META_CREDENTIALS_ENCRYPTION_KEY:?META_CREDENTIALS_ENCRYPTION_KEY is required}
+  DEMO_MODE: "false"
+  STRIPE_OPTIONAL: "false"
+  STRIPE_ENABLED: ${STRIPE_ENABLED:-true}
+  TRIAL_PERIOD_DAYS: ${TRIAL_PERIOD_DAYS:-14}
+  STORAGE_BACKEND: s3
+  MEDIA_STORAGE_BACKEND: s3
+  AWS_S3_BUCKET: ${AWS_S3_BUCKET:?AWS_S3_BUCKET is required}
+  AWS_S3_REGION: ${AWS_S3_REGION:?AWS_S3_REGION is required}
+  AWS_S3_CDN_BASE_URL: ${AWS_S3_CDN_BASE_URL:-}
+  UPLOAD_STORAGE_DIR: /tmp/pulse-uploads
+  WHATSAPP_BRIDGE_URL: http://whatsapp-bridge:3001
+  WHATSAPP_BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:?WHATSAPP_BRIDGE_SECRET is required}
+  WHATSAPP_MODE: ${WHATSAPP_MODE:-bridge}
+  WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
+  GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-true}
+  GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+  GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
+  GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp_vertex_sa
+  VERTEX_AI_ENABLED: ${VERTEX_AI_ENABLED:-true}
+  VERTEX_AI_MODEL: ${VERTEX_AI_MODEL:-gemini-2.5-flash-lite}
+  GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-${BACKEND_PUBLIC_URL}/api/auth/google/callback}
+  FACEBOOK_APP_ID: ${FACEBOOK_APP_ID:-}
+  FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+  FACEBOOK_REDIRECT_URI: ${FACEBOOK_REDIRECT_URI:-${BACKEND_PUBLIC_URL}/api/auth/facebook/callback}
+  BREVO_API_KEY: ${BREVO_API_KEY:-}
+  BREVO_SENDER_EMAIL: ${BREVO_SENDER_EMAIL:-}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+
+x-service-defaults: &service-defaults
+  env_file:
+    - ${PULSE_ENV_FILE:-.env.production}
+  restart: unless-stopped
+  networks:
+    - pulse-network
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+x-python-health: &python-health
+  interval: 20s
+  timeout: 5s
+  retries: 10
+  start_period: 30s
+
+x-ai-secrets: &ai-secrets
+  secrets:
+    - gcp_vertex_sa
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    <<: *service-defaults
+    depends_on:
+      gateway:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+      customer:
+        condition: service_healthy
+    ports:
+      - "${HTTP_HOST_PORT:-80}:80"
+    volumes:
+      - ./infra/nginx/pulse-engine.prod.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health >/dev/null 2>&1 || exit 1"]
+      <<: *python-health
+
+  whatsapp-bridge:
+    build:
+      context: .
+      dockerfile: backend/whatsapp_bridge/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/whatsapp-bridge:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    shm_size: "512m"
+    environment:
+      BRIDGE_PORT: 3001
+      PYTHON_BACKEND: http://gateway:8000
+      WHATSAPP_WEBHOOK_PATH: ${WHATSAPP_WEBHOOK_PATH:-/api/webhook/meta/whatsapp}
+      WHATSAPP_BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:?WHATSAPP_BRIDGE_SECRET is required}
+      BRIDGE_SECRET: ${WHATSAPP_BRIDGE_SECRET:?WHATSAPP_BRIDGE_SECRET is required}
+      META_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
+      WHATSAPP_WEBHOOK_SECRET: ${META_WEBHOOK_SECRET:?META_WEBHOOK_SECRET is required}
+      BRIDGE_COMPANY_ID: ${BRIDGE_COMPANY_ID:-${DEFAULT_TENANT_ID}}
+      WHATSAPP_DEFAULT_COUNTRY: ${WHATSAPP_DEFAULT_COUNTRY:-}
+      WWEBJS_AUTH_TIMEOUT_MS: ${WWEBJS_AUTH_TIMEOUT_MS:-60000}
+      WWEBJS_READY_AFTER_INIT_TIMEOUT_MS: ${WWEBJS_READY_AFTER_INIT_TIMEOUT_MS:-60000}
+      WWEBJS_INIT_MAX_ATTEMPTS: ${WWEBJS_INIT_MAX_ATTEMPTS:-3}
+      WWEBJS_INIT_RETRY_BASE_DELAY_MS: ${WWEBJS_INIT_RETRY_BASE_DELAY_MS:-2000}
+      WWEBJS_INIT_RETRY_MAX_DELAY_MS: ${WWEBJS_INIT_RETRY_MAX_DELAY_MS:-10000}
+      BRIDGE_READY_TIMEOUT_MS: ${BRIDGE_READY_TIMEOUT_MS:-60000}
+      PUPPETEER_PROTOCOL_TIMEOUT_MS: ${PUPPETEER_PROTOCOL_TIMEOUT_MS:-60000}
+      PUPPETEER_NAVIGATION_TIMEOUT_MS: ${PUPPETEER_NAVIGATION_TIMEOUT_MS:-60000}
+    expose:
+      - "3001"
+    volumes:
+      - whatsapp-bridge-auth:/app/.wwebjs_auth
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:3001/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  auth:
+    build:
+      context: .
+      dockerfile: backend/services/auth_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/auth:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: auth-service
+      PORT: 8001
+      DB_SCHEMA: auth_service
+    expose:
+      - "8001"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()\""]
+      <<: *python-health
+
+  user:
+    build:
+      context: .
+      dockerfile: backend/services/user_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/user:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: user-service
+      PORT: 8002
+      DB_SCHEMA: user_service
+    expose:
+      - "8002"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3).read()\""]
+      <<: *python-health
+
+  customer:
+    build:
+      context: .
+      dockerfile: backend/services/customer_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/customer:${PULSE_IMAGE_TAG:-latest}
+    <<: [*service-defaults, *ai-secrets]
+    environment:
+      <<: *common-env
+      SERVICE_NAME: customer-service
+      PORT: 8003
+      DB_SCHEMA: customer_service
+    expose:
+      - "8003"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3).read()\""]
+      <<: *python-health
+
+  lead:
+    build:
+      context: .
+      dockerfile: backend/services/lead_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/lead:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: lead-service
+      PORT: 8004
+      DB_SCHEMA: lead_service
+    expose:
+      - "8004"
+    volumes:
+      - fastembed-cache:/root/.cache/fastembed
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=3).read()\""]
+      <<: *python-health
+
+  email-campaign:
+    build:
+      context: .
+      dockerfile: backend/services/email_campaign_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/email-campaign:${PULSE_IMAGE_TAG:-latest}
+    <<: [*service-defaults, *ai-secrets]
+    environment:
+      <<: *common-env
+      SERVICE_NAME: email-campaign-service
+      PORT: 8013
+      DB_SCHEMA: email_campaign_service
+    expose:
+      - "8013"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
+      <<: *python-health
+
+  ai:
+    build:
+      context: .
+      dockerfile: backend/services/ai_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/ai:${PULSE_IMAGE_TAG:-latest}
+    <<: [*service-defaults, *ai-secrets]
+    environment:
+      <<: *common-env
+      SERVICE_NAME: ai-service
+      PORT: 8005
+      DB_SCHEMA: ai_service
+    expose:
+      - "8005"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
+      <<: *python-health
+
+  agent-orchestrator:
+    build:
+      context: .
+      dockerfile: backend/services/agent_orchestrator/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/agent-orchestrator:${PULSE_IMAGE_TAG:-latest}
+    <<: [*service-defaults, *ai-secrets]
+    environment:
+      <<: *common-env
+      SERVICE_NAME: agent-orchestrator-service
+      PORT: 8009
+      DB_SCHEMA: agent_orchestrator
+    expose:
+      - "8009"
+    volumes:
+      - fastembed-cache:/root/.cache/fastembed
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
+      <<: *python-health
+
+  product:
+    build:
+      context: .
+      dockerfile: backend/services/product_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/product:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: product-service
+      PORT: 8007
+      DB_SCHEMA: product_service
+    expose:
+      - "8007"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8007/health', timeout=3).read()\""]
+      <<: *python-health
+
+  analytics:
+    build:
+      context: .
+      dockerfile: backend/services/analytics_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/analytics:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: analytics-service
+      PORT: 8006
+      DB_SCHEMA: analytics_service
+    expose:
+      - "8006"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/health', timeout=3).read()\""]
+      <<: *python-health
+
+  data-pipeline:
+    build:
+      context: .
+      dockerfile: backend/services/data_pipeline_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/data-pipeline:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: data-pipeline
+      PORT: 8012
+      DB_SCHEMA: data_pipeline_service
+    expose:
+      - "8012"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/health', timeout=3).read()\""]
+      <<: *python-health
+
+  followup-scheduler:
+    build:
+      context: .
+      dockerfile: backend/services/followup_scheduler/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/followup-scheduler:${PULSE_IMAGE_TAG:-latest}
+    <<: [*service-defaults, *ai-secrets]
+    environment:
+      <<: *common-env
+      SERVICE_NAME: followup-scheduler
+      PORT: 8080
+      AI_FOLLOWUP_POLL_INTERVAL_SECONDS: ${AI_FOLLOWUP_POLL_INTERVAL_SECONDS:-60}
+      AI_FOLLOWUP_MAX_PER_ITERATION: ${AI_FOLLOWUP_MAX_PER_ITERATION:-10}
+      AI_FOLLOWUP_DISPATCH_TIMEOUT_SECONDS: ${AI_FOLLOWUP_DISPATCH_TIMEOUT_SECONDS:-25}
+      AI_FOLLOWUP_FEEDBACK_DELAY_SECONDS: ${AI_FOLLOWUP_FEEDBACK_DELAY_SECONDS:-3600}
+      AI_FOLLOWUP_UPSELL_DELAY_SECONDS: ${AI_FOLLOWUP_UPSELL_DELAY_SECONDS:-86400}
+      AI_FOLLOWUP_ORDER_CONFIRMED_DELAY_SECONDS: ${AI_FOLLOWUP_ORDER_CONFIRMED_DELAY_SECONDS:-300}
+      AI_FOLLOWUP_COOLDOWN_DAYS: ${AI_FOLLOWUP_COOLDOWN_DAYS:-7}
+      AI_FOLLOWUP_MAX_PER_MONTH: ${AI_FOLLOWUP_MAX_PER_MONTH:-4}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()\""]
+      <<: *python-health
+
+  notification:
+    build:
+      context: .
+      dockerfile: backend/services/notification_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/notification:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: notification-service
+      PORT: 8008
+      DB_SCHEMA: notification_service
+    expose:
+      - "8008"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=3).read()\""]
+      <<: *python-health
+
+  identity:
+    build:
+      context: .
+      dockerfile: backend/services/identity_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/identity:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: identity-service
+      PORT: 8010
+      DB_SCHEMA: identity_service
+    expose:
+      - "8010"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=3).read()\""]
+      <<: *python-health
+
+  super-admin:
+    build:
+      context: .
+      dockerfile: backend/services/super_admin_service/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/super-admin:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    environment:
+      <<: *common-env
+      SERVICE_NAME: super-admin-service
+      PORT: 8011
+      DB_SCHEMA: super_admin_service
+    expose:
+      - "8011"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/health', timeout=3).read()\""]
+      <<: *python-health
+
+  gateway:
+    build:
+      context: .
+      dockerfile: backend/api_gateway/Dockerfile
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/gateway:${PULSE_IMAGE_TAG:-latest}
+    <<: [*service-defaults, *ai-secrets]
+    depends_on:
+      auth:
+        condition: service_healthy
+      user:
+        condition: service_healthy
+      customer:
+        condition: service_healthy
+      lead:
+        condition: service_healthy
+      email-campaign:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+      agent-orchestrator:
+        condition: service_healthy
+      product:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      super-admin:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-gateway
+      PORT: 8000
+      GATEWAY_RATE_LIMIT_REQUESTS: ${GATEWAY_RATE_LIMIT_REQUESTS:-120}
+      GATEWAY_RATE_LIMIT_WINDOW_SECONDS: ${GATEWAY_RATE_LIMIT_WINDOW_SECONDS:-60}
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).read()\""]
+      <<: *python-health
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:?Set REACT_APP_BACKEND_URL to your HTTPS app/API domain}
+        REACT_APP_SOCKET_URL: ${REACT_APP_SOCKET_URL:?Set REACT_APP_SOCKET_URL to your HTTPS app domain}
+        REACT_APP_DEMO_MODE: "false"
+    image: ${PULSE_IMAGE_PREFIX:-pulse-engine}/frontend:${PULSE_IMAGE_TAG:-latest}
+    <<: *service-defaults
+    depends_on:
+      gateway:
+        condition: service_healthy
+      customer:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  whatsapp-bridge-auth:
+  fastembed-cache:
+
+secrets:
+  gcp_vertex_sa:
+    file: ${GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH:?Set GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH to the host path of the Vertex AI service account JSON}
+
+networks:
+  pulse-network:
+    driver: bridge
