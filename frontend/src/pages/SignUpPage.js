@@ -16,7 +16,7 @@ import {
 import PlatformLogo from '@/components/PlatformLogo';
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
-import { startOAuthLoginRedirect } from '@/lib/oauthLoginRedirect';
+import { startOAuthSignupPrefillRedirect } from '@/lib/oauthLoginRedirect';
 import { getSignupStripePlanOptions, getSignupTrialPlanOptions } from '@/data/publicPricingPlans';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 
@@ -113,7 +113,7 @@ export default function SignUpPage() {
     }
     if (oauthErr === 'no_account') {
       setError(
-        'No workspace is linked to that Google or Facebook account yet. Use Continue with Google or Facebook above (same as Sign in) if your team already uses the platform, or complete the form below to register a new workspace. Paid checkout only runs when Stripe is configured.',
+        'No workspace is linked to that Google or Facebook account yet. To create a new workspace, continue with Google or Facebook here to fill your profile, then complete checkout.',
       );
       navigate('/signup', { replace: true });
       return;
@@ -147,7 +147,7 @@ export default function SignUpPage() {
     setForm((prev) => (prev.plan_code === planCode ? prev : { ...prev, plan_code: planCode }));
   }, [searchParams]);
 
-  const startOAuth = (provider) => startOAuthLoginRedirect(backendBaseUrl, provider);
+  const startOAuth = (provider) => startOAuthSignupPrefillRedirect(backendBaseUrl, provider);
 
   const set = (key, value) => setForm((prev) => ({ ...prev, [key]: value }));
 
