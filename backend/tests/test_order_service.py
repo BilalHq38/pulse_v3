@@ -38,7 +38,7 @@ class FakeOrderDb:
             "lead_id": "lead-1",
         }
         self.products = [
-            {"id": "prod-1", "name": "Product Alpha", "product_title": "", "description": "Alpha desc", "price": "10", "price_currency": "USD", "category": "general", "status": "active"},
+            {"id": "prod-1", "name": "Product Alpha", "product_title": "", "description": "Alpha desc", "price": "10", "price_currency": "USD", "category": "general", "status": "active", "links": "https://shop.example.test/product-alpha", "slug": "product-alpha"},
             {"id": "prod-2", "name": "Product Beta", "product_title": "", "description": "Beta desc", "price": "20", "price_currency": "USD", "category": "general", "status": "active"},
             {"id": "prod-3", "name": "Product Gamma", "product_title": "", "description": "Gamma desc", "price": "30", "price_currency": "USD", "category": "general", "status": "active"},
             {"id": "prod-4", "name": "Product Delta", "product_title": "", "description": "Delta desc", "price": "40", "price_currency": "USD", "category": "general", "status": "active"},
@@ -91,6 +91,14 @@ class FakeOrderDb:
                 if order["company_id"] == company_id and order["id"] == order_id:
                     return {**order, "assigned_name": "Agent One"}
             return None
+        if query.startswith("SELECT id,name,product_title,slug,links"):
+            company_id, product_id = args[:2]
+            for product in self.products:
+                if company_id == "co-1" and product["id"] == product_id:
+                    return dict(product)
+            return None
+        if query.startswith("SELECT slug FROM companies"):
+            return {"slug": "pulse-store"}
         if query.startswith("SELECT id FROM customers"):
             return None
         return None
@@ -804,5 +812,7 @@ async def test_combined_purchase_question_uses_order_flow_not_catalog(monkeypatc
     assert result["intent"]["intent"] == "order_intent"
     assert ai_response["attachments"] == []
     assert ai_response["product_images"] == []
+    assert "https://shop.example.test/product-alpha" in ai_response["response"]
+    assert ai_response["product_links"][0]["url"].startswith("https://shop.example.test/product-alpha")
     assert not re.search(r"\b(ai|llm|gemini|google|model|provider)\b", ai_response["response"].lower())
     assert "gemini" not in ai_response["response"].lower()

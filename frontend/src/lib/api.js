@@ -160,10 +160,10 @@ export function clearAccessToken() {
   setAccessToken('');
 }
 
-export async function refreshAuthSession() {
+export async function refreshAuthSession(config = {}) {
   if (!refreshPromise) {
     refreshPromise = authClient
-      .post('/auth/refresh', {})
+      .post('/auth/refresh', {}, config)
       .then((res) => applyAuthResponse(res.data || {}))
       .finally(() => {
         refreshPromise = null;

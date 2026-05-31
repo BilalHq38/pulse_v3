@@ -12,7 +12,9 @@ from difflib import SequenceMatcher
 
 from core.utils import is_valid_image_url, normalize_product_images
 from shared.cache import get_cache_client
+from shared.config import frontend_url
 from shared.metrics import increment_counter, observe_histogram, timed_metric
+from shared.product_ref_token import create_ref_token
 from services.ai_service.embedding_service import search_similar_embeddings, store_embedding
 from services.ai_service.llm_tracking import has_embedding_budget_remaining
 from services.ai_service.routing_guards import is_low_value_message
@@ -694,6 +696,33 @@ def _score_product(product: dict, query_info: dict, vector_score: float = 0.0) -
     return score
 
 
+def _build_product_public_url(
+    product: dict,
+    *,
+    company_slug: str = "",
+    company_id: str = "",
+    customer_id: str = "",
+    conversation_id: str = "",
+) -> str:
+    manual = str(product.get("links") or product.get("public_url") or "").strip()
+    if manual.startswith(("http://", "https://")):
+        url = manual
+    else:
+        slug = str(product.get("slug") or "").strip()
+        if not (company_slug and slug):
+            return ""
+        url = f"{frontend_url().rstrip('/')}/c/{company_slug}/product/{slug}"
+    if customer_id and company_id and "ref=" not in url:
+        ref = create_ref_token(
+            customer_id=customer_id,
+            session_id=conversation_id,
+            company_id=company_id,
+        )
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}ref={ref}"
+    return url
+
+
 async def rank_products_for_query(
     db,
     company_id: str,
@@ -905,7 +934,7 @@ def _format_product_context(product: dict) -> str:
     price = str(product.get("price") or "").strip()
     currency = str(product.get("price_currency") or "").strip() or "USD"
     price_display = f"{price} {currency}".strip() if price else "Not listed"
-    return (
+    context = (
         f"Product: {product.get('name') or 'Unnamed product'}"
         f" | Title: {str(product.get('product_title') or '').strip() or 'N/A'}"
         f" | Category: {str(product.get('category') or 'general').strip() or 'general'}"
@@ -914,6 +943,10 @@ def _format_product_context(product: dict) -> str:
         f" | Description: {description}"
         f" | Features: {features}"
     )
+    public_url = str(product.get("public_url") or "").strip()
+    if public_url:
+        context = f"{context} | Product page: {public_url}"
+    return context
 
 
 async def build_ai_context(
@@ -972,7 +1005,8 @@ async def build_ai_context(
     try:
         company_profile = (
             await db.fetchrow(
-                "SELECT c.name AS company_name, cs.industry, cs.tagline, cs.description, cs.website_address "
+                "SELECT c.name AS company_name, c.slug AS company_slug, "
+                "cs.industry, cs.tagline, cs.description, cs.website_address "
                 "FROM companies c LEFT JOIN company_settings cs ON cs.company_id = c.id "
                 "WHERE c.id=$1 LIMIT 1",
                 company_id,
@@ -984,6 +1018,7 @@ async def build_ai_context(
             profile = dict(company_profile)
             public_company = {
                 "company_name": str(profile.get("company_name") or "").strip(),
+                "company_slug": str(profile.get("company_slug") or "").strip(),
                 "industry": str(profile.get("industry") or "").strip(),
                 "tagline": str(profile.get("tagline") or "").strip(),
                 "description": str(profile.get("description") or "").strip(),
@@ -1029,6 +1064,13 @@ async def build_ai_context(
             ][:max_products]
 
         for product in selected_products[:max_products]:
+            product["public_url"] = _build_product_public_url(
+                product,
+                company_slug=str(public_company.get("company_slug") or ""),
+                company_id=str(company_id or ""),
+                customer_id=customer_id,
+                conversation_id=conversation_id,
+            )
             chunks.append(_format_product_context(product))
             attachment = _build_product_attachment(product, _pick_product_image_url(product), 0)
             if attachment:

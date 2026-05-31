@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from services.followup_scheduler.loop import start_followup_scheduler, stop_followup_scheduler
-from shared.database import get_db_pool
+from shared.database import create_database
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,8 @@ async def lifespan(app: FastAPI):
     global _scheduler_handle, _db_pool
     logger.info("followup_scheduler_starting")
     try:
-        _db_pool = await get_db_pool()
+        _db_pool = create_database(application_name="followup-scheduler")
+        await _db_pool.initialize()
         _scheduler_handle = await start_followup_scheduler(_db_pool)
         logger.info("followup_scheduler_started poll_interval_seconds=%s", os.environ.get("AI_FOLLOWUP_POLL_INTERVAL_SECONDS", "60"))
     except Exception:

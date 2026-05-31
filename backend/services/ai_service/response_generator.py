@@ -1088,6 +1088,14 @@ def _product_reason(product: dict) -> str:
     return "; ".join(parts) if parts else "a strong match for the current request"
 
 
+def _product_purchase_url(product: dict) -> str:
+    for key in ("public_url", "purchase_link", "links", "url"):
+        value = str((product or {}).get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    return ""
+
+
 def _should_share_website_link(intent_name: str, query: str, conversation_state: dict | None = None) -> bool:
     lowered = str(query or "").strip().lower()
     if intent_name in {"website_link_request", "order_intent"}:
@@ -1246,6 +1254,9 @@ def _format_products_for_prompt(products: list[dict]) -> str:
             parts.append(f"Features: {', '.join(features[:4])}")
         if description:
             parts.append(f"Description: {truncate_text_for_tokens(description, 80)}")
+        purchase_url = _product_purchase_url(product)
+        if purchase_url:
+            parts.append(f"Product page: {purchase_url}")
         lines.append(" | ".join(parts))
     return "\n".join(lines)
 
@@ -1505,9 +1516,12 @@ def build_product_response(
             response += "\nI do not see an image available for this product, but these are the details I found."
         else:
             response += "\nReply with order or buy if you want to place an order."
+        purchase_url = _product_purchase_url(product)
         website_url = str((ai_context or {}).get("public_company", {}).get("website_address") or "").strip()
-        if share_website and website_url:
-            response += f" You can place the order here: {website_url}"
+        if share_website and purchase_url:
+            response += f"\nYou can complete the purchase here: {purchase_url}"
+        elif share_website and website_url:
+            response += f"\nYou can place the order here: {website_url}"
         return {
             "response": response,
             "attachments": attachments,
@@ -1534,7 +1548,11 @@ def build_product_response(
                         price = str(product.get("price") or "").strip()
                         currency = str(product.get("price_currency") or "").strip()
                         price_display = f"{price} {currency}".strip() if price else "Price on request"
-                        lines.append(f"{index}. {name} — {price_display}")
+                        line = f"{index}. {name} — {price_display}"
+                        purchase_url = _product_purchase_url(product)
+                        if share_website and purchase_url:
+                            line += f"\n   Buy: {purchase_url}"
+                        lines.append(line)
                     lines.append("")
                 if service_items:
                     lines.extend(["Services:", ""])
@@ -1543,7 +1561,11 @@ def build_product_response(
                         price = str(product.get("price") or "").strip()
                         currency = str(product.get("price_currency") or "").strip()
                         price_display = f"{price} {currency}".strip() if price else "Price on request"
-                        lines.append(f"{index}. {name} — {price_display}")
+                        line = f"{index}. {name} — {price_display}"
+                        purchase_url = _product_purchase_url(product)
+                        if share_website and purchase_url:
+                            line += f"\n   Buy: {purchase_url}"
+                        lines.append(line)
                     lines.append("")
                 lines.append("Reply with the product or service number/name to see details or continue.")
                 return {
@@ -1563,7 +1585,11 @@ def build_product_response(
             price = str(product.get("price") or "").strip()
             currency = str(product.get("price_currency") or "").strip()
             price_display = f"{price} {currency}".strip() if price else "Price on request"
-            lines.append(f"{index}. {name} — {price_display}")
+            line = f"{index}. {name} — {price_display}"
+            purchase_url = _product_purchase_url(product)
+            if share_website and purchase_url:
+                line += f"\n   Buy: {purchase_url}"
+            lines.append(line)
         lines.append("")
         lines.append("Reply with the product number or name to see details or place an order.")
         return {
@@ -1596,9 +1622,25 @@ def build_follow_up_response(
             follow_up=True,
         )
     if topic in {"products", "product_recommendation", "product_catalog_question"}:
-        product_payload = build_product_response(query, ai_context=ai_context, image_request=_looks_like_image_request(query))
+        share_website = _should_share_website_link("order_intent", query, conversation_state)
+        product_payload = build_product_response(
+            query,
+            ai_context=ai_context,
+            intent_name="order_intent" if share_website else "",
+            image_request=_looks_like_image_request(query),
+            share_website=share_website,
+        )
         return product_payload["response"]
     if topic in {"buying", "buying_intent", "order_intent", "website_link_request"}:
+        if (ai_context or {}).get("products"):
+            product_payload = build_product_response(
+                query,
+                ai_context=ai_context,
+                intent_name="order_intent",
+                image_request=_looks_like_image_request(query),
+                share_website=True,
+            )
+            return product_payload["response"]
         return "I can help you proceed with the next buying step. Which product or service should I help you confirm first?"
     return "Do you want me to continue with services, products, pricing, or support?"
 

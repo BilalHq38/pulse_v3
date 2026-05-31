@@ -112,7 +112,7 @@ def resolve_backend_base_url(request: Request) -> str:
     loopback_base = _loopback_base_url(request)
     if loopback_base:
         return loopback_base
-    configured = _first_configured_base_url("BACKEND_URL", "APP_URL")
+    configured = _first_configured_base_url("PUBLIC_BACKEND_URL", "BACKEND_PUBLIC_URL", "BACKEND_URL")
     if configured:
         return configured
     forwarded_proto = (request.headers.get("x-forwarded-proto", "") or request.url.scheme).split(",")[0].strip()
@@ -153,7 +153,7 @@ def sanitize_frontend_origin(frontend_origin: str) -> str:
         return f"{parsed.scheme}://{parsed.netloc}"
     configured_origins = [
         normalize_base_url(origin)
-        for env_name in ("FRONTEND_URL", "APP_URL")
+        for env_name in ("FRONTEND_URL", "APP_URL", "GATEWAY_ALLOWED_ORIGINS")
         for origin in os.environ.get(env_name, "").split(",")
     ]
     if any(origin and origin.lower() == candidate.lower() for origin in configured_origins):
@@ -162,10 +162,16 @@ def sanitize_frontend_origin(frontend_origin: str) -> str:
 
 
 def build_google_redirect_uri(request: Request) -> str:
+    configured = _first_configured_base_url("GOOGLE_REDIRECT_URI", "GOOGLE_OAUTH_REDIRECT_URI")
+    if configured:
+        return configured
     return f"{resolve_backend_base_url(request)}/api/auth/google/callback"
 
 
 def build_facebook_redirect_uri(request: Request) -> str:
+    configured = _first_configured_base_url("FACEBOOK_REDIRECT_URI", "FACEBOOK_OAUTH_REDIRECT_URI")
+    if configured:
+        return configured
     return f"{resolve_backend_base_url(request)}/api/auth/facebook/callback"
 
 

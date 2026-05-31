@@ -585,7 +585,13 @@ async def test_buying_intent_shares_website_only_at_order_step(monkeypatch):
     async def fake_context(*_args, **_kwargs):
         return {
             "knowledge_text": "Company: Pulse Store | Website: https://shop.example.test",
-            "products": [{"id": "prod-1", "name": "Solar Kit", "price": "120", "price_currency": "USD"}],
+            "products": [{
+                "id": "prod-1",
+                "name": "Solar Kit",
+                "price": "120",
+                "price_currency": "USD",
+                "public_url": "https://shop.example.test/c/pulse-store/product/solar-kit",
+            }],
             "product_ids": ["prod-1"],
             "product_attachments": [],
             "public_company": {"company_name": "Pulse Store", "website_address": "https://shop.example.test"},
@@ -616,7 +622,7 @@ async def test_buying_intent_shares_website_only_at_order_step(monkeypatch):
 
     assert "https://shop.example.test" not in early["response"]
     assert "Solar Kit" in early["response"]
-    assert "https://shop.example.test" in final["response"]
+    assert "https://shop.example.test/c/pulse-store/product/solar-kit" in final["response"]
 
 
 @pytest.mark.asyncio

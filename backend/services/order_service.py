@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any
 
 from core.utils import make_id
+from shared.config import frontend_url
+from shared.product_ref_token import create_ref_token
 from services.ai_service.routing_guards import route_product_order_intent
 from services.db_helpers import create_notification
 
@@ -353,6 +355,7 @@ def merge_order_details(existing: dict, details: dict) -> dict:
         "customer_phone",
         "delivery_address",
         "notes",
+        "purchase_link",
     ):
         value = details.get(key)
         if value not in (None, "", []):
@@ -392,7 +395,7 @@ def format_missing_fields_reply(missing: list[str], order: dict | None = None) -
         return ""
     product_name = _text(order.get("product_name"), 240)
     if product_name and len(missing) >= 3:
-        return (
+        response = (
             f"Sure, I can help you place the order for *{product_name}*. "
             "Please share the following details:\n\n"
             "Name:\n"
@@ -401,13 +404,14 @@ def format_missing_fields_reply(missing: list[str], order: dict | None = None) -
             "Delivery Address:\n"
             "Quantity:"
         )
+        return _append_purchase_link(response, order)
     if len(visible) == 1:
         needed = visible[0]
     elif len(visible) == 2:
         needed = f"{visible[0]} and {visible[1]}"
     else:
         needed = ", ".join(visible[:-1]) + f", and {visible[-1]}"
-    return f"Sure, I can help place the order. Please share {needed} to complete it."
+    return _append_purchase_link(f"Sure, I can help place the order. Please share {needed} to complete it.", order)
 
 
 def format_confirmation_reply(order: dict) -> str:
@@ -427,7 +431,7 @@ def format_confirmation_reply(order: dict) -> str:
         f"Quantity: {quantity}",
     ]
     lines.append("Reply 'Confirm' to place the order, or tell me what you want to change.")
-    return "\n".join(lines)
+    return _append_purchase_link("\n".join(lines), order)
 
 
 def format_order_placed_reply(order: dict) -> str:
@@ -445,12 +449,21 @@ def _order_response_payload(
 ) -> dict:
     order = dict(order or {})
     routing = dict(routing or {})
+    purchase_link = _purchase_link_from_order(order)
     return {
         "response": response,
         "confidence": 0.98,
         "attachments": [],
         "product_images": [],
         "product_ids": [order.get("product_id")] if order.get("product_id") else [],
+        "product_links": [
+            {
+                "product_id": order.get("product_id", ""),
+                "url": purchase_link,
+                "name": order.get("product_name", ""),
+                "image_url": "",
+            }
+        ] if purchase_link else [],
         "llm_id": "",
         "provider": "rule",
         "model_name": "deterministic-order-flow",
@@ -528,7 +541,13 @@ def _products_from_context_messages(conversation_context: list[dict]) -> list[di
                 240,
             )
             if product_id or product_name:
-                products.append({"product_id": product_id, "product_name": product_name})
+                products.append({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "purchase_link": _text(metadata.get("public_url") or metadata.get("purchase_link"), 2000),
+                    "links": _text(metadata.get("links"), 2000),
+                    "slug": _text(metadata.get("slug"), 160),
+                })
     return _dedupe_products(products)
 
 
@@ -564,7 +583,13 @@ async def _products_from_recent_attachments(db, company_id: str, conversation_id
         product_id = _text(metadata.get("product_id"), 120)
         product_name = _text(metadata.get("product_name") or metadata.get("name"), 240)
         if product_id or product_name:
-            products.append({"product_id": product_id, "product_name": product_name})
+            products.append({
+                "product_id": product_id,
+                "product_name": product_name,
+                "purchase_link": _text(metadata.get("public_url") or metadata.get("purchase_link"), 2000),
+                "links": _text(metadata.get("links"), 2000),
+                "slug": _text(metadata.get("slug"), 160),
+            })
     return _dedupe_products(products)
 
 
@@ -579,7 +604,7 @@ async def _products_from_ids(db, company_id: str, product_ids: list[str]) -> lis
         return []
     try:
         rows = await db.fetch(
-            "SELECT id,name,product_title,price,price_currency,status FROM company_products "
+            "SELECT id,name,product_title,price,price_currency,status,slug,links FROM company_products "
             "WHERE company_id=$1 AND id=ANY($2::text[]) "
             "ORDER BY array_position($2::text[], id)",
             company_id,
@@ -598,6 +623,8 @@ async def _products_from_ids(db, company_id: str, product_ids: list[str]) -> lis
                 "price": _text(product.get("price"), 120),
                 "price_currency": _text(product.get("price_currency"), 20),
                 "status": _text(product.get("status"), 40),
+                "slug": _text(product.get("slug"), 160),
+                "links": _text(product.get("links"), 2000),
             })
     return _dedupe_products(products)
 
@@ -658,7 +685,7 @@ async def resolve_order_product_matches(db, company_id: str, product_text: str) 
         return []
     try:
         rows = await db.fetch(
-            "SELECT id,name,product_title,price,price_currency,status "
+            "SELECT id,name,product_title,price,price_currency,status,slug,links "
             "FROM company_products "
             "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
             "ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 250",
@@ -685,6 +712,8 @@ async def resolve_order_product_matches(db, company_id: str, product_text: str) 
                         "price": _text(product.get("price"), 120),
                         "price_currency": _text(product.get("price_currency"), 20),
                         "status": _text(product.get("status"), 40),
+                        "slug": _text(product.get("slug"), 160),
+                        "links": _text(product.get("links"), 2000),
                     },
                 )
             )
@@ -716,6 +745,63 @@ def _price_display(product: dict) -> str:
     return f"{price} {currency}".strip() if price else "Price not listed"
 
 
+def _append_ref_to_purchase_url(url: str, *, company_id: str, customer_id: str = "", conversation_id: str = "") -> str:
+    cleaned = _text(url, 2000)
+    if not cleaned or not customer_id or not company_id or "ref=" in cleaned:
+        return cleaned
+    ref = create_ref_token(
+        customer_id=customer_id,
+        session_id=conversation_id,
+        company_id=company_id,
+    )
+    sep = "&" if "?" in cleaned else "?"
+    return f"{cleaned}{sep}ref={ref}"
+
+
+def _build_product_purchase_url(
+    product: dict,
+    *,
+    company_slug: str = "",
+    company_id: str = "",
+    customer_id: str = "",
+    conversation_id: str = "",
+) -> str:
+    manual = _text(
+        product.get("purchase_link") or product.get("public_url") or product.get("links") or product.get("url"),
+        2000,
+    )
+    if manual.startswith(("http://", "https://")):
+        return _append_ref_to_purchase_url(
+            manual,
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+        )
+    slug = _text(product.get("slug"), 160)
+    if not (company_slug and slug):
+        return ""
+    url = f"{frontend_url().rstrip('/')}/c/{company_slug}/product/{slug}"
+    return _append_ref_to_purchase_url(
+        url,
+        company_id=company_id,
+        customer_id=customer_id,
+        conversation_id=conversation_id,
+    )
+
+
+def _purchase_link_from_order(order: dict | None) -> str:
+    order = dict(order or {})
+    raw = _json_loads(order.get("raw_details"), {}) if "raw_details" in order else {}
+    return _text(order.get("purchase_link") or raw.get("purchase_link"), 2000)
+
+
+def _append_purchase_link(response: str, order: dict | None) -> str:
+    link = _purchase_link_from_order(order)
+    if not link or link in response:
+        return response
+    return f"{response}\n\nYou can complete the purchase here:\n{link}"
+
+
 def _serialize_product_row(row: Any) -> dict:
     product = _as_dict(row)
     if not product:
@@ -728,6 +814,9 @@ def _serialize_product_row(row: Any) -> dict:
         "status": _text(product.get("status"), 40),
         "category": _text(product.get("category"), 120),
         "description": _text(product.get("description"), 500),
+        "slug": _text(product.get("slug"), 160),
+        "links": _text(product.get("links"), 2000),
+        "purchase_link": _text(product.get("purchase_link") or product.get("public_url"), 2000),
     }
 
 
@@ -743,7 +832,7 @@ async def fetch_product_batch(
         return []
     try:
         rows = await db.fetch(
-            "SELECT id,name,product_title,description,price,price_currency,category,status "
+            "SELECT id,name,product_title,description,price,price_currency,category,status,slug,links "
             "FROM company_products "
             "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
             "  AND NOT (id = ANY($2::text[])) "
@@ -934,6 +1023,42 @@ async def resolve_order_product_candidates(
     return await _products_from_recent_attachments(db, company_id, conversation_id)
 
 
+async def _hydrate_product_purchase_fields(db, company_id: str, product: dict) -> dict:
+    hydrated = dict(product or {})
+    if not (db and company_id and hydrated.get("product_id")):
+        return hydrated
+    if hydrated.get("purchase_link") or hydrated.get("public_url") or hydrated.get("links") or hydrated.get("slug"):
+        return hydrated
+    try:
+        row = await db.fetchrow(
+            "SELECT id,name,product_title,slug,links FROM company_products "
+            "WHERE company_id=$1 AND id=$2 LIMIT 1",
+            company_id,
+            _text(hydrated.get("product_id"), 120),
+        )
+    except Exception as exc:
+        logger.debug("order_product_purchase_lookup_failed company_id=%s product_id=%s error=%s", company_id, hydrated.get("product_id"), exc)
+        return hydrated
+    product = _as_dict(row)
+    if not product:
+        return hydrated
+    hydrated.setdefault("product_name", _text(product.get("name") or product.get("product_title"), 240))
+    hydrated["slug"] = _text(product.get("slug"), 160)
+    hydrated["links"] = _text(product.get("links"), 2000)
+    return hydrated
+
+
+async def _resolve_company_slug(db, company_id: str) -> str:
+    if not (db and company_id):
+        return ""
+    try:
+        row = await db.fetchrow("SELECT slug FROM companies WHERE id=$1 LIMIT 1", company_id)
+    except Exception as exc:
+        logger.debug("order_company_slug_lookup_failed company_id=%s error=%s", company_id, exc)
+        return ""
+    return _text(_as_dict(row).get("slug"), 160)
+
+
 async def fetch_active_order(db, company_id: str, conversation_id: str) -> dict:
     if not (db and company_id and conversation_id):
         return {}
@@ -982,6 +1107,7 @@ async def _fetch_conversation_context(db, company_id: str, conversation_id: str)
 
 
 def _order_values_from_record(order: dict) -> dict:
+    raw_details = _json_loads(order.get("raw_details"), {})
     return {
         "id": _text(order.get("id"), 120),
         "company_id": _text(order.get("company_id"), 120),
@@ -1002,7 +1128,8 @@ def _order_values_from_record(order: dict) -> dict:
         "status": _text(order.get("status"), 40) or "collecting_details",
         "source_channel": _text(order.get("source_channel"), 40) or "web_chat",
         "created_by": _text(order.get("created_by"), 40) or "ai",
-        "raw_details": _json_loads(order.get("raw_details"), {}),
+        "purchase_link": _text(raw_details.get("purchase_link"), 2000),
+        "raw_details": raw_details,
         "missing_fields": _json_loads(order.get("missing_fields"), []),
     }
 
@@ -1729,12 +1856,33 @@ async def handle_order_flow(
     lead_id = _text(lead_info.get("id") or customer.get("lead_id") or conversation.get("lead_id"), 120)
     channel = _text(source_channel or conversation.get("channel") or "web_chat", 40)
 
+    if product_context:
+        product_context = await _hydrate_product_purchase_fields(db, company_id, product_context)
+        company_slug = ""
+        if not (
+            product_context.get("purchase_link")
+            or product_context.get("public_url")
+            or product_context.get("links")
+        ):
+            company_slug = await _resolve_company_slug(db, company_id)
+        purchase_link = _build_product_purchase_url(
+            product_context,
+            company_slug=company_slug,
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+        )
+        if purchase_link:
+            product_context["purchase_link"] = purchase_link
+
     details = extract_order_details(message_text, customer_info=customer, product_context=product_context)
     if selected_from_list and _is_product_selection_only(message_text):
         details.pop("quantity", None)
     if product_context:
         details["product_id"] = _text(product_context.get("product_id"), 120)
         details["product_name"] = _text(product_context.get("product_name"), 240)
+        if product_context.get("purchase_link"):
+            details["purchase_link"] = _text(product_context.get("purchase_link"), 2000)
 
     order_before_update = active_order or latest_order or {}
     needs_product_selection = bool(product_change_requested) or not (

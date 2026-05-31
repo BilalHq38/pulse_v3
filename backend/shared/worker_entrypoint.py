@@ -36,10 +36,11 @@ async def run(*, queues: list[str], concurrency: int) -> None:
 
     # Lazy imports — keep startup fast and avoid circular imports at module level
     from shared.background_queue import start_background_queue_worker, stop_background_queue_worker, BackgroundQueue
-    from shared.database import get_db_pool
+    from shared.database import create_database
 
     logger.info("background_worker_starting queues=%s concurrency=%s", queues, concurrency)
-    db_pool = await get_db_pool()
+    db_pool = create_database(application_name="background-worker")
+    await db_pool.initialize()
 
     handles = []
     for queue_name in queues:

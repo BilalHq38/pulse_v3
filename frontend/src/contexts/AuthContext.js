@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import api, { clearAuthSession, clearAccessToken, refreshAuthSession, setAccessToken } from '@/lib/api';
+import api, { clearAuthSession, clearAccessToken, getAccessToken, refreshAuthSession, setAccessToken } from '@/lib/api';
 import { normalizeAvatarUrl } from '@/lib/avatar';
 import { startActivityTracking, stopActivityTracking, isSessionExpiredByInactivity, resetActivity } from '@/lib/activityTracker';
 
@@ -12,6 +12,24 @@ const BLOCKED_STATUSES = ['pending_approval', 'rejected', 'blocked'];
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 const ACCESS_TOKEN_TTL_SECONDS = Number(process.env.REACT_APP_ACCESS_TOKEN_TTL_SECONDS || DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
 const REFRESH_INTERVAL_MS = Math.max(60 * 1000, Math.floor(ACCESS_TOKEN_TTL_SECONDS * 1000 * 0.8));
+const AUTH_BOOTSTRAP_TIMEOUT_MS = Math.max(
+  2500,
+  Number(process.env.REACT_APP_AUTH_BOOTSTRAP_TIMEOUT_MS || 6000) || 6000,
+);
+const PUBLIC_BOOTSTRAP_PATHS = new Set([
+  '/',
+  '/pricing',
+  '/contact',
+  '/privacy',
+  '/terms',
+  '/signin',
+  '/signup',
+  '/signup/complete',
+  '/admin/login',
+  '/verify-email',
+  '/accept-invite',
+  '/widget-demo',
+]);
 
 function safeUserForStorage(user) {
   if (!user) return null;
@@ -23,6 +41,60 @@ function safeUserForStorage(user) {
     email: user.email,
     avatar: user.avatar || user.profile_picture || null,
   };
+}
+
+function callbackParams() {
+  if (typeof window === 'undefined') return new URLSearchParams();
+  const params = new URLSearchParams(window.location.search || '');
+  const hash = window.location.hash?.startsWith('#') ? window.location.hash.slice(1) : '';
+  const hashParams = new URLSearchParams(hash);
+  hashParams.forEach((value, key) => {
+    if (!params.has(key)) params.set(key, value);
+  });
+  return params;
+}
+
+function hasAuthCallbackParams() {
+  const params = callbackParams();
+  return ['session_id', 'token', 'code'].some((key) => params.has(key));
+}
+
+function hasCachedAuthHint() {
+  if (getAccessToken()) return true;
+  try {
+    return Boolean(localStorage.getItem('pe_user'));
+  } catch {
+    return false;
+  }
+}
+
+function isPublicBootstrapPath() {
+  if (typeof window === 'undefined') return false;
+  const path = window.location.pathname || '/';
+  return PUBLIC_BOOTSTRAP_PATHS.has(path) || path.startsWith('/c/');
+}
+
+function shouldSkipInitialAuthBootstrap() {
+  if (typeof window === 'undefined') return false;
+  if (window.location.pathname.startsWith('/auth/callback') || hasAuthCallbackParams()) {
+    return true;
+  }
+  return isPublicBootstrapPath() && !hasCachedAuthHint();
+}
+
+async function resolveInitialAuthSession() {
+  if (getAccessToken()) {
+    try {
+      const sessionRes = await api.post('/auth/session', {}, {
+        skipAuthRefresh: true,
+        timeout: AUTH_BOOTSTRAP_TIMEOUT_MS,
+      });
+      return sessionRes.data || {};
+    } catch {
+      // Fall through to refresh-token rotation; the access token may be expired.
+    }
+  }
+  return refreshAuthSession({ timeout: AUTH_BOOTSTRAP_TIMEOUT_MS });
 }
 
 export function AuthProvider({ children }) {
@@ -63,7 +135,7 @@ export function AuthProvider({ children }) {
       // Do not refresh if user has been inactive for 6 hours
       if (isSessionExpiredByInactivity()) return;
       try {
-        const refreshed = await refreshAuthSession();
+        const refreshed = await resolveInitialAuthSession();
         if (refreshed?.token) setAccessToken(refreshed.token, { user: refreshed.user });
         if (refreshed?.user) {
           localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(refreshed.user)));
@@ -78,11 +150,17 @@ export function AuthProvider({ children }) {
 
   useEffect(() => {
     let cancelled = false;
+    if (shouldSkipInitialAuthBootstrap()) {
+      setLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
     (async () => {
       try {
         // Full user state is fetched from the server here — the localStorage copy
         // stores only display-safe fields and must NOT be used for sensitive decisions.
-        const refreshed = await refreshAuthSession();
+        const refreshed = await resolveInitialAuthSession();
         if (cancelled) return;
 
         // Guard: if the account is pending approval, blocked, or rejected,

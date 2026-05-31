@@ -7,6 +7,10 @@ import PlatformLogo from '@/components/PlatformLogo';
 
 const F = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
 const defaultRouteForUser = (user) => postAuthDestination(user);
+const OAUTH_CALLBACK_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.REACT_APP_OAUTH_CALLBACK_TIMEOUT_MS || 10000) || 10000,
+);
 
 export default function AuthCallback() {
   const { setAuthFromOAuth } = useAuth();
@@ -56,6 +60,7 @@ export default function AuthCallback() {
           if (!user.email || !user.company_id) {
             const sessionRes = await api.post('/auth/session', {}, {
               headers: { Authorization: `Bearer ${directToken}` },
+              timeout: OAUTH_CALLBACK_TIMEOUT_MS,
             });
             resolvedToken = sessionRes.data?.token || resolvedToken;
             if (sessionRes.data?.user) {
@@ -85,10 +90,14 @@ export default function AuthCallback() {
 
         let res;
         if (sessionId) {
-          res = await api.post('/auth/session', { session_id: sessionId });
+          res = await api.post('/auth/session', { session_id: sessionId }, {
+            timeout: OAUTH_CALLBACK_TIMEOUT_MS,
+          });
         } else if (code) {
           const endpoint = provider === 'facebook' ? '/auth/facebook/callback' : '/auth/google/callback';
-          res = await api.post(endpoint, { code, state });
+          res = await api.post(endpoint, { code, state }, {
+            timeout: OAUTH_CALLBACK_TIMEOUT_MS,
+          });
         } else {
           if (!cancelled) setError('No authentication token provided.');
           return;
@@ -116,6 +125,10 @@ export default function AuthCallback() {
       } catch (err) {
         if (cancelled) return;
         const status = err.response?.status;
+        if (err.code === 'ECONNABORTED' || /timeout/i.test(String(err.message || ''))) {
+          setError('Authentication service did not respond in time. Please try again, or use email sign-in while the service is recovering.');
+          return;
+        }
         const d = err.response?.data?.detail;
         const detailStr =
           typeof d === 'string'
