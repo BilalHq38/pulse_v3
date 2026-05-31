@@ -360,7 +360,7 @@ async def signup_billing_info():
 @router.get("/auth/register/status")
 async def register_status(request: Request, session_id: str = Query("", min_length=1)):
     db = _db(request)
-    return await get_public_registration_status(db, session_id)
+    return await get_public_registration_status(db, session_id, request)
 
 
 @router.post("/auth/login")

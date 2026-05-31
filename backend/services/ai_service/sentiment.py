@@ -510,7 +510,7 @@ def analyze_local_sentiment(text: str) -> dict:
     # 6. Emotion breakdown — from MiniLM if available, else derive from score
     breakdown = ml_breakdown if (ml_available and ml_breakdown) else _normalize_breakdown(None, blended)
 
-    model_name = "minilm-hybrid-v1" if ml_available else "keyword-heuristic-v1"
+    model_name = "sentence-transformers/all-MiniLM-L6-v2+crm-keyword" if ml_available else "crm-keyword-heuristic-v1"
     source = "local_minilm" if ml_available else "local_heuristic"
 
     result = {
@@ -526,6 +526,7 @@ def analyze_local_sentiment(text: str) -> dict:
         "provider": "local",
         "model_name": model_name,
         "source": source,
+        "external_api_called": False,
         "local_positive_hits": pos_hits,
         "local_negative_hits": neg_hits,
     }
@@ -606,6 +607,16 @@ def build_sentiment_gate(message_text: str, sentiment: dict | None = None) -> di
         label = "Positive"
     else:
         label = "Neutral"
+    path_taken = "human_escalation" if is_negative else "fast_path"
+    escalation_required = bool(is_negative)
+    logger.info(
+        "sentiment_gate sentiment_score=%s path_taken=%s escalation=%s classification=%s source=%s",
+        round(raw_score, 3),
+        path_taken,
+        str(escalation_required).lower(),
+        label,
+        str(sentiment.get("source") or sentiment.get("provider") or "").strip(),
+    )
     return {
         "message": message_text,
         "sentiment_score": normalized_score,
@@ -613,6 +624,9 @@ def build_sentiment_gate(message_text: str, sentiment: dict | None = None) -> di
         "raw_sentiment_label": sentiment_label,
         "classification": label,
         "ai_response_allowed": not is_negative,
+        "path_taken": path_taken,
+        "escalation_required": escalation_required,
+        "recommended_action": "escalate_to_human" if escalation_required else "continue_pipeline",
         "source": str(sentiment.get("source") or sentiment.get("provider") or "").strip(),
         "risk_flags": {
             "toxic": is_negative,
@@ -667,18 +681,20 @@ async def analyze_sentiment(text: str, db=None, company_id: str = "", **kwargs) 
     """
     source_text = (text or "").strip() or "[empty message]"
 
-    # Always run MiniLM first
     result = analyze_local_sentiment(source_text)
     result["scope"] = "message"
-
-    # Return immediately if confidence is adequate or text is short
-    word_count = len(source_text.split())
-    if result["confidence"] >= 0.35 or word_count <= 20:
-        result["source"] = result.get("source") or "local_minilm"
-        return result
+    result["source"] = result.get("source") or "local_minilm"
+    result["external_api_called"] = False
+    logger.info(
+        "sentiment_score score=%s path_taken=local_minilm escalation=false company_id=%s model=%s",
+        result.get("score"),
+        company_id or "",
+        result.get("model_name", ""),
+    )
+    return result
 
     # Low-confidence on a long complex message — attempt LLM upgrade
-    prompt = _message_prompt(source_text)
+    _unused_prompt = _message_prompt(source_text)
     try:
         raw, engine = await _call_sentiment_api(prompt, db=db, company_id=company_id)
         _log_sentiment_payload("raw", scope="message", source_text=source_text, payload=raw, engine=engine)

@@ -8,7 +8,9 @@ memory into a single interface. All memory operations go through this class.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from typing import Any
 
 from memory_engine.long_term import LongTermMemory
@@ -18,6 +20,16 @@ from memory_engine.short_term import ShortTermMemory
 from shared.metrics import increment_counter
 
 logger = logging.getLogger(__name__)
+
+
+def _estimate_memory_tokens(value: Any) -> int:
+    try:
+        text = json.dumps(value, ensure_ascii=True, default=str, separators=(",", ":"))
+    except Exception:
+        text = str(value or "")
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
 
 
 class MemoryManager:
@@ -70,6 +82,7 @@ class MemoryManager:
         Returns:
             MemoryContext containing short-term, long-term, and semantic context.
         """
+        started_at = time.monotonic()
         if not tenant_id or not user_id:
             logger.warning(
                 "memory_personalization_disabled reason=missing_scope tenant_id_present=%s user_id_present=%s conversation_id_present=%s",
@@ -140,13 +153,35 @@ class MemoryManager:
             ShortTermContext,
         )
 
+        short_context = short_term or ShortTermContext()
+        long_context = long_term or LongTermContext()
+        semantic_context = semantic or SemanticContext()
+        short_tokens = _estimate_memory_tokens(short_context.model_dump(mode="json"))
+        long_tokens = _estimate_memory_tokens(long_context.model_dump(mode="json"))
+        semantic_tokens = _estimate_memory_tokens(semantic_context.model_dump(mode="json"))
+        total_tokens = short_tokens + long_tokens + semantic_tokens
+        logger.info(
+            "memory_hydration load_time_ms=%s tenant_id=%s user_id=%s conversation_id=%s short_term_tokens=%s long_term_tokens=%s semantic_tokens=%s total_context_tokens=%s recent_messages=%s pending_intent=%s semantic_top_k=%s",
+            int((time.monotonic() - started_at) * 1000),
+            tenant_id,
+            user_id,
+            conversation_id,
+            short_tokens,
+            long_tokens,
+            semantic_tokens,
+            total_tokens,
+            len(short_context.recent_messages or []),
+            bool(short_context.pending_intent),
+            5 if include_semantic and current_query else 0,
+        )
+
         return MemoryContext(
             user_id=user_id,
             tenant_id=tenant_id,
             conversation_id=conversation_id,
-            short_term=short_term or ShortTermContext(),
-            long_term=long_term or LongTermContext(),
-            semantic=semantic or SemanticContext(),
+            short_term=short_context,
+            long_term=long_context,
+            semantic=semantic_context,
         )
 
     async def store_interaction(self, data: InteractionData) -> None:
@@ -256,12 +291,16 @@ class MemoryManager:
 
         Supported types:
             - conversation_state: Update conversation stage/intent
+            - pending_intent: Store the latest classified intent for the active turn
             - preference: Store a user preference
             - customer_summary: Update long-term summary
             - shown_products: Update shown product list
         """
         if memory_type == "conversation_state":
             await self.short_term.store_conversation_state(tenant_id, user_id, content, conversation_id=conversation_id)
+
+        elif memory_type == "pending_intent":
+            await self.short_term.store_intent(tenant_id, user_id, content, conversation_id=conversation_id)
 
         elif memory_type == "preference":
             for key, value in content.items():

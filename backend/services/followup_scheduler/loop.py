@@ -111,6 +111,26 @@ async def _log_automation(
         logger.debug("automation_log_insert_failed followup_id=%s error=%s", followup_id, exc)
 
 
+def _post_conversation_content_checks(*, answer: str, workflow_kind: str, result: Any) -> dict[str, bool]:
+    text = str(answer or "").strip().lower()
+    product_links = list(getattr(result, "product_links", []) or [])
+    product_names = [str(getattr(item, "name", "") or "").strip().lower() for item in product_links]
+    sources_used = {str(item or "") for item in (getattr(result, "sources_used", []) or [])}
+    asks_experience = any(term in text for term in ("experience", "arrived", "order", "delivery"))
+    asks_satisfaction = any(term in text for term in ("satisfied", "satisfaction", "happy", "product"))
+    suggests_related_product = any(name and name in text for name in product_names) or (
+        "product" in sources_used
+        and any(term in text for term in ("suggest", "recommend", "pair", "pairs", "complement", "related"))
+    )
+    if workflow_kind != "post_delivery_feedback":
+        suggests_related_product = True if workflow_kind != "upsell" else suggests_related_product
+    return {
+        "asks_experience": asks_experience,
+        "asks_satisfaction": asks_satisfaction,
+        "suggests_related_product": suggests_related_product,
+    }
+
+
 async def _emit_socket_message(conversation_id: str, message_id: str) -> None:
     """Best-effort socket broadcast — never raise (loop must keep running)."""
     try:
@@ -251,6 +271,21 @@ async def dispatch_one_followup(db, claimed: dict) -> dict[str, Any]:
             db, followup_id=followup_id, status="expired", outcome="empty_response",
         )
         return {"dispatched": False, "reason": "empty_response"}
+
+    content_checks = _post_conversation_content_checks(
+        answer=answer,
+        workflow_kind=workflow_kind,
+        result=result,
+    )
+    logger.info(
+        "post_conversation_message_content_check followup_id=%s workflow_kind=%s "
+        "experience_check=%s satisfaction_check=%s related_product_check=%s",
+        followup_id,
+        workflow_kind,
+        "pass" if content_checks["asks_experience"] else "fail",
+        "pass" if content_checks["asks_satisfaction"] else "fail",
+        "pass" if content_checks["suggests_related_product"] else "fail",
+    )
 
     convo_id = str(convo.get("id") or "")
     message_id = await _persist_outbound_ai_message(

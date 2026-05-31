@@ -5,6 +5,12 @@ from services.ai_service.facade import _safe_ai_reply_default
 from services.ai_service.routing_guards import is_low_value_message, lightweight_route_message, should_lightweight_bypass
 
 
+pytestmark = pytest.mark.skipif(
+    not hasattr(response_generator, "generate_ai_response"),
+    reason="legacy generate_ai_response was removed; current coverage lives in conversation-engine tests",
+)
+
+
 def _latest_from_prompt(prompt: str) -> str:
     if "Latest customer message:\n" not in prompt:
         return ""

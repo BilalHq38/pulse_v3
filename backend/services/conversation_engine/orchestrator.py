@@ -104,9 +104,12 @@ class Orchestrator:
         if workflow_kind == "post_delivery_feedback":
             directive = (
                 "Compose a brief, warm follow-up message asking the customer "
-                "whether their recent order arrived in good condition. Invite "
-                "them to reply if anything is wrong. One short paragraph; no "
-                "marketing copy."
+                "whether their recent order arrived in good condition, how "
+                "their overall experience was, and whether they are satisfied "
+                "with the product. If the retrieved product context includes a "
+                "related or complementary product from the customer's purchase "
+                "history, suggest exactly one of those products gently. Do not "
+                "pressure the customer. One short paragraph."
             )
         elif workflow_kind == "upsell":
             directive = (
@@ -139,6 +142,17 @@ class Orchestrator:
     async def run_turn(self, db, request: TurnRequest) -> TurnResult:
         started_at = time.monotonic()
         decision = context_router.score(request.user_message)
+        logger.info(
+            "guard_classification company_id=%s session_id=%s message_classified=%s path_selected=%s retrieval_triggered=%s sources=%s",
+            request.company_id,
+            request.session_id,
+            decision.direct_intent or ("full_pipeline" if not decision.low_value else "low_value"),
+            "direct_response" if decision.low_value else "full_pipeline",
+            str(not decision.low_value).lower(),
+            list(decision.sources or []),
+        )
+        if decision.low_value and decision.direct_response:
+            return await self._direct_low_value_turn(db, request, decision, started_at=started_at)
 
         retrieval_results = await self._retrieve(
             db,
@@ -216,11 +230,21 @@ class Orchestrator:
         answer = result.text.strip()
         product_links = _extract_product_links(answer, trimmed_chunks)
 
-        report = validator.validate(
+        safe_result = validator.safe_validate_response(
             answer=answer,
             product_links=product_links,
             chunks=trimmed_chunks,
             style_prompt=style_prompt,
+            user_message=request.user_message,
+        )
+        answer = safe_result.answer
+        product_links = safe_result.product_links
+        report = safe_result.report
+        logger.info(
+            "safe_validation checks_passed=%s stripped_content=%s offences=%s",
+            str(report.ok).lower(),
+            safe_result.stripped_content,
+            report.offences[:5],
         )
         if not report.ok:
             retry_prompt = prompt + _VALIDATION_RETRY_DIRECTIVE_TEMPLATE.format(
@@ -229,11 +253,21 @@ class Orchestrator:
             retry_result = await self._gateway.generate(retry_prompt)
             retry_answer = (retry_result.text or "").strip()
             retry_links = _extract_product_links(retry_answer, trimmed_chunks)
-            retry_report = validator.validate(
+            retry_safe_result = validator.safe_validate_response(
                 answer=retry_answer,
                 product_links=retry_links,
                 chunks=trimmed_chunks,
                 style_prompt=style_prompt,
+                user_message=request.user_message,
+            )
+            retry_answer = retry_safe_result.answer
+            retry_links = retry_safe_result.product_links
+            retry_report = retry_safe_result.report
+            logger.info(
+                "safe_validation checks_passed=%s stripped_content=%s offences=%s retry=true",
+                str(retry_report.ok).lower(),
+                retry_safe_result.stripped_content,
+                retry_report.offences[:5],
             )
             if retry_report.ok:
                 answer = retry_answer
@@ -317,6 +351,58 @@ class Orchestrator:
             confidence=confidence,
         )
 
+    async def _direct_low_value_turn(
+        self,
+        db,
+        request: TurnRequest,
+        decision: context_router.RoutingDecision,
+        *,
+        started_at: float,
+    ) -> TurnResult:
+        answer = decision.direct_response.strip()
+        confidence = 0.96
+        tokens = TokenUsage(
+            prompt=0,
+            completion=budget_module.count_tokens(answer),
+            total=budget_module.count_tokens(answer),
+        )
+        turn_index = await memory_module.next_turn_index(
+            db, company_id=request.company_id, session_id=request.session_id
+        )
+        turn_id = await memory_module.persist_turn(
+            db,
+            company_id=request.company_id,
+            session_id=request.session_id,
+            customer_id=request.customer_id,
+            turn_index=turn_index,
+            user_message=request.user_message,
+            ai_response=answer,
+            sources_used=[],
+            product_links=[],
+            confidence=confidence,
+            active_template="",
+            token_usage=tokens,
+            mode=request.mode,
+        )
+        logger.info(
+            "ai_turn_direct_response company_id=%s session_id=%s turn_id=%s intent=%s rag_called=false llm_called=false latency_ms=%d",
+            request.company_id,
+            request.session_id,
+            turn_id,
+            decision.direct_intent or "low_value",
+            int((time.monotonic() - started_at) * 1000),
+        )
+        return TurnResult(
+            answer=answer,
+            session_id=request.session_id,
+            turn_id=turn_id,
+            sources_used=[],
+            product_links=[],
+            tokens_used=tokens,
+            active_template="",
+            confidence=confidence,
+        )
+
     async def _fetch_shown_product_chunks(
         self,
         db,
@@ -394,7 +480,7 @@ class Orchestrator:
         if source == "product":
             if (
                 request.mode == "proactive"
-                and request.workflow_kind == "upsell"
+                and request.workflow_kind in {"post_delivery_feedback", "upsell", "order_confirmed"}
                 and request.order_id
             ):
                 return OrderRelatedProductRetriever(order_id=request.order_id)
@@ -440,11 +526,12 @@ class Orchestrator:
         # style_prompt makes it through even when faq scored below threshold.
         if not low_value and "faq" not in effective_sources:
             effective_sources.append("faq")
-        # Proactive upsell turns must consult the product source even if the
-        # directive's keywords didn't trip the rule scorer's product bucket.
+        # Proactive post-conversation turns must consult the product source even
+        # if the directive's keywords didn't trip the rule scorer's product bucket.
         if (
             request.mode == "proactive"
-            and request.workflow_kind == "upsell"
+            and request.workflow_kind in {"post_delivery_feedback", "upsell", "order_confirmed"}
+            and request.order_id
             and "product" not in effective_sources
         ):
             effective_sources.append("product")

@@ -33,6 +33,43 @@ _PRESENTATION: dict[SourceType, str] = {
     "faq": "FAQs",
     "knowledge_base": "Knowledge Base",
 }
+_FACT_SOURCE_TYPES: set[SourceType] = {"company_data", "product", "faq", "knowledge_base"}
+_PRODUCT_SCOPE_TERMS = {
+    "product",
+    "products",
+    "catalog",
+    "catalogue",
+    "item",
+    "items",
+    "price",
+    "cost",
+    "buy",
+    "order",
+    "purchase",
+    "checkout",
+    "stock",
+    "available",
+}
+_COMPANY_SCOPE_PHRASES = (
+    "who are you",
+    "about your company",
+    "your company",
+    "company do",
+    "company does",
+    "your business",
+    "your brand",
+)
+_FAQ_SCOPE_TERMS = {
+    "faq",
+    "policy",
+    "return",
+    "refund",
+    "exchange",
+    "warranty",
+    "guarantee",
+    "shipping",
+    "delivery",
+}
 
 # Patterns that look like injection attempts.
 # TWO SETS intentionally:
@@ -81,6 +118,9 @@ _CHUNK_INJECTION_PATTERNS = (
 )
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _USER_INPUT_MAX_CHARS = 4000
+_HISTORY_TURN_MAX_CHARS = 2000
+_HISTORY_TURN_RE = re.compile(r"^\s*(?P<role>User|Customer|Assistant|AI|Agent)\s*:\s*(?P<body>.*)\s*$", re.IGNORECASE | re.DOTALL)
+_ROLE_LABEL_RE = re.compile(r"(?i)\b(system|developer|assistant|user|human|tool|agent)\s*:")
 
 
 class InjectionDetected(ValueError):
@@ -107,6 +147,42 @@ def is_chunk_safe(chunk: ContextChunk) -> bool:
     legitimate product descriptions (e.g. 'acts as a moisturizer')."""
     text = chunk.content or ""
     return not any(pat.search(text) for pat in _CHUNK_INJECTION_PATTERNS)
+
+
+def sanitise_history_content(text: str) -> str:
+    """Sanitize stored conversation text before it enters prompt history."""
+    if text is None:
+        return ""
+    cleaned = _CONTROL_CHARS.sub("", str(text))
+    if any(pat.search(cleaned) for pat in _CHUNK_INJECTION_PATTERNS):
+        return ""
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _ROLE_LABEL_RE.sub(lambda match: f"{match.group(1)} -", cleaned)
+    if len(cleaned) > _HISTORY_TURN_MAX_CHARS:
+        cleaned = cleaned[:_HISTORY_TURN_MAX_CHARS].rstrip()
+    return cleaned
+
+
+def sanitise_history_turn(turn: str) -> str:
+    """Preserve the trusted outer role label while escaping role labels inside content."""
+    raw = str(turn or "").strip()
+    if not raw:
+        return ""
+    match = _HISTORY_TURN_RE.match(raw)
+    role = "Turn"
+    body = raw
+    if match:
+        role_key = match.group("role").strip().lower()
+        role = {
+            "customer": "User",
+            "user": "User",
+            "ai": "Assistant",
+            "assistant": "Assistant",
+            "agent": "Agent",
+        }.get(role_key, "Turn")
+        body = match.group("body")
+    cleaned = sanitise_history_content(body)
+    return f"{role}: {cleaned}" if cleaned else ""
 
 
 def _system_prompt(
@@ -156,7 +232,7 @@ def _system_prompt(
             "Product/service queries: answer only from <product_catalog>. Filter by category, budget, feature, use case, or stated preference. If matching products exist, present only matches.",
             "Product result format: one product per block, in this exact order: name, brief description, price, purchase link. Use the product's own Product page URL as the purchase link.",
             "Purchase intent: when the user wants to buy, order, get, place an order, asks how to buy, or confirms a product, include the product name, brief description, exact price, and Product page URL, then add a short instruction to click the link to complete the order.",
-            "Never ask the user for address, quantity, payment details, or checkout details; the product link handles purchasing.",
+            "Direct product-link checkout uses the product page URL, but an active order flow may collect quantity, delivery address, name, email, phone, and final confirmation. Never ask for payment details.",
             "Company questions: answer only from <company_info>. FAQs and policies: answer only from <faqs> or <knowledge_base> when relevant.",
             "You are a warm, knowledgeable sales assistant. Reply naturally and conversationally — like a helpful person, not a company brochure.",
             "Answer only from the retrieved context provided. If the answer is not in the context, say you don't have that information and offer to connect them with the team.",
@@ -223,8 +299,33 @@ def _context_block(chunks: list[ContextChunk]) -> str:
     return "\n\n".join(parts)
 
 
+def _scoped_chunks_for_user_message(user_message: str, chunks: list[ContextChunk]) -> list[ContextChunk]:
+    """Limit factual context to the source family relevant to the question.
+
+    Response templates are kept because they are tone/style only. Factual
+    chunks are narrowed so product questions cannot pull company/FAQ facts into
+    the prompt and company questions cannot accidentally inherit catalog data.
+    """
+    if not chunks:
+        return []
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(user_message or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    tokens = set(normalized.split())
+    allowed: set[SourceType] | None = None
+    if tokens & _FAQ_SCOPE_TERMS:
+        allowed = {"faq", "knowledge_base", "template"}
+    elif tokens & _PRODUCT_SCOPE_TERMS:
+        allowed = {"product", "template"}
+    elif any(phrase in normalized for phrase in _COMPANY_SCOPE_PHRASES):
+        allowed = {"company_data", "template"}
+    if allowed is None:
+        return chunks
+    return [chunk for chunk in chunks if chunk.source_type not in _FACT_SOURCE_TYPES or chunk.source_type in allowed]
+
+
 def _history_block(history_turns: Iterable[str]) -> str:
-    lines = [h.strip() for h in history_turns if h and h.strip()]
+    lines = [sanitise_history_turn(h) for h in history_turns if h and str(h).strip()]
+    lines = [line for line in lines if line]
     if not lines:
         return ""
     body = "\n".join(lines)
@@ -239,7 +340,8 @@ def build_prompt(
     style_prompt: str = "",
     confidence_bucket: str = "medium",
 ) -> str:
-    safe_chunks = [c for c in chunks if is_chunk_safe(c)]
+    scoped_chunks = _scoped_chunks_for_user_message(user_message, chunks)
+    safe_chunks = [c for c in scoped_chunks if is_chunk_safe(c)]
     available_sources = sorted(
         {c.source_type for c in safe_chunks},
         key=lambda s: _PRECEDENCE_ORDER.index(s) if s in _PRECEDENCE_ORDER else 99,

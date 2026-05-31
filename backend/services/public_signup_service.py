@@ -41,6 +41,7 @@ from shared.config import is_production
 logger = logging.getLogger(__name__)
 
 PENDING_SIGNUP_TTL_HOURS = max(1, int(os.environ.get("PENDING_SIGNUP_TTL_HOURS", "24") or 24))
+SIGNUP_SUPPORT_EMAIL = (os.environ.get("PUBLIC_SUPPORT_EMAIL", "") or "hello@pulseengine.io").strip()
 
 
 def _utc_now() -> datetime:
@@ -56,6 +57,80 @@ def _stripe_value(obj: Any, key: str, default: Any = "") -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _signup_setup_support_message(session_id: str = "") -> str:
+    suffix = f" and Stripe session {session_id}" if session_id else ""
+    return (
+        "Payment was confirmed, but workspace setup could not finish automatically. "
+        f"Contact support at {SIGNUP_SUPPORT_EMAIL} with your signup email{suffix}."
+    )
+
+
+async def _ensure_public_signup_workspace_records(
+    db,
+    company_id: str,
+    pending_signup: dict[str, Any] | None = None,
+) -> None:
+    company_id = (company_id or "").strip()
+    if not company_id:
+        return
+    pending_signup = pending_signup or {}
+    await set_company_context(db, company_id)
+    await db.execute(
+        "INSERT INTO companies(id,name,is_active,created_at,updated_at) "
+        "VALUES($1,$2,TRUE,NOW(),NOW()) "
+        "ON CONFLICT (id) DO UPDATE SET is_active=TRUE,updated_at=NOW()",
+        company_id,
+        (pending_signup.get("company_name") or "My Company").strip() or "My Company",
+    )
+    await ensure_company_reference_data(db, company_id)
+    await db.execute(
+        "INSERT INTO company_settings("
+        "id,company_id,industry,timezone,ai_enabled,ai_use_conversation_engine,"
+        "ai_confidence_threshold,auto_assign,created_at,updated_at"
+        ") VALUES($1,$2,$3,$4,TRUE,TRUE,0.70,TRUE,NOW(),NOW()) "
+        "ON CONFLICT (company_id) DO UPDATE SET updated_at=NOW()",
+        make_id(),
+        company_id,
+        (pending_signup.get("company_industry") or "").strip(),
+        (pending_signup.get("timezone") or "UTC").strip() or "UTC",
+    )
+
+
+async def _public_signup_workspace_ready(db, user: dict[str, Any]) -> bool:
+    if not user:
+        return False
+    company_id = str(user.get("company_id") or "").strip()
+    if not company_id:
+        return False
+    if str(user.get("status") or "").strip().lower() != "active":
+        return False
+    row = r(
+        await db.fetchrow(
+            """
+            SELECT
+              EXISTS(SELECT 1 FROM companies WHERE id=$1 AND COALESCE(is_active, TRUE)=TRUE) AS company_exists,
+              EXISTS(SELECT 1 FROM company_settings WHERE company_id=$1) AS company_settings_exists,
+              EXISTS(SELECT 1 FROM lead_statuses WHERE company_id=$1) AS lead_statuses_exist,
+              EXISTS(SELECT 1 FROM sources WHERE company_id=$1) AS sources_exist,
+              EXISTS(SELECT 1 FROM channels WHERE company_id=$1) AS channels_exist,
+              EXISTS(SELECT 1 FROM ticket_statuses WHERE company_id=$1) AS ticket_statuses_exist
+            """,
+            company_id,
+        )
+    )
+    return all(
+        bool(row.get(key))
+        for key in (
+            "company_exists",
+            "company_settings_exists",
+            "lead_statuses_exist",
+            "sources_exist",
+            "channels_exist",
+            "ticket_statuses_exist",
+        )
+    )
 
 
 async def _migrate_pending_signup_stripe_columns(db) -> None:
@@ -219,7 +294,7 @@ async def _email_verification_status_for_user(db, user: dict) -> dict[str, Any]:
 
 async def _try_finalize_paid_signup_from_stripe(
     db,
-    request: Request,
+    request: Request | None,
     pending_signup: dict[str, Any],
     session_id: str,
 ) -> None:
@@ -254,6 +329,16 @@ async def _try_finalize_paid_signup_from_stripe(
             session_id,
             _stringify_error(exc),
         )
+        try:
+            await db.execute(
+                "UPDATE public.pending_signups "
+                "SET status='finalization_failed',payment_status='paid',verification_error=$1,updated_at=NOW() "
+                "WHERE id=$2 AND COALESCE(user_id, '')=''",
+                _signup_setup_support_message(session_id),
+                pending_signup.get("id", ""),
+            )
+        except Exception:
+            logger.debug("signup status fallback failure marker skipped", exc_info=True)
 
 
 async def prepare_public_registration(
@@ -449,7 +534,7 @@ async def prepare_public_registration(
     }
 
 
-async def get_public_registration_status(db, session_id: str) -> dict[str, Any]:
+async def get_public_registration_status(db, session_id: str, request: Request | None = None) -> dict[str, Any]:
     await ensure_pending_signup_primitives(db)
     await _expire_stale_pending_signups(db)
 
@@ -461,6 +546,7 @@ async def get_public_registration_status(db, session_id: str) -> dict[str, Any]:
         await _try_finalize_paid_signup_from_stripe(db, request, pending_signup, session_id)
         pending_signup = await _pending_signup_by_session(db, session_id) or pending_signup
 
+    setup_failed = str(pending_signup.get("status") or "").strip().lower() == "finalization_failed"
     response = {
         "status": pending_signup.get("status") or "pending_payment",
         "payment_status": pending_signup.get("payment_status") or "pending",
@@ -468,13 +554,32 @@ async def get_public_registration_status(db, session_id: str) -> dict[str, Any]:
         "plan_code": pending_signup.get("plan_code", ""),
         "account_created": bool(pending_signup.get("user_id")),
         "verification_error": pending_signup.get("verification_error", ""),
+        "setup_failed": setup_failed,
+        "support_email": SIGNUP_SUPPORT_EMAIL,
     }
+    if setup_failed:
+        response["support_message"] = pending_signup.get("verification_error") or _signup_setup_support_message(session_id)
     user_id = str(pending_signup.get("user_id") or "").strip()
     if not user_id:
         return response
 
     user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", user_id))
     if not user:
+        response["account_created"] = False
+        response["setup_failed"] = True
+        response["support_message"] = _signup_setup_support_message(session_id)
+        return response
+    try:
+        await _ensure_public_signup_workspace_records(db, str(user.get("company_id") or ""), pending_signup)
+    except Exception:
+        logger.exception("signup status workspace readiness repair failed user_id=%s", user_id)
+    workspace_ready = await _public_signup_workspace_ready(db, user)
+    response["workspace_ready"] = workspace_ready
+    response["user_status"] = str(user.get("status") or "").strip().lower()
+    if not workspace_ready:
+        response["account_created"] = False
+        response["setup_failed"] = True
+        response["support_message"] = _signup_setup_support_message(session_id)
         return response
     response["account_created"] = True
     response["company_id"] = user.get("company_id", "")
@@ -486,7 +591,7 @@ async def get_public_registration_status(db, session_id: str) -> dict[str, Any]:
 
 async def _complete_pending_signup_workspace(
     db,
-    request: Request,
+    request: Request | None,
     pending_signup: dict[str, Any],
     *,
     stripe_customer_id: str,
@@ -511,9 +616,19 @@ async def _complete_pending_signup_workspace(
         )
     )
     if existing_user:
+        existing_company_id = str(existing_user.get("company_id") or "").strip()
+        if not existing_company_id:
+            existing_company_id = make_id()
+            await db.execute(
+                "UPDATE users SET company_id=$1,updated_at=NOW() WHERE id=$2",
+                existing_company_id,
+                existing_user["id"],
+            )
+            existing_user["company_id"] = existing_company_id
+        await _ensure_public_signup_workspace_records(db, existing_company_id, pending_signup)
         billing_customer = await update_billing_customer_status(
             db,
-            company_id=existing_user.get("company_id", ""),
+            company_id=existing_company_id,
             stripe_customer_id=stripe_customer_id,
             payment_status=billing_payment_status,
             billing_email=pending_signup["email"],
@@ -521,7 +636,7 @@ async def _complete_pending_signup_workspace(
         )
         await upsert_subscription(
             db,
-            existing_user.get("company_id", ""),
+            existing_company_id,
             billing_customer_id=billing_customer["id"],
             plan_code=pending_signup.get("plan_code") or "pro",
             status=subscription_status,
@@ -535,7 +650,7 @@ async def _complete_pending_signup_workspace(
             existing_user["id"],
         )
         existing_user = r(await db.fetchrow("SELECT * FROM users WHERE id=$1 LIMIT 1", existing_user["id"])) or existing_user
-        await invalidate_billing_cache(str(existing_user.get("company_id", "")).strip())
+        await invalidate_billing_cache(str(existing_user.get("company_id") or existing_company_id).strip())
         if not existing_user.get("email_verified"):
             verification_error = ""
             verification_meta: dict[str, Any] = {}
@@ -587,20 +702,7 @@ async def _complete_pending_signup_workspace(
         }
 
     company_id = make_id()
-    await set_company_context(db, company_id)
-    await db.execute(
-        "INSERT INTO companies(id,name,is_active,created_at,updated_at) VALUES($1,$2,TRUE,NOW(),NOW()) ON CONFLICT DO NOTHING",  # noqa: E501
-        company_id,
-        (pending_signup.get("company_name") or "My Company").strip() or "My Company",
-    )
-    await ensure_company_reference_data(db, company_id)
-    await db.execute(
-        "INSERT INTO company_settings(id,company_id,industry,timezone,ai_enabled,ai_confidence_threshold,auto_assign,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$1,$2,$3,TRUE,0.70,TRUE,NOW(),NOW()) ON CONFLICT DO NOTHING",
-        company_id,
-        (pending_signup.get("company_industry") or "").strip(),
-        (pending_signup.get("timezone") or "UTC").strip() or "UTC",
-    )
+    await _ensure_public_signup_workspace_records(db, company_id, pending_signup)
 
     admin_role_id = await resolve_role_id(db, "admin")
     user_id = make_id()
@@ -830,7 +932,7 @@ async def finalize_public_registration_free_plan(
 
 async def finalize_public_registration_from_checkout(
     db,
-    request: Request,
+    request: Request | None,
     checkout_session: Any,
     *,
     stripe_event_id: str = "",

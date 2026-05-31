@@ -156,8 +156,7 @@ export default function CampaignsPage() {
       const res = await api.get('/campaigns');
       setCampaigns(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setLoadError(detail || 'Failed to load campaigns');
+      setLoadError(getErrorMessage(err, 'Failed to load campaigns'));
     } finally {
       setLoading(false);
     }

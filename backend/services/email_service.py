@@ -348,16 +348,23 @@ async def _send_brevo_async(
     logger.info("%s email sent to %s", label, to_email)
 
 
-async def _run_email_with_retries(operation, *, label: str, raise_on_failure: bool = False) -> bool:
+async def _run_email_with_retries(
+    operation,
+    *,
+    label: str,
+    raise_on_failure: bool = False,
+    attempts: int = 3,
+) -> bool:
     last_exc: Exception | None = None
-    for attempt in range(3):
+    max_attempts = max(1, int(attempts or 1))
+    for attempt in range(max_attempts):
         try:
             await operation()
             return True
         except Exception as exc:
             last_exc = exc
-            if attempt == 2:
-                logger.error("Email failed after 3 attempts label=%s error=%s", label, exc)
+            if attempt == max_attempts - 1:
+                logger.error("Email failed after %s attempts label=%s error=%s", max_attempts, label, exc)
                 break
             await asyncio.sleep(2**attempt)
     if raise_on_failure and last_exc:
@@ -372,6 +379,7 @@ async def send_email_async(
     html_body: str = "",
     *,
     raise_on_failure: bool = False,
+    retry_attempts: int = 3,
 ) -> bool:
     async def _send() -> None:
         brevo_key = os.environ.get("BREVO_API_KEY", "").strip()
@@ -392,7 +400,12 @@ async def send_email_async(
             return
         await asyncio.to_thread(send_email, to_email, subject, body, html_body)
 
-    return await _run_email_with_retries(_send, label="platform", raise_on_failure=raise_on_failure)
+    return await _run_email_with_retries(
+        _send,
+        label="platform",
+        raise_on_failure=raise_on_failure,
+        attempts=retry_attempts,
+    )
 
 
 def _send_brevo_tenant(

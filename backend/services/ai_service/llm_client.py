@@ -153,7 +153,7 @@ def _gemini_json_timeout_seconds() -> float:
 
 
 def _gemini_text_timeout_seconds() -> float:
-    return _env_timeout_seconds("GEMINI_TEXT_TIMEOUT_SECONDS", 8.0)
+    return _env_timeout_seconds("GEMINI_TEXT_TIMEOUT_SECONDS", ai_api_call_timeout_seconds(), maximum=25.0)
 
 
 def _gemini_stream_timeout_seconds() -> float:

@@ -31,6 +31,27 @@ async def company_uses_conversation_engine(db, company_id: str) -> bool:
     return bool(row and row.get("v"))
 
 
+def _is_active_order_flow_plan(support_plan: dict) -> bool:
+    plan = dict(support_plan or {})
+    if not str(plan.get("response") or "").strip():
+        return False
+    if not plan.get("deliver_response", False):
+        return False
+    if str(plan.get("conversation_stage") or "").strip().lower() == "order_flow":
+        return True
+    if str(plan.get("model_name") or "").strip().lower() == "deterministic-order-flow":
+        return True
+    return str(plan.get("next_action") or "").strip().lower() in {
+        "awaiting_product_selection",
+        "clarify_selected_product",
+        "collect_order_details",
+        "request_order_confirmation",
+        "order_placed",
+        "order_cancelled",
+        "order_already_placed",
+    }
+
+
 def apply_engine_response_to_support_plan(
     *,
     support_plan: dict,
@@ -53,6 +74,11 @@ def apply_engine_response_to_support_plan(
     # Only escalate on an explicit False — None means "no opinion".
     should_escalate = ai_response_allowed is False
     merged = dict(support_plan or {})
+    if _is_active_order_flow_plan(merged):
+        merged["engine_override_skipped_reason"] = "active_order_flow"
+        if engine_turn_id:
+            merged["engine_turn_id"] = engine_turn_id
+        return merged
     merged.update(
         {
             "response": engine_answer,

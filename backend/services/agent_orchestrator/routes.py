@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 logger = logging.getLogger(__name__)
 
-from agent_orchestrator.bootstrap import bootstrap_agent_orchestrator
 from agent_orchestrator.engine import build_orchestrator_engine
 from agent_orchestrator.schemas import LeadWorkflowRequest, MessageWorkflowRequest
 from shared.auth.dependencies import get_current_user
@@ -39,11 +38,6 @@ async def list_workflow_executions(
 ):
     """Recent rule-based agent steps for the tenant (workflow_executions)."""
     db = request.app.state.db
-    try:
-        await bootstrap_agent_orchestrator(db)
-    except RuntimeError as exc:
-        logger.error("orchestrator_schema_not_ready: %s", exc)
-        return {"executions": [], "warning": str(exc)}
     cid = str(current_user.get("company_id") or "").strip()
     role = str(current_user.get("role") or "").strip().lower()
     if role != "super_admin" and not cid:
@@ -101,7 +95,6 @@ async def run_message_workflow(
     current_user: dict = Depends(get_current_user),
 ):
     db = request.app.state.db
-    await bootstrap_agent_orchestrator(db)
     engine = build_orchestrator_engine(db)
     effective_payload = payload.model_copy(
         update={
@@ -121,7 +114,6 @@ async def run_lead_workflow(
     current_user: dict = Depends(get_current_user),
 ):
     db = request.app.state.db
-    await bootstrap_agent_orchestrator(db)
     engine = build_orchestrator_engine(db)
     effective_payload = payload.model_copy(
         update={
@@ -141,7 +133,6 @@ async def get_workflow(
     current_user: dict = Depends(get_current_user),
 ):
     db = request.app.state.db
-    await bootstrap_agent_orchestrator(db)
     engine = build_orchestrator_engine(db)
     response = await engine.get_workflow(workflow_id)
     company_id = current_user.get("company_id", "")

@@ -42,13 +42,34 @@ _PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_CONTEXT_TAG_RE = re.compile(
+    r"</?(?:retrieved_context|company_info|product_catalog|knowledge_base|faqs|response_style|user_input|conversation_history)\b[^>]*>",
+    re.IGNORECASE,
+)
+_SOURCE_LABEL_RE = re.compile(r"\(?Source:\s*(?:Company Data|Product Database|Knowledge Base|FAQs?|Response Style)[^) \n]*\)?", re.IGNORECASE)
 _CAP_PHRASE_RE = re.compile(r"\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+){0,3})\b")
 _SHOUTING_RE = re.compile(r"(?:\b[A-Z]{4,}\b\s+){6,}")
+_PURCHASE_TERMS = {
+    "buy",
+    "order",
+    "purchase",
+    "checkout",
+    "cart",
+    "place",
+}
 
 
 @dataclass
 class GroundingContext:
     chunks: list[ContextChunk]
+
+
+@dataclass
+class SafeValidationResult:
+    answer: str
+    product_links: list[ProductLink]
+    report: ValidationReport
+    stripped_content: list[str]
 
 
 def _grounded_product_names(chunks: Iterable[ContextChunk]) -> set[str]:
@@ -101,6 +122,19 @@ def _grounded_product_ids(chunks: Iterable[ContextChunk]) -> set[str]:
     return {chunk.source_id for chunk in chunks if chunk.source_type == "product" and chunk.source_id}
 
 
+def _grounded_urls(chunks: Iterable[ContextChunk]) -> set[str]:
+    urls: set[str] = set()
+    for chunk in chunks:
+        meta = chunk.metadata or {}
+        for key in ("public_url", "links", "url"):
+            value = str(meta.get(key) or "").strip()
+            if value:
+                urls.add(value.rstrip(".,);:!?\"'"))
+        for match in _URL_RE.finditer(chunk.content or ""):
+            urls.add(match.group(0).rstrip(".,);:!?\"'"))
+    return urls
+
+
 def _check_schema(answer: str) -> list[str]:
     if not answer or not answer.strip():
         return ["empty_answer"]
@@ -136,6 +170,60 @@ def _check_links(product_links: list[ProductLink], grounded_ids: set[str]) -> li
         if not _is_acceptable_product_link(link.url):
             offences.append(f"link_malformed:{link.url[:32]}")
     return offences
+
+
+def _check_answer_urls(answer: str, chunks: list[ContextChunk]) -> list[str]:
+    allowed_urls = _grounded_urls(chunks)
+    offences: list[str] = []
+    for match in _URL_RE.finditer(answer or ""):
+        url = match.group(0).rstrip(".,);:!?\"'")
+        if allowed_urls and url not in allowed_urls:
+            offences.append(f"ungrounded_url:{url[:48]}")
+        if not allowed_urls:
+            offences.append(f"ungrounded_url:{url[:48]}")
+    return offences
+
+
+def _check_context_leak(answer: str) -> list[str]:
+    offences: list[str] = []
+    if _CONTEXT_TAG_RE.search(answer or ""):
+        offences.append("context_tag_leak")
+    if _SOURCE_LABEL_RE.search(answer or ""):
+        offences.append("source_label_leak")
+    return offences
+
+
+def _requires_purchase_link(user_message: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(user_message or "").lower())
+    tokens = set(normalized.split())
+    if not tokens & _PURCHASE_TERMS:
+        return False
+    return any(phrase in normalized for phrase in ("buy", "order", "purchase", "checkout", "place order", "add to cart"))
+
+
+def _check_required_purchase_link(
+    *,
+    user_message: str,
+    product_links: list[ProductLink],
+    chunks: list[ContextChunk],
+) -> list[str]:
+    if not _requires_purchase_link(user_message):
+        return []
+    if not any(chunk.source_type == "product" for chunk in chunks):
+        return []
+    return [] if product_links else ["missing_purchase_link"]
+
+
+def _check_duplicate_response(answer: str) -> list[str]:
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", answer or "") if part.strip()]
+    if len(paragraphs) >= 2 and paragraphs[-1].lower() in {part.lower() for part in paragraphs[:-1]}:
+        return ["duplicate_response"]
+    compact = re.sub(r"\s+", " ", answer or "").strip()
+    if len(compact) >= 80 and len(compact) % 2 == 0:
+        midpoint = len(compact) // 2
+        if compact[:midpoint].strip().lower() == compact[midpoint:].strip().lower():
+            return ["duplicate_response"]
+    return []
 
 
 _GROUNDING_STOPWORDS = {
@@ -228,7 +316,7 @@ def _check_grounding(answer: str, chunks: list[ContextChunk]) -> list[str]:
         token = _normalise_price(match.group(0))
         if not token or not any(ch.isdigit() for ch in token):
             continue
-        if grounded_prices and token not in grounded_prices:
+        if (grounded_prices and token not in grounded_prices) or (not grounded_prices and any(c.source_type == "product" for c in chunks)):
             offences.append(f"ungrounded_price:{token[:24]}")
     return offences
 
@@ -250,15 +338,152 @@ def validate(
     product_links: list[ProductLink],
     chunks: list[ContextChunk],
     style_prompt: str = "",
+    user_message: str = "",
 ) -> ValidationReport:
     offences: list[str] = []
     offences.extend(_check_schema(answer))
     if not offences:
         offences.extend(_check_secrets(answer))
+        offences.extend(_check_context_leak(answer))
         offences.extend(_check_links(product_links, _grounded_product_ids(chunks)))
+        offences.extend(_check_answer_urls(answer, chunks))
         offences.extend(_check_grounding(answer, chunks))
+        offences.extend(_check_required_purchase_link(user_message=user_message, product_links=product_links, chunks=chunks))
+        offences.extend(_check_duplicate_response(answer))
         offences.extend(_check_tone(answer, style_prompt))
     return ValidationReport(ok=not offences, offences=offences)
+
+
+def _strip_offending_prices(answer: str, chunks: list[ContextChunk], stripped: list[str]) -> str:
+    grounded_prices = _grounded_prices(chunks)
+    has_product_context = any(chunk.source_type == "product" for chunk in chunks)
+    if not has_product_context:
+        return answer
+
+    def repl(match: re.Match) -> str:
+        token = _normalise_price(match.group(0))
+        if token and ((grounded_prices and token not in grounded_prices) or not grounded_prices):
+            stripped.append(f"price:{match.group(0).strip()[:40]}")
+            return ""
+        return match.group(0)
+
+    return _PRICE_RE.sub(repl, answer)
+
+
+def _strip_offending_urls(answer: str, chunks: list[ContextChunk], stripped: list[str]) -> str:
+    allowed_urls = _grounded_urls(chunks)
+
+    def repl(match: re.Match) -> str:
+        url = match.group(0).rstrip(".,);:!?\"'")
+        if (allowed_urls and url not in allowed_urls) or not allowed_urls:
+            stripped.append(f"url:{url[:80]}")
+            return ""
+        return match.group(0)
+
+    return _URL_RE.sub(repl, answer)
+
+
+def _strip_context_leaks(answer: str, stripped: list[str]) -> str:
+    cleaned = _CONTEXT_TAG_RE.sub(lambda match: stripped.append(f"context_tag:{match.group(0)[:40]}") or "", answer)
+    cleaned = _SOURCE_LABEL_RE.sub(lambda match: stripped.append(f"source_label:{match.group(0)[:40]}") or "", cleaned)
+    return cleaned
+
+
+def _strip_offending_product_names(answer: str, offences: list[str], stripped: list[str]) -> str:
+    cleaned = answer
+    for offence in offences:
+        if not offence.startswith("ungrounded_product_name:"):
+            continue
+        name = offence.split(":", 1)[1].strip()
+        if not name:
+            continue
+        pattern = re.compile(re.escape(name), re.IGNORECASE)
+        if pattern.search(cleaned):
+            stripped.append(f"product_name:{name[:80]}")
+            cleaned = pattern.sub("the available product", cleaned)
+    return cleaned
+
+
+def _dedupe_answer(answer: str, stripped: list[str]) -> str:
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", answer or "") if part.strip()]
+    if len(paragraphs) >= 2:
+        kept: list[str] = []
+        seen: set[str] = set()
+        for paragraph in paragraphs:
+            key = paragraph.lower()
+            if key in seen:
+                stripped.append("duplicate_paragraph")
+                continue
+            seen.add(key)
+            kept.append(paragraph)
+        return "\n\n".join(kept)
+    return answer
+
+
+def _answer_contains_grounded_price(answer: str, chunks: list[ContextChunk]) -> bool:
+    grounded_prices = {price for price in _grounded_prices(chunks) if price}
+    if not grounded_prices:
+        return False
+    answer_prices = {_normalise_price(match.group(0)) for match in _PRICE_RE.finditer(answer or "")}
+    return bool(grounded_prices & answer_prices)
+
+
+def _answer_contains_grounded_product_name(answer: str, chunks: list[ContextChunk]) -> bool:
+    grounded_names = _grounded_product_names(chunks)
+    lowered = (answer or "").lower()
+    return any(name and name in lowered for name in grounded_names)
+
+
+def safe_validate_response(
+    *,
+    answer: str,
+    product_links: list[ProductLink],
+    chunks: list[ContextChunk],
+    style_prompt: str = "",
+    user_message: str = "",
+) -> SafeValidationResult:
+    stripped: list[str] = []
+    grounded_ids = _grounded_product_ids(chunks)
+    filtered_links = [
+        link
+        for link in product_links
+        if (not link.product_id or link.product_id in grounded_ids) and _is_acceptable_product_link(link.url)
+    ]
+    if len(filtered_links) != len(product_links):
+        stripped.append("invalid_product_link")
+
+    cleaned = _strip_context_leaks(answer or "", stripped)
+    cleaned = _strip_offending_urls(cleaned, chunks, stripped)
+    cleaned = _strip_offending_prices(cleaned, chunks, stripped)
+    initial_report = validate(
+        answer=cleaned,
+        product_links=filtered_links,
+        chunks=chunks,
+        style_prompt=style_prompt,
+        user_message=user_message,
+    )
+    cleaned = _strip_offending_product_names(cleaned, initial_report.offences, stripped)
+    cleaned = _dedupe_answer(cleaned, stripped)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    final_report = validate(
+        answer=cleaned,
+        product_links=filtered_links,
+        chunks=chunks,
+        style_prompt=style_prompt,
+        user_message=user_message,
+    )
+    if any(item.startswith("price:") for item in stripped) and not _answer_contains_grounded_price(cleaned, chunks):
+        final_report.ok = False
+        final_report.offences.append("stripped_required_price")
+    if any(item.startswith("product_name:") for item in stripped) and not _answer_contains_grounded_product_name(cleaned, chunks):
+        final_report.ok = False
+        final_report.offences.append("stripped_required_product_name")
+    return SafeValidationResult(
+        answer=cleaned,
+        product_links=filtered_links,
+        report=final_report,
+        stripped_content=stripped,
+    )
 
 
 def compute_confidence(chunks: list[ContextChunk]) -> float:

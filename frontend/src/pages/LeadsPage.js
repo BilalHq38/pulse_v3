@@ -192,12 +192,11 @@ export default function LeadsPage() {
       setLeads(res.data);
     } catch (err) {
       console.error(err);
-      const detail = err?.response?.data?.detail;
       const status = err?.response?.status;
       if (status === 401 || status === 403) {
         setLoadError('Session expired. Please refresh the page.');
       } else {
-        setLoadError(detail || 'Failed to load leads. Please try again.');
+        setLoadError(getErrorMessage(err, 'Failed to load leads. Please try again.'));
       }
     } finally {
       setLoading(false);

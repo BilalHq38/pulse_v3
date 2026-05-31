@@ -371,6 +371,19 @@ class EmailAdapter(BaseChannelAdapter):
                 channel_type=ChannelType.EMAIL,
             )
 
+        provider = str(message.metadata.get("email_provider") or "").strip().lower()
+        if not provider:
+            try:
+                row = await db.fetchrow(
+                    "SELECT email_provider FROM channel_settings "
+                    "WHERE company_id=$1 AND channel='email' AND enabled=TRUE LIMIT 1",
+                    tenant_id,
+                )
+                provider = str((dict(row) if row else {}).get("email_provider") or "").strip().lower()
+            except Exception:
+                provider = ""
+        delivery_provider = "brevo" if provider == "brevo" else "smtp"
+
         if message.attachments:
             logger.warning(
                 "email_adapter_attachments_not_sent count=%d to=%s tenant=%s attachment_urls=%s",
@@ -391,6 +404,7 @@ class EmailAdapter(BaseChannelAdapter):
             return SendResult(
                 success=True,
                 channel_type=ChannelType.EMAIL,
+                metadata={"delivery_provider": delivery_provider},
             )
         except Exception as exc:
             logger.error("Email send failed to %s: %s", to_email, exc)
@@ -398,6 +412,7 @@ class EmailAdapter(BaseChannelAdapter):
                 success=False,
                 error=str(exc),
                 channel_type=ChannelType.EMAIL,
+                metadata={"delivery_provider": delivery_provider},
             )
 
     async def validate_webhook(

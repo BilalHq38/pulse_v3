@@ -8,6 +8,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { useSocket } from '@/lib/useSocket';
 import { useAuth } from '@/contexts/AuthContext';
 import PageSkeleton from '@/components/ui/PageSkeleton';
+import { runAfterDelay } from '@/lib/retry';
 import {
   Send,
   Bot,
@@ -554,23 +555,22 @@ export default function InboxPage() {
   const [videoPreview, setVideoPreview] = useState(null);
   const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
   const [convoLoading, setConvoLoading] = useState(true);
-  const firstConvoLoadRef = useRef(true);
   const messagesEndRef = useRef(null);
   const composerFileRef = useRef(null);
   const customerSidebarRef = useRef(null);
   const selectedConvoIdRef = useRef('');
   const loadConversationsRef = useRef(null);
   const skipNextDraftSaveRef = useRef('');
+  const aiQueueTimerRef = useRef(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const inboxFilter = normalizeInboxFilter(searchParams.get('inbox_filter') || searchParams.get('filter'));
 
-  const loadConversations = useCallback(async ({ selectConversationId = '', filterOverride, _isRetry = false } = {}) => {
+  const loadConversations = useCallback(async ({ selectConversationId = '', filterOverride } = {}) => {
     try {
       const effectiveFilter = filterOverride === undefined ? inboxFilter : normalizeInboxFilter(filterOverride);
       const params = effectiveFilter ? { inbox_filter: effectiveFilter } : undefined;
       const res = await api.get('/conversations', params ? { params } : undefined);
       const items = Array.isArray(res.data) ? res.data : [];
-      firstConvoLoadRef.current = false;
       setConversations(items);
       setSelectedConvo(prev => {
         const targetId = selectConversationId || prev?.id || '';
@@ -580,14 +580,6 @@ export default function InboxPage() {
       });
     } catch (err) {
       console.error(err);
-      // On the very first load, suppress the error toast and retry once after 1s
-      if (firstConvoLoadRef.current && !_isRetry) {
-        firstConvoLoadRef.current = false;
-        setTimeout(() => {
-          loadConversationsRef.current?.({ selectConversationId, filterOverride, _isRetry: true });
-        }, 1000);
-        return;
-      }
       showToast({
         type: 'error',
         title: 'Inbox Unavailable',
@@ -895,6 +887,13 @@ export default function InboxPage() {
     const closeMenu = () => setMenuConvoId(null);
     window.addEventListener('click', closeMenu);
     return () => window.removeEventListener('click', closeMenu);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      tooltipTimerRef.current?.();
+      aiQueueTimerRef.current?.();
+    };
   }, []);
 
   const openOutboundComposer = (channelKey) => {
@@ -1227,10 +1226,12 @@ export default function InboxPage() {
           title: 'AI Reply Queued',
           message: `AI is preparing a reply for ${selectedConvo.customer_name || 'this conversation'}.`,
         });
-        setTimeout(() => {
+        aiQueueTimerRef.current?.();
+        aiQueueTimerRef.current = runAfterDelay(() => {
           if (selectedConvoIdRef.current === queuedConvoId) {
             setAiLoading(false);
           }
+          aiQueueTimerRef.current = null;
         }, 45000);
         return;
       }
@@ -1742,12 +1743,16 @@ export default function InboxPage() {
                         <button
                           onClick={(e) => { e.stopPropagation(); openOutboundComposer(ch.key); }}
                           onMouseEnter={() => {
-                            clearTimeout(tooltipTimerRef.current);
+                            tooltipTimerRef.current?.();
                             setTooltipChannel(ch.key);
-                            tooltipTimerRef.current = setTimeout(() => setTooltipChannel(null), 2000);
+                            tooltipTimerRef.current = runAfterDelay(() => {
+                              setTooltipChannel(null);
+                              tooltipTimerRef.current = null;
+                            }, 2000);
                           }}
                           onMouseLeave={() => {
-                            clearTimeout(tooltipTimerRef.current);
+                            tooltipTimerRef.current?.();
+                            tooltipTimerRef.current = null;
                             setTooltipChannel(null);
                           }}
                           className="w-6 h-6 rounded-md border border-blue-300 bg-blue-50 text-blue-500 inline-flex items-center justify-center transition-all duration-200 hover:scale-110 hover:bg-blue-500 hover:text-white hover:border-blue-500 hover:shadow-md hover:shadow-blue-200"

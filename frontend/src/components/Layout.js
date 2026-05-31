@@ -78,6 +78,50 @@ const superAdminNavItems = [
   { path: '/super-admin', label: 'Platform User Management', icon: Users },
 ];
 
+const ROUTE_PREFETCH_COOLDOWN_MS = 30000;
+const prefetchedRouteAt = new Map();
+
+const routeChunkPrefetchers = {
+  '/dashboard': () => import('@/pages/DashboardPage'),
+  '/inbox': () => import('@/pages/InboxPage'),
+  '/leads': () => import('@/pages/LeadsPage'),
+  '/settings': () => import('@/pages/SettingsPage'),
+  '/customers': () => import('@/pages/CustomersPage'),
+};
+
+function prefetchRouteTarget(target) {
+  if (typeof window === 'undefined') return;
+  let url;
+  try {
+    url = new URL(String(target || ''), window.location.origin);
+  } catch {
+    return;
+  }
+  const path = url.pathname;
+  const key = `${path}${url.search}`;
+  const lastPrefetchedAt = prefetchedRouteAt.get(key) || 0;
+  if (Date.now() - lastPrefetchedAt < ROUTE_PREFETCH_COOLDOWN_MS) return;
+  prefetchedRouteAt.set(key, Date.now());
+
+  routeChunkPrefetchers[path]?.();
+
+  if (path === '/dashboard') {
+    api.get('/dashboard/live-summary').catch(() => {});
+  } else if (path === '/inbox') {
+    api.get('/conversations').catch(() => {});
+    api.get('/notification-settings').catch(() => {});
+  } else if (path === '/leads') {
+    api.get('/leads').catch(() => {});
+    api.get('/reference-data').catch(() => {});
+  } else if (path === '/settings') {
+    api.get('/settings/company').catch(() => {});
+    api.get('/settings/personal').catch(() => {});
+    if ((url.searchParams.get('tab') || '') === 'channels') {
+      api.get('/settings/channels').catch(() => {});
+    }
+  }
+}
+
 export default function Layout({ children }) {
   const { user, logout } = useAuth();
   const location = useLocation();
@@ -322,7 +366,12 @@ export default function Layout({ children }) {
             const active = location.pathname.startsWith(path);
             if (!subItems) {
               return (
-                <Link key={path} to={path} data-testid={`nav-${label.toLowerCase().replace(/\s+/g, '-')}`}
+                <Link
+                  key={path}
+                  to={path}
+                  data-testid={`nav-${label.toLowerCase().replace(/\s+/g, '-')}`}
+                  onMouseEnter={() => prefetchRouteTarget(path)}
+                  onFocus={() => prefetchRouteTarget(path)}
                   className={`group flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-200 hover:translate-x-1 ${
                     active ? 'bg-blue-50 text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-900 hover:bg-slate-50 hover:shadow-sm'
                   }`}>
@@ -338,7 +387,12 @@ export default function Layout({ children }) {
                 <div className={`group flex items-center rounded-lg text-[13px] font-medium transition-all duration-200 hover:translate-x-1 ${
                   active ? 'bg-blue-50 text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-900 hover:bg-slate-50 hover:shadow-sm'
                 }`}>
-                  <Link to={path} className="flex items-center gap-3 flex-1 px-3 py-2.5 min-w-0">
+                  <Link
+                    to={path}
+                    onMouseEnter={() => prefetchRouteTarget(path)}
+                    onFocus={() => prefetchRouteTarget(path)}
+                    className="flex items-center gap-3 flex-1 px-3 py-2.5 min-w-0"
+                  >
                     <Icon size={18} className={`transition-transform duration-200 group-hover:scale-110 ${active ? 'text-blue-600' : ''}`} />
                     <span className="flex-1 text-left">{label}</span>
                   </Link>
@@ -358,6 +412,8 @@ export default function Layout({ children }) {
                       <Link
                         key={sub.to}
                         to={sub.to}
+                        onMouseEnter={() => prefetchRouteTarget(sub.to)}
+                        onFocus={() => prefetchRouteTarget(sub.to)}
                         className="flex items-center gap-2 px-2 py-1.5 rounded-md text-[12px] text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-all duration-150 hover:translate-x-1"
                       >
                         {sub.channelKey === 'whatsapp' && (
@@ -675,8 +731,26 @@ export default function Layout({ children }) {
                   {roleAtCompanyLabel && <p className="text-[11px] text-blue-500 font-medium mt-0.5 capitalize">{roleAtCompanyLabel}</p>}
                 </div>
                 <button onClick={openProfileView} className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"><UserCircle size={14} /> View Account</button>
-                {user?.role === 'super_admin' && <Link to="/super-admin" className="flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50">Super Admin</Link>}
-                {user?.role === 'admin' && <Link to="/settings" className="flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"><Settings size={14} /> Settings</Link>}
+                {user?.role === 'super_admin' && (
+                  <Link
+                    to="/super-admin"
+                    onMouseEnter={() => prefetchRouteTarget('/super-admin')}
+                    onFocus={() => prefetchRouteTarget('/super-admin')}
+                    className="flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"
+                  >
+                    Super Admin
+                  </Link>
+                )}
+                {user?.role === 'admin' && (
+                  <Link
+                    to="/settings"
+                    onMouseEnter={() => prefetchRouteTarget('/settings')}
+                    onFocus={() => prefetchRouteTarget('/settings')}
+                    className="flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"
+                  >
+                    <Settings size={14} /> Settings
+                  </Link>
+                )}
                 <button onClick={handleLogout} className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-red-50" data-testid="logout-btn"><LogOut size={14} /> Sign Out</button>
               </div>}
             </div>

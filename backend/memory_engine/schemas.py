@@ -17,6 +17,7 @@ class MemoryType(str, Enum):
     CUSTOMER_PROFILE = "customer_profile"
     LAST_AI_RESPONSE = "last_ai_response"
     CONVERSATION_STATE = "conversation_state"
+    PENDING_INTENT = "pending_intent"
     SHOWN_PRODUCTS = "shown_products"
     INTERACTION_SUMMARY = "interaction_summary"
     PREFERENCE = "preference"
@@ -32,7 +33,7 @@ class ShortTermContext(BaseModel):
     pending_intent: dict[str, Any] = Field(default_factory=dict)
     last_ai_response: str = ""
     conversation_state: dict[str, Any] = Field(default_factory=dict)
-    ttl_seconds: int = 300  # 5 minutes
+    ttl_seconds: int = 1800
 
 
 class LongTermContext(BaseModel):

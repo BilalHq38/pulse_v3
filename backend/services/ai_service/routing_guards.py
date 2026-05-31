@@ -29,6 +29,7 @@ KNOWLEDGE_INTENTS = {
 
 LOW_VALUE_INTENTS = {
     "greeting",
+    "social",
     "gratitude",
     "acknowledgement",
     "rejection_or_opt_out",
@@ -61,6 +62,15 @@ _LOW_VALUE_EXACT = {
 }
 
 _GREETING_EXACT = {"hi", "hii", "hello", "hey", "salam", "assalam", "assalamu alaikum"}
+_SOCIAL_EXACT = {
+    "how are you",
+    "how r u",
+    "how are u",
+    "how you doing",
+    "how are you doing",
+    "how is it going",
+    "how's it going",
+}
 _GRATITUDE_EXACT = {"thanks", "thank you", "thx"}
 _ACK_EXACT = _LOW_VALUE_EXACT - _GREETING_EXACT - _GRATITUDE_EXACT
 
@@ -318,7 +328,9 @@ _ORDER_DETAIL_TERMS = {
     "sector",
 }
 _ORDER_CONFIRM_TERMS = {"confirm", "confirmed", "yes", "ok", "okay", "done", "proceed", "finalize"}
-_ORDER_CANCEL_PHRASES = ("cancel", "stop order", "do not order", "don't order", "leave it")
+_ORDER_CANCEL_PHRASES = ("cancel", "stop order", "do not order", "don't order", "leave it", "changed my mind")
+_ORDER_CANCEL_SHORT_REJECTIONS = {"no", "nope", "nah", "reset"}
+_ORDER_CANCEL_NON_REJECTIONS = {"no problem", "no worries"}
 _NUMBER_SELECTION_WORDS = {
     "first",
     "second",
@@ -367,6 +379,16 @@ def _is_numeric_product_selection(normalized: str) -> bool:
     return normalized in _NUMBER_SELECTION_WORDS or any(
         re.fullmatch(rf"{re.escape(word)}(?:\s+one)?", normalized)
         for word in _NUMBER_SELECTION_WORDS
+    )
+
+
+def _is_active_order_cancel_message(normalized: str) -> bool:
+    if normalized in _ORDER_CANCEL_NON_REJECTIONS:
+        return False
+    return (
+        normalized in _ORDER_CANCEL_SHORT_REJECTIONS
+        or normalized.startswith("no i ")
+        or any(phrase in normalized for phrase in _ORDER_CANCEL_PHRASES)
     )
 
 
@@ -668,7 +690,7 @@ def classify_product_order_demand(text: str, context: dict[str, Any] | None = No
         return _intent_result("normal_support", confidence="low", reason="empty_message")
 
     if active_order:
-        if any(phrase in normalized for phrase in _ORDER_CANCEL_PHRASES):
+        if _is_active_order_cancel_message(normalized):
             return _intent_result(
                 "order_continuation",
                 confidence="high",
@@ -984,6 +1006,8 @@ def is_low_value_message(text: str) -> bool:
         return False
     if normalized in _LOW_VALUE_EXACT:
         return True
+    if normalized in _SOCIAL_EXACT:
+        return True
     tokens = normalized.split()
     if len(tokens) <= 3 and any(token in _LOW_VALUE_EXACT for token in tokens):
         product_overlap = any(token in _PRODUCT_TERMS for token in tokens)
@@ -1095,6 +1119,16 @@ def lightweight_route_message(
     if normalized in _GREETING_EXACT:
         return {
             "intent": "greeting",
+            "confidence": 0.98,
+            "entities": {},
+            "urgency": "low",
+            "source": "lightweight_rule",
+            "low_value": True,
+            "lightweight_risk": risk,
+        }
+    if normalized in _SOCIAL_EXACT:
+        return {
+            "intent": "social",
             "confidence": 0.98,
             "entities": {},
             "urgency": "low",

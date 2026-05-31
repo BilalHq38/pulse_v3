@@ -284,31 +284,7 @@ def _fallback_reason(exc: Exception) -> str:
 
 
 async def analyze_sentiment(text: str, db=None, company_id: str = "", **kwargs) -> dict:
-    if _prefer_local_impl():
-        return await _local_analyze_sentiment(text, db=db, company_id=company_id, **kwargs)
-    try:
-        result = await _call_remote_ai(
-            "POST",
-            "/api/ai/analyze",
-            company_id=company_id,
-            json_body={"text": text, "company_id": company_id},
-        )
-        sentiment = result.get("sentiment", {}) if isinstance(result, dict) else {}
-        if not _sentiment_result_usable(sentiment):
-            raise ValueError("Remote sentiment payload was empty or zero-scored")
-        return sentiment
-    except Exception as exc:
-        logger.warning(
-            "ai_service sentiment remote failed company_id=%s error=%s",
-            company_id or "",
-            exc.__class__.__name__,
-        )
-        return await _local_analyze_sentiment(
-            text,
-            db=db,
-            company_id=company_id,
-            **kwargs,
-        )
+    return await _local_analyze_sentiment(text, db=db, company_id=company_id, **kwargs)
 
 
 async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) -> dict:

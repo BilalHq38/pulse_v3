@@ -102,6 +102,92 @@ def test_public_signup_creates_active_user():
     assert any("public_signup_user_activated" in str(item) for item in source)
 
 
+@pytest.mark.asyncio
+async def test_register_status_passes_request_to_paid_signup_fallback(monkeypatch):
+    async def noop(*_args, **_kwargs):
+        return None
+
+    pending = {
+        "id": "pending-1",
+        "stripe_checkout_session_id": "cs_test_123",
+        "user_id": "",
+        "status": "checkout_created",
+        "payment_status": "pending",
+        "email": "paid@example.com",
+        "plan_code": "pro",
+        "verification_error": "",
+    }
+    seen = {}
+
+    async def fake_pending_by_session(_db, _session_id):
+        return pending
+
+    async def fake_try_finalize(db, request, pending_signup, session_id):
+        seen["db"] = db
+        seen["request"] = request
+        seen["pending_signup"] = pending_signup
+        seen["session_id"] = session_id
+
+    monkeypatch.setattr(public_signup_service, "ensure_pending_signup_primitives", noop)
+    monkeypatch.setattr(public_signup_service, "_expire_stale_pending_signups", noop)
+    monkeypatch.setattr(public_signup_service, "_pending_signup_by_session", fake_pending_by_session)
+    monkeypatch.setattr(public_signup_service, "_try_finalize_paid_signup_from_stripe", fake_try_finalize)
+
+    request = _Request("/api/auth/register/status")
+    db = object()
+    result = await public_signup_service.get_public_registration_status(db, "cs_test_123", request)
+
+    assert seen["db"] is db
+    assert seen["request"] is request
+    assert seen["pending_signup"] == pending
+    assert seen["session_id"] == "cs_test_123"
+    assert result["account_created"] is False
+
+
+@pytest.mark.asyncio
+async def test_register_status_waits_for_active_workspace_before_redirect(monkeypatch):
+    async def noop(*_args, **_kwargs):
+        return None
+
+    pending = {
+        "id": "pending-1",
+        "stripe_checkout_session_id": "cs_test_123",
+        "user_id": "user-1",
+        "status": "account_created",
+        "payment_status": "paid",
+        "email": "paid@example.com",
+        "plan_code": "pro",
+        "verification_error": "",
+    }
+    user = {
+        "id": "user-1",
+        "company_id": "company-1",
+        "status": "pending_approval",
+        "email_verified": False,
+    }
+
+    class Db:
+        async def fetchrow(self, query, *_args):
+            if "SELECT * FROM users" in query:
+                return user
+            return None
+
+    async def fake_pending_by_session(_db, _session_id):
+        return pending
+
+    monkeypatch.setattr(public_signup_service, "ensure_pending_signup_primitives", noop)
+    monkeypatch.setattr(public_signup_service, "_expire_stale_pending_signups", noop)
+    monkeypatch.setattr(public_signup_service, "_pending_signup_by_session", fake_pending_by_session)
+    monkeypatch.setattr(public_signup_service, "_ensure_public_signup_workspace_records", noop)
+
+    result = await public_signup_service.get_public_registration_status(Db(), "cs_test_123", _Request("/api/auth/register/status"))
+
+    assert result["account_created"] is False
+    assert result["setup_failed"] is True
+    assert result["user_status"] == "pending_approval"
+    assert "Contact support" in result["support_message"]
+
+
 def test_starter_plan_alias_maps_to_free_plan():
     assert get_plan("starter")["code"] == "free"
 

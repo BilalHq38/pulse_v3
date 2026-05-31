@@ -42,7 +42,20 @@ async def bootstrap_ai_runtime(db) -> None:
 
 async def bootstrap_customer_runtime(db) -> None:
     await ensure_conversation_ai_pause_schema(db)
+    await bootstrap_request_runtime_schema(db)
 
 
 async def bootstrap_data_pipeline(db) -> None:
     await ensure_pipeline_tables(db)
+
+
+async def bootstrap_request_runtime_schema(db) -> None:
+    """Warm request-path schema checks at startup instead of inside first requests."""
+    from routers.conversations import _ensure_inbox_visibility_schema
+    from routers.misc import _ensure_visitor_tracking_schema
+    from routers.webhooks import _ensure_messages_idempotency_schema, _ensure_whatsapp_identity_schema
+
+    await _ensure_inbox_visibility_schema(db)
+    await _ensure_visitor_tracking_schema(db)
+    await _ensure_messages_idempotency_schema(db)
+    await _ensure_whatsapp_identity_schema(db)

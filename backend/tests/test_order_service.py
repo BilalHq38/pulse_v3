@@ -497,6 +497,67 @@ async def test_active_order_address_message_continues_without_images():
 
 
 @pytest.mark.asyncio
+async def test_order_flow_collects_address_after_quantity_then_places_order(monkeypatch):
+    db = FakeOrderDb()
+
+    async def fake_notification(db_arg, *_args, **kwargs):
+        db_arg.notifications.append(kwargs)
+        return {"id": "note-1"}
+
+    monkeypatch.setattr(order_service, "create_notification", fake_notification)
+
+    product_selected = await order_service.handle_order_flow(
+        db=db,
+        company_id="co-1",
+        conversation_id="convo-1",
+        message_text="I want this",
+        customer_info={"id": "cust-1", "name": "Avery Stone", "email": "avery@example.com", "phone": "+15550123"},
+        conversation_context=[],
+        source_channel="whatsapp",
+        source="webhook",
+    )
+    quantity_collected = await order_service.handle_order_flow(
+        db=db,
+        company_id="co-1",
+        conversation_id="convo-1",
+        message_text="Quantity: 2",
+        customer_info={"id": "cust-1", "name": "Avery Stone", "email": "avery@example.com", "phone": "+15550123"},
+        conversation_context=[],
+        source_channel="whatsapp",
+        source="webhook",
+    )
+    confirmation = await order_service.handle_order_flow(
+        db=db,
+        company_id="co-1",
+        conversation_id="convo-1",
+        message_text="Delivery Address: House 12, Islamabad",
+        customer_info={"id": "cust-1", "name": "Avery Stone", "email": "avery@example.com", "phone": "+15550123"},
+        conversation_context=[],
+        source_channel="whatsapp",
+        source="webhook",
+    )
+    placed = await order_service.handle_order_flow(
+        db=db,
+        company_id="co-1",
+        conversation_id="convo-1",
+        message_text="confirm",
+        customer_info={"id": "cust-1", "name": "Avery Stone", "email": "avery@example.com", "phone": "+15550123"},
+        conversation_context=[],
+        source_channel="whatsapp",
+        source="webhook",
+    )
+
+    assert product_selected["next_action"] == "collect_order_details"
+    assert quantity_collected["next_action"] == "collect_order_details"
+    assert "delivery address" in quantity_collected["response"].lower()
+    assert confirmation["next_action"] == "request_order_confirmation"
+    assert "Delivery Address: House 12" in confirmation["response"]
+    assert placed["next_action"] == "order_placed"
+    assert db.orders[0]["status"] == "admin_review"
+    assert db.notifications
+
+
+@pytest.mark.asyncio
 async def test_order_confirmation_requested_when_details_complete():
     db = FakeOrderDb()
 
@@ -642,6 +703,7 @@ async def test_duplicate_order_prevented_after_placement(monkeypatch):
     )
     monkeypatch.setattr(order_service, "create_notification", lambda *_args, **_kwargs: {"id": "note-1"})
     await order_service.place_order(db, "co-1", db.orders[0]["id"])
+    db.orders[0]["updated_at"] = order_service._dt.datetime.now(order_service._dt.timezone.utc).isoformat()
 
     result = await order_service.handle_order_flow(
         db=db,

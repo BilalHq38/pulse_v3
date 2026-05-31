@@ -30,6 +30,7 @@ from channel_layer.validators import (
     client_ip_from_request,
 )
 from shared.cache import get_cache_client
+from shared.config import dedup_cache_ttl_seconds
 from shared.metrics import increment_counter
 from shared.webhook_task_runner import create_safe_detached_task
 
@@ -73,6 +74,248 @@ def get_outbound_router() -> OutboundRouter:
 
 
 # ── Request/Response Models ──────────────────────────────────────────────────
+
+
+def _channel_layer_dedup_cache_key(channel: str, tenant_id: str, key: str) -> str:
+    return f"{str(tenant_id or '').strip()}:{str(channel or '').strip()}:{str(key or '').strip()}"
+
+
+def _channel_layer_idempotency_key(channel: str, tenant_id: str, provider_event_id: str) -> str:
+    provider_id = str(provider_event_id or "").strip()
+    if not provider_id:
+        return ""
+    return f"channel_webhook:{str(tenant_id or '').strip()}:{str(channel or '').strip()}:{provider_id}"
+
+
+def _extract_provider_event_id(channel_type: ChannelType, payload: dict) -> str:
+    direct = str(
+        (payload or {}).get("provider_event_id")
+        or (payload or {}).get("message_id")
+        or (payload or {}).get("message_id_header")
+        or (payload or {}).get("client_message_id")
+        or (payload or {}).get("event_id")
+        or (payload or {}).get("id")
+        or ""
+    ).strip()
+    if direct:
+        return direct
+
+    if channel_type == ChannelType.WHATSAPP:
+        for entry in (payload or {}).get("entry", []) or []:
+            for change in (entry or {}).get("changes", []) or []:
+                value = (change or {}).get("value", {}) or {}
+                for msg in value.get("messages", []) or []:
+                    mid = str((msg or {}).get("provider_event_id") or (msg or {}).get("id") or "").strip()
+                    if mid:
+                        return mid
+
+    if channel_type in (ChannelType.FACEBOOK, ChannelType.INSTAGRAM):
+        for entry in (payload or {}).get("entry", []) or []:
+            for event in (entry or {}).get("messaging", []) or []:
+                message = (event or {}).get("message", {}) or {}
+                postback = (event or {}).get("postback", {}) or {}
+                mid = str(
+                    message.get("mid")
+                    or postback.get("mid")
+                    or (event or {}).get("message_id")
+                    or ""
+                ).strip()
+                if mid:
+                    return mid
+            for change in (entry or {}).get("changes", []) or []:
+                value = (change or {}).get("value", {}) or {}
+                mid = str(
+                    value.get("comment_id")
+                    or value.get("id")
+                    or value.get("media_id")
+                    or ""
+                ).strip()
+                if mid:
+                    return mid
+
+    return ""
+
+
+def _log_channel_inbound_pipeline_stage(
+    stage: str,
+    channel: str,
+    *,
+    tenant_id: str = "",
+    provider_event_id: str = "",
+    idempotency_key: str = "",
+    trace_id: str = "",
+    duplicate: bool | None = None,
+    message_id: str = "",
+) -> None:
+    duplicate_value = "" if duplicate is None else str(bool(duplicate)).lower()
+    logger.info(
+        "inbound_pipeline channel=%s stage=%s tenant_id=%s provider_event_id=%s idempotency_key=%s trace_id=%s duplicate=%s message_id=%s",
+        str(channel or "").strip(),
+        str(stage or "").strip(),
+        str(tenant_id or "").strip(),
+        str(provider_event_id or "").strip(),
+        str(idempotency_key or "").strip(),
+        str(trace_id or "").strip(),
+        duplicate_value,
+        str(message_id or "").strip(),
+    )
+
+
+async def _find_channel_layer_duplicate_message(
+    db,
+    *,
+    tenant_id: str,
+    provider_event_id: str = "",
+    idempotency_key: str = "",
+) -> dict:
+    scoped_tenant = str(tenant_id or "").strip()
+    provider_id = str(provider_event_id or "").strip()
+    idem_key = str(idempotency_key or "").strip()
+    if not db or not scoped_tenant or (not provider_id and not idem_key):
+        return {}
+    try:
+        if provider_id:
+            row = await db.fetchrow(
+                "SELECT id,conversation_id FROM messages "
+                "WHERE company_id=$1 AND external_message_id=$2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                scoped_tenant,
+                provider_id,
+            )
+            if row:
+                return dict(row)
+        if idem_key:
+            row = await db.fetchrow(
+                "SELECT id,conversation_id FROM messages "
+                "WHERE company_id=$1 AND idempotency_key=$2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                scoped_tenant,
+                idem_key,
+            )
+            if row:
+                return dict(row)
+    except Exception as exc:
+        logger.warning(
+            "channel_layer inbound idempotency lookup failed tenant=%s provider_event_id=%s idempotency_key=%s: %s",
+            scoped_tenant,
+            provider_id,
+            idem_key,
+            exc,
+        )
+    return {}
+
+
+async def _check_channel_layer_duplicate(
+    db,
+    *,
+    channel: str,
+    tenant_id: str,
+    provider_event_id: str = "",
+    idempotency_key: str = "",
+    trace_id: str = "",
+) -> dict:
+    scoped_channel = str(channel or "").strip()
+    scoped_tenant = str(tenant_id or "").strip()
+    provider_id = str(provider_event_id or "").strip()
+    idem_key = str(idempotency_key or "").strip()
+    _log_channel_inbound_pipeline_stage(
+        "event_received",
+        scoped_channel,
+        tenant_id=scoped_tenant,
+        provider_event_id=provider_id,
+        idempotency_key=idem_key,
+        trace_id=trace_id,
+    )
+    if not scoped_tenant or (not provider_id and not idem_key):
+        _log_channel_inbound_pipeline_stage(
+            "deduplicated",
+            scoped_channel,
+            tenant_id=scoped_tenant,
+            provider_event_id=provider_id,
+            idempotency_key=idem_key,
+            trace_id=trace_id,
+            duplicate=False,
+        )
+        return {"duplicate": False}
+
+    existing = await _find_channel_layer_duplicate_message(
+        db,
+        tenant_id=scoped_tenant,
+        provider_event_id=provider_id,
+        idempotency_key=idem_key,
+    )
+    if existing:
+        _log_channel_inbound_pipeline_stage(
+            "deduplicated",
+            scoped_channel,
+            tenant_id=scoped_tenant,
+            provider_event_id=provider_id,
+            idempotency_key=idem_key,
+            trace_id=trace_id,
+            duplicate=True,
+            message_id=str(existing.get("id") or ""),
+        )
+        return {
+            "duplicate": True,
+            "dedup_stage": "message_store",
+            "message_id": str(existing.get("id") or ""),
+            "conversation_id": str(existing.get("conversation_id") or ""),
+        }
+
+    cache = get_cache_client(namespace="inbound_dedup")
+    cache_material = idem_key or provider_id
+    if cache_material:
+        dedup_key = _channel_layer_dedup_cache_key(scoped_channel, scoped_tenant, cache_material)
+        try:
+            cached = await cache.get_json(dedup_key)
+            if cached:
+                cached_message_id = str((cached or {}).get("message_id") or provider_id or "").strip()
+                _log_channel_inbound_pipeline_stage(
+                    "deduplicated",
+                    scoped_channel,
+                    tenant_id=scoped_tenant,
+                    provider_event_id=provider_id,
+                    idempotency_key=idem_key,
+                    trace_id=trace_id,
+                    duplicate=True,
+                    message_id=cached_message_id,
+                )
+                return {
+                    "duplicate": True,
+                    "dedup_stage": "cache",
+                    "message_id": cached_message_id,
+                    "conversation_id": str((cached or {}).get("conversation_id") or ""),
+                }
+            await cache.set_json(
+                dedup_key,
+                {
+                    "channel": scoped_channel,
+                    "tenant_id": scoped_tenant,
+                    "provider_event_id": provider_id,
+                    "idempotency_key": idem_key,
+                    "trace_id": str(trace_id or ""),
+                },
+                ttl_seconds=dedup_cache_ttl_seconds(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "channel_layer inbound dedup cache unavailable tenant=%s channel=%s provider_event_id=%s: %s",
+                scoped_tenant,
+                scoped_channel,
+                provider_id,
+                exc,
+            )
+
+    _log_channel_inbound_pipeline_stage(
+        "deduplicated",
+        scoped_channel,
+        tenant_id=scoped_tenant,
+        provider_event_id=provider_id,
+        idempotency_key=idem_key,
+        trace_id=trace_id,
+        duplicate=False,
+    )
+    return {"duplicate": False}
 
 
 class SendMessageRequest(BaseModel):
@@ -256,8 +499,49 @@ async def unified_channel_webhook(
         )
         return {"status": "quota_exceeded", "channel": channel, "tenant_id": tenant_id}
 
+    provider_event_id = _extract_provider_event_id(channel_type, payload)
+    idempotency_key = str(payload.get("idempotency_key") or "").strip() or _channel_layer_idempotency_key(
+        channel,
+        tenant_id,
+        provider_event_id,
+    )
+    trace_id = str(payload.get("trace_id") or request.headers.get("X-Trace-Id", "") or "").strip()
+    dedup_result = await _check_channel_layer_duplicate(
+        db,
+        channel=channel,
+        tenant_id=tenant_id,
+        provider_event_id=provider_event_id,
+        idempotency_key=idempotency_key,
+        trace_id=trace_id,
+    )
+    if dedup_result.get("duplicate"):
+        return {
+            "status": "duplicate",
+            "duplicate": True,
+            "message_id": dedup_result.get("message_id", ""),
+            "conversation_id": dedup_result.get("conversation_id", ""),
+            "channel": channel,
+            "tenant_id": tenant_id,
+        }
+
     message = await adapter.receive_message(payload, db, tenant_id)
     message = await _normalizer.normalize(message, db)
+    provider_event_id = provider_event_id or message.message_id
+    idempotency_key = idempotency_key or _channel_layer_idempotency_key(
+        message.channel_type.value,
+        message.tenant_id,
+        provider_event_id,
+    )
+    if trace_id and not message.trace_id:
+        message.trace_id = trace_id
+    message.metadata.update(
+        {
+            "provider_event_id": provider_event_id,
+            "external_message_id": provider_event_id,
+            "idempotency_key": idempotency_key,
+            "trace_id": message.trace_id or trace_id,
+        }
+    )
 
     increment_counter(
         "channel_layer.webhook.processed",
@@ -281,26 +565,33 @@ async def unified_channel_webhook(
         if not str(workflow_metadata.get("message_id") or "").strip():
             workflow_metadata["message_id"] = message.message_id
         if not str(workflow_metadata.get("external_message_id") or "").strip():
-            workflow_metadata["external_message_id"] = message.message_id
+            workflow_metadata["external_message_id"] = provider_event_id
         if not str(workflow_metadata.get("provider_event_id") or "").strip():
-            workflow_metadata["provider_event_id"] = message.message_id
+            workflow_metadata["provider_event_id"] = provider_event_id
         if not str(workflow_metadata.get("idempotency_key") or "").strip():
-            workflow_metadata["idempotency_key"] = (
-                f"channel_webhook:{message.tenant_id}:{message.channel_type.value}:{message.message_id}"
-            )
+            workflow_metadata["idempotency_key"] = idempotency_key
         workflow_request = MessageWorkflowRequest(
             company_id=message.tenant_id,
             conversation_id=message.resolved_conversation_id or "",
             customer_id=message.resolved_customer_id or "",
             message_id=message.message_id,
-            external_message_id=message.message_id,
-            provider_event_id=message.message_id,
+            external_message_id=provider_event_id,
+            provider_event_id=provider_event_id,
             idempotency_key=workflow_metadata["idempotency_key"],
             message_text=message.content,
             channel=message.channel_type.value,
             sender_contact=message.external_user_id,
             trace_id=message.trace_id or "",
             metadata=workflow_metadata,
+        )
+        _log_channel_inbound_pipeline_stage(
+            "passed_to_pipeline",
+            message.channel_type.value,
+            tenant_id=message.tenant_id,
+            provider_event_id=provider_event_id,
+            idempotency_key=workflow_metadata["idempotency_key"],
+            trace_id=message.trace_id or trace_id,
+            message_id=message.message_id,
         )
         create_safe_detached_task(
             db,

@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 from core.utils import is_valid_image_url, normalize_product_images
 from shared.cache import get_cache_client
@@ -139,6 +140,29 @@ _RAG_SKIP_PHRASES = {
     "no",
 }
 
+_PRODUCT_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "tee": ("shirt", "tshirt", "t-shirt"),
+    "tshirt": ("shirt", "tee", "t-shirt"),
+    "t-shirt": ("shirt", "tee", "tshirt"),
+    "top": ("shirt", "blouse"),
+    "tops": ("shirt", "blouse"),
+    "sneaker": ("shoe", "shoes"),
+    "sneakers": ("shoe", "shoes"),
+    "trainer": ("shoe", "shoes"),
+    "trainers": ("shoe", "shoes"),
+    "mobile": ("phone", "smartphone"),
+    "cellphone": ("phone", "smartphone"),
+    "cell": ("phone", "smartphone"),
+    "sofa": ("couch",),
+    "couch": ("sofa",),
+    "jewellery": ("jewelry",),
+    "jewelery": ("jewelry",),
+    "necklace": ("necklaces",),
+    "ring": ("rings",),
+    "bracelet": ("bracelets",),
+}
+_FUZZY_CATEGORY_THRESHOLD = 0.82
+
 
 def _normalize_term(text: str) -> str:
     normalized = re.sub(r"[^a-z0-9\s-]", " ", str(text or "").lower())
@@ -175,6 +199,38 @@ def _build_dynamic_category_aliases(categories: list[str]) -> dict[str, str]:
 
 def _tokenize(text: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if token]
+
+
+def _expand_synonyms(tokens: list[str] | set[str]) -> set[str]:
+    expanded: set[str] = set()
+    for token in tokens:
+        normalized = _normalize_term(token)
+        if not normalized:
+            continue
+        expanded.add(normalized)
+        singular = _to_singular(normalized)
+        if singular:
+            expanded.add(singular)
+        for synonym in _PRODUCT_SYNONYMS.get(normalized, ()):
+            expanded.add(_normalize_term(synonym))
+        for synonym in _PRODUCT_SYNONYMS.get(singular, ()):
+            expanded.add(_normalize_term(synonym))
+    return {item for item in expanded if item}
+
+
+def fuzzy_category_match(query: str, category: str) -> bool:
+    """Return True when query terms match a category by synonym or close spelling."""
+    query_terms = _expand_synonyms(_tokenize(query))
+    category_terms = _expand_synonyms(_tokenize(category))
+    if not query_terms or not category_terms:
+        return False
+    if query_terms & category_terms:
+        return True
+    for query_term in query_terms:
+        for category_term in category_terms:
+            if SequenceMatcher(None, query_term, category_term).ratio() >= _FUZZY_CATEGORY_THRESHOLD:
+                return True
+    return False
 
 
 def _should_skip_rag_query(query: str, *, intent_name: str = "", has_history: bool = False) -> tuple[bool, str]:
@@ -315,11 +371,7 @@ async def _load_product_catalog(
     increment_counter("ai.cache.catalog.miss")
     started = time.perf_counter()
     product_columns = await _company_products_columns(db)
-    tags_select = "tags" if "tags" in product_columns else "NULL::jsonb AS tags"
-    sku_select = "sku" if "sku" in product_columns else "''::text AS sku"
-    stock_select = "stock_quantity" if "stock_quantity" in product_columns else "0::integer AS stock_quantity"
-    slug_select = "slug" if "slug" in product_columns else "''::text AS slug"
-    links_select = "links" if "links" in product_columns else "''::text AS links"
+    tags_select, sku_select, stock_select, slug_select, links_select = _product_projection_for_columns(product_columns)
     rows = await db.fetch(
         "SELECT id, company_id, name, product_title, description, category, product_type, "
         f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, "
@@ -399,6 +451,111 @@ async def _company_products_columns(db) -> set[str]:
         logger.warning("company_products column validation failed: %s", exc)
         _COMPANY_PRODUCTS_COLUMNS = set()
     return _COMPANY_PRODUCTS_COLUMNS
+
+
+def _product_projection_for_columns(product_columns: set[str]) -> tuple[str, str, str, str, str]:
+    tags_select = "tags" if "tags" in product_columns else "NULL::jsonb AS tags"
+    sku_select = "sku" if "sku" in product_columns else "''::text AS sku"
+    stock_select = "stock_quantity" if "stock_quantity" in product_columns else "0::integer AS stock_quantity"
+    slug_select = "slug" if "slug" in product_columns else "''::text AS slug"
+    links_select = "links" if "links" in product_columns else "''::text AS links"
+    return tags_select, sku_select, stock_select, slug_select, links_select
+
+
+async def _keyword_retrieve_products(
+    db,
+    company_id: str,
+    query: str,
+    *,
+    limit: int = 12,
+    catalog_kind: str = "",
+) -> list[dict]:
+    terms = [
+        term
+        for term in _expand_synonyms(_tokenize(query))
+        if term and term not in STOPWORDS and len(term) > 1
+    ]
+    if not db or not company_id or not terms:
+        return []
+    patterns = [f"%{term}%" for term in terms[:12]]
+    product_columns = await _company_products_columns(db)
+    tags_select, sku_select, stock_select, slug_select, links_select = _product_projection_for_columns(product_columns)
+    rows = await db.fetch(
+        "SELECT id, company_id, name, product_title, description, category, product_type, "
+        f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, "
+        f"       {slug_select}, {links_select}, created_at, updated_at "
+        "FROM company_products "
+        "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
+        "  AND ($4='' OR ($4='service' AND LOWER(COALESCE(product_type,'')) IN ('service','services')) "
+        "       OR ($4='product' AND LOWER(COALESCE(product_type,'')) NOT IN ('service','services'))) "
+        "  AND (LOWER(COALESCE(name,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(product_title,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(description,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(category,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(product_type,'')) LIKE ANY($3::text[])) "
+        "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, name ASC LIMIT $2",
+        company_id,
+        max(1, int(limit)),
+        patterns,
+        catalog_kind,
+    )
+    return [dict(row) for row in rows or []]
+
+
+def _score_fuzzy_product_match(product: dict, query: str) -> float:
+    normalized_query = _normalize_term(query)
+    if not normalized_query:
+        return 0.0
+    score = 0.0
+    category = str(product.get("category") or "")
+    product_type = str(product.get("product_type") or "")
+    if fuzzy_category_match(normalized_query, category):
+        score = max(score, 0.75)
+    if fuzzy_category_match(normalized_query, product_type):
+        score = max(score, 0.65)
+    query_terms = _expand_synonyms(_tokenize(normalized_query))
+    text_terms = _expand_synonyms(_tokenize(_product_search_text(product)))
+    if query_terms and text_terms:
+        overlap = len(query_terms & text_terms)
+        if overlap:
+            score = max(score, min(0.9, 0.35 + overlap * 0.15))
+        else:
+            for query_term in query_terms:
+                if any(SequenceMatcher(None, query_term, text_term).ratio() >= _FUZZY_CATEGORY_THRESHOLD for text_term in text_terms):
+                    score = max(score, 0.45)
+                    break
+    return score
+
+
+def _fuzzy_retrieve_products_from_catalog(products: list[dict], query: str) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for product in products:
+        product_id = str(product.get("id") or "").strip()
+        if not product_id:
+            continue
+        score = _score_fuzzy_product_match(product, query)
+        if score > 0:
+            scores[product_id] = score
+    return scores
+
+
+def _fuse_product_scores(
+    *,
+    keyword_scores: dict[str, float],
+    fuzzy_scores: dict[str, float],
+    vector_scores: dict[str, float],
+    lexical_scores: dict[str, float],
+) -> dict[str, float]:
+    product_ids = set(keyword_scores) | set(fuzzy_scores) | set(vector_scores) | set(lexical_scores)
+    fused: dict[str, float] = {}
+    for product_id in product_ids:
+        fused[product_id] = (
+            lexical_scores.get(product_id, 0.0)
+            + keyword_scores.get(product_id, 0.0) * 0.9
+            + fuzzy_scores.get(product_id, 0.0) * 0.7
+            + vector_scores.get(product_id, 0.0) * 1.7
+        )
+    return fused
 
 
 def _product_search_text(product: dict) -> str:
@@ -576,6 +733,17 @@ async def rank_products_for_query(
 
     increment_counter("ai.cache.ranking.miss")
     catalog_kind = _catalog_kind_for_query(query)
+    try:
+        keyword_products = await _keyword_retrieve_products(
+            db,
+            company_id,
+            query,
+            limit=max(limit * 4, 12),
+            catalog_kind=catalog_kind,
+        )
+    except Exception as exc:
+        logger.debug("rag_keyword_retrieval_failed company_id=%s error=%s", company_id, exc)
+        keyword_products = []
     products = await _load_product_catalog(
         db,
         company_id,
@@ -583,6 +751,13 @@ async def rank_products_for_query(
         bypass_cache=bypass_product_cache,
         catalog_kind=catalog_kind,
     )
+    if keyword_products:
+        by_id: dict[str, dict] = {}
+        for product in [*keyword_products, *products]:
+            product_id = str(product.get("id") or "").strip()
+            if product_id:
+                by_id[product_id] = product
+        products = list(by_id.values())
     if not products:
         return []
     query_info = understand_product_query(
@@ -660,10 +835,24 @@ async def rank_products_for_query(
             if str(row.get("source_id") or "").strip()
             and float(row.get("similarity") or 0) >= _MIN_PRODUCT_VECTOR_SIMILARITY
         }
+        keyword_scores = {
+            str(product.get("id") or ""): max(0.25, 1.0 - (index * 0.05))
+            for index, product in enumerate(keyword_products)
+            if str(product.get("id") or "").strip()
+        }
+        fuzzy_scores = _fuzzy_retrieve_products_from_catalog(products, query)
 
         ranked: list[tuple[float, dict]] = []
         for product in products:
-            score = _score_product(product, query_info, vector_scores.get(product["id"], 0.0))
+            product_id = str(product.get("id") or "")
+            lexical_score = _score_product(product, query_info, 0.0)
+            fused_scores = _fuse_product_scores(
+                keyword_scores=keyword_scores,
+                fuzzy_scores=fuzzy_scores,
+                vector_scores=vector_scores,
+                lexical_scores={product_id: lexical_score},
+            )
+            score = fused_scores.get(product_id, lexical_score)
             if history_terms:
                 product_terms = _token_set(_product_search_text(product))
                 overlap = len(product_terms & history_terms)
@@ -673,6 +862,14 @@ async def rank_products_for_query(
                 if category and category in history_terms:
                     score += 0.2
             ranked.append((score, product))
+        logger.info(
+            "rag_fuse company_id=%s keyword_results=%s fuzzy_results=%s vector_results=%s candidate_count=%s",
+            company_id,
+            len(keyword_scores),
+            len(fuzzy_scores),
+            len(vector_scores),
+            len(products),
+        )
         ranked.sort(
             key=lambda item: (
                 item[0],
@@ -901,6 +1098,7 @@ def recent_customer_image_urls(conversation_context: list[dict]) -> list[str]:
 
 __all__ = [
     "build_ai_context",
+    "fuzzy_category_match",
     "get_company_knowledge",
     "rank_products_for_query",
     "recent_customer_image_urls",

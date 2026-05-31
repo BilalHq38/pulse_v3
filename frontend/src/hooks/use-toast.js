@@ -282,6 +282,8 @@ function getErrorMessage(error, fallback = "We couldn't finish that action.") {
   const text = String(raw || "").trim()
   if (!text) return fallback
   if (/network error/i.test(text)) return "The request could not reach the server. Please try again."
+  if (/internal server error/i.test(text)) return fallback
+  if (/service temporarily unavailable/i.test(text)) return "The service is still starting. Please try again."
   if (/request failed with status code/i.test(text)) return fallback
   if (text.startsWith("{") || text.startsWith("[")) return fallback
   return mapTechnicalErrorMessage(text, fallback)

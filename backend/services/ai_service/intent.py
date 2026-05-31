@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 _ALLOWED_URGENCY = {"low", "medium", "high", "critical"}
 _QUOTA_MARKERS = ("resource_exhausted", "quota", "rate-limit", "rate limit", "429")
 _INTENT_ALIASES = {
+    "faq_question": "faq",
+    "frequently_asked_question": "faq",
     "product_interest": "product_recommendation",
     "product_inquiry": "product_catalog_question",
     "product_question": "product_catalog_question",
@@ -23,9 +25,11 @@ _INTENT_ALIASES = {
     "payment_question": "pricing_question",
     "order_status": "shipping_question",
     "delivery_question": "shipping_question",
+    "order_tracking": "shipping_question",
     "purchase": "buying_intent",
     "purchase_intent": "buying_intent",
     "conversion_intent": "buying_intent",
+    "refund_request": "refund",
     "service_inquiry": "service_question",
     "service_info": "service_question",
     "company_info": "company_question",
@@ -34,7 +38,20 @@ _INTENT_ALIASES = {
     "next": "follow_up_continue",
     "opt_out": "rejection_or_opt_out",
     "escalation": "human_handoff",
+    "unrecognized": "unknown",
+    "not_understood": "unknown",
 }
+
+
+def _log_intent_classification(text: str, payload: dict, *, company_id: str = "", source: str = "") -> None:
+    logger.info(
+        "intent_classification raw_message=%s classified_intent=%s confidence=%s company_id=%s source=%s",
+        " ".join(str(text or "").split())[:160],
+        str((payload or {}).get("intent") or ""),
+        float((payload or {}).get("confidence") or 0.0),
+        company_id or "",
+        source or str((payload or {}).get("source") or ""),
+    )
 
 
 def _normalize_intent_payload(raw: dict) -> dict:
@@ -49,12 +66,49 @@ def _normalize_intent_payload(raw: dict) -> dict:
     if urgency not in _ALLOWED_URGENCY:
         urgency = "medium"
     entities = payload.get("entities") if isinstance(payload.get("entities"), dict) else {}
-    return {
+    normalized = {
         "intent": intent_name,
         "confidence": confidence,
         "entities": entities,
         "urgency": urgency,
     }
+    source = str(payload.get("source") or "").strip()
+    if source:
+        normalized["source"] = source
+    return normalized
+
+
+def _deterministic_intent(text: str) -> dict:
+    lower = str(text or "").strip().lower()
+    normalized = " ".join("".join(ch if ch.isalnum() or ch.isspace() else " " for ch in lower).split())
+    if not normalized:
+        return {}
+    if any(
+        phrase in lower
+        for phrase in (
+            "return policy",
+            "refund policy",
+            "exchange policy",
+            "warranty",
+            "guarantee",
+            "business hours",
+            "opening hours",
+            "faq",
+            "frequently asked",
+        )
+    ):
+        return {"intent": "faq", "confidence": 0.82, "entities": {}, "urgency": "low", "source": "deterministic_intent_rule"}
+    if any(token in lower for token in ("complaint", "angry", "terrible", "awful", "unacceptable", "broken", "damaged")):
+        return {"intent": "complaint", "confidence": 0.84, "entities": {}, "urgency": "high", "source": "deterministic_intent_rule"}
+    if any(phrase in lower for phrase in ("who are you", "about your company", "your business", "your brand", "about your business")):
+        return {
+            "intent": "company_question",
+            "confidence": 0.78,
+            "entities": {},
+            "urgency": "low",
+            "source": "deterministic_intent_rule",
+        }
+    return {}
 
 
 def _render_history_context(conversation_context: list | None) -> str:
@@ -126,7 +180,7 @@ def _safe_intent_error(exc: Exception | None) -> tuple[str, str]:
 def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None = None) -> dict:
     lower = (text or "").lower()
     normalized = " ".join("".join(ch if ch.isalnum() or ch.isspace() else " " for ch in lower).split())
-    intent_name = previous_intent if previous_intent and previous_intent != "unknown" else "general_question"
+    intent_name = previous_intent if previous_intent and previous_intent != "unknown" else "unknown"
     confidence = 0.15
     lightweight = lightweight_route_message(text, previous_intent=previous_intent)
     if lightweight:
@@ -141,7 +195,24 @@ def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None
     elif any(phrase in lower for phrase in ("where can i buy", "where can i order", "order link", "website", "buy link")):
         intent_name = "website_link_request"
         confidence = 0.45
-    elif any(phrase in lower for phrase in ("i want to buy", "want to buy", "i want this", "want this", "purchase", "place order", "how can i order")):
+    elif any(
+        phrase in lower
+        for phrase in (
+            "place order",
+            "place an order",
+            "take my order",
+            "order this",
+            "order it",
+            "i want to order",
+            "i want to place an order",
+            "how can i order",
+            "how to order",
+            "how to place order",
+        )
+    ):
+        intent_name = "order_intent"
+        confidence = 0.5
+    elif any(phrase in lower for phrase in ("i want to buy", "want to buy", "i want this", "want this", "purchase")):
         intent_name = "buying_intent"
         confidence = 0.45
     elif any(token in lower for token in ("price", "cost", "how much", "rate", "charges")):
@@ -159,7 +230,26 @@ def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None
     elif any(phrase in lower for phrase in ("who are you", "about your company", "your business", "your brand")):
         intent_name = "company_question"
         confidence = 0.35
-    elif any(token in lower for token in ("refund", "cancel", "complaint", "broken", "issue", "problem")):
+    elif any(
+        phrase in lower
+        for phrase in (
+            "return policy",
+            "refund policy",
+            "exchange policy",
+            "warranty",
+            "guarantee",
+            "business hours",
+            "opening hours",
+            "faq",
+            "frequently asked",
+        )
+    ):
+        intent_name = "faq"
+        confidence = 0.45
+    elif any(token in lower for token in ("complaint", "angry", "terrible", "awful", "unacceptable", "broken", "damaged")):
+        intent_name = "complaint"
+        confidence = 0.45
+    elif any(token in lower for token in ("refund", "cancel", "issue", "problem")):
         intent_name = "support_request"
         confidence = 0.35
     elif any(token in lower for token in ("order", "delivery", "shipping", "tracking")):
@@ -189,23 +279,40 @@ def _fallback_intent(text: str, previous_intent: str = "", exc: Exception | None
 async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) -> dict:
     history_context = _render_history_context(kwargs.get("conversation_context"))
     previous_intent = str(kwargs.get("previous_intent") or "").strip().lower()
+    deterministic = _deterministic_intent(text)
+    if deterministic:
+        normalized = _normalize_intent_payload(deterministic)
+        _log_intent_classification(
+            text,
+            normalized,
+            company_id=company_id,
+            source=str(deterministic.get("source") or "deterministic_intent_rule"),
+        )
+        return normalized
     lightweight = lightweight_route_message(
         text,
         previous_intent=previous_intent,
         previous_ai_message=str(kwargs.get("previous_ai_message") or ""),
     )
-    if lightweight:
+    if lightweight and str(lightweight.get("source") or "") != "local_minilm":
         logger.info(
             "intent_llm_skipped company_id=%s reason=lightweight_route intent=%s confidence=%s",
             company_id or "",
             str(lightweight.get("intent") or ""),
             lightweight.get("confidence"),
         )
-        return _normalize_intent_payload(lightweight)
+        normalized = _normalize_intent_payload(lightweight)
+        _log_intent_classification(
+            text,
+            normalized,
+            company_id=company_id,
+            source=str(lightweight.get("source") or "lightweight"),
+        )
+        return normalized
     prompt = (
         "Classify the latest CRM customer message.\n"
         "Return ONLY JSON: {\"intent\":\"snake_case_intent\",\"confidence\":0.0,\"entities\":{},\"urgency\":\"low|medium|high|critical\"}\n"
-        "Allowed intents: greeting, gratitude, general_question, unclear_request, company_question, service_question, business_question, "
+        "Allowed intents: greeting, gratitude, general_question, unclear_request, unknown, faq, company_question, service_question, business_question, "
         "follow_up_continue, product_catalog_question, product_recommendation, purchase_inquiry, product_image_request, pricing_question, "
         "availability_question, buying_intent, order_intent, website_link_request, support_request, complaint, refund, cancel_request, "
         "shipping_question, negotiation, human_handoff, rejection_or_opt_out.\n"
@@ -228,9 +335,11 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
                 function_name="classify_intent",
             )
             normalized = _normalize_intent_payload(remote)
+            normalized.setdefault("source", "llm")
             last_topic = _extract_last_topic(kwargs.get("conversation_context"))
             if last_topic and isinstance(normalized.get("entities"), dict):
                 normalized["entities"].setdefault("last_topic", last_topic)
+            _log_intent_classification(text, normalized, company_id=company_id, source="llm")
             return normalized
         except Exception as exc:
             last_exc = exc
@@ -257,6 +366,12 @@ async def classify_intent(text: str, db=None, company_id: str = "", **kwargs) ->
     last_topic = _extract_last_topic(kwargs.get("conversation_context"))
     if last_topic and isinstance(fallback.get("entities"), dict):
         fallback["entities"].setdefault("last_topic", last_topic)
+    _log_intent_classification(
+        text,
+        fallback,
+        company_id=company_id,
+        source=str(fallback.get("source") or "local_fallback"),
+    )
     return fallback
 
 

@@ -86,9 +86,11 @@ class OutboundRouter:
                     "channel_layer.outbound.success",
                     labels={"channel": message.channel_type.value},
                 )
+                delivery_provider = str((result.metadata or {}).get("delivery_provider") or "").strip()
                 logger.info(
-                    "Outbound message sent channel=%s tenant=%s external_id=%s latency_ms=%s",
+                    "Outbound message sent channel=%s provider=%s tenant=%s external_id=%s latency_ms=%s",
                     message.channel_type.value,
+                    delivery_provider or message.channel_type.value,
                     message.tenant_id,
                     result.external_message_id or "n/a",
                     latency_ms,
@@ -98,9 +100,11 @@ class OutboundRouter:
                     "channel_layer.outbound.failed",
                     labels={"channel": message.channel_type.value},
                 )
+                delivery_provider = str((result.metadata or {}).get("delivery_provider") or "").strip()
                 logger.warning(
-                    "Outbound message failed channel=%s tenant=%s error=%s latency_ms=%s",
+                    "Outbound message failed channel=%s provider=%s tenant=%s error=%s latency_ms=%s",
                     message.channel_type.value,
+                    delivery_provider or message.channel_type.value,
                     message.tenant_id,
                     result.error,
                     latency_ms,

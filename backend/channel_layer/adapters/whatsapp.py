@@ -178,7 +178,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
             if att.url or att.data_url
         ]
 
-        sent, error = await send_whatsapp_message(
+        send_result = await send_whatsapp_message(
             to_phone,
             message.content,
             attachments=attachments or None,
@@ -190,12 +190,24 @@ class WhatsAppAdapter(BaseChannelAdapter):
             customer_id=customer_id,
             idempotency_key=idempotency_key,
             single_dispatch=_is_ai_auto_response_idempotency_key(idempotency_key),
+            return_details=True,
         )
+        sent = bool(send_result[0]) if isinstance(send_result, tuple) and len(send_result) >= 1 else False
+        error = str(send_result[1] or "") if isinstance(send_result, tuple) and len(send_result) >= 2 else ""
+        details = send_result[2] if isinstance(send_result, tuple) and len(send_result) >= 3 else {}
+        details = dict(details or {}) if isinstance(details, dict) else {}
 
         return SendResult(
             success=sent,
             error=error,
+            external_message_id=str(details.get("external_message_id") or ""),
             channel_type=ChannelType.WHATSAPP,
+            metadata={
+                "delivery_provider": str(details.get("delivery_provider") or "meta_api").strip() or "meta_api",
+                "bridge_state": str(details.get("bridge_state") or ""),
+                "bridge_scope": str(details.get("bridge_scope") or ""),
+                "meta_attempted": bool(details.get("meta_attempted")),
+            },
         )
 
     async def validate_webhook(

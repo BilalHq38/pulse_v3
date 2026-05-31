@@ -174,6 +174,33 @@ def test_engine_override_helper_handles_missing_sentiment_gate():
     assert merged["existing_field"] == "kept"
 
 
+def test_engine_override_helper_preserves_active_order_flow_response():
+    support_plan = {
+        "response": "Please share your delivery address to complete the order.",
+        "deliver_response": True,
+        "escalate": False,
+        "conversation_stage": "order_flow",
+        "model_name": "deterministic-order-flow",
+        "next_action": "collect_order_details",
+        "order_id": "order-1",
+    }
+
+    merged = apply_engine_response_to_support_plan(
+        support_plan=support_plan,
+        capture={"sentiment_gate": {"ai_response_allowed": True}},
+        engine_answer="Here is a general product answer.",
+        engine_confidence=0.91,
+        engine_turn_id="turn-1",
+        engine_product_links=[ProductLink(product_id="p1", url="https://example.com/p1")],
+    )
+
+    assert merged["response"] == "Please share your delivery address to complete the order."
+    assert merged["next_action"] == "collect_order_details"
+    assert merged["engine_override_skipped_reason"] == "active_order_flow"
+    assert merged["engine_turn_id"] == "turn-1"
+    assert "product_links" not in merged
+
+
 class _FakeSettingsDb:
     def __init__(self, *, raise_lookup: bool = False, value):
         self._raise = raise_lookup

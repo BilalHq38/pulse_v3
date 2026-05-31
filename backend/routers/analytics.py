@@ -41,9 +41,19 @@ def _sentiment_label(score: float | int | None) -> str:
 def _summary_dedupe_key(item: dict) -> tuple[str, ...]:
     entity_type = str(item.get("entity_type") or "").strip().lower()
     if entity_type == "customer":
-        return ("customer", str(item.get("customer_id") or "").strip())
+        return (
+            "customer",
+            str(item.get("customer_id") or "").strip(),
+            str(item.get("conversation_id") or "").strip(),
+            str(item.get("date") or "").strip(),
+        )
     if entity_type == "lead":
-        return ("lead", str(item.get("lead_id") or "").strip())
+        return (
+            "lead",
+            str(item.get("lead_id") or "").strip(),
+            str(item.get("conversation_id") or "").strip(),
+            str(item.get("date") or "").strip(),
+        )
     return (str(item.get("id") or ""),)
 
 
@@ -78,10 +88,10 @@ async def analytics_overview(request: Request):
     open_conversations = await db.fetchval("SELECT COUNT(*) FROM conversations WHERE company_id=$1 AND status='open'", cid)
     # Only count active (unconverted) leads — converted leads are now customers.
     total_leads = await db.fetchval(
-        "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND status != 'converted'", cid
+        "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND status IS DISTINCT FROM 'converted'", cid
     )
     hot_leads = await db.fetchval(
-        "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot' AND status != 'converted'", cid
+        "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot' AND status IS DISTINCT FROM 'converted'", cid
     )
     total_customers = await db.fetchval(
         "SELECT COUNT(*) FROM customers WHERE company_id=$1 AND lifecycle_stage != 'lead'", cid
@@ -256,6 +266,7 @@ async def analytics_leads(request: Request):
         latest_metrics = await db.fetch(
             "SELECT DISTINCT ON (lead_id) lead_id,status,source,grade "
             f"FROM {_LEAD_METRICS_TABLE} WHERE company_id=$1 "
+            "AND status IS DISTINCT FROM 'converted' "
             "ORDER BY lead_id, metric_date DESC, updated_at DESC",
             cid,
         )
@@ -270,9 +281,10 @@ async def analytics_leads(request: Request):
             source_counts[row["source"]] = source_counts.get(row["source"], 0) + 1
             grade_counts[row["grade"]] = grade_counts.get(row["grade"], 0) + 1
         return {"by_status": status_counts, "by_source": source_counts, "by_grade": grade_counts}
-    sr = await db.fetch("SELECT status,COUNT(*) AS count FROM leads WHERE company_id=$1 GROUP BY status", cid)
-    so = await db.fetch("SELECT source,COUNT(*) AS count FROM leads WHERE company_id=$1 GROUP BY source", cid)
-    gr = await db.fetch("SELECT grade,COUNT(*) AS count FROM leads WHERE company_id=$1 GROUP BY grade", cid)
+    active_lead_filter = "company_id=$1 AND status IS DISTINCT FROM 'converted'"
+    sr = await db.fetch(f"SELECT status,COUNT(*) AS count FROM leads WHERE {active_lead_filter} GROUP BY status", cid)
+    so = await db.fetch(f"SELECT source,COUNT(*) AS count FROM leads WHERE {active_lead_filter} GROUP BY source", cid)
+    gr = await db.fetch(f"SELECT grade,COUNT(*) AS count FROM leads WHERE {active_lead_filter} GROUP BY grade", cid)
     return {
         "by_status": {r["status"]: r["count"] for r in sr},
         "by_source": {r["source"]: r["count"] for r in so},

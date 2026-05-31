@@ -37,6 +37,7 @@ from services.bootstrap import (
     bootstrap_data_pipeline,
     bootstrap_demo_accounts,
     bootstrap_roles,
+    bootstrap_request_runtime_schema,
     bootstrap_signup_primitives,
     bootstrap_super_admin,
 )
@@ -217,6 +218,7 @@ app = create_service_app(
         bootstrap_demo_accounts,
         bootstrap_ai_runtime,
         bootstrap_data_pipeline,
+        bootstrap_request_runtime_schema,
         bootstrap_agent_orchestrator,
     ),
 )

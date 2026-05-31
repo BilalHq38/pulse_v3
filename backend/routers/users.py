@@ -214,7 +214,7 @@ async def super_admin_overview(request: Request):
         "pending_approval_users": await db.fetchval("SELECT COUNT(*) FROM users WHERE status='pending_approval' AND role != 'super_admin'") or 0,
         "rejected_users":         await db.fetchval("SELECT COUNT(*) FROM users WHERE status='rejected' AND role != 'super_admin'") or 0,
         "inactive_users":         await db.fetchval("SELECT COUNT(*) FROM users WHERE status='inactive' AND role != 'super_admin'") or 0,
-        "total_leads":            await db.fetchval("SELECT COUNT(*) FROM leads") or 0,
+        "total_leads":            await db.fetchval("SELECT COUNT(*) FROM leads WHERE status IS DISTINCT FROM 'converted'") or 0,
         "total_customers":        await db.fetchval("SELECT COUNT(*) FROM customers") or 0,
         "total_conversations":    await db.fetchval("SELECT COUNT(*) FROM conversations") or 0,
         "total_tickets":          await db.fetchval("SELECT COUNT(*) FROM tickets") or 0,
@@ -232,7 +232,15 @@ async def super_admin_list_users(request: Request):
         cid = u.get("company_id", "")
         company = r(await db.fetchrow("SELECT name FROM companies WHERE id=$1 LIMIT 1", cid)) if cid else None
         u["company_name"] = (company or {}).get("name", "")
-        u["leads_count"] = await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1", cid) or 0 if cid else 0
+        u["leads_count"] = (
+            await db.fetchval(
+                "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND status IS DISTINCT FROM 'converted'",
+                cid,
+            )
+            or 0
+            if cid
+            else 0
+        )
         u["customers_count"] = (
             await db.fetchval("SELECT COUNT(*) FROM customers WHERE company_id=$1", cid) or 0 if cid else 0
         )

@@ -60,7 +60,6 @@ x-common-env: &common-env
   UPLOAD_STORAGE_DIR: ${UPLOAD_STORAGE_DIR:-/app/uploads}
   STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
   MEDIA_STORAGE_BACKEND: ${MEDIA_STORAGE_BACKEND:-${STORAGE_BACKEND:-local}}
-  GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/app/secrets/gcp-vertex-sa.json}
 
 x-service-defaults: &service-defaults
   env_file:
@@ -281,7 +280,6 @@ services:
       - "${CUSTOMER_HOST_PORT:-8003}:8003"
     volumes:
       - uploads-data:/app/uploads
-      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     logging: *default-logging
     deploy:
       resources:
@@ -336,8 +334,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=3).read()\""]
       interval: 15s
@@ -368,8 +364,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3).read()\""]
       interval: 15s
@@ -401,7 +395,6 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
       - fastembed-cache:/root/.cache/fastembed
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
@@ -602,8 +595,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).read()\""]
       interval: 15s

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from services.conversation_engine.prompt_builder import sanitise_history_content
+
 
 def format_messages_as_dialogue(msgs: list[dict], max_pairs: int = 12) -> list[str]:
     """Convert message rows into the engine's dialogue history format."""
     lines: list[str] = []
     for msg in msgs or []:
         sender = str(msg.get("sender_type") or "")
-        text = str(msg.get("content") or "").strip()
+        text = sanitise_history_content(str(msg.get("content") or ""))
         if not text:
             continue
         if sender == "customer":

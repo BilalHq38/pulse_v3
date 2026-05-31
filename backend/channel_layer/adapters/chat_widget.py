@@ -137,14 +137,14 @@ class ChatWidgetAdapter(BaseChannelAdapter):
                 return SendResult(
                     success=True,
                     channel_type=ChannelType.WEB_CHAT,
-                    metadata={"delivery_method": "websocket"},
+                    metadata={"delivery_method": "websocket", "delivery_provider": "websocket"},
                 )
 
             # No conversation_id — store for polling
             return SendResult(
                 success=True,
                 channel_type=ChannelType.WEB_CHAT,
-                metadata={"delivery_method": "stored_for_polling"},
+                metadata={"delivery_method": "stored_for_polling", "delivery_provider": "stored_for_polling"},
             )
 
         except Exception as exc:

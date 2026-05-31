@@ -211,6 +211,8 @@ def create_service_app(
     app.state.service_name = service_name
     app.state.allow_direct_jwt_auth = False
     app.state.require_internal_service_secret = True
+    app.state.startup_ready = False
+    app.state.startup_error = ""
 
     _register_security_handlers(app)
 
@@ -228,6 +230,17 @@ def create_service_app(
         try:
             if request.method.upper() == "OPTIONS":
                 response = Response(status_code=200)
+            elif not getattr(request.app.state, "startup_ready", False) and request.url.path not in {
+                "/health",
+                "/ready",
+                "/api/healthz",
+                "/metrics",
+                "/api/metrics",
+            }:
+                response = JSONResponse(
+                    status_code=503,
+                    content={"success": False, "error": "Service is starting", "data": None},
+                )
             elif not is_trusted_service_request(request):
                 response = JSONResponse(
                     status_code=401,
@@ -325,6 +338,8 @@ def create_service_app(
 
     @app.on_event("startup")
     async def startup() -> None:
+        app.state.startup_ready = False
+        app.state.startup_error = ""
         if is_production():
             require_secret("JWT_SECRET", min_length=32)
             require_secret("INTERNAL_SERVICE_SECRET", min_length=24)
@@ -357,6 +372,7 @@ def create_service_app(
             logger.warning("background queue startup skipped for %s: %s", service_name, exc)
             app.state.background_queue_handle = None
             app.state.background_queue_handles = []
+        app.state.startup_ready = True
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
@@ -374,6 +390,7 @@ def create_service_app(
     async def health() -> dict:
         return {
             "service": service_name,
+            "startup_ready": bool(getattr(app.state, "startup_ready", False)),
             "database": "ok" if await db.command() else "error",
         }
 
@@ -394,6 +411,8 @@ def create_service_app(
         except Exception:
             checks["redis"] = "error"
         is_ready = checks["database"] == "ok"
+        checks["startup"] = "ok" if getattr(app.state, "startup_ready", False) else "starting"
+        is_ready = is_ready and checks["startup"] == "ok"
         return {
             "service": service_name,
             "ready": is_ready,

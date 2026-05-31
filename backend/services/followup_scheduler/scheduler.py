@@ -44,6 +44,43 @@ def _idempotency_key(order_id: str, workflow_kind: str, to_status: str) -> str:
     return hashlib.sha256(f"{order_id}:{workflow_kind}:{to_status}".encode("utf-8")).hexdigest()
 
 
+def _normalize_trigger_status(to_status: str) -> str:
+    normalized = str(to_status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "delivery_complete": "delivery_completed",
+        "delivery_completed": "delivery_completed",
+        "order_complete": "order_completed",
+        "order_completed": "order_completed",
+        "delivered": "delivered",
+        "completed": "completed",
+        "confirmed": "confirmed",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _log_post_conversation_trigger(
+    *,
+    trigger_status: str,
+    order_id: str,
+    customer_id: str,
+    workflow_kind: str = "",
+    followup_id: str = "",
+    passed: bool,
+    reason: str = "",
+) -> None:
+    logger.info(
+        "post_conversation_trigger_evaluated trigger=%s order_id=%s customer_id=%s "
+        "workflow_kind=%s followup_id=%s trigger_result=%s reason=%s",
+        trigger_status,
+        order_id,
+        customer_id,
+        workflow_kind,
+        followup_id,
+        "pass" if passed else "fail",
+        reason,
+    )
+
+
 async def _engagement_ok(db, *, company_id: str, customer_id: str) -> tuple[bool, str]:
     """Returns (allowed, reason). reason is empty when allowed=True."""
     if not customer_id:
@@ -89,12 +126,27 @@ async def evaluate_order_event(
     Idempotent — replays of the same (order_id, workflow_kind, to_status)
     are no-ops because of uq_followups_idempotency_key.
     """
-    normalized_status = str(to_status or "").strip().lower()
+    raw_status = str(to_status or "").strip().lower()
+    normalized_status = _normalize_trigger_status(to_status)
     if normalized_status not in (_ORDER_CONFIRMED_STATUSES | _DELIVERY_COMPLETION_STATUSES):
+        _log_post_conversation_trigger(
+            trigger_status=raw_status,
+            order_id=order_id,
+            customer_id=customer_id,
+            passed=False,
+            reason="not_a_followup_status",
+        )
         return {"scheduled": False, "reason": "not_a_followup_status"}
 
     allowed, reason = await _engagement_ok(db, company_id=company_id, customer_id=customer_id)
     if not allowed:
+        _log_post_conversation_trigger(
+            trigger_status=normalized_status,
+            order_id=order_id,
+            customer_id=customer_id,
+            passed=False,
+            reason=reason,
+        )
         return {"scheduled": False, "reason": reason}
 
     if normalized_status in _ORDER_CONFIRMED_STATUSES:
@@ -133,15 +185,39 @@ async def evaluate_order_event(
             "followup_insert_failed order_id=%s workflow_kind=%s error=%s",
             order_id, workflow_kind, exc,
         )
+        _log_post_conversation_trigger(
+            trigger_status=normalized_status,
+            order_id=order_id,
+            customer_id=customer_id,
+            workflow_kind=workflow_kind,
+            passed=False,
+            reason="already_active_or_db_error",
+        )
         return {"scheduled": False, "reason": "already_active_or_db_error"}
 
     if not row:
+        _log_post_conversation_trigger(
+            trigger_status=normalized_status,
+            order_id=order_id,
+            customer_id=customer_id,
+            workflow_kind=workflow_kind,
+            passed=False,
+            reason="idempotent_replay",
+        )
         return {"scheduled": False, "reason": "idempotent_replay"}
 
     inserted_id = str(dict(row).get("id") or followup_id)
     logger.info(
         "followup_scheduled order_id=%s customer_id=%s workflow_kind=%s followup_id=%s delay_seconds=%s",
         order_id, customer_id, workflow_kind, inserted_id, delay,
+    )
+    _log_post_conversation_trigger(
+        trigger_status=normalized_status,
+        order_id=order_id,
+        customer_id=customer_id,
+        workflow_kind=workflow_kind,
+        followup_id=inserted_id,
+        passed=True,
     )
     return {"scheduled": True, "followup_id": inserted_id, "workflow_kind": workflow_kind}
 

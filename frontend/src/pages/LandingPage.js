@@ -1257,7 +1257,10 @@ const isMobileUA = () =>
 export default function LandingPage() {
   const pageRef = useRef(null);
   const lenisRef = useRef(null);
-  const isMobile = isMobileUA();
+  const [isMobileViewport, setIsMobileViewport] = useState(() => (
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false
+  ));
+  const isMobile = isMobileViewport || isMobileUA();
 
   const [scrolled, setScrolled] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -1277,6 +1280,15 @@ export default function LandingPage() {
   const heroMouseY = useMotionValue(0);
   const { scrollYProgress } = useScroll();
   const progressScale = useSpring(scrollYProgress, { stiffness: 120, damping: 28, restDelta: 0.001 });
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+    const query = window.matchMedia('(max-width: 767px)');
+    const update = () => setIsMobileViewport(query.matches);
+    update();
+    query.addEventListener?.('change', update);
+    return () => query.removeEventListener?.('change', update);
+  }, []);
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 18);
@@ -1468,6 +1480,29 @@ export default function LandingPage() {
           animation: shimmer 4.5s linear infinite;
           background-size: 200% 100%;
         }
+        .landing-shell,
+        .landing-shell * {
+          box-sizing: border-box;
+        }
+        .landing-shell img,
+        .landing-shell svg,
+        .landing-shell video {
+          max-width: 100%;
+        }
+        .landing-mesh,
+        .floating-orb,
+        .workflow-beam,
+        .chart-glow,
+        [data-float-layer],
+        [data-particle-dot],
+        .orbit-spin-slow,
+        .orbit-spin-medium,
+        .orbit-spin-fast,
+        .orbit-reverse-slow,
+        .orbit-reverse-medium,
+        .orbit-reverse-fast {
+          will-change: transform;
+        }
         @keyframes meshShift {
           0% {
             transform: translate3d(0, 0, 0) scale(1);
@@ -1544,6 +1579,74 @@ export default function LandingPage() {
           .workflow-beam,
           .chart-glow {
             animation: none !important;
+          }
+        }
+        @media (max-width: 768px) {
+          .landing-shell {
+            overflow-x: hidden;
+          }
+          .landing-shell::before {
+            display: none;
+          }
+          .landing-shell section,
+          .landing-shell footer,
+          .landing-shell header {
+            max-width: 100vw;
+            overflow-x: clip;
+          }
+          .hero-visual-wrapper {
+            width: min(100%, calc(100vw - 32px));
+            max-width: calc(100vw - 32px);
+          }
+          .glass-panel,
+          .glass-deep,
+          .landing-shell .backdrop-blur-xl,
+          .landing-shell .backdrop-blur-2xl {
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
+          }
+          .glass-panel,
+          .glass-deep,
+          .landing-shell [class*="shadow-"] {
+            box-shadow: 0 14px 34px -28px rgba(15, 23, 42, 0.34) !important;
+          }
+          .landing-mesh,
+          .floating-orb,
+          .workflow-beam,
+          .chart-glow,
+          [data-float-layer],
+          [data-particle-dot],
+          .orbit-spin-slow,
+          .orbit-spin-medium,
+          .orbit-spin-fast,
+          .orbit-reverse-slow,
+          .orbit-reverse-medium,
+          .orbit-reverse-fast {
+            animation: none !important;
+          }
+        }
+        @media (max-width: 430px) {
+          .hero-visual-wrapper {
+            transform: scale(0.94);
+            transform-origin: top center;
+            margin-bottom: -22px;
+          }
+          .landing-shell .glass-panel,
+          .landing-shell .glass-deep {
+            border-radius: 28px !important;
+          }
+          .landing-shell section {
+            padding-left: 16px;
+            padding-right: 16px;
+          }
+        }
+        @supports not (overflow: clip) {
+          @media (max-width: 768px) {
+            .landing-shell section,
+            .landing-shell footer,
+            .landing-shell header {
+              overflow-x: hidden;
+            }
           }
         }
       `}</style>
@@ -2506,5 +2609,3 @@ export default function LandingPage() {
     </div>
   );
 }
-
-

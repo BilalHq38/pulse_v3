@@ -344,7 +344,7 @@ def ai_temperature(default: float = 0.7) -> float:
         return default
 
 
-def ai_max_tokens(default: int = 8192) -> int:
+def ai_max_tokens(default: int = 2048) -> int:
     try:
         return int(os.environ.get("AI_MAX_TOKENS", str(default)) or default)
     except ValueError:
@@ -359,9 +359,9 @@ def ai_model_name(default: str = "") -> str:
     return (os.environ.get("AI_MODEL_NAME", default) or default).strip()
 
 
-def ai_api_call_timeout_seconds(default: float = 15.0) -> float:
+def ai_api_call_timeout_seconds(default: float = 25.0) -> float:
     try:
-        return max(1.0, min(15.0, float(os.environ.get("AI_API_CALL_TIMEOUT_SECONDS", str(default)) or default)))
+        return max(1.0, min(25.0, float(os.environ.get("AI_API_CALL_TIMEOUT_SECONDS", str(default)) or default)))
     except ValueError:
         return default
 
@@ -386,7 +386,7 @@ def anthropic_model_name(default: str = "claude-3-5-sonnet-20241022") -> str:
     return (os.environ.get("ANTHROPIC_MODEL", default) or default).strip()
 
 
-def gemini_flash_model_name(default: str = "gemini-2.5-flash-lite") -> str:
+def gemini_flash_model_name(default: str = "gemini-2.5-flash") -> str:
     return (os.environ.get("GEMINI_FLASH_MODEL", default) or default).strip()
 
 
@@ -404,7 +404,7 @@ def gemini_fallback_models(
     ]
 
 
-def normalize_gemini_embedding_model_name(model_name: str | None = None, default: str = "gemini-embedding-exp-03-07") -> str:
+def normalize_gemini_embedding_model_name(model_name: str | None = None, default: str = "text-embedding-004") -> str:
     """Return the Gemini embedding model name expected by the SDK.
 
     The REST API documents resource names as ``models/{model}``, while the
@@ -419,7 +419,7 @@ def normalize_gemini_embedding_model_name(model_name: str | None = None, default
     return value or default
 
 
-def gemini_embedding_model_name(default: str = "gemini-embedding-exp-03-07") -> str:
+def gemini_embedding_model_name(default: str = "text-embedding-004") -> str:
     return normalize_gemini_embedding_model_name(default=default)
 
 

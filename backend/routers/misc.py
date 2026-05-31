@@ -860,7 +860,13 @@ async def dashboard_live_summary(request: Request):
     suggested_replies_pending = 0
 
     new_leads_today = (
-        await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1 AND created_at >= $2", cid, today_start) or 0
+        await db.fetchval(
+            "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND created_at >= $2 "
+            "AND status IS DISTINCT FROM 'converted'",
+            cid,
+            today_start,
+        )
+        or 0
     )
     converted_leads_today = (
         await db.fetchval(
@@ -871,10 +877,19 @@ async def dashboard_live_summary(request: Request):
         )
         or 0
     )
-    hot_leads = await db.fetchval("SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot'", cid) or 0
+    hot_leads = (
+        await db.fetchval(
+            "SELECT COUNT(*) FROM leads WHERE company_id=$1 AND grade='hot' "
+            "AND status IS DISTINCT FROM 'converted'",
+            cid,
+        )
+        or 0
+    )
     recent_lead_activity = rs(
         await db.fetch(
-            "SELECT id,name,customer_company_name,grade,status,updated_at,score FROM leads WHERE company_id=$1 ORDER BY updated_at DESC LIMIT 5",  # noqa: E501
+            "SELECT id,name,customer_company_name,grade,status,updated_at,score FROM leads "
+            "WHERE company_id=$1 AND status IS DISTINCT FROM 'converted' "
+            "ORDER BY updated_at DESC LIMIT 5",
             cid,
         )
     )

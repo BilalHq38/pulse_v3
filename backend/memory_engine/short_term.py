@@ -7,6 +7,7 @@ and pending intent state. Data expires after configurable TTL.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -54,18 +55,27 @@ class ShortTermMemory:
         conversation_id: str = "",
     ) -> ShortTermContext:
         """Load all short-term context for a user."""
-        recent_messages = await self._get_recent_messages(tenant_id, user_id, conversation_id=conversation_id)
-        active_session = await self._get_json(tenant_id, user_id, "session", conversation_id=conversation_id)
-        pending_intent = await self._get_json(tenant_id, user_id, "intent", conversation_id=conversation_id)
-        last_ai_response = await self._get_string(tenant_id, user_id, "last_ai", conversation_id=conversation_id)
-        conversation_state = await self._get_json(tenant_id, user_id, "conv_state", conversation_id=conversation_id)
+        (
+            recent_messages,
+            active_session,
+            pending_intent,
+            last_ai_response,
+            conversation_state,
+        ) = await asyncio.gather(
+            self._get_recent_messages(tenant_id, user_id, conversation_id=conversation_id),
+            self._get_json(tenant_id, user_id, "session", conversation_id=conversation_id),
+            self._get_json(tenant_id, user_id, "intent", conversation_id=conversation_id),
+            self._get_string(tenant_id, user_id, "last_ai", conversation_id=conversation_id),
+            self._get_json(tenant_id, user_id, "conv_state", conversation_id=conversation_id),
+        )
 
         return ShortTermContext(
-            recent_messages=recent_messages,
+            recent_messages=list(recent_messages or [])[-_MAX_RECENT_MESSAGES:],
             active_session=active_session,
             pending_intent=pending_intent,
             last_ai_response=last_ai_response,
             conversation_state=conversation_state,
+            ttl_seconds=_DEFAULT_TTL,
         )
 
     async def store_message(
@@ -152,7 +162,18 @@ class ShortTermMemory:
 
     async def _get_recent_messages(self, tenant_id: str, user_id: str, *, conversation_id: str = "") -> list[dict]:
         key = self._key(tenant_id, user_id, "messages", conversation_id=conversation_id)
-        return await self._cache.get_list(key)
+        get_list = getattr(self._cache, "get_list", None)
+        if get_list:
+            data = await get_list(key)
+            return data if isinstance(data, list) else []
+        get_json = getattr(self._cache, "get_json", None)
+        if get_json:
+            data = await get_json(key)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and isinstance(data.get("items"), list):
+                return data["items"]
+        return []
 
     async def _get_json(self, tenant_id: str, user_id: str, suffix: str, *, conversation_id: str = "") -> dict:
         key = self._key(tenant_id, user_id, suffix, conversation_id=conversation_id)

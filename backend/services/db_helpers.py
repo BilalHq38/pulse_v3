@@ -2165,6 +2165,36 @@ async def ensure_message_reaction_schema(db, *, force: bool = False) -> None:
         if exists is True:
             _message_reaction_schema_ready.add(scope)
             return
+        try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_reactions(
+                    id TEXT PRIMARY KEY,
+                    company_id TEXT NOT NULL,
+                    conversation_id TEXT DEFAULT '',
+                    message_id TEXT DEFAULT '',
+                    provider_message_id TEXT NOT NULL,
+                    target_provider_message_id TEXT DEFAULT '',
+                    channel TEXT NOT NULL,
+                    actor_type TEXT DEFAULT 'customer',
+                    actor_id TEXT DEFAULT '',
+                    emoji TEXT DEFAULT '',
+                    action TEXT DEFAULT 'added',
+                    raw_payload JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(company_id, channel, provider_message_id)
+                )
+                """
+            )
+            _message_reaction_schema_ready.add(scope)
+            return
+        except Exception as exc:
+            logger.warning(
+                "runtime_schema_migration_create_failed area=message_reactions schema=%s error=%s",
+                scope,
+                exc,
+            )
         logger.warning(
             "runtime_schema_migration_required area=message_reactions migration=%s missing=relation:message_reactions schema=%s",
             DEPLOYMENT_SCHEMA_MIGRATION,
@@ -2862,12 +2892,20 @@ async def send_email_verification_message(
         "subject": "Verify your Pulse Engine email address",
         "body": f"Verify here: {ver['verify_link']}",
         "html_body": html,
-        "raise_on_failure": False,
+        "raise_on_failure": True,
+        "retry_attempts": 2,
     }
-    if background_tasks is not None:
-        background_tasks.add_task(send_email_async, **email_kwargs)
-    else:
+    try:
         await send_email_async(**email_kwargs)
+    except Exception as exc:
+        logger.exception(
+            "verification_email_delivery_failed user_id=%s email=%s reason=%s error=%s",
+            user.get("id", ""),
+            ver["email"],
+            reason,
+            exc,
+        )
+        raise
     now = datetime.now(timezone.utc)
     if reason == "register":
         avail = now + timedelta(seconds=VERIFICATION_RESEND_COOLDOWN_SECONDS)

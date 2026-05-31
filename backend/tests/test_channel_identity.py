@@ -9,6 +9,8 @@ from channel_layer.channel_identity import (
     normalize_whatsapp_phone,
     resolve_outbound_recipient,
 )
+from channel_layer.normalizer import MessageNormalizer
+from channel_layer.schemas import ChannelType, UnifiedMessage
 
 
 def test_whatsapp_incoming_e164_sender_preserved():
@@ -205,3 +207,32 @@ def test_email_address_normalization_is_not_overwritten_by_channel_id():
     assert email.is_valid
     assert email.canonical_value == "customer+sales@example.com"
     assert channel_id.canonical_value != email.canonical_value
+
+
+class _SocialIdentityDb:
+    def __init__(self):
+        self.calls = []
+
+    async def fetchval(self, sql, *args):
+        self.calls.append((sql, args))
+        return "cust-social-1"
+
+
+def test_social_identity_resolution_is_company_scoped():
+    db = _SocialIdentityDb()
+    message = UnifiedMessage(
+        message_id="m1",
+        tenant_id="company-1",
+        external_user_id="profile-123",
+        user_id="profile-123",
+        channel_type=ChannelType.FACEBOOK,
+        content="hello",
+    )
+
+    resolved = asyncio.run(MessageNormalizer().normalize(message, db))
+
+    assert resolved.resolved_customer_id == "cust-social-1"
+    sql, args = db.calls[0]
+    assert "JOIN customers" in sql
+    assert "c.company_id=$1" in sql
+    assert args == ("company-1", "facebook", "profile-123")

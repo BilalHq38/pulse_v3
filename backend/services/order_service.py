@@ -113,7 +113,13 @@ def _json_loads(value: Any, default: Any) -> Any:
 
 
 def normalize_order_status(status: str) -> str:
-    cleaned = _text(status, 40).lower()
+    cleaned = _text(status, 40).lower().replace("-", "_").replace(" ", "_")
+    cleaned = {
+        "order_complete": "completed",
+        "order_completed": "completed",
+        "delivery_complete": "delivered",
+        "delivery_completed": "delivered",
+    }.get(cleaned, cleaned)
     if cleaned not in ORDER_ALLOWED_STATUSES:
         raise ValueError("Invalid order status")
     return cleaned

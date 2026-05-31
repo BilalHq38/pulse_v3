@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from services.ai_service.routing_guards import is_low_value_message
+from services.ai_service.routing_guards import is_low_value_message, lightweight_route_message
 from services.conversation_engine.schemas import SourceType
 
 
@@ -72,6 +72,8 @@ class RoutingDecision:
     scores: dict[SourceType, float]
     ambiguous: bool
     low_value: bool = False
+    direct_intent: str = ""
+    direct_response: str = ""
 
 
 def _normalise(text: str) -> str:
@@ -94,9 +96,33 @@ def is_conversational_message(query: str) -> bool:
     return bool(text and (is_low_value_message(text) or plain in _SMALL_TALK_EXACT))
 
 
+def _direct_conversational_response(query: str) -> tuple[str, str]:
+    text = _normalise(query)
+    plain = re.sub(r"[^a-z0-9\s']", " ", text)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if plain in _SMALL_TALK_EXACT:
+        return "social", "I'm doing well, thanks for asking. What can I help you with today?"
+    routed = lightweight_route_message(query)
+    intent = str((routed or {}).get("intent") or "").strip().lower()
+    if intent == "greeting":
+        return "greeting", "Hi! Thanks for reaching out. What can I help you with today?"
+    if intent == "social":
+        return "social", "I'm doing well, thanks for asking. What can I help you with today?"
+    if intent == "gratitude":
+        return "low_value", "Glad to help. Let me know if there's anything else I can do for you."
+    if intent == "acknowledgement":
+        normalized = re.sub(r"[^a-z0-9\s]", " ", text)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized in {"no", "nope"}:
+            return "low_value", "Understood. I will not continue unless you ask for something else."
+        return "low_value", "Understood. Tell me what you would like to do next."
+    return "low_value", "Thanks. What can I help you with next?"
+
+
 def score(query: str) -> RoutingDecision:
     text = _normalise(query)
     if is_conversational_message(text):
+        direct_intent, direct_response = _direct_conversational_response(text)
         return RoutingDecision(
             sources=[],
             scores={
@@ -107,6 +133,8 @@ def score(query: str) -> RoutingDecision:
             },
             ambiguous=False,
             low_value=True,
+            direct_intent=direct_intent,
+            direct_response=direct_response,
         )
 
     scores: dict[SourceType, float] = {

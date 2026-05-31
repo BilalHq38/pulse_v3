@@ -45,11 +45,11 @@ export default function SuperAdminDashboardPage() {
       const [overviewRes, usersRes] = await Promise.all([
         api.get('/admin/overview'),
         api.get('/admin/users'),
-      ]);
+    ]);
       setOverview(overviewRes.data);
       setUsers(usersRes.data || []);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to load data');
+      setError(getErrorMessage(err, 'Failed to load data'));
     } finally { setLoading(false); }
   }, []);
 
@@ -81,7 +81,7 @@ export default function SuperAdminDashboardPage() {
       const r = await api.get('/admin/tenants?limit=500');
       setTenants(r.data?.tenants || []);
     } catch (e) {
-      setError(e.response?.data?.detail || 'Failed to load tenants');
+      setError(getErrorMessage(e, 'Failed to load tenants'));
     } finally {
       setTenantsLoading(false);
     }
@@ -93,7 +93,7 @@ export default function SuperAdminDashboardPage() {
       const r = await api.get('/visitor/tracking?limit=100');
       setVisitors(r.data?.sessions || []);
     } catch (e) {
-      setError(e.response?.data?.detail || 'Failed to load visitor tracking');
+      setError(getErrorMessage(e, 'Failed to load visitor tracking'));
     } finally {
       setLoadingVisitors(false);
     }

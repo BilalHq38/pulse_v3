@@ -87,6 +87,7 @@ class InstagramAdapter(BaseChannelAdapter):
             success=sent,
             error=error,
             channel_type=ChannelType.INSTAGRAM,
+            metadata={"delivery_provider": "meta_api"},
         )
 
     async def validate_webhook(

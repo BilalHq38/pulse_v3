@@ -1077,6 +1077,7 @@ async def send_whatsapp_message(
     customer_id: str = "",
     idempotency_key: str = "",
     single_dispatch: bool = False,
+    return_details: bool = False,
 ) -> tuple[bool, str]:
     scoped_company_id = (company_id or "").strip()
     local_message_id = (db_message_id or "").strip()
@@ -1092,6 +1093,18 @@ async def send_whatsapp_message(
     bridge_snapshot: dict[str, Any] = {}
     bridge_preferred = False
     tenant_meta_attempted = False
+    delivery_provider = ""
+
+    def _result(success: bool, err: str) -> tuple:
+        details = {
+            "delivery_provider": delivery_provider,
+            "external_message_id": external_message_id,
+            "bridge_state": bridge_status,
+            "bridge_scope": str(bridge_snapshot.get("scope") or "") if bridge_snapshot else "",
+            "meta_attempted": tenant_meta_attempted,
+        }
+        return (success, err, details) if return_details else (success, err)
+
     if db and scoped_company_id:
         logger.info(
             "whatsapp_outbound_meta_first company_id=%s user_id=%s conversation_id=%s customer_id=%s message_id=%s selected_whatsapp_scope=%s recipient_id=%s send_attempt=%s idempotency_key=%s delivery_status=%s",
@@ -1119,6 +1132,7 @@ async def send_whatsapp_message(
                 db_message_id=local_message_id,
             )
             if sent:
+                delivery_provider = "meta_api"
                 record_provider_success(
                     "meta",
                     channel="whatsapp",
@@ -1133,7 +1147,7 @@ async def send_whatsapp_message(
                         delivery_status="sent",
                         external_message_id=external_message_id,
                     )
-                return sent, error
+                return _result(sent, error)
             if not _tenant_meta_error_allows_bridge_fallback(error):
                 record_provider_failure(
                     "meta",
@@ -1162,7 +1176,8 @@ async def send_whatsapp_message(
                         delivery_status="failed",
                         external_message_id=external_message_id,
                 )
-                return sent, error
+                delivery_provider = "meta_api"
+                return _result(sent, error)
             bridge_snapshot = await _bridge_session_snapshot(
                 company_id=scoped_company_id,
                 user_id=scoped_user_id,
@@ -1178,7 +1193,8 @@ async def send_whatsapp_message(
                         delivery_status="failed",
                         external_message_id=external_message_id,
                     )
-                return sent, error
+                delivery_provider = "meta_api"
+                return _result(sent, error)
             logger.warning("[MetaTenant] bridge fallback after tenant send failure: %s", error or "unknown")
         except HTTPException as exc:
             logger.warning("[MetaTenant] falling back after config error: %s", exc.detail)
@@ -1212,6 +1228,7 @@ async def send_whatsapp_message(
             tenant_meta_attempted,
         )
     if bridge_preferred or _use_bridge():
+        delivery_provider = "whatsapp_bridge"
         bridge_error = _bridge_not_ready_error(bridge_snapshot) if bridge_snapshot else ""
         if bridge_error:
             record_provider_failure(
@@ -1244,7 +1261,7 @@ async def send_whatsapp_message(
                     db_message_id=local_message_id,
                     delivery_status="failed",
                 )
-            return False, bridge_error
+            return _result(False, bridge_error)
         sent, error, external_message_id = await _send_via_bridge(
             to_phone,
             message_text,
@@ -1259,6 +1276,7 @@ async def send_whatsapp_message(
             send_attempt=1,
         )
     else:
+        delivery_provider = "meta_api"
         sent, error, external_message_id = await _send_via_meta(
             to_phone,
             message_text,
@@ -1275,7 +1293,7 @@ async def send_whatsapp_message(
             delivery_status="sent" if sent else "failed",
             external_message_id=external_message_id,
         )
-    return sent, error
+    return _result(sent, error)
 
 
 async def _send_meta_channel_via_legacy_settings(

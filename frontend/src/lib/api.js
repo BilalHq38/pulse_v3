@@ -17,8 +17,77 @@ const api = axios.create({
   timeout: REQUEST_TIMEOUT_MS,
 });
 
-let accessToken = '';
+const ACCESS_TOKEN_STORAGE_KEY = 'pe_token';
+const LEGACY_REFRESH_STORAGE_KEY = 'pe_refresh';
+
+function safeStorage(storage) {
+  try {
+    const key = '__pe_storage_probe__';
+    storage.setItem(key, '1');
+    storage.removeItem(key);
+    return storage;
+  } catch {
+    return null;
+  }
+}
+
+const localTokenStorage = typeof window !== 'undefined' ? safeStorage(window.localStorage) : null;
+const sessionTokenStorage = typeof window !== 'undefined' ? safeStorage(window.sessionStorage) : null;
+
+function parseJwtPayload(token) {
+  try {
+    const [, payload] = String(token || '').split('.');
+    if (!payload) return {};
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
+    return JSON.parse(window.atob(padded));
+  } catch {
+    return {};
+  }
+}
+
+function storedAccessToken() {
+  const sessionToken = sessionTokenStorage?.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
+  if (sessionToken) return sessionToken;
+
+  const localToken = localTokenStorage?.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
+  if (String(parseJwtPayload(localToken).role || '').toLowerCase() === 'super_admin') {
+    localTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+    return '';
+  }
+  return localToken;
+}
+
+let accessToken = storedAccessToken();
 let refreshPromise = null;
+const MIN_ERROR_DISPLAY_DELAY_MS = 3000;
+const RETRYABLE_GET_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableGetError(error) {
+  const config = error?.config || {};
+  const method = String(config.method || 'get').toLowerCase();
+  if (method !== 'get' || config.skipGuardedRetry || config._guardedRetry) return false;
+  const status = Number(error?.response?.status || 0);
+  return !status || RETRYABLE_GET_STATUSES.has(status);
+}
+
+async function retryGetAfterMinimumLoadWindow(error) {
+  const config = error.config;
+  config._guardedRetry = true;
+  const startedAt = Number(config.metadata?.startedAt || Date.now());
+  const elapsed = Date.now() - startedAt;
+  const retryDelayMs = 500;
+  const waitMs = Math.max(retryDelayMs, MIN_ERROR_DISPLAY_DELAY_MS - elapsed);
+  await delay(waitMs);
+  config.metadata = { ...(config.metadata || {}), startedAt: Date.now() };
+  return api.request(config);
+}
 
 function isFormDataPayload(data) {
   return typeof FormData !== 'undefined' && data instanceof FormData;
@@ -37,8 +106,10 @@ function removeContentTypeHeader(headers) {
 }
 
 function clearCachedUser() {
-  localStorage.removeItem('pe_token');
-  localStorage.removeItem('pe_refresh');
+  localTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+  localTokenStorage?.removeItem(LEGACY_REFRESH_STORAGE_KEY);
+  sessionTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+  sessionTokenStorage?.removeItem(LEGACY_REFRESH_STORAGE_KEY);
   localStorage.removeItem('pe_user');
   localStorage.removeItem('pe_avatar');
   localStorage.removeItem('pe_company_name');
@@ -47,7 +118,7 @@ function clearCachedUser() {
 
 export function applyAuthResponse(data = {}) {
   if (data?.token) {
-    setAccessToken(data.token);
+    setAccessToken(data.token, { user: data.user });
   }
   if (data?.user) {
     localStorage.removeItem('pe_account_status');
@@ -56,10 +127,28 @@ export function applyAuthResponse(data = {}) {
   return data;
 }
 
-export function setAccessToken(token) {
+export function setAccessToken(token, options = {}) {
   accessToken = token || '';
-  localStorage.removeItem('pe_token');
-  localStorage.removeItem('pe_refresh');
+  localTokenStorage?.removeItem(LEGACY_REFRESH_STORAGE_KEY);
+  sessionTokenStorage?.removeItem(LEGACY_REFRESH_STORAGE_KEY);
+  if (!accessToken) {
+    localTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+    sessionTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+    window.dispatchEvent(new CustomEvent('pe-access-token-updated', { detail: { token: accessToken } }));
+    return;
+  }
+
+  const payloadRole = String(parseJwtPayload(accessToken).role || '').toLowerCase();
+  const userRole = String(options.user?.role || options.role || '').toLowerCase();
+  const storageScope = options.storage || (userRole === 'super_admin' || payloadRole === 'super_admin' ? 'session' : 'local');
+
+  if (storageScope === 'session') {
+    sessionTokenStorage?.setItem(ACCESS_TOKEN_STORAGE_KEY, accessToken);
+    localTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+  } else {
+    localTokenStorage?.setItem(ACCESS_TOKEN_STORAGE_KEY, accessToken);
+    sessionTokenStorage?.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+  }
   window.dispatchEvent(new CustomEvent('pe-access-token-updated', { detail: { token: accessToken } }));
 }
 
@@ -94,6 +183,7 @@ export async function clearAuthSession() {
 }
 
 api.interceptors.request.use((config) => {
+  config.metadata = { ...(config.metadata || {}), startedAt: Date.now() };
   if (isFormDataPayload(config.data)) {
     removeContentTypeHeader(config.headers);
   }
@@ -188,6 +278,9 @@ api.interceptors.response.use(
         clearAccessToken();
         clearCachedUser();
       }
+    }
+    if (isRetryableGetError(error)) {
+      return retryGetAfterMinimumLoadWindow(error);
     }
     return Promise.reject(error);
   }

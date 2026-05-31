@@ -15,10 +15,12 @@ const mockApi = {
   put: jest.fn(),
   delete: jest.fn(),
 };
+const mockAuthUser = { role: 'company_admin', company_id: 'co-1' };
 
 jest.mock('@/lib/api', () => ({
   __esModule: true,
   default: mockApi,
+  getAccessToken: jest.fn(() => ''),
 }));
 
 jest.mock('@/hooks/use-toast', () => ({
@@ -33,11 +35,21 @@ jest.mock('@/hooks/use-confirm-dialog', () => ({
   }),
 }));
 
+jest.mock('@/contexts/AuthContext', () => ({
+  useAuth: () => ({
+    user: mockAuthUser,
+    loading: false,
+  }),
+}));
+
 jest.mock('@/components/BulkUploadModal', () => () => null);
 jest.mock('@/lib/backend-url', () => ({ resolveMediaUrl: (url) => url || '' }));
 
 const CustomersPage = require('./CustomersPage').default;
 const { buildCustomerMethods } = require('../lib/channelUtils');
+
+let setIntervalSpy;
+let clearIntervalSpy;
 
 const BASE_CUSTOMER = {
   id: 'cust-1',
@@ -141,8 +153,15 @@ async function openCustomerDetail(container) {
 }
 
 afterEach(() => {
+  setIntervalSpy?.mockRestore();
+  clearIntervalSpy?.mockRestore();
   jest.clearAllMocks();
   document.body.innerHTML = '';
+});
+
+beforeEach(() => {
+  setIntervalSpy = jest.spyOn(global, 'setInterval').mockImplementation(() => 0);
+  clearIntervalSpy = jest.spyOn(global, 'clearInterval').mockImplementation(() => {});
 });
 
 test('customer detail closes with X and removes the customer URL parameter', async () => {

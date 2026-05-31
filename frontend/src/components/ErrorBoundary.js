@@ -1,21 +1,31 @@
 import React from 'react';
+import BrandedLoader from '@/components/ui/BrandedLoader';
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { hasError: false, error: null };
+    this.state = { hasError: false, error: null, showFallback: false };
+    this.fallbackTimer = null;
   }
 
   static getDerivedStateFromError(error) {
-    return { hasError: true, error };
+    return { hasError: true, error, showFallback: false };
   }
 
   componentDidCatch(error, info) {
     console.error('ErrorBoundary caught:', error, info);
+    this.fallbackTimer = window.setTimeout(() => {
+      this.setState({ showFallback: true });
+    }, 3000);
+  }
+
+  componentWillUnmount() {
+    if (this.fallbackTimer) window.clearTimeout(this.fallbackTimer);
   }
 
   render() {
     if (this.state.hasError) {
+      if (!this.state.showFallback) return <BrandedLoader />;
       return (
         <div style={{
           display: 'flex', flexDirection: 'column', alignItems: 'center',

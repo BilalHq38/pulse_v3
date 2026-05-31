@@ -8,9 +8,10 @@ const AuthContext = createContext(null);
 // Statuses that should NOT retain an authenticated session after refresh
 const BLOCKED_STATUSES = ['pending_approval', 'rejected', 'blocked'];
 
-// Silent background refresh every 55 minutes (access tokens expire in 15 min,
-// cookie-backed refresh token lasts 30 days — this keeps the access token alive).
-const REFRESH_INTERVAL_MS = 55 * 60 * 1000;
+// Refresh at 80% of access-token TTL so the default 15-minute token refreshes at 12 minutes.
+const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
+const ACCESS_TOKEN_TTL_SECONDS = Number(process.env.REACT_APP_ACCESS_TOKEN_TTL_SECONDS || DEFAULT_ACCESS_TOKEN_TTL_SECONDS);
+const REFRESH_INTERVAL_MS = Math.max(60 * 1000, Math.floor(ACCESS_TOKEN_TTL_SECONDS * 1000 * 0.8));
 
 function safeUserForStorage(user) {
   if (!user) return null;
@@ -41,6 +42,7 @@ export function AuthProvider({ children }) {
     localStorage.removeItem('pe_user');
     localStorage.removeItem('pe_avatar');
     localStorage.removeItem('pe_company_name');
+    localStorage.removeItem('pe_account_status');
     stopActivityTracking();
     if (refreshTimerRef.current) {
       clearInterval(refreshTimerRef.current);
@@ -49,7 +51,7 @@ export function AuthProvider({ children }) {
   }, []);
 
   const _setAuthenticatedUser = useCallback((userData, token) => {
-    if (token) setAccessToken(token);
+    if (token) setAccessToken(token, { user: userData });
     localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(userData)));
     setUser(userData);
     saveAvatar(userData?.avatar || '');
@@ -62,7 +64,7 @@ export function AuthProvider({ children }) {
       if (isSessionExpiredByInactivity()) return;
       try {
         const refreshed = await refreshAuthSession();
-        if (refreshed?.token) setAccessToken(refreshed.token);
+        if (refreshed?.token) setAccessToken(refreshed.token, { user: refreshed.user });
         if (refreshed?.user) {
           localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(refreshed.user)));
           setUser(refreshed.user);
@@ -88,12 +90,16 @@ export function AuthProvider({ children }) {
         const accountStatus = refreshed?.user?.account_status || refreshed?.user?.status || '';
         if (refreshed?.user && BLOCKED_STATUSES.includes(accountStatus)) {
           _clearLocalAuth();
+          localStorage.setItem('pe_account_status', accountStatus);
           setUser(null);
           setLoading(false);
+          if (!window.location.pathname.startsWith('/account-status')) {
+            window.location.replace('/account-status');
+          }
           return;
         }
 
-        if (refreshed?.token) setAccessToken(refreshed.token);
+        if (refreshed?.token) setAccessToken(refreshed.token, { user: refreshed.user });
         if (refreshed?.user) {
           localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(refreshed.user)));
           setUser(refreshed.user);
@@ -158,7 +164,7 @@ export function AuthProvider({ children }) {
   const adminLogin = useCallback(async (email, password) => {
     const res = await api.post('/admin/login', { email, password });
     const { token, user: userData } = res.data;
-    setAccessToken(token);
+    setAccessToken(token, { user: userData, storage: 'session' });
     localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(userData)));
     setUser(userData);
     localStorage.removeItem('pe_avatar');
@@ -213,7 +219,7 @@ export function AuthProvider({ children }) {
     try {
       const res = await api.post('/auth/session', {});
       const data = res.data || {};
-      if (data.token) setAccessToken(data.token);
+      if (data.token) setAccessToken(data.token, { user: data.user });
       if (data.user) {
         localStorage.setItem('pe_user', JSON.stringify(safeUserForStorage(data.user)));
         setUser(data.user);

@@ -2337,6 +2337,15 @@ async def _handle_whatsapp_webhook_payload(
                             else ""
                         )
                     ).strip()
+                    inbound_trace_id = _trace_id_from_context()
+                    _log_inbound_pipeline_stage(
+                        "event_received",
+                        "whatsapp",
+                        company_id=resolved_company_id,
+                        provider_event_id=provider_event_id,
+                        idempotency_key=idempotency_key,
+                        trace_id=inbound_trace_id,
+                    )
                     dedup_result = await _record_whatsapp_event_dedup(
                         db,
                         resolved_company_id,
@@ -2347,6 +2356,16 @@ async def _handle_whatsapp_webhook_payload(
                         payload=msg or {},
                     )
                     if dedup_result.get("duplicate"):
+                        _log_inbound_pipeline_stage(
+                            "deduplicated",
+                            "whatsapp",
+                            company_id=resolved_company_id,
+                            provider_event_id=provider_event_id,
+                            idempotency_key=idempotency_key,
+                            trace_id=inbound_trace_id,
+                            duplicate=True,
+                            message_id=provider_event_id,
+                        )
                         processed_results.append(
                             {
                                 "message_id": provider_event_id,
@@ -2357,6 +2376,15 @@ async def _handle_whatsapp_webhook_payload(
                         )
                         processed_any = True
                         continue
+                    _log_inbound_pipeline_stage(
+                        "deduplicated",
+                        "whatsapp",
+                        company_id=resolved_company_id,
+                        provider_event_id=provider_event_id,
+                        idempotency_key=idempotency_key,
+                        trace_id=inbound_trace_id,
+                        duplicate=False,
+                    )
                     single_payload = {
                         "entry": [
                             {
@@ -2500,6 +2528,16 @@ async def _handle_whatsapp_webhook_payload(
                         try:
                             cached = await dedup_cache.get_json(dedup_key)
                             if cached:
+                                _log_inbound_pipeline_stage(
+                                    "deduplicated",
+                                    "whatsapp",
+                                    company_id=resolved_company_id,
+                                    provider_event_id=dedup_message_id,
+                                    idempotency_key=idempotency_key,
+                                    trace_id=unified_message.trace_id,
+                                    duplicate=True,
+                                    message_id=dedup_message_id,
+                                )
                                 logger.info(
                                     "Skipping duplicate WhatsApp inbound before persistence company_id=%s event_id=%s external_message_id=%s trace_id=%s",
                                     resolved_company_id,
@@ -2713,6 +2751,29 @@ async def _handle_facebook_webhook_payload(
                     )
                     continue
 
+                provider_event_id = str(
+                    msg_payload.get("mid")
+                    or ((evt or {}).get("postback", {}) or {}).get("mid")
+                    or (evt or {}).get("message_id")
+                    or ""
+                ).strip()
+                idempotency_key = _build_inbound_message_idempotency_key(
+                    "facebook",
+                    company_id,
+                    provider_event_id,
+                )
+                trace_id = _trace_id_from_context(str((evt or {}).get("trace_id") or ""))
+                dedup_result = await _check_inbound_provider_duplicate(
+                    db,
+                    channel="facebook",
+                    company_id=company_id,
+                    provider_event_id=provider_event_id,
+                    idempotency_key=idempotency_key,
+                    trace_id=trace_id,
+                )
+                if dedup_result.get("duplicate"):
+                    continue
+
                 single_payload = {
                     "entry": [
                         {
@@ -2727,7 +2788,7 @@ async def _handle_facebook_webhook_payload(
                     company_id,
                 )
                 unified_message.trace_id = _trace_id_from_context(
-                    str((unified_message.metadata or {}).get("trace_id") or "")
+                    str((unified_message.metadata or {}).get("trace_id") or trace_id)
                 )
                 unified_message.metadata.update(
                     {
@@ -2735,6 +2796,9 @@ async def _handle_facebook_webhook_payload(
                         "company_id": company_id,
                         "source": "facebook_webhook",
                         "event_id": event_id,
+                        "provider_event_id": provider_event_id,
+                        "external_message_id": provider_event_id or unified_message.message_id,
+                        "idempotency_key": idempotency_key,
                         "trace_id": unified_message.trace_id,
                     }
                 )
@@ -2880,6 +2944,29 @@ async def _handle_instagram_webhook_payload(
                     )
                     continue
 
+                provider_event_id = str(
+                    msg_payload.get("mid")
+                    or ((evt or {}).get("postback", {}) or {}).get("mid")
+                    or (evt or {}).get("message_id")
+                    or ""
+                ).strip()
+                idempotency_key = _build_inbound_message_idempotency_key(
+                    "instagram",
+                    company_id,
+                    provider_event_id,
+                )
+                trace_id = _trace_id_from_context(str((evt or {}).get("trace_id") or ""))
+                dedup_result = await _check_inbound_provider_duplicate(
+                    db,
+                    channel="instagram",
+                    company_id=company_id,
+                    provider_event_id=provider_event_id,
+                    idempotency_key=idempotency_key,
+                    trace_id=trace_id,
+                )
+                if dedup_result.get("duplicate"):
+                    continue
+
                 single_payload = {
                     "entry": [
                         {
@@ -2894,7 +2981,7 @@ async def _handle_instagram_webhook_payload(
                     company_id,
                 )
                 unified_message.trace_id = _trace_id_from_context(
-                    str((unified_message.metadata or {}).get("trace_id") or "")
+                    str((unified_message.metadata or {}).get("trace_id") or trace_id)
                 )
                 unified_message.metadata.update(
                     {
@@ -2902,6 +2989,9 @@ async def _handle_instagram_webhook_payload(
                         "company_id": company_id,
                         "source": "instagram_webhook",
                         "event_id": event_id,
+                        "provider_event_id": provider_event_id,
+                        "external_message_id": provider_event_id or unified_message.message_id,
+                        "idempotency_key": idempotency_key,
                         "trace_id": unified_message.trace_id,
                     }
                 )
@@ -3540,6 +3630,86 @@ async def _capture_raw_message_background(
             metadata.get("company_id", ""),
             message.get("conversation_id", ""),
             message.get("id", ""),
+            exc,
+        )
+
+
+def _outbound_delivery_provider_label(channel: str, result_metadata: dict | None = None) -> str:
+    metadata = dict(result_metadata or {})
+    explicit = str(metadata.get("delivery_provider") or "").strip()
+    if explicit:
+        return explicit
+    delivery_method = str(metadata.get("delivery_method") or "").strip()
+    if delivery_method:
+        return delivery_method
+    normalized = str(channel or "").strip().lower()
+    if normalized == "web_chat":
+        return "websocket"
+    if normalized == "email":
+        return "smtp"
+    if normalized in {"facebook", "instagram"}:
+        return "meta_api"
+    if normalized == "whatsapp":
+        return "whatsapp_bridge_or_meta_api"
+    return normalized or "unknown"
+
+
+async def _capture_outbound_delivery_analytics_background(
+    db,
+    *,
+    conversation: dict,
+    message: dict,
+    source: str,
+    metadata: dict,
+) -> None:
+    message_id = str((message or {}).get("id") or "").strip()
+    company_id = str(
+        (metadata or {}).get("company_id")
+        or (conversation or {}).get("company_id")
+        or (message or {}).get("company_id")
+        or ""
+    ).strip()
+    conversation_id = str(
+        (metadata or {}).get("conversation_id")
+        or (conversation or {}).get("id")
+        or (message or {}).get("conversation_id")
+        or ""
+    ).strip()
+    trace_id = str((metadata or {}).get("trace_id") or "").strip()
+    try:
+        from data_pipeline.ingestion.raw_store import capture_raw_message
+
+        record = await capture_raw_message(
+            db,
+            conversation=conversation,
+            message=message,
+            source=source,
+            metadata={
+                "action": "ai_response_delivered",
+                **dict(metadata or {}),
+            },
+        )
+        logger.info(
+            "ai_outbound_delivery_analytics_event_fired company_id=%s conversation_id=%s channel=%s "
+            "message_id=%s delivery_provider=%s delivery_status=%s raw_message_id=%s trace_id=%s",
+            company_id,
+            conversation_id,
+            source,
+            message_id,
+            str((metadata or {}).get("delivery_provider") or ""),
+            str((metadata or {}).get("delivery_status") or ""),
+            str((record or {}).get("id") or ""),
+            trace_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "ai_outbound_delivery_analytics_event_failed company_id=%s conversation_id=%s channel=%s "
+            "message_id=%s trace_id=%s error=%s",
+            company_id,
+            conversation_id,
+            source,
+            message_id,
+            trace_id,
             exc,
         )
 
@@ -4700,6 +4870,249 @@ def _dedup_cache_key(channel: str, company_id: str, external_message_id: str) ->
     return f"{str(company_id or '').strip()}:{str(channel or '').strip()}:{str(external_message_id or '').strip()}"
 
 
+def _build_inbound_message_idempotency_key(channel: str, company_id: str, provider_event_id: str) -> str:
+    provider_id = str(provider_event_id or "").strip()
+    if not provider_id:
+        return ""
+    return f"{str(channel or '').strip()}:{str(company_id or '').strip()}:message:{provider_id}"
+
+
+def _log_inbound_pipeline_stage(
+    stage: str,
+    channel: str,
+    *,
+    company_id: str = "",
+    provider_event_id: str = "",
+    idempotency_key: str = "",
+    trace_id: str = "",
+    duplicate: bool | None = None,
+    message_id: str = "",
+) -> None:
+    duplicate_value = "" if duplicate is None else str(bool(duplicate)).lower()
+    logger.info(
+        "inbound_pipeline channel=%s stage=%s company_id=%s provider_event_id=%s idempotency_key=%s trace_id=%s duplicate=%s message_id=%s",
+        str(channel or "").strip(),
+        str(stage or "").strip(),
+        str(company_id or "").strip(),
+        str(provider_event_id or "").strip(),
+        str(idempotency_key or "").strip(),
+        str(trace_id or "").strip(),
+        duplicate_value,
+        str(message_id or "").strip(),
+    )
+
+
+def _log_channel_identity_stage(
+    stage: str,
+    channel: str,
+    *,
+    company_id: str = "",
+    customer_id: str = "",
+    conversation_id: str = "",
+    resolution: str = "",
+    sender_contact: str = "",
+    trace_id: str = "",
+) -> None:
+    logger.info(
+        "channel_identity channel=%s stage=%s company_id=%s customer_id=%s conversation_id=%s resolution=%s sender_contact=%s trace_id=%s",
+        str(channel or "").strip(),
+        str(stage or "").strip(),
+        str(company_id or "").strip(),
+        str(customer_id or "").strip(),
+        str(conversation_id or "").strip(),
+        str(resolution or "").strip(),
+        str(sender_contact or "").strip(),
+        str(trace_id or "").strip(),
+    )
+
+
+async def _find_existing_inbound_message_by_keys(
+    db,
+    *,
+    company_id: str,
+    external_message_id: str = "",
+    idempotency_key: str = "",
+) -> dict:
+    scoped_company_id = str(company_id or "").strip()
+    external_id = str(external_message_id or "").strip()
+    idem_key = str(idempotency_key or "").strip()
+    if not db or not scoped_company_id or (not external_id and not idem_key):
+        return {}
+    await _ensure_messages_idempotency_schema(db)
+    try:
+        if external_id:
+            existing = r(
+                await db.fetchrow(
+                    "SELECT id,conversation_id,sender_id FROM messages "
+                    "WHERE company_id=$1 AND external_message_id=$2 "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    scoped_company_id,
+                    external_id,
+                )
+            )
+            if existing:
+                return existing
+        if idem_key:
+            existing = r(
+                await db.fetchrow(
+                    "SELECT id,conversation_id,sender_id FROM messages "
+                    "WHERE company_id=$1 AND idempotency_key=$2 "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    scoped_company_id,
+                    idem_key,
+                )
+            )
+            if existing:
+                return existing
+    except Exception as exc:
+        logger.warning(
+            "Inbound message idempotency lookup failed company_id=%s external_message_id=%s idempotency_key=%s: %s",
+            scoped_company_id,
+            external_id,
+            idem_key,
+            exc,
+        )
+    return {}
+
+
+async def _duplicate_inbound_message_result(
+    db,
+    existing: dict,
+    *,
+    customer_id: str = "",
+    lead_id: str = "",
+    message_text: str = "",
+) -> dict:
+    existing_message_id = str((existing or {}).get("id") or "").strip()
+    return {
+        "conversation_id": str((existing or {}).get("conversation_id") or ""),
+        "message_id": existing_message_id,
+        "customer_id": str(customer_id or (existing or {}).get("sender_id") or ""),
+        "lead_id": str(lead_id or ""),
+        "customer_message": await _load_message_with_attachments(db, existing_message_id) if existing_message_id else None,
+        "ai_message": None,
+        "sentiment_analysis": build_sentiment_gate(message_text, {}),
+        "duplicate": True,
+    }
+
+
+async def _check_inbound_provider_duplicate(
+    db,
+    *,
+    channel: str,
+    company_id: str,
+    provider_event_id: str = "",
+    idempotency_key: str = "",
+    trace_id: str = "",
+    cache=None,
+) -> dict:
+    scoped_channel = str(channel or "").strip()
+    scoped_company_id = str(company_id or "").strip()
+    provider_id = str(provider_event_id or "").strip()
+    idem_key = str(idempotency_key or "").strip()
+    _log_inbound_pipeline_stage(
+        "event_received",
+        scoped_channel,
+        company_id=scoped_company_id,
+        provider_event_id=provider_id,
+        idempotency_key=idem_key,
+        trace_id=trace_id,
+    )
+    if not scoped_company_id or (not provider_id and not idem_key):
+        _log_inbound_pipeline_stage(
+            "deduplicated",
+            scoped_channel,
+            company_id=scoped_company_id,
+            provider_event_id=provider_id,
+            idempotency_key=idem_key,
+            trace_id=trace_id,
+            duplicate=False,
+        )
+        return {"duplicate": False}
+
+    existing = await _find_existing_inbound_message_by_keys(
+        db,
+        company_id=scoped_company_id,
+        external_message_id=provider_id,
+        idempotency_key=idem_key,
+    )
+    if existing:
+        _log_inbound_pipeline_stage(
+            "deduplicated",
+            scoped_channel,
+            company_id=scoped_company_id,
+            provider_event_id=provider_id,
+            idempotency_key=idem_key,
+            trace_id=trace_id,
+            duplicate=True,
+            message_id=str(existing.get("id") or ""),
+        )
+        return {
+            "duplicate": True,
+            "dedup_stage": "message_store",
+            "message_id": str(existing.get("id") or ""),
+            "conversation_id": str(existing.get("conversation_id") or ""),
+            "existing": existing,
+        }
+
+    dedup_cache = cache or get_cache_client(namespace="inbound_dedup")
+    cache_material = idem_key or provider_id
+    if dedup_cache and cache_material:
+        dedup_key = _dedup_cache_key(scoped_channel, scoped_company_id, cache_material)
+        try:
+            cached = await dedup_cache.get_json(dedup_key)
+            if cached:
+                cached_message_id = str((cached or {}).get("message_id") or provider_id or "").strip()
+                _log_inbound_pipeline_stage(
+                    "deduplicated",
+                    scoped_channel,
+                    company_id=scoped_company_id,
+                    provider_event_id=provider_id,
+                    idempotency_key=idem_key,
+                    trace_id=trace_id,
+                    duplicate=True,
+                    message_id=cached_message_id,
+                )
+                return {
+                    "duplicate": True,
+                    "dedup_stage": "cache",
+                    "message_id": cached_message_id,
+                    "conversation_id": str((cached or {}).get("conversation_id") or ""),
+                    "existing": dict(cached or {}),
+                }
+            await dedup_cache.set_json(
+                dedup_key,
+                {
+                    "channel": scoped_channel,
+                    "company_id": scoped_company_id,
+                    "provider_event_id": provider_id,
+                    "idempotency_key": idem_key,
+                    "trace_id": str(trace_id or ""),
+                },
+                ttl_seconds=dedup_cache_ttl_seconds(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Inbound dedup cache unavailable company_id=%s channel=%s provider_event_id=%s idempotency_key=%s: %s",
+                scoped_company_id,
+                scoped_channel,
+                provider_id,
+                idem_key,
+                exc,
+            )
+
+    _log_inbound_pipeline_stage(
+        "deduplicated",
+        scoped_channel,
+        company_id=scoped_company_id,
+        provider_event_id=provider_id,
+        idempotency_key=idem_key,
+        trace_id=trace_id,
+        duplicate=False,
+    )
+    return {"duplicate": False}
+
+
 async def _run_lead_workflow_sync(
     db,
     *,
@@ -4978,6 +5391,7 @@ async def _auto_capture_lead(
             return None
         normalized_channel = str(channel or "").strip().lower()
         existing = None
+        customer_created = False
         contact_fields = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)
         avatar_url = _safe_provider_avatar_url(
             metadata_payload.get("profile_picture_url")
@@ -5139,6 +5553,7 @@ async def _auto_capture_lead(
                 avatar_url,
             )
             existing = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1", nid))
+            customer_created = True
         else:
             customer_updates = []
             args = []
@@ -5189,6 +5604,24 @@ async def _auto_capture_lead(
                     f"UPDATE customers SET {', '.join(customer_updates)},updated_at=NOW() WHERE id=${len(args)}",
                     *args,
                 )
+        _log_channel_identity_stage(
+            "customer_identified",
+            channel,
+            company_id=company_id,
+            customer_id=str(existing.get("id") or ""),
+            resolution="created" if customer_created else "existing",
+            sender_contact=contact_fields.get("channel_id") or sender_contact,
+            trace_id=str(metadata_payload.get("trace_id") or ""),
+        )
+        _log_channel_identity_stage(
+            "company_assigned",
+            channel,
+            company_id=company_id,
+            customer_id=str(existing.get("id") or ""),
+            resolution="tenant_resolved",
+            sender_contact=contact_fields.get("channel_id") or sender_contact,
+            trace_id=str(metadata_payload.get("trace_id") or ""),
+        )
         await upsert_customer_social_profile(db, existing["id"], channel, social_profile_id)
         await db.execute(
             "INSERT INTO customer_tags(customer_id,tag) VALUES($1,'auto-captured') ON CONFLICT DO NOTHING",
@@ -5683,6 +6116,21 @@ async def _send_outbound_response_via_channel_layer(
             )
             external_message_id = str(result.external_message_id or "").strip()
             last_error = str(result.error or "").strip()
+            delivery_provider = _outbound_delivery_provider_label(channel, result.metadata)
+            if isinstance(metadata, dict):
+                metadata["delivery_provider"] = delivery_provider
+                metadata["external_message_id"] = external_message_id
+            logger.info(
+                "ai_outbound_delivery_channel_used company_id=%s conversation_id=%s channel=%s "
+                "delivery_provider=%s message_id=%s external_message_id=%s trace_id=%s",
+                company_id,
+                conversation_id,
+                channel,
+                delivery_provider,
+                db_message_id,
+                external_message_id,
+                trace_id,
+            )
             if result.success:
                 if db_message_id:
                     await _persist_outbound_message_state(
@@ -5691,6 +6139,17 @@ async def _send_outbound_response_via_channel_layer(
                         db_message_id=db_message_id,
                         delivery_status="delivered",
                         external_message_id=external_message_id,
+                )
+                logger.info(
+                    "ai_outbound_delivery_confirmed company_id=%s conversation_id=%s channel=%s "
+                    "delivery_provider=%s message_id=%s external_message_id=%s delivery_status=delivered trace_id=%s",
+                    company_id,
+                    conversation_id,
+                    channel,
+                    delivery_provider,
+                    db_message_id,
+                    external_message_id,
+                    trace_id,
                 )
                 return True, ""
             failure_code = _outbound_failure_code(last_error)
@@ -6370,6 +6829,43 @@ async def _process_incoming_message(
     metadata_payload = dict(metadata or {})
     if sender_contact and not metadata_payload.get("sender_contact"):
         metadata_payload["sender_contact"] = sender_contact
+    inbound_external_message_id = str(
+        metadata_payload.get("inbound_external_message_id")
+        or metadata_payload.get("external_message_id")
+        or metadata_payload.get("provider_event_id")
+        or ""
+    ).strip()
+    explicit_inbound_idempotency_key = str(metadata_payload.get("idempotency_key") or "").strip()
+    candidate_company_id = str(metadata_payload.get("company_id") or "").strip()
+    if candidate_company_id and inbound_external_message_id:
+        candidate_idempotency_key = explicit_inbound_idempotency_key or _build_inbound_message_idempotency_key(
+            channel,
+            candidate_company_id,
+            inbound_external_message_id,
+        )
+        existing_before_capture = await _find_existing_inbound_message_by_keys(
+            db,
+            company_id=candidate_company_id,
+            external_message_id=inbound_external_message_id,
+            idempotency_key=candidate_idempotency_key,
+        )
+        if existing_before_capture:
+            trace_id = _trace_id_from_context(str(metadata_payload.get("trace_id") or ""))
+            _log_inbound_pipeline_stage(
+                "deduplicated",
+                channel,
+                company_id=candidate_company_id,
+                provider_event_id=inbound_external_message_id,
+                idempotency_key=candidate_idempotency_key,
+                trace_id=trace_id,
+                duplicate=True,
+                message_id=str(existing_before_capture.get("id") or ""),
+            )
+            return await _duplicate_inbound_message_result(
+                db,
+                existing_before_capture,
+                message_text=message_text,
+            )
     result = await _auto_capture_lead(db, channel, sender_name, sender_contact, message_text, metadata_payload)
     if not result:
         return None
@@ -6392,7 +6888,11 @@ async def _process_incoming_message(
         )
         return None
     inbound_external_message_id = str(
-        metadata_payload.get("inbound_external_message_id") or metadata_payload.get("external_message_id") or ""
+        metadata_payload.get("inbound_external_message_id")
+        or metadata_payload.get("external_message_id")
+        or metadata_payload.get("provider_event_id")
+        or inbound_external_message_id
+        or ""
     ).strip()
     channel_binding = _extract_sender_contact_fields(channel, sender_contact, metadata_payload)["channel_id"]
     is_group_message = channel == "whatsapp" and _is_whatsapp_group_metadata(metadata_payload)
@@ -6410,39 +6910,39 @@ async def _process_incoming_message(
         metadata_payload["group_participant_name"] = message_sender_name
         metadata_payload["group_direct_lead_capture"] = True
 
-    if inbound_external_message_id and company_id:
-        existing = r(
-            await db.fetchrow(
-                "SELECT id,conversation_id FROM messages "
-                "WHERE company_id=$1 AND external_message_id=$2 "
-                "ORDER BY created_at DESC LIMIT 1",
-                company_id,
-                inbound_external_message_id,
-            )
+    prestore_idempotency_key = explicit_inbound_idempotency_key or (
+        f"in:{company_id}:{channel}:{inbound_external_message_id}" if inbound_external_message_id else ""
+    )
+    if (inbound_external_message_id or prestore_idempotency_key) and company_id:
+        existing = await _find_existing_inbound_message_by_keys(
+            db,
+            company_id=company_id,
+            external_message_id=inbound_external_message_id,
+            idempotency_key=prestore_idempotency_key,
         )
         if existing:
             logger.info(
-                "Duplicate inbound event ignored company_id=%s channel=%s external_message_id=%s message_id=%s",
+                "Duplicate inbound event ignored company_id=%s channel=%s external_message_id=%s idempotency_key=%s message_id=%s",
                 company_id,
                 channel,
                 inbound_external_message_id,
+                prestore_idempotency_key,
                 existing.get("id", ""),
             )
-            return {
-                "conversation_id": existing.get("conversation_id", ""),
-                "message_id": existing.get("id", ""),
-                "customer_id": cid,
-                "lead_id": result.get("lead_id", ""),
-                "customer_message": await _load_message_with_attachments(db, existing.get("id", "")),
-                "ai_message": None,
-                "sentiment_analysis": build_sentiment_gate(message_text, {}),
-                "duplicate": True,
-            }
+            return await _duplicate_inbound_message_result(
+                db,
+                existing,
+                customer_id=cid,
+                lead_id=str(result.get("lead_id") or ""),
+                message_text=message_text,
+            )
 
     msg_id = make_id()
     ext_part = inbound_external_message_id.strip()
     usage_idempotency_key = (
-        f"in:{company_id}:{channel}:{ext_part}" if ext_part else f"in:{company_id}:{channel}:msg:{msg_id}"
+        explicit_inbound_idempotency_key
+        or prestore_idempotency_key
+        or (f"in:{company_id}:{channel}:{ext_part}" if ext_part else f"in:{company_id}:{channel}:msg:{msg_id}")
     )
     saved_attachments: list[dict] = []
     convo: dict = {}
@@ -6459,6 +6959,7 @@ async def _process_incoming_message(
         metadata_payload.get("message_timestamp") or metadata_payload.get("timestamp")
     )
     support_plan: dict = {}
+    conversation_resolution = "resumed"
     history_message = {
         "id": msg_id,
         "conversation_id": "",
@@ -6497,38 +6998,33 @@ async def _process_incoming_message(
                     channel,
                 )
                 metadata_payload["conversation_limit_exhausted"] = True
-            if inbound_external_message_id and company_id:
+            if (inbound_external_message_id or usage_idempotency_key) and company_id:
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtext($1))",
                     usage_idempotency_key,
                 )
-                existing_inbound = r(
-                    await conn.fetchrow(
-                        "SELECT id,conversation_id FROM messages "
-                        "WHERE company_id=$1 AND external_message_id=$2 "
-                        "ORDER BY created_at DESC LIMIT 1",
-                        company_id,
-                        inbound_external_message_id,
-                    )
+                existing_inbound = await _find_existing_inbound_message_by_keys(
+                    conn,
+                    company_id=company_id,
+                    external_message_id=inbound_external_message_id,
+                    idempotency_key=usage_idempotency_key,
                 )
                 if existing_inbound:
                     logger.info(
-                        "Duplicate inbound event ignored after lock company_id=%s channel=%s external_message_id=%s message_id=%s",
+                        "Duplicate inbound event ignored after lock company_id=%s channel=%s external_message_id=%s idempotency_key=%s message_id=%s",
                         company_id,
                         channel,
                         inbound_external_message_id,
+                        usage_idempotency_key,
                         existing_inbound.get("id", ""),
                     )
-                    return {
-                        "conversation_id": existing_inbound.get("conversation_id", ""),
-                        "message_id": existing_inbound.get("id", ""),
-                        "customer_id": cid,
-                        "lead_id": result.get("lead_id", ""),
-                        "customer_message": await _load_message_with_attachments(db, existing_inbound.get("id", "")),
-                        "ai_message": None,
-                        "sentiment_analysis": build_sentiment_gate(message_text, {}),
-                        "duplicate": True,
-                    }
+                    return await _duplicate_inbound_message_result(
+                        db,
+                        existing_inbound,
+                        customer_id=cid,
+                        lead_id=str(result.get("lead_id") or ""),
+                        message_text=message_text,
+                    )
 
             convo = r(
                 await conn.fetchrow(
@@ -6544,6 +7040,7 @@ async def _process_incoming_message(
             )
             if not convo:
                 convo_id = make_id()
+                conversation_resolution = "created"
                 conversation_subject = _conversation_subject_from_identity(
                     channel,
                     _clean_display_name(conversation_customer.get("name")) or message_sender_name,
@@ -6573,13 +7070,15 @@ async def _process_incoming_message(
                     convo_id,
                 )
                 convo = r(await conn.fetchrow("SELECT * FROM conversations WHERE id=$1", convo_id))
-            elif company_id and not convo.get("company_id"):
-                await conn.execute(
-                    "UPDATE conversations SET company_id=$1,updated_at=NOW() WHERE id=$2",
-                    company_id,
-                    convo["id"],
-                )
-                convo["company_id"] = company_id
+            else:
+                conversation_resolution = "resumed"
+                if company_id and not convo.get("company_id"):
+                    await conn.execute(
+                        "UPDATE conversations SET company_id=$1,updated_at=NOW() WHERE id=$2",
+                        company_id,
+                        convo["id"],
+                    )
+                    convo["company_id"] = company_id
             if conversation_channel_binding and convo.get("channel_id") != conversation_channel_binding:
                 await conn.execute(
                     "UPDATE conversations SET channel_id=$1,updated_at=NOW() WHERE id=$2 AND company_id=$3",
@@ -6670,7 +7169,30 @@ async def _process_incoming_message(
                 message_created_at,
                 convo_id,
             )
-    except Exception:
+    except Exception as exc:
+        if _is_unique_constraint_violation(exc):
+            existing_after_race = await _find_existing_inbound_message_by_keys(
+                db,
+                company_id=company_id,
+                external_message_id=inbound_external_message_id,
+                idempotency_key=usage_idempotency_key,
+            )
+            if existing_after_race:
+                logger.info(
+                    "Duplicate inbound event ignored after insert race company_id=%s channel=%s external_message_id=%s idempotency_key=%s message_id=%s",
+                    company_id,
+                    channel,
+                    inbound_external_message_id,
+                    usage_idempotency_key,
+                    existing_after_race.get("id", ""),
+                )
+                return await _duplicate_inbound_message_result(
+                    db,
+                    existing_after_race,
+                    customer_id=cid,
+                    lead_id=str(result.get("lead_id") or ""),
+                    message_text=message_text,
+                )
         logger.exception(
             "Inbound message transaction failed company_id=%s channel=%s message_id=%s external_message_id=%s",
             company_id,
@@ -6680,6 +7202,16 @@ async def _process_incoming_message(
         )
         return None
 
+    _log_channel_identity_stage(
+        f"conversation_{conversation_resolution}",
+        channel,
+        company_id=company_id,
+        customer_id=cid,
+        conversation_id=convo_id,
+        resolution=conversation_resolution,
+        sender_contact=sender_contact,
+        trace_id=str(metadata_payload.get("trace_id") or ""),
+    )
     logger.info(
         "Inbound message persisted company_id=%s user_id=%s source=%s conversation_id=%s customer_id=%s message_id=%s provider_message_id=%s raw_sender=%s normalized_sender=%s selected_recipient=%s saved=true",
         company_id,
@@ -6833,6 +7365,15 @@ async def _process_incoming_message(
             "group_message": is_group_message,
         }
 
+    _log_inbound_pipeline_stage(
+        "passed_to_pipeline",
+        channel,
+        company_id=company_id,
+        provider_event_id=inbound_external_message_id,
+        idempotency_key=usage_idempotency_key,
+        trace_id=trace_id,
+        message_id=msg_id,
+    )
     try:
         context_started_at = time.monotonic()
         msgs_history = await fetch_messages_with_attachments(
@@ -7358,6 +7899,15 @@ async def _process_incoming_message(
                     ai_id,
                 )
                 logger.info(
+                    "ai_outbound_write_success company_id=%s conversation_id=%s channel=%s "
+                    "message_id=%s delivery_status=sending trace_id=%s",
+                    company_id,
+                    convo_id,
+                    channel,
+                    ai_id,
+                    trace_id,
+                )
+                logger.info(
                     "ai_latency_stage stage=persistence duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
                     _elapsed_ms(persist_started_at),
                     convo_id,
@@ -7402,6 +7952,26 @@ async def _process_incoming_message(
                     customer,
                     sender_contact,
                 )
+                outbound_metadata = {
+                    "source": f"webhook_{channel}",
+                    "trace_id": trace_id,
+                    "customer_id": str(cid or ""),
+                    "conversation_id": convo_id,
+                    "company_id": company_id,
+                    "actor_user_id": str(
+                        metadata_payload.get("bridge_user_id")
+                        or metadata_payload.get("actor_user_id")
+                        or metadata_payload.get("user_id")
+                        or ""
+                    ),
+                    "bridge_scope": str(metadata_payload.get("bridge_scope") or ""),
+                    "bridge_user_id": str(metadata_payload.get("bridge_user_id") or ""),
+                    "idempotency_key": ai_idempotency_key,
+                    "raw_sender_id": str(sender_contact or ""),
+                    "normalized_sender_id": recipient_id,
+                    "selected_outbound_recipient": recipient_id,
+                }
+                sent = False
                 if recipient_id:
                     outbound_started_at = time.monotonic()
                     logger.info(
@@ -7422,24 +7992,7 @@ async def _process_incoming_message(
                         conversation_id=convo_id,
                         attachments=ai_attachments,
                         db_message_id=ai_id,
-                        metadata={
-                            "source": f"webhook_{channel}",
-                            "trace_id": trace_id,
-                            "customer_id": str(cid or ""),
-                            "conversation_id": convo_id,
-                            "actor_user_id": str(
-                                metadata_payload.get("bridge_user_id")
-                                or metadata_payload.get("actor_user_id")
-                                or metadata_payload.get("user_id")
-                                or ""
-                            ),
-                            "bridge_scope": str(metadata_payload.get("bridge_scope") or ""),
-                            "bridge_user_id": str(metadata_payload.get("bridge_user_id") or ""),
-                            "idempotency_key": ai_idempotency_key,
-                            "raw_sender_id": str(sender_contact or ""),
-                            "normalized_sender_id": recipient_id,
-                            "selected_outbound_recipient": recipient_id,
-                        },
+                        metadata=outbound_metadata,
                     )
                     logger.info(
                         "Outbound AI send completed company_id=%s conversation_id=%s channel=%s message_id=%s trace_id=%s sent=%s elapsed_ms=%s",
@@ -7499,6 +8052,30 @@ async def _process_incoming_message(
                         trace_id,
                     )
                 ai_message = await _load_message_with_attachments(db, ai_id)
+                create_safe_detached_task(
+                    db,
+                    _capture_outbound_delivery_analytics_background(
+                        db,
+                        conversation=dict(convo),
+                        message=dict(ai_message or ai_history_message),
+                        source=channel,
+                        metadata={
+                            **outbound_metadata,
+                            "delivery_status": "delivered" if recipient_id and sent else "failed",
+                            "delivery_provider": str(
+                                outbound_metadata.get("delivery_provider")
+                                or _outbound_delivery_provider_label(channel)
+                            ),
+                        },
+                    ),
+                    name=f"analytics-outbound-delivery-{ai_id}",
+                    idempotency_key=f"etl:outbound:{company_id}:{ai_id}",
+                    company_id=company_id,
+                    channel=channel,
+                    trace_id=trace_id,
+                    event_id=ai_id,
+                    source_queue="etl",
+                )
                 await emit_new_message(convo_id, ai_message)
                 create_safe_detached_task(
                     db,
@@ -7798,12 +8375,45 @@ async def web_chat_webhook(request: Request):
             raise RuntimeError("Web chat adapter is not registered")
 
         company_id = str(payload.get("company_id") or "").strip()
+        payload_session_id = str(payload.get("session_id") or "").strip()
+        webchat_provider_event_id = str(
+            payload.get("client_message_id")
+            or payload.get("message_id")
+            or payload.get("event_id")
+            or ""
+        ).strip()
+        webchat_idempotency_key = (
+            f"webchat:{company_id}:{payload_session_id}:{webchat_provider_event_id}"
+            if company_id and payload_session_id and webchat_provider_event_id
+            else _build_inbound_message_idempotency_key("web_chat", company_id, webchat_provider_event_id)
+        )
+        trace_id = _trace_id_from_context(str(payload.get("trace_id") or ""))
+        if webchat_provider_event_id:
+            dedup_result = await _check_inbound_provider_duplicate(
+                db,
+                channel="web_chat",
+                company_id=company_id,
+                provider_event_id=webchat_provider_event_id,
+                idempotency_key=webchat_idempotency_key,
+                trace_id=trace_id,
+            )
+            if dedup_result.get("duplicate"):
+                return {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "conversation_id": dedup_result.get("conversation_id", ""),
+                    "message_id": dedup_result.get("message_id", ""),
+                    "channel": "web_chat",
+                }
         unified_message = await adapter.receive_message(payload, db, company_id)
-        unified_message.trace_id = _trace_id_from_context(str((unified_message.metadata or {}).get("trace_id") or ""))
+        unified_message.trace_id = _trace_id_from_context(str((unified_message.metadata or {}).get("trace_id") or trace_id))
         unified_message.metadata.update(
             {
                 "company_id": company_id,
                 "source": "webhook_web_chat",
+                "provider_event_id": webchat_provider_event_id,
+                "external_message_id": webchat_provider_event_id,
+                "idempotency_key": webchat_idempotency_key,
                 "trace_id": unified_message.trace_id,
             }
         )
@@ -7812,6 +8422,9 @@ async def web_chat_webhook(request: Request):
         session_id = str(
             (unified_message.metadata or {}).get("session_id") or payload.get("session_id") or make_id()
         ).strip()
+        if webchat_provider_event_id and not webchat_idempotency_key:
+            webchat_idempotency_key = f"webchat:{company_id}:{session_id}:{webchat_provider_event_id}"
+            unified_message.metadata["idempotency_key"] = webchat_idempotency_key
         content = str(unified_message.content or "").strip()
         attachments = _legacy_attachments_from_unified(list(unified_message.attachments or []))
         if not attachments and isinstance(payload.get("attachments", []), list):
@@ -7826,6 +8439,8 @@ async def web_chat_webhook(request: Request):
         page_url = str((unified_message.metadata or {}).get("page_url") or payload.get("page_url") or "").strip()
         if not content and not attachments:
             return {"status": "error", "detail": "No message content or attachments"}
+        webchat_conversation_resolution = "resumed"
+        webchat_customer_resolution = "existing"
         convo = r(
             await db.fetchrow(
                 "SELECT * FROM conversations WHERE company_id=$1 AND session_id=$2 LIMIT 1",
@@ -7834,6 +8449,7 @@ async def web_chat_webhook(request: Request):
             )
         )
         if not convo:
+            webchat_conversation_resolution = "created"
             # Omni-channel identity resolution: reuse the existing customer by
             # normalized email or phone (last-10-digits) before creating a new
             # one. This ensures the same person reaching us via widget + WhatsApp
@@ -7870,6 +8486,7 @@ async def web_chat_webhook(request: Request):
                 cust_id = resolved_customer_id
             else:
                 cust_id = make_id()
+                webchat_customer_resolution = "created"
                 await db.execute(
                     "INSERT INTO customers(id,company_id,name,email,phone,segment,avatar,lifecycle_stage,lifetime_value,avg_sentiment,recent_tickets,complaint_count,days_since_last_contact,total_conversations,created_at,updated_at) VALUES($1,$2,$3,$4,'','website','','lead',0,0,0,0,0,1,NOW(),NOW())",  # noqa: E501
                     cust_id,
@@ -7894,6 +8511,36 @@ async def web_chat_webhook(request: Request):
         convo_id = convo["id"]
         customer_id = convo.get("customer_id", "")
         customer = r(await db.fetchrow("SELECT * FROM customers WHERE id=$1", customer_id)) if customer_id else {}
+        _log_channel_identity_stage(
+            "customer_identified",
+            "web_chat",
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=convo_id,
+            resolution=webchat_customer_resolution,
+            sender_contact=customer_email or session_id,
+            trace_id=trace_id,
+        )
+        _log_channel_identity_stage(
+            "company_assigned",
+            "web_chat",
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=convo_id,
+            resolution="tenant_resolved",
+            sender_contact=customer_email or session_id,
+            trace_id=trace_id,
+        )
+        _log_channel_identity_stage(
+            f"conversation_{webchat_conversation_resolution}",
+            "web_chat",
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=convo_id,
+            resolution=webchat_conversation_resolution,
+            sender_contact=customer_email or session_id,
+            trace_id=trace_id,
+        )
         lead_capture = await _auto_capture_lead(
             db,
             "web_chat",
@@ -7921,19 +8568,77 @@ async def web_chat_webhook(request: Request):
         sent_conf = None
         intent_type = None
         support_plan: dict = {}
-        await db.execute(
-            "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,sentiment_score,sentiment_emotion,sentiment_confidence,intent_type,read,created_at) VALUES($1,$2,$3,$4,'customer',$5,$6,$7,$8,$9,$10,FALSE,NOW())",  # noqa: E501
-            msg_id,
-            company_id,
-            convo_id,
-            content,
-            session_id,
-            customer_name,
-            sent_score,
-            sent_emotion,
-            sent_conf,
-            intent_type,
-        )
+        await _ensure_messages_idempotency_schema(db)
+        if webchat_provider_event_id or webchat_idempotency_key:
+            existing_webchat_message = await _find_existing_inbound_message_by_keys(
+                db,
+                company_id=company_id,
+                external_message_id=webchat_provider_event_id,
+                idempotency_key=webchat_idempotency_key,
+            )
+            if existing_webchat_message:
+                _log_inbound_pipeline_stage(
+                    "deduplicated",
+                    "web_chat",
+                    company_id=company_id,
+                    provider_event_id=webchat_provider_event_id,
+                    idempotency_key=webchat_idempotency_key,
+                    trace_id=trace_id,
+                    duplicate=True,
+                    message_id=str(existing_webchat_message.get("id") or ""),
+                )
+                return {
+                    "status": "duplicate",
+                    "duplicate": True,
+                    "conversation_id": existing_webchat_message.get("conversation_id", ""),
+                    "message_id": existing_webchat_message.get("id", ""),
+                    "customer_message": await _load_message_with_attachments(db, existing_webchat_message.get("id", "")),
+                    "channel": "web_chat",
+                }
+        try:
+            await db.execute(
+                "INSERT INTO messages(id,company_id,conversation_id,content,sender_type,sender_id,sender_name,sentiment_score,sentiment_emotion,sentiment_confidence,intent_type,external_message_id,idempotency_key,read,created_at) VALUES($1,$2,$3,$4,'customer',$5,$6,$7,$8,$9,$10,$11,$12,FALSE,NOW())",  # noqa: E501
+                msg_id,
+                company_id,
+                convo_id,
+                content,
+                session_id,
+                customer_name,
+                sent_score,
+                sent_emotion,
+                sent_conf,
+                intent_type,
+                webchat_provider_event_id,
+                webchat_idempotency_key,
+            )
+        except Exception as exc:
+            if _is_unique_constraint_violation(exc):
+                existing_webchat_message = await _find_existing_inbound_message_by_keys(
+                    db,
+                    company_id=company_id,
+                    external_message_id=webchat_provider_event_id,
+                    idempotency_key=webchat_idempotency_key,
+                )
+                if existing_webchat_message:
+                    _log_inbound_pipeline_stage(
+                        "deduplicated",
+                        "web_chat",
+                        company_id=company_id,
+                        provider_event_id=webchat_provider_event_id,
+                        idempotency_key=webchat_idempotency_key,
+                        trace_id=trace_id,
+                        duplicate=True,
+                        message_id=str(existing_webchat_message.get("id") or ""),
+                    )
+                    return {
+                        "status": "duplicate",
+                        "duplicate": True,
+                        "conversation_id": existing_webchat_message.get("conversation_id", ""),
+                        "message_id": existing_webchat_message.get("id", ""),
+                        "customer_message": await _load_message_with_attachments(db, existing_webchat_message.get("id", "")),
+                        "channel": "web_chat",
+                    }
+            raise
         saved_attachments = await save_message_attachments(db, msg_id, attachments)
         await persist_chat_history(
             db,
@@ -8003,12 +8708,13 @@ async def web_chat_webhook(request: Request):
                 msg_id,
                 exc,
             )
-        usage_key_seed = str(payload.get("client_message_id") or "").strip() or msg_id
+        usage_key_seed = webchat_provider_event_id or msg_id
+        webchat_usage_idempotency_key = webchat_idempotency_key or f"webchat:{company_id}:{session_id}:{usage_key_seed}"
         usage_result = await reserve_conversation_usage(
             db,
             company_id,
             channel="web_chat",
-            idempotency_key=f"webchat:{company_id}:{session_id}:{usage_key_seed}",
+            idempotency_key=webchat_usage_idempotency_key,
         )
         limit_state = await conversation_limit_status(db, company_id)
         if usage_result == "denied" or not bool(limit_state.get("allowed", True)):
@@ -8033,6 +8739,15 @@ async def web_chat_webhook(request: Request):
                 ),
                 "is_ai": False,
             }
+        _log_inbound_pipeline_stage(
+            "passed_to_pipeline",
+            "web_chat",
+            company_id=company_id,
+            provider_event_id=webchat_provider_event_id,
+            idempotency_key=webchat_usage_idempotency_key,
+            trace_id=trace_id,
+            message_id=msg_id,
+        )
         try:
             context_started_at = time.monotonic()
             msgs_history = await fetch_messages_with_attachments(
@@ -8556,6 +9271,14 @@ async def web_chat_webhook(request: Request):
                         ai_id,
                     )
                     logger.info(
+                        "ai_outbound_write_success company_id=%s conversation_id=%s channel=web_chat "
+                        "message_id=%s delivery_status=sending trace_id=%s",
+                        company_id,
+                        convo_id,
+                        ai_id,
+                        trace_id,
+                    )
+                    logger.info(
                         "ai_latency_stage stage=persistence duration_ms=%s conversation_id=%s company_id=%s request_id=%s trace_id=%s",
                         _elapsed_ms(persist_started_at),
                         convo_id,
@@ -8595,6 +9318,14 @@ async def web_chat_webhook(request: Request):
                         event_id=ai_id,
                     )
                     ai_message = await _load_message_with_attachments(db, ai_id)
+                    outbound_metadata = {
+                        "source": "webhook_web_chat",
+                        "trace_id": trace_id,
+                        "conversation_id": convo_id,
+                        "company_id": company_id,
+                        "customer_id": customer_id,
+                        "message_payload": ai_message,
+                    }
                     outbound_started_at = time.monotonic()
                     logger.info(
                         "FINAL_SEND_PAYLOAD company_id=%s conversation_id=%s message_id=%s "
@@ -8625,12 +9356,7 @@ async def web_chat_webhook(request: Request):
                         conversation_id=convo_id,
                         attachments=ai_attachments,
                         db_message_id=ai_id,
-                        metadata={
-                            "source": "webhook_web_chat",
-                            "trace_id": trace_id,
-                            "conversation_id": convo_id,
-                            "message_payload": ai_message,
-                        },
+                        metadata=outbound_metadata,
                     )
                     if not sent:
                         logger.warning(
@@ -8655,6 +9381,30 @@ async def web_chat_webhook(request: Request):
                         company_id,
                         "",
                         trace_id,
+                    )
+                    create_safe_detached_task(
+                        db,
+                        _capture_outbound_delivery_analytics_background(
+                            db,
+                            conversation=dict(convo),
+                            message=dict(ai_message or {}),
+                            source="web_chat",
+                            metadata={
+                                **outbound_metadata,
+                                "delivery_status": "delivered" if sent else "failed",
+                                "delivery_provider": str(
+                                    outbound_metadata.get("delivery_provider")
+                                    or _outbound_delivery_provider_label("web_chat")
+                                ),
+                            },
+                        ),
+                        name=f"analytics-outbound-delivery-{ai_id}",
+                        idempotency_key=f"etl:outbound:{company_id}:{ai_id}",
+                        company_id=company_id,
+                        channel="web_chat",
+                        trace_id=trace_id,
+                        event_id=ai_id,
+                        source_queue="etl",
                     )
                     ai_response_text = support_result["response"]
                     is_ai = True

@@ -103,6 +103,7 @@ class CaptureAgent(BaseAgent):
             }
             sentiment_gate = build_sentiment_gate(message_text, sentiment)
             context.global_memory.shared_context["latest_intent"] = intent_name
+            await self._store_pending_intent(context, intent)
             logger.info(
                 "capture_llm_skipped workflow_id=%s message_id=%s conversation_id=%s company_id=%s reason=%s",
                 context.workflow_id,
@@ -147,8 +148,25 @@ class CaptureAgent(BaseAgent):
                 intent_name, confidence = "greeting", 0.7
             elif any(t in lower for t in ("price", "cost", "how much")):
                 intent_name, confidence = "pricing_question", 0.6
+            elif any(
+                t in lower
+                for t in (
+                    "place order",
+                    "place an order",
+                    "order this",
+                    "i want to order",
+                    "how can i order",
+                )
+            ):
+                intent_name, confidence = "order_intent", 0.65
             elif any(t in lower for t in ("buy", "purchase", "order")):
                 intent_name, confidence = "buying_intent", 0.6
+            elif any(t in lower for t in ("return policy", "warranty", "business hours", "faq")):
+                intent_name, confidence = "faq", 0.6
+            elif any(t in lower for t in ("who are you", "about your company", "your business", "your brand")):
+                intent_name, confidence = "company_question", 0.6
+            elif any(t in lower for t in ("complaint", "broken", "damaged", "terrible", "unacceptable")):
+                intent_name, confidence = "complaint", 0.65
             elif any(t in lower for t in ("return", "refund", "cancel")):
                 intent_name, confidence = "refund", 0.6
             elif any(t in lower for t in ("product", "available", "stock")):
@@ -167,6 +185,7 @@ class CaptureAgent(BaseAgent):
         conversation_sentiment = dict(sentiment)
         sentiment_gate = build_sentiment_gate(message_text, sentiment)
         context.global_memory.shared_context["latest_intent"] = str(intent.get("intent") or "")
+        await self._store_pending_intent(context, intent)
         logger.info(
             "capture_local_classify workflow_id=%s message_id=%s conversation_id=%s company_id=%s intent=%s",
             context.workflow_id,
@@ -189,6 +208,50 @@ class CaptureAgent(BaseAgent):
             "rag_called": False,
         }
         return AgentRunResult(agent_name=self.name, payload=payload)
+
+    async def _store_pending_intent(self, context: WorkflowContextProtocol, intent: dict[str, Any]) -> None:
+        if not isinstance(intent, dict) or not str(intent.get("intent") or "").strip():
+            return
+        request = context.request
+        company_id = str(context.company_id or "")
+        customer_id = str(
+            getattr(request, "customer_id", "")
+            or getattr(context.global_memory, "customer_id", "")
+            or ""
+        )
+        conversation_id = str(
+            getattr(request, "conversation_id", "")
+            or getattr(context.global_memory, "conversation_id", "")
+            or ""
+        )
+        if not company_id or not customer_id or not conversation_id:
+            return
+        try:
+            from memory_engine.manager import MemoryManager
+
+            await MemoryManager(context.db).update_memory(
+                user_id=customer_id,
+                tenant_id=company_id,
+                memory_type="pending_intent",
+                content=intent,
+                conversation_id=conversation_id,
+            )
+            logger.info(
+                "pending_intent_stored company_id=%s customer_id=%s conversation_id=%s intent=%s confidence=%s",
+                company_id,
+                customer_id,
+                conversation_id,
+                str(intent.get("intent") or ""),
+                float(intent.get("confidence") or 0.0),
+            )
+        except Exception as exc:
+            logger.warning(
+                "pending_intent_store_failed company_id=%s customer_id=%s conversation_id=%s error=%s",
+                company_id,
+                customer_id,
+                conversation_id,
+                exc,
+            )
 
     async def _capture_lead_event(
         self,

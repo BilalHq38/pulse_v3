@@ -241,7 +241,10 @@ class MessageNormalizer:
             # Try social profile match (Instagram, Facebook)
             elif message.channel_type in (ChannelType.INSTAGRAM, ChannelType.FACEBOOK):
                 customer_id = await db.fetchval(
-                    "SELECT customer_id FROM customer_social_profiles WHERE platform=$1 AND profile_id=$2 LIMIT 1",
+                    "SELECT csp.customer_id FROM customer_social_profiles csp "
+                    "JOIN customers c ON c.id=csp.customer_id "
+                    "WHERE c.company_id=$1 AND csp.platform=$2 AND csp.profile_id=$3 LIMIT 1",
+                    message.tenant_id,
                     message.channel_type.value,
                     external_id,
                 )

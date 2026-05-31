@@ -6,6 +6,9 @@ import PlatformLogo from '@/components/PlatformLogo';
 import api from '@/lib/api';
 
 const F = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
+const MAX_STATUS_ATTEMPTS = 40;
+const STATUS_POLL_INTERVAL_MS = 3000;
+const DEFAULT_SUPPORT_EMAIL = 'hello@pulseengine.io';
 
 function buildVerificationParams(email, verificationMeta = {}) {
   const params = new URLSearchParams({
@@ -45,6 +48,17 @@ export default function SignupCompletePage() {
         const data = response.data || {};
         setDetails(data);
 
+        if (data.setup_failed) {
+          const supportEmail = data.support_email || DEFAULT_SUPPORT_EMAIL;
+          setStatus('error');
+          setMessage(
+            data.support_message ||
+              data.verification_error ||
+              `Payment was confirmed, but workspace setup could not finish automatically. Contact support at ${supportEmail} with your signup email and Stripe session ID.`,
+          );
+          return;
+        }
+
         if (data.account_created) {
           if (data.email_verified) {
             setStatus('success');
@@ -71,11 +85,12 @@ export default function SignupCompletePage() {
             ? 'Payment is confirmed. We are finishing workspace setup now.'
             : 'Payment confirmation is still in progress. This page will refresh automatically.'
         );
-        if (attempts < 40) {
-          timerId = window.setTimeout(checkStatus, 3000);
+        if (attempts < MAX_STATUS_ATTEMPTS) {
+          timerId = window.setTimeout(checkStatus, STATUS_POLL_INTERVAL_MS);
         } else {
+          const supportEmail = data.support_email || DEFAULT_SUPPORT_EMAIL;
           setStatus('pending');
-          setMessage('Payment looks successful, but setup is taking longer than expected. You can wait here a little longer or contact support.');
+          setMessage(`Payment looks successful, but setup is taking longer than expected. Contact support at ${supportEmail} with your signup email and Stripe session ID.`);
         }
       } catch (err) {
         if (cancelled) return;
@@ -157,6 +172,11 @@ export default function SignupCompletePage() {
             <Link to="/signup" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 20px', borderRadius: 12, border: '1px solid #d7dce5', background: '#fff', color: '#475569', textDecoration: 'none', fontSize: 14, fontWeight: 600 }}>
               Start Over
             </Link>
+            {(status === 'error' || status === 'pending') && (
+              <Link to="/contact" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 20px', borderRadius: 12, border: '1px solid #bfdbfe', background: '#eff6ff', color: '#1d4ed8', textDecoration: 'none', fontSize: 14, fontWeight: 700 }}>
+                Contact Support
+              </Link>
+            )}
           </div>
         </div>
       </div>

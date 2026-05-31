@@ -85,6 +85,17 @@ class _LiveDb:
             return {"id": fid}
         return None
 
+    async def fetchval(self, sql, *args):
+        sql_norm = " ".join(sql.split())
+        if "MAX(turn_index)" in sql_norm:
+            company_id, session_id = args
+            relevant = [
+                t for t in self.ai_conversation_turns
+                if t["company_id"] == company_id and t["session_id"] == session_id
+            ]
+            return max((t["turn_index"] for t in relevant), default=0)
+        return None
+
     async def fetch(self, sql, *args):
         sql_norm = " ".join(sql.split())
         if "FROM ai_conversation_turns" in sql_norm and "ORDER BY turn_index DESC" in sql_norm:

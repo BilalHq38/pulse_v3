@@ -365,9 +365,16 @@ async def test_combined_low_value_message_uses_zero_llm_and_zero_rag(monkeypatch
         max_embedding_calls=1,
     )
     try:
-        result = await response_generator.generate_combined_ai_analysis(
+        greeting_result = await response_generator.generate_combined_ai_analysis(
             "hi",
             [{"sender_type": "customer", "content": "hi"}],
+            company_id="co-low",
+            db=object(),
+            conversation_id="c-low",
+        )
+        social_result = await response_generator.generate_combined_ai_analysis(
+            "How are you?",
+            [{"sender_type": "customer", "content": "How are you?"}],
             company_id="co-low",
             db=object(),
             conversation_id="c-low",
@@ -376,8 +383,12 @@ async def test_combined_low_value_message_uses_zero_llm_and_zero_rag(monkeypatch
     finally:
         reset_llm_context(token)
 
-    assert result["ai_response"]["low_value_short_circuit"] is True
-    assert result["ai_response"]["rag_called"] is False
+    assert greeting_result["intent"]["intent"] == "greeting"
+    assert social_result["intent"]["intent"] == "social"
+    assert greeting_result["ai_response"]["low_value_short_circuit"] is True
+    assert social_result["ai_response"]["low_value_short_circuit"] is True
+    assert greeting_result["ai_response"]["rag_called"] is False
+    assert social_result["ai_response"]["rag_called"] is False
     assert snapshot["llm_call_count"] == 0
     assert snapshot["embedding_call_count"] == 0
 

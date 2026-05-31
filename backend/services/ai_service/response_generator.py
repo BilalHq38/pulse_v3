@@ -875,6 +875,7 @@ def _customer_safe_next_action(state: dict, intent_name: str) -> str:
     intent_name = _canonical_intent(intent_name or str((state or {}).get("intent") or ""))
     mapping = {
         "greeting": "greet_and_ask",
+        "social": "greet_and_ask",
         "acknowledgement": "acknowledge",
         "follow_up_continue": "continue_topic",
         "human_handoff": "escalate_to_human",
@@ -1013,6 +1014,8 @@ def _build_low_value_response_text(
             knowledge_context=knowledge_context,
             customer_id=str((customer_info or {}).get("id") or ""),
         )
+    if intent_name == "social":
+        return "I'm doing well, thanks for asking. What can I help you with today?"
     if intent_name == "gratitude":
         return "Glad to help. Let me know if there's anything else I can do for you."
     normalized = normalize_message_text(query)
@@ -1991,7 +1994,7 @@ def _compose_rule_based_response(
             "intent_shift": bool((conversation_state or {}).get("intent_shift")),
         }
 
-    if intent_name in {"gratitude", "acknowledgement"}:
+    if intent_name in {"gratitude", "acknowledgement", "social"}:
         return {
             "response": _build_low_value_response_text(
                 query,

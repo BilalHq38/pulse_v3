@@ -75,6 +75,7 @@ class FacebookAdapter(BaseChannelAdapter):
             success=sent,
             error=error,
             channel_type=ChannelType.FACEBOOK,
+            metadata={"delivery_provider": "meta_api"},
         )
 
     async def validate_webhook(

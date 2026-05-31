@@ -250,15 +250,15 @@ async def admin_overview(
         f"""
         SELECT
             (SELECT COUNT(*) FROM companies WHERE deleted_at IS NULL) AS total_tenants,
-            (SELECT COUNT(*) FROM users) AS total_users,
+            (SELECT COUNT(*) FROM users WHERE role != 'super_admin') AS total_users,
             (SELECT COUNT(*) FROM users WHERE role = 'company_agent') AS total_agents,
-            (SELECT COUNT(*) FROM users WHERE status = 'active') AS active_users,
-            (SELECT COUNT(*) FROM users WHERE status = 'paused') AS paused_users,
-            (SELECT COUNT(*) FROM users WHERE status = 'blocked') AS blocked_users,
-            (SELECT COUNT(*) FROM users WHERE status = 'pending_approval') AS pending_approval_users,
-            (SELECT COUNT(*) FROM users WHERE status = 'rejected') AS rejected_users,
-            (SELECT COUNT(*) FROM users WHERE status = 'inactive') AS inactive_users,
-            (SELECT COUNT(*) FROM leads WHERE status != 'converted') AS total_leads,
+            (SELECT COUNT(*) FROM users WHERE status = 'active' AND role != 'super_admin') AS active_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'paused' AND role != 'super_admin') AS paused_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'blocked' AND role != 'super_admin') AS blocked_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'pending_approval' AND role != 'super_admin') AS pending_approval_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'rejected' AND role != 'super_admin') AS rejected_users,
+            (SELECT COUNT(*) FROM users WHERE status = 'inactive' AND role != 'super_admin') AS inactive_users,
+            (SELECT COUNT(*) FROM leads WHERE status IS DISTINCT FROM 'converted') AS total_leads,
             (SELECT COUNT(*) FROM customers) AS total_customers,
             (SELECT COUNT(*) FROM conversations) AS total_conversations,
             (SELECT COUNT(*) FROM tickets) AS total_tickets,
@@ -348,7 +348,7 @@ async def admin_users(
             -- status != 'converted' matches the overview endpoint filter.
             SELECT company_id, COUNT(DISTINCT id) AS total_leads
             FROM leads
-            WHERE status != 'converted'
+            WHERE status IS DISTINCT FROM 'converted'
             GROUP BY company_id
         ),
         user_totals AS (
@@ -419,6 +419,7 @@ async def admin_users(
         LEFT JOIN ticket_totals tt ON tt.company_id = u.company_id
         LEFT JOIN product_totals pt ON pt.company_id = u.company_id
         LEFT JOIN conversation_month cm ON cm.company_id = u.company_id
+        WHERE u.role != 'super_admin'
         ORDER BY u.created_at DESC
         LIMIT $1
         """,
@@ -693,11 +694,13 @@ async def admin_tenants(
                 COUNT(*) FILTER (WHERE status = 'active') AS active_users,
                 MAX(COALESCE(last_login, created_at)) AS last_user_activity_at
             FROM users
+            WHERE role != 'super_admin'
             GROUP BY company_id
         ),
         lead_totals AS (
             SELECT company_id, COUNT(*) AS total_leads, MAX(updated_at) AS last_lead_activity_at
             FROM leads
+            WHERE status IS DISTINCT FROM 'converted'
             GROUP BY company_id
         ),
         customer_totals AS (

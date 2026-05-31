@@ -17,10 +17,12 @@ const mockApi = {
 };
 
 const mockToast = jest.fn();
+const mockAuthUser = { role: 'company_admin', company_id: 'co-1' };
 
 jest.mock('@/lib/api', () => ({
   __esModule: true,
   default: mockApi,
+  getAccessToken: jest.fn(() => ''),
 }));
 
 jest.mock('@/hooks/use-toast', () => ({
@@ -35,10 +37,20 @@ jest.mock('@/hooks/use-confirm-dialog', () => ({
   }),
 }));
 
+jest.mock('@/contexts/AuthContext', () => ({
+  useAuth: () => ({
+    user: mockAuthUser,
+    loading: false,
+  }),
+}));
+
 jest.mock('@/components/BulkUploadModal', () => () => null);
 jest.mock('@/lib/backend-url', () => ({ resolveMediaUrl: (url) => url || '' }));
 
 const LeadsPage = require('./LeadsPage').default;
+
+let setIntervalSpy;
+let clearIntervalSpy;
 
 const BASE_LEAD = {
   id: 'lead-1',
@@ -169,8 +181,15 @@ async function openLeadDetail(container) {
 }
 
 afterEach(() => {
+  setIntervalSpy?.mockRestore();
+  clearIntervalSpy?.mockRestore();
   jest.clearAllMocks();
   document.body.innerHTML = '';
+});
+
+beforeEach(() => {
+  setIntervalSpy = jest.spyOn(global, 'setInterval').mockImplementation(() => 0);
+  clearIntervalSpy = jest.spyOn(global, 'clearInterval').mockImplementation(() => {});
 });
 
 test('lead Email opens an editable composer and sends edited content', async () => {
@@ -538,7 +557,11 @@ test('AI Auto Nurture All generates drafts before Send Message to All sends them
   });
 
   const sendAllButton = await waitForSelector('[data-testid="send-nurture-all-btn"]', container);
-  expect(mockApi.post).toHaveBeenCalledWith('/leads/auto-nurture-all');
+  expect(mockApi.post).toHaveBeenCalledWith(
+    '/leads/auto-nurture-all',
+    {},
+    expect.objectContaining({ timeout: expect.any(Number) }),
+  );
   expect(mockApi.post.mock.calls.filter(([url]) => url.includes('/send'))).toHaveLength(0);
 
   await act(async () => {

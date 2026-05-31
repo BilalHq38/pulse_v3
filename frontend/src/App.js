@@ -7,6 +7,7 @@ import Layout from '@/components/Layout';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { Toaster } from '@/components/ui/toaster';
 import BrandedLoader from '@/components/ui/BrandedLoader';
+import PageSkeleton from '@/components/ui/PageSkeleton';
 import '@/App.css';
 
 const LandingPage = lazy(() => import('@/pages/LandingPage'));
@@ -50,6 +51,16 @@ function defaultRouteForUser(user) {
 
 function Spinner() {
   return <BrandedLoader />;
+}
+
+function RouteTransitionFallback() {
+  const location = useLocation();
+  if (location.pathname.startsWith('/inbox')) return <PageSkeleton variant="inbox" />;
+  if (location.pathname.startsWith('/settings')) return <PageSkeleton variant="settings" />;
+  if (['/dashboard', '/leads', '/customers', '/analytics'].some((path) => location.pathname.startsWith(path))) {
+    return <PageSkeleton variant="generic" />;
+  }
+  return <Spinner />;
 }
 
 const VISITOR_COOKIE = 'pulse_visitor_session';
@@ -235,15 +246,19 @@ function DashboardWithAuthCheck() {
 
 function PrefetchRoutes() {
   useEffect(() => {
-    const id = (window.requestIdleCallback || window.setTimeout)(
-      () => {
-        import('@/pages/InboxPage');
-        import('@/pages/LeadsPage');
-        import('@/pages/SettingsPage');
-      },
-      { timeout: 3000 },
-    );
-    return () => (window.cancelIdleCallback || window.clearTimeout)(id);
+    const prefetch = () => {
+      import('@/pages/DashboardPage');
+      import('@/pages/InboxPage');
+      import('@/pages/LeadsPage');
+      import('@/pages/SettingsPage');
+      import('@/pages/CustomersPage');
+    };
+    if (typeof window.requestIdleCallback === 'function') {
+      const id = window.requestIdleCallback(prefetch, { timeout: 3000 });
+      return () => window.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(prefetch, 1500);
+    return () => window.clearTimeout(id);
   }, []);
   return null;
 }
@@ -255,7 +270,7 @@ function App() {
         <VisitorTracker />
         <PrefetchRoutes />
         <ErrorBoundary>
-        <Suspense fallback={<Spinner />}>
+        <Suspense fallback={<RouteTransitionFallback />}>
           <Routes>
             <Route path="/" element={<PublicRoute><LandingPage /></PublicRoute>} />
             <Route path="/pricing" element={<PricingPage />} />

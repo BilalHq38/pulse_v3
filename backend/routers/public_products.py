@@ -272,10 +272,11 @@ async def public_buy_product(
                 )
                 if not product_row:
                     raise HTTPException(404, "product not found")
-                if not product_row["public_page_enabled"] or product_row["status"] != "active":
+                product_data = dict(product_row)
+                if not product_data.get("public_page_enabled") or product_data.get("status") != "active":
                     raise HTTPException(404, "product not found")
 
-                stock = product_row["stock_quantity"]
+                stock = product_data.get("stock_quantity")
                 if stock is not None and stock < buy.quantity:
                     raise HTTPException(409, "insufficient_stock")
 
@@ -284,14 +285,14 @@ async def public_buy_product(
                         "UPDATE company_products SET stock_quantity = stock_quantity - $1, updated_at = NOW() "
                         "WHERE id = $2",
                         buy.quantity,
-                        product_row["id"],
+                        product_data.get("id"),
                     )
 
                 order_id = make_id()
                 # Use the conversation session as conversation_id if available.
                 conversation_id = tracked_session_id or ""
                 # Calculate total price from product price × quantity.
-                unit_price = product_row["price"]
+                unit_price = product_data.get("price")
                 total_price = (float(unit_price) * buy.quantity) if unit_price is not None else None
                 try:
                     await conn.execute(
@@ -300,15 +301,15 @@ async def public_buy_product(
                         "quantity, variant, size, color, customer_name, customer_email, customer_phone, "
                         "delivery_address, notes, status, source_channel, created_by, raw_details, "
                         "missing_fields, idempotency_key, total_price, created_at, updated_at"
-                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'confirmed',$14,'public',"
+                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'pending',$14,'public',"
                         "'{}'::jsonb,'[]'::jsonb,$15,$16,NOW(),NOW())",
                         order_id,
                         company_id,
                         conversation_id,
                         resolved_lead_id,
                         resolved_customer_id,
-                        str(product_row["id"]),
-                        str(product_row["name"] or ""),
+                        str(product_data.get("id") or ""),
+                        str(product_data.get("name") or ""),
                         buy.quantity,
                         buy.customer_name.strip(),
                         customer_email,
@@ -332,7 +333,7 @@ async def public_buy_product(
                         PUBLIC_BUY_SOURCE_CHANNEL,
                         idempotency_key,
                         customer_phone,
-                        str(product_row["id"]),
+                        str(product_data.get("id") or ""),
                     )
                     if not existing:
                         raise
@@ -419,7 +420,7 @@ async def public_buy_product(
     return {
         "order_id": order_id,
         "order_ref": order_ref,
-        "status": "confirmed",
+        "status": "pending",
         "deduplicated": False,
         "customer_id": resolved_customer_id or None,
         "lead_converted": bool(resolved_lead_id),
