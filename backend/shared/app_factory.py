@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -336,7 +337,6 @@ def create_service_app(
         )
         return response
 
-    @app.on_event("startup")
     async def startup() -> None:
         app.state.startup_ready = False
         app.state.startup_error = ""
@@ -374,7 +374,6 @@ def create_service_app(
             app.state.background_queue_handles = []
         app.state.startup_ready = True
 
-    @app.on_event("shutdown")
     async def shutdown() -> None:
         handles = list(getattr(app.state, "background_queue_handles", []) or [])
         if not handles:
@@ -385,6 +384,16 @@ def create_service_app(
         await close_socket_resources()
         await close_cache_clients()
         await db.close()
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        await startup()
+        try:
+            yield
+        finally:
+            await shutdown()
+
+    app.router.lifespan_context = lifespan
 
     @app.get("/health")
     async def health() -> dict:

@@ -79,6 +79,8 @@ class FakeConn:
                     "stock_quantity": product.get("stock_quantity"),
                     "status": product.get("status", "active"),
                     "public_page_enabled": product.get("public_page_enabled", True),
+                    "price": product.get("price"),
+                    "price_currency": "USD",
                 }
             return None
         if "FROM companies WHERE id" in q:
@@ -201,6 +203,10 @@ def test_public_buy_creates_pending_order_and_decrements_stock():
     assert resp.status_code == 200, resp.text
     payload = resp.json()
     assert payload["status"] == "pending"
+    assert payload["order_ref"].startswith("ORD-")
+    assert payload["order_reference"] == payload["order_ref"]
+    assert payload["product_name"] == "Starter"
+    assert payload["quantity"] == 2
     assert payload["deduplicated"] is False
     assert state["product"]["stock_quantity"] == 1
     assert len(state["orders"]) == 1
@@ -274,7 +280,11 @@ def test_public_buy_dedupes_on_unique_violation_and_returns_existing():
     assert resp.status_code == 200
     body = resp.json()
     assert body["order_id"] == "existing-order-id"
+    assert body["order_ref"] == "ORD-EXISTI"
+    assert body["order_reference"] == body["order_ref"]
     assert body["deduplicated"] is True
+    assert state["product"]["stock_quantity"] == 5
+    assert "orders" not in state
 
 
 def test_public_buy_disabled_product_returns_404():

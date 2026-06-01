@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from services.conversation_engine.sentiment import build_sentiment_gate
+
 
 async def company_uses_conversation_engine(db, company_id: str) -> bool:
     """Read the per-company opt-in flag.
@@ -60,23 +62,30 @@ def apply_engine_response_to_support_plan(
     *,
     support_plan: dict,
     capture: dict,
+    user_message: str = "",
     engine_answer: str,
     engine_confidence: float,
     engine_turn_id: str,
     engine_product_links: Iterable,
     engine_sources_used: Iterable[str] | None = None,
+    engine_sentiment: dict | None = None,
+    engine_conversation_sentiment: dict | None = None,
+    engine_escalation_required: bool = False,
 ) -> dict:
     """Synthesise a support_plan that drives the webhook's existing send path
     using the engine's answer.
 
-    Escalation is sourced from the legacy capture's sentiment_gate so we keep
-    the existing safety net (toxicity / handoff request / api exhaustion) even
-    when the engine produces the actual reply.
+    Escalation is sourced from the legacy capture when available, otherwise
+    from the conversation engine's local sentiment. The old workflow often runs
+    in the background for metadata only, so capture can be empty on live paths.
     """
-    sentiment_gate = dict((capture or {}).get("sentiment_gate") or {})
+    capture = dict(capture or {})
+    sentiment_gate = dict(capture.get("sentiment_gate") or {})
+    if not sentiment_gate and engine_sentiment is not None:
+        sentiment_gate = build_sentiment_gate(user_message, dict(engine_sentiment or {}))
     ai_response_allowed = sentiment_gate.get("ai_response_allowed")
     # Only escalate on an explicit False — None means "no opinion".
-    should_escalate = ai_response_allowed is False
+    should_escalate = ai_response_allowed is False or bool(engine_escalation_required)
     merged = dict(support_plan or {})
     if _is_active_order_flow_plan(merged):
         merged["engine_override_skipped_reason"] = "active_order_flow"
@@ -96,6 +105,11 @@ def apply_engine_response_to_support_plan(
             "api_error": False,
             "engine_turn_id": engine_turn_id,
             "sources_used": list(engine_sources_used or []),
+            "sentiment": dict(engine_sentiment or capture.get("sentiment") or {}),
+            "conversation_sentiment": dict(
+                engine_conversation_sentiment or capture.get("conversation_sentiment") or {}
+            ),
+            "sentiment_gate": sentiment_gate,
             "product_links": [
                 {
                     "product_id": pl.product_id,

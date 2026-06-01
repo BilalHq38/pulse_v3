@@ -33,13 +33,13 @@ from channel_layer.schemas import (
 )
 from channel_layer.social_lead_detector import detect as detect_social_lead
 
-from services.ai_service.facade import build_sentiment_gate
 from services.ai_service.common import estimate_tokens
 from services.agent_orchestrator.facade import (
     orchestrate_lead_workflow,
     orchestrate_message_workflow,
 )
 from services.conversation_engine import TurnRequest, run_turn as engine_run_turn
+from services.conversation_engine.sentiment import build_sentiment_gate
 from services.conversation_engine_webchat import (
     apply_engine_response_to_support_plan,
 )
@@ -299,6 +299,41 @@ def _is_image_request(text: str, ai_response: str = "") -> bool:
         if any(phrase in ai_lower for phrase in _AI_IMAGE_SEND_PHRASES):
             return True
     return False
+
+
+def _user_requested_image(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(kw in lower for kw in _IMAGE_REQUEST_KEYWORDS)
+
+
+def _is_static_info_fallback(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return normalized in {
+        "i don't have that information right now. would you like me to connect you with our team?",
+        "i don't have that information right now.",
+        "i do not have that information right now. would you like me to connect you with our team?",
+    }
+
+
+def _is_image_ack_only(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower()).strip(" .!")
+    return bool(normalized) and any(
+        normalized.startswith(phrase)
+        for phrase in (
+            "here's an image",
+            "here is an image",
+            "here's the image",
+            "here is the image",
+            "here's the product image",
+            "here is the product image",
+        )
+    )
+
+
+def _should_skip_text_after_image_send(sent_urls: list[str], user_message: str, ai_response: str) -> bool:
+    if not sent_urls:
+        return False
+    return _user_requested_image(user_message) or _is_static_info_fallback(ai_response) or _is_image_ack_only(ai_response)
 
 
 def _make_absolute_image_url(image_url: str) -> str:
@@ -7497,11 +7532,15 @@ async def _process_incoming_message(
             support_plan = apply_engine_response_to_support_plan(
                 support_plan=support_plan,
                 capture=capture,
+                user_message=message_text,
                 engine_answer=engine_result.answer,
                 engine_confidence=engine_result.confidence,
                 engine_turn_id=engine_result.turn_id,
                 engine_product_links=engine_result.product_links,
                 engine_sources_used=engine_result.sources_used,
+                engine_sentiment=engine_result.sentiment,
+                engine_conversation_sentiment=engine_result.conversation_sentiment,
+                engine_escalation_required=engine_result.escalation_required,
             )
         except Exception as engine_exc:
             logger.warning(
@@ -7521,6 +7560,8 @@ async def _process_incoming_message(
             channel=channel,
             trace_id=trace_id,
         )
+        if not sentiment:
+            sentiment = dict(support_plan.get("sentiment") or {})
         conversation_sentiment = _coerce_workflow_dict(
             capture.get("conversation_sentiment"),
             field_name="capture.conversation_sentiment",
@@ -7531,6 +7572,8 @@ async def _process_incoming_message(
             channel=channel,
             trace_id=trace_id,
         )
+        if not conversation_sentiment:
+            conversation_sentiment = dict(support_plan.get("conversation_sentiment") or {})
         intent = _coerce_workflow_dict(
             capture.get("intent"),
             field_name="capture.intent",
@@ -7550,7 +7593,7 @@ async def _process_incoming_message(
             conversation_id=convo_id,
             channel=channel,
             trace_id=trace_id,
-        ) or build_sentiment_gate(message_text, sentiment)
+        ) or dict(support_plan.get("sentiment_gate") or {}) or build_sentiment_gate(message_text, sentiment)
         sent_score = _float_or_none(sentiment.get("score"))
         sent_emotion = str(sentiment.get("emotion", "neutral"))
         sent_conf = _float_or_none(sentiment.get("confidence"))
@@ -7782,7 +7825,7 @@ async def _process_incoming_message(
                 # explicitly asked to see images OR the AI response indicates
                 # it is sending one. For outbound channels the image is sent
                 # via the channel layer so WhatsApp/FB/IG delivers it natively.
-                await _send_product_images(
+                sent_image_urls = await _send_product_images(
                     db,
                     company_id=company_id,
                     conversation_id=convo_id,
@@ -7798,6 +7841,29 @@ async def _process_incoming_message(
                         "customer_id": str(cid or ""),
                     },
                 )
+                if _should_skip_text_after_image_send(
+                    sent_image_urls,
+                    message_text,
+                    str(support_result.get("response") or ""),
+                ):
+                    logger.info(
+                        "product_image_text_skipped company_id=%s conversation_id=%s channel=%s image_sends=%d reason=image_sent",
+                        company_id,
+                        convo_id,
+                        channel,
+                        len(sent_image_urls),
+                    )
+                    return {
+                        "conversation_id": convo_id,
+                        "message_id": msg_id,
+                        "customer_id": cid,
+                        "lead_id": result["lead_id"],
+                        "customer_message": customer_message,
+                        "ai_message": None,
+                        "sentiment_analysis": sentiment_gate,
+                        "product_image_urls": sent_image_urls,
+                        "image_sent": True,
+                    }
                 await _ensure_messages_idempotency_schema(db)
                 persist_started_at = time.monotonic()
                 logger.info(
@@ -8895,11 +8961,15 @@ async def web_chat_webhook(request: Request):
                 support_plan = apply_engine_response_to_support_plan(
                     support_plan=support_plan,
                     capture=capture,
+                    user_message=content,
                     engine_answer=engine_result.answer,
                     engine_confidence=engine_result.confidence,
                     engine_turn_id=engine_result.turn_id,
                     engine_product_links=engine_result.product_links,
                     engine_sources_used=engine_result.sources_used,
+                    engine_sentiment=engine_result.sentiment,
+                    engine_conversation_sentiment=engine_result.conversation_sentiment,
+                    engine_escalation_required=engine_result.escalation_required,
                 )
                 logger.info(
                     "ENGINE_RESPONSE company_id=%s conversation_id=%s turn_id=%s "
@@ -8952,6 +9022,8 @@ async def web_chat_webhook(request: Request):
                 channel="web_chat",
                 trace_id=trace_id,
             )
+            if not sentiment:
+                sentiment = dict(support_plan.get("sentiment") or {})
             conversation_sentiment = _coerce_workflow_dict(
                 capture.get("conversation_sentiment"),
                 field_name="capture.conversation_sentiment",
@@ -8962,6 +9034,8 @@ async def web_chat_webhook(request: Request):
                 channel="web_chat",
                 trace_id=trace_id,
             )
+            if not conversation_sentiment:
+                conversation_sentiment = dict(support_plan.get("conversation_sentiment") or {})
             intent = _coerce_workflow_dict(
                 capture.get("intent"),
                 field_name="capture.intent",
@@ -8981,7 +9055,7 @@ async def web_chat_webhook(request: Request):
                 conversation_id=convo_id,
                 channel="web_chat",
                 trace_id=trace_id,
-            ) or build_sentiment_gate(content, sentiment)
+            ) or dict(support_plan.get("sentiment_gate") or {}) or build_sentiment_gate(content, sentiment)
             sent_score = _float_or_none(sentiment.get("score"))
             sent_emotion = str(sentiment.get("emotion", "neutral"))
             sent_conf = _float_or_none(sentiment.get("confidence"))
@@ -9205,6 +9279,30 @@ async def web_chat_webhook(request: Request):
                         ai_response=str(support_result.get("response") or ""),
                         outbound_metadata={"trace_id": trace_id},
                     )
+                    if _should_skip_text_after_image_send(
+                        sent_image_urls,
+                        content,
+                        str(support_result.get("response") or ""),
+                    ):
+                        logger.info(
+                            "product_image_text_skipped company_id=%s conversation_id=%s channel=web_chat image_sends=%d reason=image_sent trace_id=%s",
+                            company_id,
+                            convo_id,
+                            len(sent_image_urls),
+                            trace_id,
+                        )
+                        return {
+                            "status": "ok",
+                            "conversation_id": convo_id,
+                            "customer_message": customer_message,
+                            "ai_message": None,
+                            "response": "",
+                            "is_ai": True,
+                            "product_links": list(support_plan.get("product_links") or []),
+                            "company_link": "",
+                            "product_image_urls": sent_image_urls,
+                            "image_sent": True,
+                        }
                     logger.info(
                         "OUTBOUND_RENDER company_id=%s conversation_id=%s channel=web_chat "
                         "response_source=%s response_len=%d product_links=%d image_sends=%d trace_id=%s",

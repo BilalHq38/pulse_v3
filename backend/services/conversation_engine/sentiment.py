@@ -19,6 +19,8 @@ import math
 import re
 from typing import Any
 
+from services.conversation_engine.routing_guards import is_low_value_message, lightweight_route_message
+
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_EMOTIONS = {
@@ -103,6 +105,12 @@ _INTENSIFIERS = {
     "very": 1.3,
 }
 
+_NEUTRAL_MESSAGE_RE = re.compile(
+    r"^\s*(hi|hello|hey|salam|assalamualaikum|good\s+(morning|afternoon|evening)|"
+    r"thanks?|thank\s+you|ok(?:ay)?|sure|yes|yeah|yep|no|nope|hmm|hmmm)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
 def _clamp(value: Any, *, low: float, high: float, default: float) -> float:
     try:
         parsed = float(value)
@@ -117,6 +125,49 @@ def _sentiment_label_from_score(score: float) -> str:
     if score <= -0.2:
         return "negative"
     return "neutral"
+
+
+def _neutral_result(source_text: str, *, source: str = "neutral_guard") -> dict[str, Any]:
+    return {
+        "score": 0.0,
+        "emotion": "neutral",
+        "confidence": 0.99,
+        "sentiment_label": "neutral",
+        "keywords": [],
+        "emotion_breakdown": {
+            "joy": 0.0,
+            "anger": 0.0,
+            "sadness": 0.0,
+            "fear": 0.0,
+            "surprise": 0.0,
+        },
+        "normalized_score": normalize_sentiment_score(0.0),
+        "percentage": sentiment_to_percentage(0.0),
+        "label": get_sentiment_label(sentiment_to_percentage(0.0)),
+        "provider": "local",
+        "model_name": "neutral-guard-v1",
+        "source": source,
+        "external_api_called": False,
+        "local_positive_hits": 0,
+        "local_negative_hits": 0,
+    }
+
+
+def _is_neutral_low_value_message(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return True
+    if _NEUTRAL_MESSAGE_RE.match(normalized):
+        return True
+    if is_low_value_message(normalized):
+        return True
+    routed = lightweight_route_message(normalized) or {}
+    return str(routed.get("intent") or "").strip().lower() in {
+        "greeting",
+        "social",
+        "gratitude",
+        "acknowledgement",
+    }
 
 
 def _normalize_emotion(label: str, raw_emotion: str, score: float) -> str:
@@ -210,7 +261,7 @@ def _dedupe_keywords(values: list[str], *, limit: int = 12) -> list[str]:
 def _local_sentiment_components(text: str) -> tuple[float, list[str], int, int]:
     lowered = str(text or "").strip().lower()
     if not lowered:
-        return 0.04, [], 0, 0
+        return 0.0, [], 0, 0
 
     keywords: list[str] = []
     positive_hits = 0
@@ -271,7 +322,7 @@ def _local_sentiment_components(text: str) -> tuple[float, list[str], int, int]:
         elif positive_hits > negative_hits:
             score = 0.04
         else:
-            score = 0.02
+            score = 0.0
     return score, _dedupe_keywords(keywords), positive_hits, negative_hits
 
 
@@ -314,6 +365,16 @@ def analyze_local_sentiment(text: str) -> dict:
     No external API calls. No GPU required.
     """
     source_text = (text or "").strip() or "[empty message]"
+    if _is_neutral_low_value_message(text):
+        result = _neutral_result(source_text)
+        _log_sentiment_payload(
+            "processed",
+            scope="local",
+            source_text=source_text,
+            payload=result,
+            engine={"provider": "local", "model_name": result["model_name"]},
+        )
+        return result
 
     # 1. Domain keyword supplement â€” always runs (fast, catches CRM-specific phrases)
     kw_score, keywords, pos_hits, neg_hits = _local_sentiment_components(source_text)
@@ -345,7 +406,7 @@ def analyze_local_sentiment(text: str) -> dict:
         blended = kw_score
 
     if abs(blended) < 0.015:
-        blended = 0.02
+        blended = 0.0
     blended = float(max(-1.0, min(1.0, round(blended, 4))))
     label = _sentiment_label_from_score(blended)
 
@@ -434,7 +495,7 @@ def normalize_sentiment_score(raw_score: float | None) -> float:
 
 def build_sentiment_gate(message_text: str, sentiment: dict | None = None) -> dict:
     sentiment = sentiment or {}
-    raw_score = _clamp(sentiment.get("score"), low=-1.0, high=1.0, default=0.02)
+    raw_score = _clamp(sentiment.get("score"), low=-1.0, high=1.0, default=0.0)
     sentiment_label = str(sentiment.get("sentiment_label") or "").strip().lower()
     if sentiment_label not in {"positive", "neutral", "negative"}:
         sentiment_label = _sentiment_label_from_score(raw_score)
@@ -523,7 +584,7 @@ def should_auto_escalate(message_text: str, sentiment: dict | None = None, inten
             r"\bcomplaint\b",
         ]
     )
-    score = _clamp((sentiment or {}).get("score"), low=-1.0, high=1.0, default=0.02)
+    score = _clamp((sentiment or {}).get("score"), low=-1.0, high=1.0, default=0.0)
     urgency = str((intent or {}).get("urgency", "") or "").lower()
     if high_urgency:
         return score < -0.2 or urgency in {"high", "critical"}

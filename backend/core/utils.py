@@ -22,6 +22,12 @@ def make_id() -> str:
     return str(uuid.uuid4())
 
 
+def format_order_reference(order_id: str, *, prefix: str = "ORD", length: int = 6) -> str:
+    token = re.sub(r"[^A-Za-z0-9]", "", str(order_id or "")).upper()
+    trimmed = token[: max(1, int(length or 6))]
+    return f"{prefix}-{trimmed}" if trimmed else f"{prefix}-"
+
+
 def clean_doc(doc):
     if doc and isinstance(doc, dict):
         doc.pop("_id", None)

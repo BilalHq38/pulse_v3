@@ -194,8 +194,18 @@ class Orchestrator:
                 }
                 for line in history_dialogue
             ]
-            conversation_sentiment = analyze_conversation_sentiment(
+            conversation_sentiment_result = analyze_conversation_sentiment(
                 history_as_context, latest_message=request.user_message
+            )
+            if asyncio.iscoroutine(conversation_sentiment_result):
+                conversation_sentiment_result = await conversation_sentiment_result
+            conversation_sentiment = dict(conversation_sentiment_result or {})
+            logger.debug(
+                "conversation_sentiment_type company_id=%s session_id=%s type=%s keys=%s",
+                request.company_id,
+                request.session_id,
+                type(conversation_sentiment).__name__,
+                sorted(conversation_sentiment.keys()),
             )
 
         chunks: list[ContextChunk] = []
@@ -214,7 +224,9 @@ class Orchestrator:
         confidence = validator.compute_confidence(compressed)
         bucket = validator.confidence_bucket(confidence)
 
-        deterministic = build_grounded_answer(request.user_message, compressed)
+        deterministic = None
+        if request.mode != "proactive":
+            deterministic = build_grounded_answer(request.user_message, compressed)
         if deterministic is not None:
             answer = deterministic.answer
             product_links = deterministic.product_links
@@ -243,7 +255,7 @@ class Orchestrator:
                 _shown = [pl.product_id for pl in product_links if pl.product_id]
                 if _shown:
                     asyncio.create_task(
-                        self._safe_store_shown_products(db, request, _shown),
+                        self._safe_store_shown_products(db, request, _shown, product_chunks=compressed),
                         name=f"shown-products-{request.session_id}",
                     )
             logger.info(
@@ -412,7 +424,7 @@ class Orchestrator:
             _shown = [pl.product_id for pl in product_links if pl.product_id]
             if _shown:
                 asyncio.create_task(
-                    self._safe_store_shown_products(db, request, _shown),
+                    self._safe_store_shown_products(db, request, _shown, product_chunks=trimmed_chunks),
                     name=f"shown-products-{request.session_id}",
                 )
 
@@ -740,6 +752,8 @@ class Orchestrator:
         db,
         request: TurnRequest,
         shown_ids: list[str],
+        *,
+        product_chunks: list[ContextChunk] | None = None,
     ) -> None:
         """Fire-and-forget wrapper for storing shown product IDs.
 
@@ -755,6 +769,7 @@ class Orchestrator:
                 request.customer_id,
                 shown_ids,
                 conversation_id=request.session_id,
+                last_product_category=_last_product_category(shown_ids, product_chunks or []),
             )
         except Exception as exc:
             logger.debug(
@@ -819,6 +834,27 @@ def _extract_template_name(chunks: list[ContextChunk]) -> str:
     for chunk in chunks:
         if chunk.source_type == "template":
             return chunk.title or (chunk.metadata or {}).get("name") or ""
+    return ""
+
+
+def _last_product_category(product_ids: list[str], chunks: list[ContextChunk]) -> str:
+    if not product_ids or not chunks:
+        return ""
+    wanted = [str(item).strip() for item in product_ids if str(item).strip()]
+    categories: dict[str, str] = {}
+    for chunk in chunks:
+        if chunk.source_type != "product":
+            continue
+        product_id = str(chunk.source_id or "").strip()
+        if not product_id:
+            continue
+        category = str((chunk.metadata or {}).get("category") or "").strip()
+        if category:
+            categories[product_id] = category
+    for product_id in reversed(wanted):
+        category = categories.get(product_id, "")
+        if category:
+            return category
     return ""
 
 

@@ -56,6 +56,25 @@ _BROWSE_RE = re.compile(
     r"all (your |the )?(products?|items?))\b",
     re.IGNORECASE,
 )
+_REFERENTIAL_MORE_RE = re.compile(
+    r"\b("
+    r"more\s+of\s+(?:them|those|these|it)|"
+    r"show\s+me\s+more|"
+    r"(?:them|those|these)\s+more|"
+    r"all\s+of\s+(?:them|those|these)|"
+    r"the\s+ones\s+you\s+showed|"
+    r"the\s+one\s+you\s+showed"
+    r")\b",
+    re.IGNORECASE,
+)
+_IMAGE_REFERENCE_RE = re.compile(
+    r"\b("
+    r"image|images|photo|photos|picture|pictures|"
+    r"show\s+me\s+(?:it|them|those|these)|"
+    r"can\s+i\s+see\s+(?:it|them|those|these)"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 async def _set_tenant(conn, company_id: str) -> None:
@@ -185,6 +204,19 @@ def _build_public_url(company_slug: str, product: dict) -> str:
     return ""
 
 
+def _category_label(category: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(category or "").strip().lower())
+    return cleaned or "products"
+
+
+def _is_referential_more_request(query: str) -> bool:
+    return bool(_REFERENTIAL_MORE_RE.search(str(query or "")))
+
+
+def _is_image_reference_request(query: str) -> bool:
+    return bool(_IMAGE_REFERENCE_RE.search(str(query or "")))
+
+
 def _product_row_to_chunk(
     product: dict,
     *,
@@ -254,6 +286,15 @@ class ProductRetriever:
         if not company_id or not query:
             return []
 
+        referential = await self._fetch_referential_context(
+            db,
+            company_id=company_id,
+            query=query,
+            top_k=top_k,
+        )
+        if referential is not None:
+            return referential
+
         # For catalog-browse queries ("what products do you have?"), the scored
         # ranker rank_products_for_query returns 0 results because generic browse
         # phrases score below its relevance threshold. Bypass the ranker and
@@ -311,6 +352,183 @@ class ProductRetriever:
                 chunks.append(chunk)
         return chunks
 
+    async def _fetch_referential_context(
+        self,
+        db,
+        *,
+        company_id: str,
+        query: str,
+        top_k: int,
+    ) -> list[ContextChunk] | None:
+        wants_more = _is_referential_more_request(query)
+        wants_images = _is_image_reference_request(query)
+        if not (wants_more or wants_images):
+            return None
+        if not (self._customer_id and self._session_id):
+            return None
+
+        try:
+            from memory_engine.long_term import LongTermMemory  # noqa: PLC0415
+
+            memory = LongTermMemory()
+            context = await memory._fetch_shown_product_context(
+                db,
+                company_id,
+                self._customer_id,
+                self._session_id,
+            )
+        except Exception:
+            context = {}
+
+        shown_ids = [
+            str(item).strip()
+            for item in (context.get("product_ids") or context.get("last_shown_product_ids") or [])
+            if str(item).strip()
+        ]
+        if not shown_ids:
+            return []
+
+        if wants_images and not wants_more:
+            return await self._fetch_products_by_ids(
+                db,
+                company_id=company_id,
+                product_ids=list(reversed(shown_ids[-3:])),
+                top_k=min(3, max(1, int(top_k))),
+            )
+
+        category = str(context.get("last_product_category") or "").strip()
+        if not category:
+            category = await self._infer_category_from_products(
+                db,
+                company_id=company_id,
+                product_ids=shown_ids,
+            )
+        if not category:
+            return []
+
+        rows = await _rls_fetch(
+            db,
+            company_id,
+            "SELECT id, name, product_title, category, product_type, price, "
+            "price_currency, description, stock_quantity, slug, links "
+            "FROM company_products "
+            "WHERE company_id = $1 "
+            "AND LOWER(COALESCE(category, '')) = LOWER($2) "
+            "AND NOT (id = ANY($3::text[])) "
+            "AND COALESCE(status, 'active') != 'archived' "
+            "ORDER BY name ASC LIMIT $4",
+            company_id,
+            category,
+            shown_ids,
+            max(1, int(top_k)),
+        )
+        if not rows:
+            label = _category_label(category)
+            return [
+                ContextChunk(
+                    source_type="product",
+                    source_id=f"end-of-catalog:{label}",
+                    title=f"No more {label}",
+                    content=f"No more products are available in category: {label}.",
+                    metadata={"is_end_of_catalog": True, "category": label},
+                    relevance_score=1.0,
+                )
+            ]
+        return await self._rows_to_chunks(
+            db,
+            company_id=company_id,
+            products=[dict(row) for row in rows],
+        )
+
+    async def _fetch_products_by_ids(
+        self,
+        db,
+        *,
+        company_id: str,
+        product_ids: list[str],
+        top_k: int,
+    ) -> list[ContextChunk]:
+        ids = [str(item).strip() for item in product_ids if str(item).strip()]
+        if not ids:
+            return []
+        rows = await _rls_fetch(
+            db,
+            company_id,
+            "SELECT id, name, product_title, category, product_type, price, "
+            "price_currency, description, stock_quantity, slug, links "
+            "FROM company_products "
+            "WHERE company_id = $1 AND id = ANY($2::text[]) "
+            "AND COALESCE(status, 'active') != 'archived' "
+            "ORDER BY array_position($2::text[], id) LIMIT $3",
+            company_id,
+            ids,
+            max(1, int(top_k)),
+        )
+        return await self._rows_to_chunks(
+            db,
+            company_id=company_id,
+            products=[dict(row) for row in rows],
+        )
+
+    async def _infer_category_from_products(
+        self,
+        db,
+        *,
+        company_id: str,
+        product_ids: list[str],
+    ) -> str:
+        ids = [str(item).strip() for item in product_ids if str(item).strip()]
+        if not ids:
+            return ""
+        rows = await _rls_fetch(
+            db,
+            company_id,
+            "SELECT id, category FROM company_products "
+            "WHERE company_id = $1 AND id = ANY($2::text[]) "
+            "ORDER BY array_position($2::text[], id)",
+            company_id,
+            ids,
+        )
+        categories = {
+            str(dict(row).get("id") or ""): str(dict(row).get("category") or "").strip()
+            for row in rows
+        }
+        for product_id in reversed(ids):
+            category = categories.get(product_id, "")
+            if category:
+                return category
+        return ""
+
+    async def _rows_to_chunks(
+        self,
+        db,
+        *,
+        company_id: str,
+        products: list[dict],
+    ) -> list[ContextChunk]:
+        if not products:
+            return []
+        product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
+        company_slug, images = await asyncio.gather(
+            _resolve_company_slug(db, company_id),
+            _fetch_first_images(db, product_ids, company_id=company_id),
+        )
+        chunks: list[ContextChunk] = []
+        denom = max(1, len(products))
+        for index, product in enumerate(products):
+            pid = str(product.get("id") or "")
+            chunk = _product_row_to_chunk(
+                product,
+                score=(denom - index) / denom,
+                company_slug=company_slug,
+                company_id=company_id,
+                image_url=images.get(pid, ""),
+                customer_id=self._customer_id,
+                session_id=self._session_id,
+            )
+            if chunk is not None:
+                chunks.append(chunk)
+        return chunks
 
     async def _fetch_full_catalog(self, db, *, company_id: str, top_k: int = 6) -> list[ContextChunk]:
         """Return top-N active products ordered by name — used when the scored

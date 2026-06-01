@@ -1,6 +1,3 @@
-x-vertex-credentials-volume: &vertex-credentials-volume
-  ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
-
 x-common-env: &common-env
   ENVIRONMENT: ${ENVIRONMENT:-development}
   APP_ENV: ${APP_ENV:-development}
@@ -63,7 +60,6 @@ x-common-env: &common-env
   UPLOAD_STORAGE_DIR: ${UPLOAD_STORAGE_DIR:-/app/uploads}
   STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
   MEDIA_STORAGE_BACKEND: ${MEDIA_STORAGE_BACKEND:-${STORAGE_BACKEND:-local}}
-  GOOGLE_APPLICATION_CREDENTIALS: "${GOOGLE_APPLICATION_CREDENTIALS:-/app/secrets/gcp-vertex-sa.json}"
   LOCAL_ML_ENABLED: "${LOCAL_ML_ENABLED:-false}"
 
 x-service-defaults: &service-defaults
@@ -285,7 +281,6 @@ services:
       - "${CUSTOMER_HOST_PORT:-8003}:8003"
     volumes:
       - uploads-data:/app/uploads
-      - *vertex-credentials-volume
     logging: *default-logging
     deploy:
       resources:
@@ -347,8 +342,6 @@ services:
       retries: 10
     expose:
       - "8013"
-    volumes:
-      - *vertex-credentials-volume
     logging: *default-logging
 
   ai:
@@ -379,8 +372,6 @@ services:
       retries: 10
     expose:
       - "8005"
-    volumes:
-      - *vertex-credentials-volume
     logging: *default-logging
 
   agent-orchestrator:
@@ -406,7 +397,6 @@ services:
         condition: service_healthy
     volumes:
       - fastembed-cache:/root/.cache/fastembed
-      - *vertex-credentials-volume
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
       interval: 15s
@@ -613,8 +603,6 @@ services:
       retries: 10
     ports:
       - "${GATEWAY_HOST_PORT:-8000}:8000"
-    volumes:
-      - *vertex-credentials-volume
     logging: *default-logging
 
   frontend:

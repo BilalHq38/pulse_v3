@@ -458,7 +458,6 @@ function getTagColor(tag) { return TAG_COLORS[tag] || 'bg-slate-50 text-slate-50
 function normalizeSentimentScore(rawScore) {
   if (rawScore === null || rawScore === undefined || Number.isNaN(Number(rawScore))) return null;
   const numeric = Number(rawScore);
-  if (numeric >= 0 && numeric <= 1) return numeric;
   return Math.max(0, Math.min(1, (numeric + 1) / 2));
 }
 
@@ -2178,7 +2177,7 @@ export default function InboxPage() {
                           ) : (
                             <>
                               {isAI && <Sparkles size={12} className="inline-block text-purple-400 mr-1" />}
-                              {messageContent}
+                              <span style={{ whiteSpace: 'pre-line' }}>{messageContent}</span>
                             </>
                           )}
                           {isAI && msg.raw_metadata ? (

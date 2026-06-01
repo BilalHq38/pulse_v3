@@ -111,6 +111,36 @@ async def _engagement_ok(db, *, company_id: str, customer_id: str) -> tuple[bool
     return True, ""
 
 
+async def _record_engagement_contact(db, *, company_id: str, customer_id: str, context: str) -> None:
+    if not customer_id:
+        return
+    try:
+        await db.execute(
+            "UPDATE customer_engagement "
+            "SET followup_count = COALESCE(followup_count, 0) + 1, "
+            "    last_contacted_at = NOW() "
+            "WHERE company_id = $1 AND customer_id = $2",
+            company_id,
+            customer_id,
+        )
+        await db.execute(
+            "INSERT INTO customer_engagement (company_id, customer_id, followup_count, last_contacted_at) "
+            "SELECT $1, $2, 1, NOW() "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM customer_engagement WHERE company_id = $1 AND customer_id = $2"
+            ")",
+            company_id,
+            customer_id,
+        )
+    except Exception as exc:
+        logger.debug(
+            "%s_followup_count_increment_failed customer_id=%s error=%s",
+            context,
+            customer_id,
+            exc,
+        )
+
+
 async def evaluate_order_event(
     db,
     *,
@@ -209,21 +239,12 @@ async def evaluate_order_event(
         return {"scheduled": False, "reason": "idempotent_replay"}
 
     inserted_id = str(dict(row).get("id") or followup_id)
-    try:
-        await db.execute(
-            "INSERT INTO customer_engagement (company_id, customer_id, followup_count, last_contacted_at) "
-            "VALUES ($1, $2, 1, NOW()) "
-            "ON CONFLICT (company_id, customer_id) DO UPDATE "
-            "SET followup_count = customer_engagement.followup_count + 1, "
-            "    last_contacted_at = NOW()",
-            company_id,
-            customer_id or "",
-        )
-    except Exception as _ce:
-        logger.debug(
-            "followup_count_increment_failed order_id=%s customer_id=%s error=%s",
-            order_id, customer_id, _ce,
-        )
+    await _record_engagement_contact(
+        db,
+        company_id=company_id,
+        customer_id=customer_id or "",
+        context="post_delivery",
+    )
     logger.info(
         "followup_scheduled order_id=%s customer_id=%s workflow_kind=%s followup_id=%s delay_seconds=%s",
         order_id, customer_id, workflow_kind, inserted_id, delay,
@@ -327,19 +348,10 @@ async def schedule_upsell_followup(
         return {"scheduled": False, "reason": "already_active_or_db_error"}
     if not row:
         return {"scheduled": False, "reason": "idempotent_replay"}
-    try:
-        await db.execute(
-            "INSERT INTO customer_engagement (company_id, customer_id, followup_count, last_contacted_at) "
-            "VALUES ($1, $2, 1, NOW()) "
-            "ON CONFLICT (company_id, customer_id) DO UPDATE "
-            "SET followup_count = customer_engagement.followup_count + 1, "
-            "    last_contacted_at = NOW()",
-            company_id,
-            customer_id or "",
-        )
-    except Exception as _ce:
-        logger.debug(
-            "upsell_followup_count_increment_failed order_id=%s error=%s",
-            order_id, _ce,
-        )
+    await _record_engagement_contact(
+        db,
+        company_id=company_id,
+        customer_id=customer_id or "",
+        context="upsell",
+    )
     return {"scheduled": True, "followup_id": str(dict(row).get("id") or followup_id), "workflow_kind": workflow_kind}

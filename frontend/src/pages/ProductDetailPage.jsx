@@ -179,6 +179,7 @@ function QuantityStepper({ value, onChange, max }) {
 /* ─── Order Form ────────────────────────────────────────────────────────── */
 function OrderForm({ product, availability, productPath, onSuccess }) {
   const [submitting, setSubmitting] = useState(false);
+  const clientRequestIdRef = useRef(genId());
   const [form, setForm] = useState({
     customer_name: '', customer_phone: '', customer_email: '',
     quantity: 1, shipping_address: '', notes: '',
@@ -212,7 +213,7 @@ function OrderForm({ product, availability, productPath, onSuccess }) {
         quantity: Math.max(1, Number(form.quantity) || 1),
         shipping_address: form.shipping_address.trim(),
         notes: form.notes.trim(),
-        client_request_id: genId(),
+        client_request_id: clientRequestIdRef.current,
       });
       onSuccess(data);
     } catch (err) {

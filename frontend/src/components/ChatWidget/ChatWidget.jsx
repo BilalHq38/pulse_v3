@@ -235,7 +235,7 @@ export default function ChatWidget({
               ts: new Date(),
             },
           ]);
-        } else if (data?.status === 'received' || data?.status === 'ok') {
+        } else if ((data?.status === 'received' || data?.status === 'ok') && productImageUrls.length === 0) {
           setMessages((prev) => [
             ...prev,
             {

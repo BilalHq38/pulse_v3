@@ -16,6 +16,7 @@ from services.conversation_engine import budget
 from services.conversation_engine import history_format
 from services.conversation_engine import prompt_builder
 from services.conversation_engine import validator
+from services.conversation_engine.deterministic_answers import build_grounded_answer
 from services.conversation_engine.llm_gateway import GenerationResult
 from services.conversation_engine.orchestrator import Orchestrator, _extract_product_links
 from services.conversation_engine.schemas import (
@@ -23,6 +24,7 @@ from services.conversation_engine.schemas import (
     ProductLink,
     TurnRequest,
 )
+from services.conversation_engine.sentiment import analyze_local_sentiment, build_sentiment_gate
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +429,7 @@ def test_orchestrator_uses_deterministic_catalog_answer_without_llm():
     assert gateway.calls == 0
     assert "Aquamarine Drop Earrings" in result.answer
     assert "Category: earrings" in result.answer
-    assert "Budget/price: USD 899" in result.answer
+    assert "Price: USD 899" in result.answer
     assert result.product_links[0].url == "https://shop.test/aqua"
 
 
@@ -470,15 +472,66 @@ def test_orchestrator_uses_deterministic_buy_link_without_llm():
     )
 
     assert gateway.calls == 0
-    assert result.answer.startswith("You can buy Aquamarine Drop Earrings here:")
+    assert result.answer.startswith("Here's the link to purchase Aquamarine Drop Earrings:")
     assert "https://shop.test/aqua" in result.answer
-    assert "Budget/price: USD 899" in result.answer
+    assert "It's priced at USD 899" in result.answer
+    assert "Budget/price:" not in result.answer
     assert result.product_links == [
         ProductLink(product_id="p1", url="https://shop.test/aqua", name="Aquamarine Drop Earrings", image_url="")
     ]
 
 
-def test_orchestrator_uses_deterministic_company_answer_without_llm():
+def test_deterministic_image_request_returns_image_product_link():
+    answer = build_grounded_answer(
+        "Can I see images?",
+        [
+            _chunk(
+                "product",
+                "p1",
+                "Product: Emerald Ring | Category: rings | Price: 120 USD | Description: Emerald ring | Product page: https://shop.test/ring | Image: available",
+                score=0.9,
+                metadata={
+                    "name": "Emerald Ring",
+                    "category": "rings",
+                    "price": "120",
+                    "price_currency": "USD",
+                    "public_url": "https://shop.test/ring",
+                    "image_url": "/api/products/media/ring.jpg",
+                },
+            )
+        ],
+    )
+
+    assert answer is not None
+    assert answer.answer == "Here's an image of Emerald Ring:"
+    assert answer.product_links == [
+        ProductLink(
+            product_id="p1",
+            url="https://shop.test/ring",
+            name="Emerald Ring",
+            image_url="/api/products/media/ring.jpg",
+        )
+    ]
+
+
+def test_deterministic_referential_end_of_catalog_message():
+    answer = build_grounded_answer(
+        "I want some more of them",
+        [
+            _chunk(
+                "product",
+                "end-of-catalog:rings",
+                "No more products are available in category: rings.",
+                metadata={"is_end_of_catalog": True, "category": "rings"},
+            )
+        ],
+    )
+
+    assert answer is not None
+    assert answer.answer == "Those are all the rings I have available. Would you like to see something else?"
+
+
+def test_orchestrator_routes_company_questions_to_llm_context():
     retrievers = {
         "company_data": FakeRetriever(
             "company_data",
@@ -495,16 +548,17 @@ def test_orchestrator_uses_deterministic_company_answer_without_llm():
         "faq": FakeRetriever("faq", []),
         "knowledge_base": FakeRetriever("knowledge_base", []),
     }
-    gateway = FakeGateway(response="model should not be called")
+    gateway = FakeGateway(response="Ash & Aura sells unique jewelry with a warm, personal shopping experience.")
     orch = Orchestrator(retrievers=retrievers, gateway=gateway)
 
     result = asyncio.run(
         orch.run_turn(FakeDb(), TurnRequest(session_id="s_test", company_id="co_1", user_message="What is your company about?"))
     )
 
-    assert gateway.calls == 0
-    assert "Ash & Aura is jewelry seller." in result.answer
-    assert "sale unique jewelry" in result.answer
+    assert gateway.calls == 1
+    assert "Ash & Aura sells unique jewelry" in result.answer
+    assert "Industry:" not in result.answer
+    assert "Company name:" not in result.answer
 
 
 @pytest.mark.parametrize("message", ["Hello", "ok", "yes", "no", "sure", "How are you?"])
@@ -529,6 +583,17 @@ def test_orchestrator_skips_retrieval_and_llm_for_conversational_messages(messag
     assert all(retriever.calls == 0 for retriever in retrievers.values())
     assert "guard_classification" in caplog.text
     assert "retrieval_triggered=false" in caplog.text
+
+
+def test_conversation_engine_sentiment_neutral_guard_for_greetings():
+    result = analyze_local_sentiment("Hello")
+    gate = build_sentiment_gate("Hello", result)
+
+    assert result["score"] == 0.0
+    assert result["sentiment_label"] == "neutral"
+    assert result["percentage"] == 50
+    assert gate["classification"] == "Neutral"
+    assert gate["ai_response_allowed"] is True
 
 
 def test_orchestrator_returns_fallback_on_validation_failure_twice():

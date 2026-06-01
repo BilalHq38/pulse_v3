@@ -19,7 +19,7 @@ import re as _re
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from core.utils import make_id
+from core.utils import format_order_reference, make_id
 from shared.cache import get_cache_client
 from shared.database import platform_admin_context
 from shared.product_ref_token import decode_ref_token
@@ -73,6 +73,60 @@ def _hydrate(record) -> dict:
     record["images"] = _coerce_list(record.get("images"))
     record["features"] = _coerce_list(record.get("features"))
     return record
+
+
+def _public_order_payload(
+    order_id: str,
+    *,
+    status: str = "pending",
+    deduplicated: bool = False,
+    customer_id: str = "",
+    lead_converted: bool = False,
+    product_name: str = "",
+    quantity: int | None = None,
+) -> dict:
+    order_ref = format_order_reference(order_id)
+    payload = {
+        "order_id": order_id,
+        "order_ref": order_ref,
+        "order_reference": order_ref,
+        "status": status or "pending",
+        "deduplicated": deduplicated,
+        "customer_id": customer_id or None,
+        "lead_converted": bool(lead_converted),
+    }
+    if product_name:
+        payload["product_name"] = product_name
+    if quantity is not None:
+        payload["quantity"] = quantity
+    return payload
+
+
+async def _find_existing_public_order(
+    conn,
+    *,
+    company_id: str,
+    product_id: str,
+    idempotency_key: str,
+    customer_phone: str,
+):
+    if not idempotency_key and not customer_phone:
+        return None
+    return await conn.fetchrow(
+        "SELECT id, status, customer_id, lead_id, product_name, quantity "
+        "FROM orders "
+        "WHERE company_id = $1 AND source_channel = $2 AND ("
+        "  (BTRIM(idempotency_key) <> '' AND idempotency_key = $3) OR "
+        "  (BTRIM(customer_phone) <> '' AND customer_phone = $4 "
+        "   AND product_id = $5 "
+        "   AND created_at >= date_trunc('minute', NOW()))"
+        ") ORDER BY created_at DESC LIMIT 1",
+        company_id,
+        PUBLIC_BUY_SOURCE_CHANNEL,
+        idempotency_key,
+        customer_phone,
+        product_id,
+    )
 
 
 async def _load_company_public_profile(conn, company_id: str) -> dict:
@@ -261,6 +315,10 @@ async def public_buy_product(
                 resolved_customer_id = str(cust_row["id"])
                 resolved_lead_id = str(cust_row["lead_id"] or "")
 
+        order_id = ""
+        product_id = ""
+        product_name = ""
+        order_quantity = buy.quantity
         try:
             async with conn.transaction():
                 product_row = await conn.fetchrow(
@@ -276,6 +334,27 @@ async def public_buy_product(
                 if not product_data.get("public_page_enabled") or product_data.get("status") != "active":
                     raise HTTPException(404, "product not found")
 
+                product_id = str(product_data.get("id") or "")
+                product_name = str(product_data.get("name") or "")
+                existing = await _find_existing_public_order(
+                    conn,
+                    company_id=company_id,
+                    product_id=product_id,
+                    idempotency_key=idempotency_key,
+                    customer_phone=customer_phone,
+                )
+                if existing:
+                    existing_data = dict(existing)
+                    return _public_order_payload(
+                        str(existing_data.get("id") or ""),
+                        status=str(existing_data.get("status") or "pending"),
+                        deduplicated=True,
+                        customer_id=str(existing_data.get("customer_id") or ""),
+                        lead_converted=bool(existing_data.get("lead_id")),
+                        product_name=str(existing_data.get("product_name") or product_name),
+                        quantity=int(existing_data.get("quantity") or order_quantity),
+                    )
+
                 stock = product_data.get("stock_quantity")
                 if stock is not None and stock < buy.quantity:
                     raise HTTPException(409, "insufficient_stock")
@@ -289,61 +368,46 @@ async def public_buy_product(
                     )
 
                 order_id = make_id()
+                order_ref = format_order_reference(order_id)
                 # Use the conversation session as conversation_id if available.
                 conversation_id = tracked_session_id or ""
-                # Calculate total price from product price × quantity.
+                # Calculate total price from product price times quantity.
                 unit_price = product_data.get("price")
                 total_price = (float(unit_price) * buy.quantity) if unit_price is not None else None
-                try:
-                    await conn.execute(
-                        "INSERT INTO orders("
-                        "id, company_id, conversation_id, lead_id, customer_id, product_id, product_name, "
-                        "quantity, variant, size, color, customer_name, customer_email, customer_phone, "
-                        "delivery_address, notes, status, source_channel, created_by, raw_details, "
-                        "missing_fields, idempotency_key, total_price, created_at, updated_at"
-                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'pending',$14,'public',"
-                        "'{}'::jsonb,'[]'::jsonb,$15,$16,NOW(),NOW())",
-                        order_id,
-                        company_id,
-                        conversation_id,
-                        resolved_lead_id,
-                        resolved_customer_id,
-                        str(product_data.get("id") or ""),
-                        str(product_data.get("name") or ""),
-                        buy.quantity,
-                        buy.customer_name.strip(),
-                        customer_email,
-                        customer_phone,
-                        buy.shipping_address.strip(),
-                        buy.notes.strip(),
-                        PUBLIC_BUY_SOURCE_CHANNEL,
-                        idempotency_key,
-                        total_price,
-                    )
-                except asyncpg.UniqueViolationError:
-                    existing = await conn.fetchrow(
-                        "SELECT id, status FROM orders "
-                        "WHERE company_id = $1 AND source_channel = $2 AND ("
-                        "  (BTRIM(idempotency_key) <> '' AND idempotency_key = $3) OR "
-                        "  (BTRIM(customer_phone) <> '' AND customer_phone = $4 "
-                        "   AND product_id = $5 "
-                        "   AND created_at >= date_trunc('minute', NOW()))"
-                        ") ORDER BY created_at DESC LIMIT 1",
-                        company_id,
-                        PUBLIC_BUY_SOURCE_CHANNEL,
-                        idempotency_key,
-                        customer_phone,
-                        str(product_data.get("id") or ""),
-                    )
-                    if not existing:
-                        raise
-                    _eid = str(existing["id"])
-                    return {
-                        "order_id": _eid,
-                        "order_ref": "ORD-" + _eid.replace("-", "").upper()[:6],
-                        "status": str(existing["status"] or "pending"),
-                        "deduplicated": True,
-                    }
+                raw_details = {
+                    "order_ref": order_ref,
+                    "product_slug": product_slug,
+                    "company_slug": company_slug,
+                    "unit_price": str(unit_price) if unit_price is not None else "",
+                    "total_price": total_price,
+                    "source": PUBLIC_BUY_SOURCE_CHANNEL,
+                }
+                await conn.execute(
+                    "INSERT INTO orders("
+                    "id, company_id, conversation_id, lead_id, customer_id, product_id, product_name, "
+                    "quantity, variant, size, color, customer_name, customer_email, customer_phone, "
+                    "delivery_address, notes, status, source_channel, created_by, raw_details, "
+                    "missing_fields, idempotency_key, total_price, created_at, updated_at"
+                    ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','',$9,$10,$11,$12,$13,'pending',$14,'public',"
+                    "$15::jsonb,'[]'::jsonb,$16,$17,NOW(),NOW())",
+                    order_id,
+                    company_id,
+                    conversation_id,
+                    resolved_lead_id,
+                    resolved_customer_id,
+                    product_id,
+                    product_name,
+                    buy.quantity,
+                    buy.customer_name.strip(),
+                    customer_email,
+                    customer_phone,
+                    buy.shipping_address.strip(),
+                    buy.notes.strip(),
+                    PUBLIC_BUY_SOURCE_CHANNEL,
+                    json.dumps(raw_details),
+                    idempotency_key,
+                    total_price,
+                )
 
                 # Update customer record: fill in any missing contact details
                 # provided by the buyer and mark them as a customer.
@@ -400,6 +464,26 @@ async def public_buy_product(
 
         except HTTPException:
             raise
+        except asyncpg.UniqueViolationError as exc:
+            existing = await _find_existing_public_order(
+                conn,
+                company_id=company_id,
+                product_id=product_id,
+                idempotency_key=idempotency_key,
+                customer_phone=customer_phone,
+            )
+            if existing:
+                existing_data = dict(existing)
+                return _public_order_payload(
+                    str(existing_data.get("id") or ""),
+                    status=str(existing_data.get("status") or "pending"),
+                    deduplicated=True,
+                    customer_id=str(existing_data.get("customer_id") or ""),
+                    lead_converted=bool(existing_data.get("lead_id")),
+                    product_name=str(existing_data.get("product_name") or product_name),
+                    quantity=int(existing_data.get("quantity") or order_quantity),
+                )
+            raise exc
         except asyncpg.UndefinedColumnError as exc:
             logger.error(
                 "public_buy_schema_error company_id=%s product_slug=%s missing_column=%s",
@@ -416,15 +500,15 @@ async def public_buy_product(
     cache = get_cache_client(namespace=AVAILABILITY_CACHE_NAMESPACE)
     await cache.delete(f"{company_slug}:{product_slug}")
 
-    order_ref = "ORD-" + order_id.replace("-", "").upper()[:6]
-    return {
-        "order_id": order_id,
-        "order_ref": order_ref,
-        "status": "pending",
-        "deduplicated": False,
-        "customer_id": resolved_customer_id or None,
-        "lead_converted": bool(resolved_lead_id),
-    }
+    return _public_order_payload(
+        order_id,
+        status="pending",
+        deduplicated=False,
+        customer_id=resolved_customer_id,
+        lead_converted=bool(resolved_lead_id),
+        product_name=product_name,
+        quantity=order_quantity,
+    )
 
 
 @router.post("/public/track/click")

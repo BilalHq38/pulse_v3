@@ -48,6 +48,14 @@ function customerLabel(order) {
   return order.customer_name || order.customer_phone || order.conversation_customer_name || 'Customer';
 }
 
+function shortOrderId(order) {
+  return String(order?.id || '').replace(/-/g, '').slice(0, 8).toUpperCase() || '-';
+}
+
+function orderReference(order) {
+  return order?.order_ref || order?.order_reference || (shortOrderId(order) !== '-' ? `ORD-${shortOrderId(order).slice(0, 6)}` : '-');
+}
+
 function StatusBadge({ status }) {
   let tone;
   switch (status) {
@@ -243,7 +251,7 @@ export default function OrdersPage() {
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search customer, phone, or product"
+              placeholder="Search order, customer, phone, or product"
               className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-700 shadow-sm focus:border-blue-500 focus:outline-none"
             />
           </div>
@@ -275,7 +283,10 @@ export default function OrdersPage() {
                   </tr>
                 ) : visibleOrders.map((order) => (
                   <tr key={order.id} data-testid={`order-row-${order.id}`} className="hover:bg-slate-50">
-                    <td className="whitespace-nowrap px-4 py-3 text-sm font-medium text-slate-900">{String(order.id || '').slice(0, 8)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 text-sm font-medium text-slate-900">
+                      <span className="font-mono">{orderReference(order)}</span>
+                      <span className="mt-0.5 block font-mono text-xs font-normal text-slate-400">{shortOrderId(order)}</span>
+                    </td>
                     <td className="px-4 py-3 text-sm text-slate-700">{customerLabel(order)}</td>
                     <td className="px-4 py-3 text-sm text-slate-700">
                       <div className="flex max-w-xs items-center gap-2 truncate">
@@ -363,7 +374,7 @@ export default function OrdersPage() {
           >
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
               <div>
-                <h2 className="text-lg font-semibold text-slate-900">Order {String(selected.id || '').slice(0, 8)}</h2>
+                <h2 className="text-lg font-semibold text-slate-900">Order {orderReference(selected)}</h2>
                 <p className="text-sm text-slate-500">{formatDate(selected.created_at)}</p>
               </div>
               <button
@@ -376,6 +387,8 @@ export default function OrdersPage() {
               </button>
             </div>
             <div className="grid gap-4 px-5 py-5 sm:grid-cols-2">
+              <Detail label="Order reference" value={orderReference(selected)} />
+              <Detail label="Order ID" value={shortOrderId(selected)} />
               <Detail label="Customer" value={customerLabel(selected)} />
               <Detail label="Email" value={selected.customer_email} />
               <Detail label="Phone" value={selected.customer_phone} />

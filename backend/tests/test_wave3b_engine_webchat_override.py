@@ -174,6 +174,25 @@ def test_engine_override_helper_handles_missing_sentiment_gate():
     assert merged["existing_field"] == "kept"
 
 
+def test_engine_override_helper_uses_engine_sentiment_when_capture_empty():
+    merged = apply_engine_response_to_support_plan(
+        support_plan={},
+        capture={},
+        user_message="I am very angry",
+        engine_answer="I can help with that.",
+        engine_confidence=0.8,
+        engine_turn_id="t_angry",
+        engine_product_links=[],
+        engine_sentiment={"score": -0.72, "sentiment_label": "negative", "source": "local_heuristic"},
+        engine_escalation_required=True,
+    )
+
+    assert merged["escalate"] is True
+    assert merged["deliver_response"] is False
+    assert merged["sentiment_gate"]["classification"] == "Negative"
+    assert merged["next_action"] == "manual_review"
+
+
 def test_engine_override_helper_preserves_active_order_flow_response():
     support_plan = {
         "response": "Please confirm your order.",

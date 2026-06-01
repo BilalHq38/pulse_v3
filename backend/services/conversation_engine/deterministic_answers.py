@@ -1,8 +1,9 @@
 """Deterministic grounded answers for high-volume commerce questions.
 
-Catalog browsing, buy intent, budget filtering, and company profile questions
-can be answered directly from retrieved context. This avoids LLM latency and
-prevents a static fallback when the facts are already available.
+Catalog browsing, buy intent, budget filtering, image requests, and simple
+referential follow-ups can be answered directly from retrieved product context.
+Company profile questions intentionally stay on the LLM path so structured
+company context is rewritten naturally instead of leaking raw key-value facts.
 """
 
 from __future__ import annotations
@@ -43,11 +44,25 @@ _PURCHASE_RE = re.compile(
     re.IGNORECASE,
 )
 _BUDGET_RE = re.compile(r"\b(budget|affordable|cheap|under|below|less than|price range|within)\b", re.IGNORECASE)
-_COMPANY_RE = re.compile(
+_IMAGE_RE = re.compile(
+    r"\b(image|images|photo|photos|picture|pictures|show\s+me\s+(?:it|them|those|these)|see\s+(?:it|them|those|these))\b",
+    re.IGNORECASE,
+)
+_REFERENTIAL_MORE_RE = re.compile(
     r"\b("
-    r"your\s+company|your\s+business|company\s+about|business\s+about|"
-    r"what\s+is\s+your\s+company|what\s+are\s+you\s+about|"
-    r"who\s+are\s+you|what\s+do\s+you\s+do|about\s+you"
+    r"more\s+of\s+(?:them|those|these|it)|"
+    r"show\s+me\s+more|"
+    r"(?:them|those|these)\s+more|"
+    r"all\s+of\s+(?:them|those|these)|"
+    r"the\s+ones\s+you\s+showed|"
+    r"the\s+one\s+you\s+showed"
+    r")\b",
+    re.IGNORECASE,
+)
+_PRODUCT_BROWSE_RE = re.compile(
+    r"\b("
+    r"show\s+me|list|browse|see|what\s+(?:.+\s+)?(?:do\s+you\s+have|are\s+available)|"
+    r"available|options|collection|catalog|catalogue"
     r")\b",
     re.IGNORECASE,
 )
@@ -56,17 +71,20 @@ _COMPANY_RE = re.compile(
 def build_grounded_answer(user_message: str, chunks: Iterable[ContextChunk]) -> DeterministicAnswer | None:
     text = str(user_message or "").strip()
     chunk_list = list(chunks or [])
+    end_of_catalog = _end_of_catalog_fact(chunk_list)
     products = _product_facts(chunk_list)
-    company = _company_facts(chunk_list)
+
+    if end_of_catalog and _REFERENTIAL_MORE_RE.search(text):
+        return _end_of_catalog_answer(end_of_catalog)
+
+    if products and _IMAGE_RE.search(text):
+        return _image_answer(products)
 
     if products and (_PURCHASE_RE.search(text) or _BUDGET_RE.search(text)):
         return _purchase_answer(text, products)
 
-    if products and _CATALOG_RE.search(text):
+    if products and (_CATALOG_RE.search(text) or _REFERENTIAL_MORE_RE.search(text) or _PRODUCT_BROWSE_RE.search(text)):
         return _catalog_answer(products)
-
-    if company and _COMPANY_RE.search(text):
-        return _company_answer(company)
 
     return None
 
@@ -79,6 +97,8 @@ def _product_facts(chunks: list[ContextChunk]) -> list[dict]:
             continue
         metadata = dict(chunk.metadata or {})
         if metadata.get("is_category_overview"):
+            continue
+        if metadata.get("is_end_of_catalog"):
             continue
         product_id = str(chunk.source_id or "").strip()
         name = str(metadata.get("name") or chunk.title or "").strip()
@@ -105,18 +125,13 @@ def _product_facts(chunks: list[ContextChunk]) -> list[dict]:
     return products
 
 
-def _company_facts(chunks: list[ContextChunk]) -> dict:
+def _end_of_catalog_fact(chunks: list[ContextChunk]) -> dict:
     for chunk in chunks:
-        if chunk.source_type != "company_data":
-            continue
-        facts: dict[str, str] = {}
-        for line in str(chunk.content or "").splitlines():
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            facts[key.strip().lower()] = value.strip()
-        if facts:
-            return facts
+        metadata = dict(chunk.metadata or {})
+        if chunk.source_type == "product" and metadata.get("is_end_of_catalog"):
+            return {
+                "category": str(metadata.get("category") or "products").strip() or "products",
+            }
     return {}
 
 
@@ -127,9 +142,12 @@ def _catalog_answer(products: list[dict]) -> DeterministicAnswer:
             [
                 f"{index}. {product['name']}",
                 f"   Category: {product['category'] or 'general'}",
-                f"   Budget/price: {product['price']}",
+                f"   Price: {product['price']}",
+                "",
             ]
         )
+    if lines and lines[-1] == "":
+        lines.pop()
     lines.append("Tell me which product you want to buy and I will send the direct purchase link.")
     return DeterministicAnswer(
         answer="\n".join(lines),
@@ -141,45 +159,45 @@ def _catalog_answer(products: list[dict]) -> DeterministicAnswer:
 def _purchase_answer(user_message: str, products: list[dict]) -> DeterministicAnswer:
     product = _select_product(user_message, products)
     url = product.get("url") or ""
-    lines = [
-        f"You can buy {product['name']} here:",
-        url or "The product page link is not available right now.",
-        "",
-        f"Name: {product['name']}",
-        f"Category: {product['category'] or 'general'}",
-        f"Budget/price: {product['price']}",
-    ]
-    if product.get("description"):
-        lines.append(f"Description: {product['description']}")
+    description = product.get("description") or "it is ready to order"
     if url:
-        lines.append("Click the link above to complete the purchase.")
+        answer = (
+            f"Here's the link to purchase {product['name']}: {url}. "
+            f"It's priced at {product['price']} and {description}. "
+            "Click the link to complete your order."
+        )
+    else:
+        answer = (
+            f"{product['name']} is priced at {product['price']} and {description}. "
+            "The direct purchase link is not available right now."
+        )
     return DeterministicAnswer(
-        answer="\n".join(lines),
+        answer=answer,
         product_links=_links([product]),
         sources_used=["product"],
     )
 
 
-def _company_answer(facts: dict[str, str]) -> DeterministicAnswer:
-    name = facts.get("company name") or "The company"
-    tagline = facts.get("tagline")
-    description = facts.get("about")
-    industry = facts.get("industry")
-    parts: list[str] = []
-    if tagline:
-        parts.append(f"{name} is {tagline}.")
-    elif industry:
-        parts.append(f"{name} works in {industry}.")
-    else:
-        parts.append(f"{name} is the business behind this chat.")
-    if description:
-        parts.append(description.rstrip(".") + ".")
-    if industry and tagline:
-        parts.append(f"Industry: {industry}.")
+def _image_answer(products: list[dict]) -> DeterministicAnswer | None:
+    image_products = [product for product in products if product.get("image_url")]
+    if not image_products:
+        return None
+    product = image_products[0]
     return DeterministicAnswer(
-        answer=" ".join(parts),
+        answer=f"Here's an image of {product['name']}:",
+        product_links=_links(image_products[:3]),
+        sources_used=["product"],
+        confidence=0.99,
+    )
+
+
+def _end_of_catalog_answer(fact: dict) -> DeterministicAnswer:
+    category = str(fact.get("category") or "products").strip().lower() or "products"
+    return DeterministicAnswer(
+        answer=f"Those are all the {category} I have available. Would you like to see something else?",
         product_links=[],
-        sources_used=["company_data"],
+        sources_used=["product"],
+        confidence=0.99,
     )
 
 

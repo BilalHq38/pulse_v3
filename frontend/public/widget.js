@@ -26,7 +26,7 @@
     .pulse-chat-message { margin-bottom: 12px; display: flex; flex-direction: column; }
     .pulse-chat-message.customer { align-items: flex-end; }
     .pulse-chat-message.agent, .pulse-chat-message.ai { align-items: flex-start; }
-    .pulse-chat-bubble { max-width: 82%; padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.4; overflow: hidden; }
+    .pulse-chat-bubble { max-width: 82%; padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.4; overflow: hidden; white-space: pre-line; }
     .pulse-chat-message.customer .pulse-chat-bubble { background: #3b82f6; color: white; border-bottom-right-radius: 4px; }
     .pulse-chat-message.agent .pulse-chat-bubble, .pulse-chat-message.ai .pulse-chat-bubble { background: white; color: #1e293b; border: 1px solid #e2e8f0; border-bottom-left-radius: 4px; }
     .pulse-chat-message.ai .pulse-chat-bubble { background: #f5f3ff; border-color: #ddd6fe; }
@@ -374,7 +374,7 @@
           `).join('')}
         </div>
       ` : '';
-      const textHtml = msg.content ? `<div>${this._escapeHtml(msg.content)}</div>` : '';
+      const textHtml = msg.content ? `<div style="white-space:pre-line">${this._escapeHtml(msg.content)}</div>` : '';
 
       msgEl.innerHTML = `
         ${badge}

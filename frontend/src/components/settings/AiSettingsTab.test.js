@@ -128,6 +128,7 @@ afterEach(() => {
 test('LLM Engines renders a single default Gemini 2.5 Flash engine with capability badges', async () => {
   const { container, root } = renderTab();
 
+  await tick();
   await waitForSelector('[data-testid="llm-engine-card"]', container);
   expect(container.querySelectorAll('[data-testid="llm-engine-card"]')).toHaveLength(1);
   expect(container.textContent).toContain('gemini-2.5-flash');
@@ -187,6 +188,7 @@ test('Add Engine dropdown exposes Vertex AI and supported Gemini models', async 
   await act(async () => {
     root.render(<StateHarness />);
   });
+  await tick();
 
   const addButton = await waitForSelector('[data-testid="add-llm-engine-btn"]', container);
   await act(async () => {

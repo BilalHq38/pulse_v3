@@ -25,6 +25,7 @@ DISENGAGEMENT_KEYWORDS: tuple[str, ...] = (
     "no more emails",
     "unsubscribe",
     "remove me",
+    "not interested",
     "not interested anymore",
     "not interested thanks",
     "not interested, stop",

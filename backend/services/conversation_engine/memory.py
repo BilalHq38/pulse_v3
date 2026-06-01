@@ -269,6 +269,28 @@ async def persist_turn_atomic(
         }),
         mode,
     )
+    if row is None:
+        fallback_turn_index = await next_turn_index(
+            db,
+            company_id=company_id,
+            session_id=session_id,
+        )
+        fallback_turn_id = await persist_turn(
+            db,
+            company_id=company_id,
+            session_id=session_id,
+            customer_id=customer_id,
+            turn_index=fallback_turn_index,
+            user_message=user_message,
+            ai_response=ai_response,
+            sources_used=sources_used,
+            product_links=product_links,
+            confidence=confidence,
+            active_template=active_template,
+            token_usage=token_usage,
+            mode=mode,
+        )
+        return fallback_turn_id, fallback_turn_index
     turn_index = int((row or {}).get("turn_index") or 1)
     return turn_id, turn_index
 

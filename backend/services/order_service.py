@@ -7,7 +7,7 @@ import datetime as _dt
 from datetime import datetime
 from typing import Any
 
-from core.utils import make_id
+from core.utils import format_order_reference, make_id
 from shared.config import frontend_url
 from shared.product_ref_token import create_ref_token
 from services.ai_service.routing_guards import route_product_order_intent
@@ -2048,9 +2048,21 @@ async def list_orders(
         args.append(_text(channel, 40))
         clauses.append(f"o.source_channel=${len(args)}")
     if customer:
-        args.append(f"%{_text(customer, 120).lower()}%")
+        customer_text = _text(customer, 120).lower()
+        args.append(f"%{customer_text}%")
+        text_arg = len(args)
+        normalized_order_search = re.sub(r"[^a-z0-9]", "", customer_text)
+        order_ref_text = (
+            normalized_order_search[3:]
+            if normalized_order_search.startswith("ord") and not normalized_order_search.startswith("order")
+            else normalized_order_search
+        )
+        order_clause = f"LOWER(o.id) LIKE ${text_arg}"
+        if order_ref_text:
+            args.append(f"%{order_ref_text}%")
+            order_clause = f"({order_clause} OR REPLACE(LOWER(o.id), '-', '') LIKE ${len(args)})"
         clauses.append(
-            f"(LOWER(o.customer_name) LIKE ${len(args)} OR LOWER(o.customer_email) LIKE ${len(args)} OR LOWER(o.customer_phone) LIKE ${len(args)} OR LOWER(o.product_name) LIKE ${len(args)})"
+            f"({order_clause} OR LOWER(o.customer_name) LIKE ${text_arg} OR LOWER(o.customer_email) LIKE ${text_arg} OR LOWER(o.customer_phone) LIKE ${text_arg} OR LOWER(o.product_name) LIKE ${text_arg})"
         )
     args.append(max(1, min(int(limit or 100), 300)))
     query = (
@@ -2210,6 +2222,9 @@ def serialize_order(order: dict) -> dict:
     if not order:
         return {}
     serialized = dict(order)
+    order_ref = format_order_reference(str(serialized.get("id") or ""))
+    serialized["order_ref"] = order_ref
+    serialized["order_reference"] = order_ref
     for key in ("raw_details", "missing_fields"):
         default = [] if key == "missing_fields" else {}
         serialized[key] = _json_loads(serialized.get(key), default)

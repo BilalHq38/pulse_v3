@@ -172,6 +172,7 @@ class LongTermMemory:
         product_ids: list[str],
         *,
         conversation_id: str = "",
+        last_product_category: str = "",
     ) -> None:
         """Store the rolling set of shown product IDs in context memory."""
         if not db or not tenant_id or not user_id:
@@ -187,17 +188,42 @@ class LongTermMemory:
         cleaned = [str(item).strip() for item in product_ids if str(item).strip()]
         if not cleaned:
             return
-        merged_ids = list(dict.fromkeys(cleaned))[:20]
-        payload = json.dumps({"product_ids": merged_ids}, ensure_ascii=True)
+        last_category = str(last_product_category or "").strip()
 
-        existing_id = await db.fetchval(
-            "SELECT id FROM context_memories "
+        existing = await db.fetchrow(
+            "SELECT id, memory_content FROM context_memories "
             "WHERE company_id=$1 AND entity_id=$2 AND memory_type='shown_products' "
             "AND convo_id=$3 "
             "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1",
             tenant_id,
             user_id,
             conversation_id,
+        )
+        previous_ids: list[str] = []
+        existing_id = ""
+        if existing:
+            existing_dict = dict(existing)
+            existing_id = str(existing_dict.get("id") or "")
+            try:
+                parsed = json.loads(str(existing_dict.get("memory_content") or "{}"))
+                previous_ids = [
+                    str(item).strip()
+                    for item in (parsed.get("product_ids") or [])
+                    if str(item).strip()
+                ]
+                if not last_category:
+                    last_category = str(parsed.get("last_product_category") or "").strip()
+            except Exception:
+                previous_ids = []
+
+        merged_ids = list(dict.fromkeys([*previous_ids, *cleaned]))[-20:]
+        payload = json.dumps(
+            {
+                "product_ids": merged_ids,
+                "last_shown_product_ids": cleaned,
+                "last_product_category": last_category,
+            },
+            ensure_ascii=True,
         )
         if existing_id:
             await db.execute(
@@ -339,6 +365,43 @@ class LongTermMemory:
         except Exception as exc:
             logger.debug("Shown products fetch failed: %s", exc)
             return []
+
+    async def _fetch_shown_product_context(self, db, tenant_id: str, user_id: str, conversation_id: str) -> dict[str, Any]:
+        """Fetch shown product memory, including last batch and category."""
+        if not conversation_id:
+            return {}
+        try:
+            row = await db.fetchrow(
+                "SELECT memory_content FROM context_memories "
+                "WHERE company_id=$1 AND entity_id=$2 AND memory_type='shown_products' "
+                "AND convo_id=$3 "
+                "ORDER BY updated_at DESC LIMIT 1",
+                tenant_id,
+                user_id,
+                conversation_id,
+            )
+            if not row:
+                return {}
+            content = str(dict(row).get("memory_content", ""))
+            parsed = json.loads(content) if content else {}
+            if not isinstance(parsed, dict):
+                return {}
+            return {
+                "product_ids": [
+                    str(pid).strip()
+                    for pid in (parsed.get("product_ids") or [])
+                    if str(pid).strip()
+                ],
+                "last_shown_product_ids": [
+                    str(pid).strip()
+                    for pid in (parsed.get("last_shown_product_ids") or [])
+                    if str(pid).strip()
+                ],
+                "last_product_category": str(parsed.get("last_product_category") or "").strip(),
+            }
+        except Exception as exc:
+            logger.debug("Shown product context fetch failed: %s", exc)
+            return {}
 
     async def _fetch_context_memories(self, db, tenant_id: str, user_id: str, conversation_id: str) -> list[dict]:
         """Fetch all context memories for additional context."""

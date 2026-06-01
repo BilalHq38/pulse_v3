@@ -7,7 +7,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 # Install devDependencies (@craco/craco, tailwind, etc.); npm omits them when NODE_ENV=production.
 ENV NODE_ENV=development
 RUN --mount=type=cache,target=/root/.npm \
-    npm ci --include=dev --prefer-offline --no-audit
+    npm ci --include=dev --prefer-offline --no-audit --loglevel=error
 
 COPY frontend/ ./
 ARG REACT_APP_BACKEND_URL=http://localhost:8000
@@ -21,10 +21,9 @@ ENV NODE_ENV=production
 # Faster production builds (smaller output, less work for webpack)
 ENV CI=true
 ENV GENERATE_SOURCEMAP=false
-ENV DISABLE_ESLINT_PLUGIN=true
 
 RUN --mount=type=cache,target=/app/node_modules/.cache \
-    node node_modules/@craco/craco/dist/bin/craco.js build
+    node ./scripts/craco-no-deprecation.js build
 
 FROM nginx:1.27-alpine
 

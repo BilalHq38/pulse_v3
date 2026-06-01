@@ -19,10 +19,11 @@ from channel_layer.channel_identity import (
 from channel_layer.router import get_outbound_router
 from channel_layer.schemas import ChannelType
 
-from services.ai_service.facade import build_sentiment_gate, summarize_conversation
+from services.ai_service.facade import summarize_conversation
 from services.agent_orchestrator.facade import orchestrate_message_workflow
 from services.conversation_engine import TurnRequest, run_turn as engine_run_turn
 from services.conversation_engine.history_format import format_messages_as_dialogue
+from services.conversation_engine.sentiment import build_sentiment_gate
 from core.socket import emit_message_deleted, emit_message_updated, emit_new_message
 from core.utils import make_id, now_ts
 from shared.tracing import current_trace_context
