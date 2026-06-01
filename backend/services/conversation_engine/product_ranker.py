@@ -1,0 +1,957 @@
+﻿"""Product ranking and context formatting for the conversation engine.
+
+Extracted from services.ai_service.rag. Only the functions used by
+ProductRetriever are here. build_ai_context and get_company_knowledge
+remain in ai_service.rag until the old engine is fully removed.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import time
+from collections import defaultdict
+from difflib import SequenceMatcher
+
+from core.utils import is_valid_image_url, normalize_product_images
+from shared.cache import get_cache_client
+from shared.config import frontend_url
+from shared.metrics import increment_counter, observe_histogram, timed_metric
+from shared.product_ref_token import create_ref_token
+from services.conversation_engine.embedding_service import search_similar_embeddings, store_embedding
+from services.ai_service.llm_tracking import has_embedding_budget_remaining
+from services.conversation_engine.routing_guards import is_low_value_message
+
+_CATALOG_CACHE_TTL_SECONDS = max(
+    30,
+    int(os.environ.get("RAG_CATALOG_CACHE_TTL_SECONDS", "300") or 300),
+)
+
+logger = logging.getLogger(__name__)
+
+_CATALOG_CACHE = get_cache_client(namespace="ai-rag-catalog")
+_RANKING_CACHE = get_cache_client(namespace="ai-rag-ranking")
+_COMPANY_PRODUCTS_COLUMNS: set[str] | None = None
+
+GENERAL_PRODUCT_PATTERNS = (
+    "what do you sell",
+    "what do you have",
+    "what do you offer",
+    "what are you offering",
+    "what you are offering",
+    "what products do you provide",
+    "show me products",
+    "show products",
+    "tell me about products",
+    "show your catalog",
+    "catalog",
+    "collection",
+    "inventory",
+    "available products",
+    "available options",
+    "options dikhao",
+    "products kya hain",
+    "kya available hai",
+    "what services do you offer",
+    "show services",
+)
+
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "can",
+    "for",
+    "which",
+    "have",
+    "i",
+    "please",
+    "need",
+    "want",
+    "in",
+    "is",
+    "me",
+    "of",
+    "show",
+    "sell",
+    "the",
+    "to",
+    "what",
+    "you",
+    "your",
+    # Added: generic intent and query words that are not product names
+    "know",
+    "about",
+    "tell",
+    "us",
+    "do",
+    "does",
+    "offering",
+    "offer",
+    "buy",
+    "purchase",
+    "order",
+    "get",
+    "any",
+    "some",
+    "all",
+    "available",
+    "more",
+    "options",
+    "option",
+    "how",
+    "with",
+    "list",
+    "catalog",
+    "our",
+    "this",
+    "that",
+    "just",
+    "also",
+    "item",
+    "items",
+    "see",
+    "would",
+    "like",
+    "from",
+    "by",
+    "on",
+    "at",
+    "been",
+    "we",
+    "provide",
+    "providing",
+    "product",
+    "products",
+    "catalog",
+    "catalogue",
+    "service",
+    "services",
+    "option",
+    "options",
+    "available",
+}
+
+_RAG_SKIP_PHRASES = {
+    "hi",
+    "hello",
+    "hey",
+    "thanks",
+    "thank you",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+}
+
+_PRODUCT_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "tee": ("shirt", "tshirt", "t-shirt"),
+    "tshirt": ("shirt", "tee", "t-shirt"),
+    "t-shirt": ("shirt", "tee", "tshirt"),
+    "top": ("shirt", "blouse"),
+    "tops": ("shirt", "blouse"),
+    "sneaker": ("shoe", "shoes"),
+    "sneakers": ("shoe", "shoes"),
+    "trainer": ("shoe", "shoes"),
+    "trainers": ("shoe", "shoes"),
+    "mobile": ("phone", "smartphone"),
+    "cellphone": ("phone", "smartphone"),
+    "cell": ("phone", "smartphone"),
+    "sofa": ("couch",),
+    "couch": ("sofa",),
+    "jewellery": ("jewelry",),
+    "jewelery": ("jewelry",),
+    "necklace": ("necklaces",),
+    "ring": ("rings",),
+    "bracelet": ("bracelets",),
+}
+_FUZZY_CATEGORY_THRESHOLD = 0.82
+
+
+def _normalize_term(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s-]", " ", str(text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _to_singular(token: str) -> str:
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith("ses") and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s") and len(token) > 3 and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _build_dynamic_category_aliases(categories: list[str]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for raw_category in categories:
+        canonical = _normalize_term(raw_category)
+        if not canonical:
+            continue
+        parts = [part for part in canonical.split(" ") if part]
+        candidates = {canonical, canonical.replace("-", " ")}
+        candidates.update(parts)
+        candidates.update(_to_singular(part) for part in parts)
+        for alias in candidates:
+            alias = _normalize_term(alias)
+            if alias and alias not in aliases:
+                aliases[alias] = canonical
+    return aliases
+
+
+def _tokenize(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if token]
+
+
+def _expand_synonyms(tokens: list[str] | set[str]) -> set[str]:
+    expanded: set[str] = set()
+    for token in tokens:
+        normalized = _normalize_term(token)
+        if not normalized:
+            continue
+        expanded.add(normalized)
+        singular = _to_singular(normalized)
+        if singular:
+            expanded.add(singular)
+        for synonym in _PRODUCT_SYNONYMS.get(normalized, ()):
+            expanded.add(_normalize_term(synonym))
+        for synonym in _PRODUCT_SYNONYMS.get(singular, ()):
+            expanded.add(_normalize_term(synonym))
+    return {item for item in expanded if item}
+
+
+def fuzzy_category_match(query: str, category: str) -> bool:
+    """Return True when query terms match a category by synonym or close spelling."""
+    query_terms = _expand_synonyms(_tokenize(query))
+    category_terms = _expand_synonyms(_tokenize(category))
+    if not query_terms or not category_terms:
+        return False
+    if query_terms & category_terms:
+        return True
+    for query_term in query_terms:
+        for category_term in category_terms:
+            if SequenceMatcher(None, query_term, category_term).ratio() >= _FUZZY_CATEGORY_THRESHOLD:
+                return True
+    return False
+
+
+def _should_skip_rag_query(query: str, *, intent_name: str = "", has_history: bool = False) -> tuple[bool, str]:
+    normalized = _normalize_term(query)
+    if not normalized:
+        return True, "empty_query"
+    if is_low_value_message(normalized):
+        return True, "low_value_message"
+    if intent_name == "follow_up_continue" or has_history:
+        return False, ""
+    if normalized in _RAG_SKIP_PHRASES:
+        return True, "greeting_or_gratitude"
+    tokens = _tokenize(normalized)
+    if len(tokens) <= 2 and not any(
+        term in normalized
+        for term in (
+            "product",
+            "catalog",
+            "price",
+            "buy",
+            "order",
+            "shipping",
+            "refund",
+            "support",
+            "feature",
+            "service",
+        )
+    ):
+        return True, "short_low_value_query"
+    query_info = understand_product_query(normalized)
+    needs_knowledge = any(
+        term in normalized
+        for term in (
+            "product",
+            "catalog",
+            "price",
+            "buy",
+            "order",
+            "shipping",
+            "refund",
+            "policy",
+            "support",
+            "feature",
+            "service",
+            "plan",
+        )
+    )
+    if not (query_info.get("general") or query_info.get("specific") or needs_knowledge):
+        return True, "no_retrieval_intent"
+    return False, ""
+
+
+def understand_product_query(
+    query: str,
+    catalog_categories: list[str] | None = None,
+) -> dict:
+    lowered = _normalize_term(query)
+    query_tokens = [token for token in _tokenize(lowered) if token not in STOPWORDS]
+    category_aliases = _build_dynamic_category_aliases(catalog_categories or [])
+
+    matched_categories: list[str] = []
+    if lowered and category_aliases:
+        padded = f" {lowered} "
+        for alias, canonical in category_aliases.items():
+            alias_token = _normalize_term(alias)
+            if alias_token and f" {alias_token} " in padded:
+                matched_categories.append(canonical)
+    matched_categories = list(dict.fromkeys(matched_categories))
+
+    matched_category_tokens = {
+        _to_singular(part) for category in matched_categories for part in _normalize_term(category).split(" ") if part
+    }
+    keyword_tokens = [token for token in query_tokens if _to_singular(token) not in matched_category_tokens]
+
+    mentions_catalog = any(
+        token in lowered
+        for token in (
+            "product",
+            "products",
+            "catalog",
+            "collection",
+            "inventory",
+            "item",
+            "items",
+            "service",
+            "services",
+            "solution",
+            "solutions",
+            "offer",
+            "offering",
+            "option",
+            "options",
+            "available",
+        )
+    )
+    is_general_phrase = any(pattern in lowered for pattern in GENERAL_PRODUCT_PATTERNS)
+    is_general = (is_general_phrase or mentions_catalog) and not matched_categories and not keyword_tokens
+
+    return {
+        "query": lowered,
+        "categories": matched_categories,
+        "keywords": keyword_tokens,
+        "general": is_general,
+        "specific": bool(matched_categories or keyword_tokens),
+    }
+
+
+def _catalog_kind_for_query(query: str) -> str:
+    normalized = _normalize_term(query)
+    service_signal = any(term in normalized for term in ("service", "services", "solution", "solutions"))
+    product_signal = any(term in normalized for term in ("product", "products", "catalog", "item", "items", "collection", "inventory"))
+    if service_signal and not product_signal:
+        return "service"
+    if product_signal and not service_signal:
+        return "product"
+    return ""
+
+
+async def _load_product_catalog(
+    db,
+    company_id: str,
+    limit: int = 120,
+    *,
+    bypass_cache: bool = False,
+    catalog_kind: str = "",
+) -> list[dict]:
+    if not db or not company_id:
+        return []
+
+    catalog_kind = str(catalog_kind or "").strip().lower()
+    cache_key = f"catalog:{company_id}:{max(1, int(limit))}:{catalog_kind}"
+    if not bypass_cache:
+        cached = await _CATALOG_CACHE.get_json(cache_key)
+        if isinstance(cached, list):
+            increment_counter("ai.cache.catalog.hit")
+            return [dict(item) for item in cached if isinstance(item, dict)]
+
+    increment_counter("ai.cache.catalog.miss")
+    started = time.perf_counter()
+    product_columns = await _company_products_columns(db)
+    tags_select, sku_select, stock_select, slug_select, links_select = _product_projection_for_columns(product_columns)
+    rows = await db.fetch(
+        "SELECT id, company_id, name, product_title, description, category, product_type, "
+        f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, "
+        f"       {slug_select}, {links_select}, created_at, updated_at "
+        "FROM company_products "
+        "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
+        "  AND ($3='' OR ($3='service' AND LOWER(COALESCE(product_type,'')) IN ('service','services')) "
+        "       OR ($3='product' AND LOWER(COALESCE(product_type,'')) NOT IN ('service','services'))) "
+        "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, name ASC LIMIT $2",
+        company_id,
+        limit,
+        catalog_kind,
+    )
+    products = [dict(row) for row in rows]
+    if not products:
+        observe_histogram("ai.catalog.load_ms", (time.perf_counter() - started) * 1000.0)
+        return []
+
+    product_ids = [product["id"] for product in products if product.get("id")]
+    if not product_ids:
+        observe_histogram("ai.catalog.load_ms", (time.perf_counter() - started) * 1000.0)
+        return []
+
+    feature_rows = await db.fetch(
+        "SELECT product_id,feature FROM product_features WHERE product_id = ANY($1::text[]) ORDER BY sort_order",
+        product_ids,
+    )
+    image_rows = await db.fetch(
+        "SELECT product_id,image_url FROM product_images WHERE product_id = ANY($1::text[]) ORDER BY sort_order",
+        product_ids,
+    )
+    features_by_product: dict[str, list[str]] = defaultdict(list)
+    images_by_product: dict[str, list[str]] = defaultdict(list)
+    for row in feature_rows:
+        features_by_product[str(row["product_id"])].append(str(row["feature"]))
+    for row in image_rows:
+        images_by_product[str(row["product_id"])].append(str(row["image_url"]))
+
+    for product in products:
+        product_id = str(product.get("id") or "")
+        product["features"] = features_by_product.get(product_id, [])
+        product["images"] = normalize_product_images(images_by_product.get(product_id, []), limit=3)
+        raw_tags: list[str] = []
+        if isinstance(product.get("tags"), list):
+            raw_tags.extend(str(item) for item in product.get("tags") or [])
+        elif isinstance(product.get("tags"), str):
+            raw_tags.extend(part.strip() for part in str(product.get("tags") or "").split(","))
+        raw_tags.extend(product.get("features") or [])
+        raw_tags.extend(
+            [
+                str(product.get("category") or ""),
+                str(product.get("product_type") or ""),
+            ]
+        )
+        product["normalized_name"] = _normalize_term(str(product.get("name") or product.get("product_title") or ""))
+        product["normalized_category"] = _normalize_term(str(product.get("category") or ""))
+        product["normalized_tags"] = sorted({_normalize_term(item) for item in raw_tags if _normalize_term(item)})
+
+    observe_histogram("ai.catalog.load_ms", (time.perf_counter() - started) * 1000.0)
+    if not bypass_cache:
+        await _CATALOG_CACHE.set_json(cache_key, products, ttl_seconds=_CATALOG_CACHE_TTL_SECONDS)
+    return products
+
+
+async def _company_products_columns(db) -> set[str]:
+    global _COMPANY_PRODUCTS_COLUMNS
+    if _COMPANY_PRODUCTS_COLUMNS is not None:
+        return _COMPANY_PRODUCTS_COLUMNS
+    try:
+        rows = await db.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ANY(current_schemas(FALSE)) "
+            "  AND table_name='company_products'"
+        )
+        _COMPANY_PRODUCTS_COLUMNS = {str(row["column_name"]) for row in rows if row["column_name"]}
+    except Exception as exc:
+        logger.warning("company_products column validation failed: %s", exc)
+        _COMPANY_PRODUCTS_COLUMNS = set()
+    return _COMPANY_PRODUCTS_COLUMNS
+
+
+def _product_projection_for_columns(product_columns: set[str]) -> tuple[str, str, str, str, str]:
+    tags_select = "tags" if "tags" in product_columns else "NULL::jsonb AS tags"
+    sku_select = "sku" if "sku" in product_columns else "''::text AS sku"
+    stock_select = "stock_quantity" if "stock_quantity" in product_columns else "0::integer AS stock_quantity"
+    slug_select = "slug" if "slug" in product_columns else "''::text AS slug"
+    links_select = "links" if "links" in product_columns else "''::text AS links"
+    return tags_select, sku_select, stock_select, slug_select, links_select
+
+
+async def _keyword_retrieve_products(
+    db,
+    company_id: str,
+    query: str,
+    *,
+    limit: int = 12,
+    catalog_kind: str = "",
+) -> list[dict]:
+    terms = [
+        term
+        for term in _expand_synonyms(_tokenize(query))
+        if term and term not in STOPWORDS and len(term) > 1
+    ]
+    if not db or not company_id or not terms:
+        return []
+    patterns = [f"%{term}%" for term in terms[:12]]
+    product_columns = await _company_products_columns(db)
+    tags_select, sku_select, stock_select, slug_select, links_select = _product_projection_for_columns(product_columns)
+    rows = await db.fetch(
+        "SELECT id, company_id, name, product_title, description, category, product_type, "
+        f"       price, price_currency, status, {tags_select}, {sku_select}, {stock_select}, "
+        f"       {slug_select}, {links_select}, created_at, updated_at "
+        "FROM company_products "
+        "WHERE company_id=$1 AND (status='active' OR status IS NULL OR status='') "
+        "  AND ($4='' OR ($4='service' AND LOWER(COALESCE(product_type,'')) IN ('service','services')) "
+        "       OR ($4='product' AND LOWER(COALESCE(product_type,'')) NOT IN ('service','services'))) "
+        "  AND (LOWER(COALESCE(name,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(product_title,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(description,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(category,'')) LIKE ANY($3::text[]) "
+        "       OR LOWER(COALESCE(product_type,'')) LIKE ANY($3::text[])) "
+        "ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, name ASC LIMIT $2",
+        company_id,
+        max(1, int(limit)),
+        patterns,
+        catalog_kind,
+    )
+    return [dict(row) for row in rows or []]
+
+
+def _score_fuzzy_product_match(product: dict, query: str) -> float:
+    normalized_query = _normalize_term(query)
+    if not normalized_query:
+        return 0.0
+    score = 0.0
+    category = str(product.get("category") or "")
+    product_type = str(product.get("product_type") or "")
+    if fuzzy_category_match(normalized_query, category):
+        score = max(score, 0.75)
+    if fuzzy_category_match(normalized_query, product_type):
+        score = max(score, 0.65)
+    query_terms = _expand_synonyms(_tokenize(normalized_query))
+    text_terms = _expand_synonyms(_tokenize(_product_search_text(product)))
+    if query_terms and text_terms:
+        overlap = len(query_terms & text_terms)
+        if overlap:
+            score = max(score, min(0.9, 0.35 + overlap * 0.15))
+        else:
+            for query_term in query_terms:
+                if any(SequenceMatcher(None, query_term, text_term).ratio() >= _FUZZY_CATEGORY_THRESHOLD for text_term in text_terms):
+                    score = max(score, 0.45)
+                    break
+    return score
+
+
+def _fuzzy_retrieve_products_from_catalog(products: list[dict], query: str) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for product in products:
+        product_id = str(product.get("id") or "").strip()
+        if not product_id:
+            continue
+        score = _score_fuzzy_product_match(product, query)
+        if score > 0:
+            scores[product_id] = score
+    return scores
+
+
+def _fuse_product_scores(
+    *,
+    keyword_scores: dict[str, float],
+    fuzzy_scores: dict[str, float],
+    vector_scores: dict[str, float],
+    lexical_scores: dict[str, float],
+) -> dict[str, float]:
+    product_ids = set(keyword_scores) | set(fuzzy_scores) | set(vector_scores) | set(lexical_scores)
+    fused: dict[str, float] = {}
+    for product_id in product_ids:
+        fused[product_id] = (
+            lexical_scores.get(product_id, 0.0)
+            + keyword_scores.get(product_id, 0.0) * 0.9
+            + fuzzy_scores.get(product_id, 0.0) * 0.7
+            + vector_scores.get(product_id, 0.0) * 1.7
+        )
+    return fused
+
+
+def _product_search_text(product: dict) -> str:
+    return " ".join(
+        filter(
+            None,
+            [
+                str(product.get("name") or ""),
+                str(product.get("product_title") or ""),
+                str(product.get("description") or ""),
+                str(product.get("category") or ""),
+                str(product.get("product_type") or ""),
+                " ".join(str(item) for item in product.get("features") or []),
+                " ".join(str(item) for item in product.get("normalized_tags") or []),
+            ],
+        )
+    ).lower()
+
+
+def _token_set(text: str) -> set[str]:
+    return set(_tokenize(text or ""))
+
+
+def _is_acceptable_product_image_url(image_url: str) -> bool:
+    image_url = str(image_url or "").strip()
+    if image_url.startswith("/api/") or image_url.startswith("/media/"):
+        return True
+    return is_valid_image_url(image_url)
+
+
+def _pick_product_image_url(product: dict) -> str:
+    for image_url in normalize_product_images(product.get("images") or [], limit=3):
+        if _is_acceptable_product_image_url(image_url):
+            return image_url
+    return ""
+
+
+def _build_product_attachment(product: dict, image_url: str, image_index: int) -> dict | None:
+    if not image_url or not _is_acceptable_product_image_url(image_url):
+        return None
+    name = str(product.get("name") or "").strip()
+    title = str(product.get("product_title") or "").strip()
+    category = str(product.get("category") or "").strip()
+    label = f"{name} ({title})" if name and title and title.lower() != name.lower() else (name or title or "Product")
+    caption_lines = [f"Product: {label}"]
+    if category:
+        caption_lines.append(f"Category: {category}")
+    caption = "\n".join(caption_lines)
+    return {
+        "type": "image",
+        "url": image_url,
+        "name": name or title,
+        "size": 0,
+        "product_id": str(product.get("id") or "").strip(),
+        "product_name": name,
+        "product_title": title,
+        "product_category": category,
+        "image_index": image_index,
+        "caption": caption,
+        "raw_metadata": {
+            "product_id": str(product.get("id") or "").strip(),
+            "product_name": name,
+            "product_title": title,
+            "product_category": category,
+            "image_index": image_index,
+            "caption": caption,
+        },
+    }
+
+
+async def _ensure_product_embeddings(db, company_id: str, products: list[dict], *, limit: int = 20) -> None:
+    if not db or not company_id or not products:
+        return
+    product_ids = [product["id"] for product in products[:limit] if product.get("id")]
+    if not product_ids:
+        return
+    existing_rows = await db.fetch(
+        "SELECT DISTINCT source_id FROM embeddings "
+        "WHERE company_id=$1 AND source_type='company_product' AND source_id = ANY($2::text[])",
+        company_id,
+        product_ids,
+    )
+    existing_ids = {str(row["source_id"]) for row in existing_rows if str(row.get("source_id") or "").strip()}
+    for product in products[:limit]:
+        if product["id"] in existing_ids:
+            continue
+        try:
+            await store_embedding(
+                db,
+                company_id,
+                "company_product",
+                product["id"],
+                _product_search_text(product),
+                metadata=product.get("category", ""),
+            )
+        except Exception as exc:
+            logger.debug("Product embedding seed skipped for %s: %s", product["id"], exc)
+
+
+def _score_product(product: dict, query_info: dict, vector_score: float = 0.0) -> float:
+    haystack = _product_search_text(product)
+    normalized_name = str(product.get("normalized_name") or "")
+    normalized_category = str(product.get("normalized_category") or "")
+    normalized_tags = set(product.get("normalized_tags") or [])
+    score = 0.0
+    if query_info["general"]:
+        score += 0.2
+        if product.get("images"):
+            score += 0.15
+        if product.get("features"):
+            score += 0.1
+    for category in query_info["categories"]:
+        normalized_category_query = _normalize_term(category)
+        if not normalized_category_query:
+            continue
+        if normalized_category_query == normalized_category:
+            score += 1.2
+        if normalized_category_query in haystack:
+            score += 0.8
+    for keyword in query_info["keywords"]:
+        normalized_keyword = _normalize_term(keyword)
+        if not normalized_keyword:
+            continue
+        if normalized_keyword == normalized_category:
+            score += 0.8
+        if normalized_keyword in normalized_name:
+            score += 1.0
+        elif normalized_keyword in _normalize_term(str(product.get("product_title") or "")):
+            score += 0.8
+        elif normalized_keyword in normalized_tags:
+            score += 0.6
+        elif normalized_keyword in haystack:
+            score += 0.45
+    if vector_score > 0:
+        score += vector_score * 1.7
+    return score
+
+
+def _build_product_public_url(
+    product: dict,
+    *,
+    company_slug: str = "",
+    company_id: str = "",
+    customer_id: str = "",
+    conversation_id: str = "",
+) -> str:
+    manual = str(product.get("links") or product.get("public_url") or "").strip()
+    if manual.startswith(("http://", "https://")):
+        url = manual
+    else:
+        slug = str(product.get("slug") or "").strip()
+        if not (company_slug and slug):
+            return ""
+        url = f"{frontend_url().rstrip('/')}/c/{company_slug}/product/{slug}"
+    if customer_id and company_id and "ref=" not in url:
+        ref = create_ref_token(
+            customer_id=customer_id,
+            session_id=conversation_id,
+            company_id=company_id,
+        )
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}ref={ref}"
+    return url
+
+
+async def rank_products_for_query(
+    db,
+    company_id: str,
+    query: str,
+    *,
+    limit: int = 6,
+    exclude_ids: list[str] | None = None,
+    history_text: str = "",
+    history_product_ids: list[str] | None = None,
+    customer_id: str = "",
+    conversation_id: str = "",
+    bypass_product_cache: bool = False,
+) -> list[dict]:
+    excluded = {str(item).strip() for item in [*(exclude_ids or []), *(history_product_ids or [])] if str(item).strip()}
+    history_affects_ranking = bool(str(history_text or "").strip() or excluded)
+    cache_material = json.dumps(
+        {
+            "company_id": company_id,
+            "conversation_id": str(conversation_id or "").strip() if history_affects_ranking else "",
+            "customer_id": str(customer_id or "").strip() if history_affects_ranking else "",
+            "query": str(query or "").strip().lower(),
+            "exclude": sorted(excluded),
+            "history": str(history_text or "").strip().lower()[:600],
+            "limit": max(1, int(limit)),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    ranking_key = f"rank:{hashlib.sha256(cache_material.encode('utf-8')).hexdigest()}"
+
+    if not bypass_product_cache:
+        cached_ranked = await _RANKING_CACHE.get_json(ranking_key)
+        if isinstance(cached_ranked, list):
+            increment_counter("ai.cache.ranking.hit")
+            return [dict(item) for item in cached_ranked if isinstance(item, dict)][: max(1, int(limit))]
+
+    increment_counter("ai.cache.ranking.miss")
+    catalog_kind = _catalog_kind_for_query(query)
+    try:
+        keyword_products = await _keyword_retrieve_products(
+            db,
+            company_id,
+            query,
+            limit=max(limit * 4, 12),
+            catalog_kind=catalog_kind,
+        )
+    except Exception as exc:
+        logger.debug("rag_keyword_retrieval_failed company_id=%s error=%s", company_id, exc)
+        keyword_products = []
+    products = await _load_product_catalog(
+        db,
+        company_id,
+        limit=max(3, min(max(1, int(limit or 3)) * 4, 50)),
+        bypass_cache=bypass_product_cache,
+        catalog_kind=catalog_kind,
+    )
+    if keyword_products:
+        by_id: dict[str, dict] = {}
+        for product in [*keyword_products, *products]:
+            product_id = str(product.get("id") or "").strip()
+            if product_id:
+                by_id[product_id] = product
+        products = list(by_id.values())
+    if not products:
+        return []
+    query_info = understand_product_query(
+        query,
+        catalog_categories=[str(product.get("category") or "") for product in products],
+    )
+    if query_info.get("general") and not query_info.get("specific"):
+        selected = [
+            product
+            for product in products
+            if str(product.get("id") or "").strip() not in excluded
+        ][: max(1, int(limit or 3))]
+        logger.info(
+            "top_products_selected company_id=%s conversation_id=%s batch_limit=%s selected_product_ids=%s recently_shown_product_ids=%s reason=generic_product_query",
+            company_id,
+            conversation_id or "",
+            max(1, int(limit or 3)),
+            ",".join(str(product.get("id") or "") for product in selected),
+            ",".join(sorted(excluded)),
+        )
+        return selected
+
+    with timed_metric("ai.ranking.total_ms"):
+        history_terms = _token_set(history_text)
+        if has_embedding_budget_remaining():
+            vector_rows = await search_similar_embeddings(
+                db,
+                company_id,
+                query,
+                source_type="company_product",
+                top_k=max(limit * 4, 12),
+            )
+        else:
+            logger.info("rag_skipped_embedding company_id=%s reason=embedding_budget_exhausted", company_id)
+            vector_rows = []
+        if not vector_rows and query_info["specific"]:
+            increment_counter("ai.ranking.embedding_seeded")
+            if has_embedding_budget_remaining():
+                try:
+                    # Cap embedding seeding so a slow/unavailable embedding API
+                    # does not block the keyword-fallback scoring path.
+                    await asyncio.wait_for(
+                        _ensure_product_embeddings(db, company_id, products),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "embedding_seed_timeout company_id=%s reason=exceeded_1s_budget", company_id
+                    )
+                except Exception as _seed_exc:
+                    logger.debug("embedding_seed_error company_id=%s error=%s", company_id, _seed_exc)
+                try:
+                    vector_rows = await search_similar_embeddings(
+                        db,
+                        company_id,
+                        query,
+                        source_type="company_product",
+                        top_k=max(limit * 4, 12),
+                    )
+                except Exception:
+                    vector_rows = []
+        if not vector_rows:
+            logger.info(
+                "embedding_fallback_catalog_keyword_match_used company_id=%s conversation_id=%s query_specific=%s query_general=%s product_count=%s",
+                company_id,
+                conversation_id or "",
+                bool(query_info.get("specific")),
+                bool(query_info.get("general")),
+                len(products),
+            )
+        _MIN_PRODUCT_VECTOR_SIMILARITY = 0.35
+        vector_scores = {
+            str(row.get("source_id") or ""): float(row.get("similarity") or 0)
+            for row in vector_rows
+            if str(row.get("source_id") or "").strip()
+            and float(row.get("similarity") or 0) >= _MIN_PRODUCT_VECTOR_SIMILARITY
+        }
+        keyword_scores = {
+            str(product.get("id") or ""): max(0.25, 1.0 - (index * 0.05))
+            for index, product in enumerate(keyword_products)
+            if str(product.get("id") or "").strip()
+        }
+        fuzzy_scores = _fuzzy_retrieve_products_from_catalog(products, query)
+
+        ranked: list[tuple[float, dict]] = []
+        for product in products:
+            product_id = str(product.get("id") or "")
+            lexical_score = _score_product(product, query_info, 0.0)
+            fused_scores = _fuse_product_scores(
+                keyword_scores=keyword_scores,
+                fuzzy_scores=fuzzy_scores,
+                vector_scores=vector_scores,
+                lexical_scores={product_id: lexical_score},
+            )
+            score = fused_scores.get(product_id, lexical_score)
+            if history_terms:
+                product_terms = _token_set(_product_search_text(product))
+                overlap = len(product_terms & history_terms)
+                if overlap:
+                    score += min(0.55, overlap * 0.09)
+                category = str(product.get("category") or "").lower()
+                if category and category in history_terms:
+                    score += 0.2
+            ranked.append((score, product))
+        logger.info(
+            "rag_fuse company_id=%s keyword_results=%s fuzzy_results=%s vector_results=%s candidate_count=%s",
+            company_id,
+            len(keyword_scores),
+            len(fuzzy_scores),
+            len(vector_scores),
+            len(products),
+        )
+        ranked.sort(
+            key=lambda item: (
+                item[0],
+                len(item[1].get("features") or []),
+                len(item[1].get("images") or []),
+                str(item[1].get("updated_at") or item[1].get("created_at") or ""),
+            ),
+            reverse=True,
+        )
+
+        selected: list[dict] = []
+        seen_ids: set[str] = set()
+        min_specific_score = 0.45 if query_info.get("specific") and not query_info.get("general") else 0.0
+        for score, product in ranked:
+            if min_specific_score and score < min_specific_score:
+                continue
+            product_id = str(product.get("id") or "").strip()
+            if not product_id or product_id in excluded or product_id in seen_ids:
+                continue
+            selected.append(product)
+            seen_ids.add(product_id)
+            if len(selected) >= limit:
+                break
+
+    if not bypass_product_cache:
+        await _RANKING_CACHE.set_json(ranking_key, selected, ttl_seconds=30)
+    return selected
+
+
+def _format_product_context(product: dict) -> str:
+    description = " ".join(str(product.get("description") or "").split()) or "No description provided."
+    features = ", ".join(product.get("features") or []) or "No key features listed."
+    price = str(product.get("price") or "").strip()
+    currency = str(product.get("price_currency") or "").strip() or "USD"
+    price_display = f"{price} {currency}".strip() if price else "Not listed"
+    context = (
+        f"Product: {product.get('name') or 'Unnamed product'}"
+        f" | Title: {str(product.get('product_title') or '').strip() or 'N/A'}"
+        f" | Category: {str(product.get('category') or 'general').strip() or 'general'}"
+        f" | Type: {str(product.get('product_type') or 'standard').strip() or 'standard'}"
+        f" | Price: {price_display}"
+        f" | Description: {description}"
+        f" | Features: {features}"
+    )
+    public_url = str(product.get("public_url") or "").strip()
+    if public_url:
+        context = f"{context} | Product page: {public_url}"
+    return context
+
+

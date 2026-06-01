@@ -84,3 +84,6 @@ class TurnResult:
     active_template: str
     confidence: float
     error: str = ""
+    sentiment: dict[str, Any] = field(default_factory=dict)
+    conversation_sentiment: dict[str, Any] = field(default_factory=dict)
+    escalation_required: bool = False

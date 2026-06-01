@@ -70,41 +70,43 @@ def trim_to_budget(
 ) -> tuple[list[ContextChunk], list[str]]:
     """Return chunks/history that together fit inside the target token budget.
 
-    Trimming order (per the plan):
+    Trimming order:
       1. Drop oldest history turns first.
       2. Drop lowest relevance_score chunks.
       3. Higher-precedence sources are trimmed last.
+
+    Token counts are computed once upfront - O(n) instead of O(n^2).
     """
     chunks = list(chunks)
     history = list(history_turns)
     budget = max(1000, target_total_tokens - system_tokens)
 
-    def _total() -> int:
-        return sum(count_tokens(c.content) for c in chunks) + sum(count_tokens(t) for t in history)
+    # Pre-compute all token counts once.
+    chunk_tok: dict[int, int] = {id(c): count_tokens(c.content) for c in chunks}
+    history_tok: list[int] = [count_tokens(t) for t in history]
+    running: int = sum(chunk_tok.values()) + sum(history_tok)
 
-    # Step 1: trim oldest history.
-    while history and _total() > budget:
+    # Step 1: trim oldest history first.
+    while history and running > budget:
+        running -= history_tok.pop(0)
         history.pop(0)
 
-    if _total() <= budget:
+    if running <= budget:
         return chunks, history
 
-    # Step 2 + 3: drop lowest-score chunks first, but never drop higher
-    # precedence before lower precedence. Score = (precedence, relevance).
-    # We sort the "drop queue" so least-valuable chunks come first.
+    # Step 2 + 3: drop lowest-value chunks first.
     drop_order = sorted(
         range(len(chunks)),
         key=lambda i: (-_PRECEDENCE.get(chunks[i].source_type, 9), chunks[i].relevance_score),
     )
     surviving = list(chunks)
     for idx in drop_order:
-        if _total() <= budget:
+        if running <= budget:
             break
-        try:
-            target = chunks[idx]
-            surviving.remove(target)
+        target_chunk = chunks[idx]
+        if target_chunk in surviving:
+            surviving.remove(target_chunk)
+            running -= chunk_tok.get(id(target_chunk), 0)
             chunks = surviving
-        except ValueError:
-            continue
 
     return chunks, history

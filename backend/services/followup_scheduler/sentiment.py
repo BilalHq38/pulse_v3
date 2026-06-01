@@ -46,16 +46,27 @@ NEGATIVE_SIGNALS: tuple[str, ...] = (
     "not working",
     "disappointed",
     "disappointing",
-    "return",
-    "refund",
+    "want a refund",
+    "need a refund",
+    "requesting refund",
     "complaint",
-    "issue",
-    "problem",
+    "have an issue",
+    "got an issue",
+    "there's an issue",
+    "there is an issue",
+    "have a problem",
+    "got a problem",
+    "there's a problem",
     "defective",
-    "damaged",
-    "missing",
-    "wrong",
-    "late",
+    "item damaged",
+    "arrived damaged",
+    "something missing",
+    "item missing",
+    "parts missing",
+    "wrong item",
+    "wrong product",
+    "arrived late",
+    "still not arrived",
     "never arrived",
     "unhappy",
     "terrible",
@@ -68,7 +79,17 @@ def _normalise(text: str) -> str:
 
 
 def _any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
-    return any(kw in text for kw in keywords)
+    """Match keywords with simple boundary check to avoid false positives.
+    'issue' must not match 'no issues'. Check preceded/followed by non-word char or boundary."""
+    for kw in keywords:
+        idx = text.find(kw)
+        if idx == -1:
+            continue
+        before_ok = idx == 0 or not text[idx - 1].isalpha()
+        after_ok = (idx + len(kw)) >= len(text) or not text[idx + len(kw)].isalpha()
+        if before_ok and after_ok:
+            return True
+    return False
 
 
 def classify_sentiment(text: str) -> Sentiment:
@@ -84,7 +105,7 @@ def classify_sentiment(text: str) -> Sentiment:
 
     # MiniLM primary
     try:
-        from services.ai_service.local_ml import classify_sentiment as _ml  # noqa: PLC0415
+        from services.conversation_engine.local_ml import classify_sentiment as _ml  # noqa: PLC0415
         result = _ml(text or "")
         label = result.get("label", "neutral")
         if label in {"positive", "neutral", "negative"}:

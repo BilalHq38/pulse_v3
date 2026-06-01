@@ -66,21 +66,49 @@ async def _persist_outbound_ai_message(
     text: str,
     confidence: float,
 ) -> str:
+    """Insert the outbound message and update the conversation atomically.
+
+    Both statements run inside a single transaction so a partial failure
+    (message inserted but conversation not updated) cannot occur.
+    """
     msg_id = make_id()
     try:
-        await db.execute(
-            "INSERT INTO messages "
-            "(id, company_id, conversation_id, content, sender_type, sender_id, sender_name, "
-            " ai_confidence, delivery_status, read, created_at) "
-            "VALUES ($1, $2, $3, $4, 'ai', 'ai-assistant', 'AI Assistant', $5, 'sent', FALSE, NOW())",
-            msg_id, company_id, conversation_id, text, float(confidence or 0.0),
-        )
-        await db.execute(
-            "UPDATE conversations SET last_message = $1, last_message_at = NOW(), "
-            "message_count = message_count + 1 WHERE id = $2",
-            text[:200],
-            conversation_id,
-        )
+        async with db.transaction():
+            await db.execute(
+                "INSERT INTO messages "
+                "(id, company_id, conversation_id, content, sender_type, sender_id, sender_name, "
+                " ai_confidence, delivery_status, read, created_at) "
+                "VALUES ($1, $2, $3, $4, 'ai', 'ai-assistant', 'AI Assistant', $5, 'sent', FALSE, NOW())",
+                msg_id, company_id, conversation_id, text, float(confidence or 0.0),
+            )
+            await db.execute(
+                "UPDATE conversations SET last_message = $1, last_message_at = NOW(), "
+                "message_count = message_count + 1 WHERE id = $2",
+                text[:200],
+                conversation_id,
+            )
+    except AttributeError:
+        # db is a plain connection without transaction() - fall back to
+        # sequential execute (less safe, only happens in tests).
+        try:
+            await db.execute(
+                "INSERT INTO messages "
+                "(id, company_id, conversation_id, content, sender_type, sender_id, sender_name, "
+                " ai_confidence, delivery_status, read, created_at) "
+                "VALUES ($1, $2, $3, $4, 'ai', 'ai-assistant', 'AI Assistant', $5, 'sent', FALSE, NOW())",
+                msg_id, company_id, conversation_id, text, float(confidence or 0.0),
+            )
+            await db.execute(
+                "UPDATE conversations SET last_message = $1, last_message_at = NOW(), "
+                "message_count = message_count + 1 WHERE id = $2",
+                text[:200],
+                conversation_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "followup_loop_persist_failed conversation_id=%s error=%s",
+                conversation_id, exc,
+            )
     except Exception as exc:
         logger.warning(
             "followup_loop_persist_failed conversation_id=%s error=%s",
@@ -343,11 +371,27 @@ async def _loop_body(db, stop_event: asyncio.Event) -> None:
                     )
                 dispatched += 1
             except asyncio.TimeoutError:
+                _fid = str(claimed.get("id") or "")
                 logger.warning(
                     "followup_dispatch_timeout followup_id=%s workflow_kind=%s",
-                    claimed.get("id"),
+                    _fid,
                     claimed.get("workflow_kind"),
                 )
+                if _fid:
+                    try:
+                        async with platform_admin_context(db):
+                            await mark_followup_outcome(
+                                db,
+                                followup_id=_fid,
+                                status="expired",
+                                outcome="dispatch_timeout",
+                            )
+                    except Exception as _te:
+                        logger.warning(
+                            "followup_timeout_cleanup_failed followup_id=%s error=%s",
+                            _fid,
+                            _te,
+                        )
             except Exception:
                 # Defensive: dispatch_one_followup already swallows its own
                 # errors, but the outer guard keeps the loop alive in case a

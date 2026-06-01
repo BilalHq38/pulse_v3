@@ -1,44 +1,25 @@
+﻿"""Local-only sentiment analysis for the conversation engine.
+
+No LLM calls. No external API. All analysis is done in-process using
+all-MiniLM-L6-v2 (via local_ml) with a keyword-heuristic fallback.
+
+Public API used by the orchestrator:
+  analyze_local_sentiment(text)           -> dict
+  analyze_conversation_sentiment(ctx, ...) -> dict
+  build_sentiment_gate(text, sentiment)   -> dict
+  should_auto_escalate(text, sentiment)   -> bool
+  sentiment_to_percentage(score)          -> int
+  get_sentiment_label(pct)               -> str
+  normalize_sentiment_score(score)       -> float
+"""
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
-import os
 import re
 from typing import Any
 
-from services.ai_service.common import SentimentResult
-from services.ai_service.llm_client import (
-    _default_engine,
-    _provider_default_model,
-    _resolve_engine_for_request,
-    call_model_json,
-    call_model_json_batch,
-    get_provider_runtime_info,
-)
-
 logger = logging.getLogger(__name__)
-
-def _sentiment_fallback_engine() -> dict[str, Any]:
-    provider = (os.getenv("AI_SENTIMENT_FALLBACK_PROVIDER", "gemini") or "gemini").strip().lower()
-    model_name = (
-        os.getenv("AI_SENTIMENT_FALLBACK_MODEL") or _provider_default_model(provider, use_pro=False)
-    ).strip()
-    try:
-        temperature = float(os.getenv("AI_SENTIMENT_FALLBACK_TEMPERATURE", "0.25") or 0.25)
-    except Exception:
-        temperature = 0.25
-    try:
-        max_tokens = int(os.getenv("AI_SENTIMENT_FALLBACK_MAX_TOKENS", "1024") or 1024)
-    except Exception:
-        max_tokens = 1024
-    return {
-        "provider": provider,
-        "model_name": model_name,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "supports_vision": False,
-    }
 
 _SUPPORTED_EMOTIONS = {
     "angry",
@@ -121,7 +102,6 @@ _INTENSIFIERS = {
     "too": 1.2,
     "very": 1.3,
 }
-
 
 def _clamp(value: Any, *, low: float, high: float, default: float) -> float:
     try:
@@ -323,124 +303,6 @@ def _finalize_sentiment(raw: dict[str, Any], source_text: str, *, scope: str) ->
     }
 
 
-def _message_prompt(text: str) -> str:
-    return (
-        "You are a CRM sentiment analyzer for a single customer message.\n"
-        "Task: estimate message sentiment polarity, customer emotion, and salient emotional keywords.\n"
-        "Input format:\n"
-        "- message: one customer-authored text message\n"
-        "Output format: return ONLY valid JSON with this schema:\n"
-        '{"score": float(-1 to 1), "emotion": "angry|frustrated|confused|neutral|satisfied|happy|excited", '
-        '"confidence": float(0-1), "sentiment_label": "positive|neutral|negative", '
-        '"keywords": ["short keyword"], "emotion_breakdown": {"joy":0,"anger":0,"sadness":0,"fear":0,"surprise":0}}\n'
-        "Rules:\n"
-        "- score must reflect sentiment polarity and MUST NOT be exactly 0.0.\n"
-        "- Use a slight non-zero value for near-neutral sentiment.\n"
-        "- Keep keywords short, factual, and grounded in the message.\n"
-        "- emotion_breakdown values must stay between 0 and 1.\n"
-        f"\nmessage:\n{text}"
-    )
-
-
-def _conversation_prompt(history: str, latest_message: str) -> str:
-    return (
-        "You are a CRM sentiment analyzer for a multi-turn conversation.\n"
-        "Task: evaluate the overall trajectory of the conversation, not just the final line, while giving extra weight to the latest customer message.\n"
-        "Input format:\n"
-        "- conversation: chronological turns labelled by role\n"
-        "- latest_customer_message: the newest customer message in the thread\n"
-        "Output format: return ONLY valid JSON with this schema:\n"
-        '{"score": float(-1 to 1), "emotion": "angry|frustrated|confused|neutral|satisfied|happy|excited", '
-        '"confidence": float(0-1), "sentiment_label": "positive|neutral|negative", '
-        '"keywords": ["short keyword"], "emotion_breakdown": {"joy":0,"anger":0,"sadness":0,"fear":0,"surprise":0}}\n'
-        "Rules:\n"
-        "- score must represent the overall conversation mood and MUST NOT be exactly 0.0.\n"
-        "- Weigh repeated frustration, relief, or escalation across turns.\n"
-        "- Keep keywords grounded in the conversation, not inferred facts.\n"
-        f"\nconversation:\n{history}\n\nlatest_customer_message:\n{latest_message}"
-    )
-
-
-def _should_retry_for_zero_score(raw: dict[str, Any]) -> bool:
-    score = _clamp((raw or {}).get("score"), low=-1.0, high=1.0, default=0.0)
-    return abs(score) < 0.01
-
-
-def _with_non_zero_retry_instruction(prompt: str) -> str:
-    return (
-        f"{prompt}\n\n"
-        "IMPORTANT: The score must never be 0.0. "
-        "If sentiment is neutral, return a slight non-zero score with absolute value between 0.02 and 0.12 "
-        "based on the best-fit polarity from the text and conversation."
-    )
-
-
-async def _call_sentiment_api(
-    prompt: str,
-    *,
-    db=None,
-    company_id: str = "",
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    selected_engine = await _resolve_engine_for_request(db=db, company_id=company_id)
-    candidates = [
-        selected_engine,
-        _sentiment_fallback_engine(),
-        _default_engine(use_pro=False),
-        _default_engine(use_pro=True),
-    ]
-    errors: list[str] = []
-    quota_exhausted_providers: set[str] = set()
-    for pass_index in range(2):
-        attempted: set[str] = set()
-        for engine in candidates:
-            provider = str((engine or {}).get("provider") or "").strip().lower()
-            model = str((engine or {}).get("model_name") or "").strip().lower()
-            if not provider:
-                continue
-            # Skip providers whose quota is already exhausted this request.
-            if provider in quota_exhausted_providers:
-                errors.append(f"{provider}:{model}: skipped (quota exhausted)")
-                continue
-            signature = f"{provider}:{model}"
-            if signature in attempted:
-                continue
-            attempted.add(signature)
-            ready, reason = get_provider_runtime_info(provider)
-            if not ready:
-                errors.append(f"{signature}: {reason}")
-                continue
-            try:
-                logger.info(
-                    "sentiment_llm_called company_id=%s provider=%s model=%s",
-                    company_id or "",
-                    provider,
-                    model,
-                )
-                payload = await call_model_json(
-                    prompt,
-                    SentimentResult,
-                    engine=engine,
-                    call_purpose="sentiment",
-                    function_name="_call_sentiment_api",
-                    max_provider_attempts=1,
-                    allow_provider_fallback=False,
-                )
-                return payload, engine
-            except Exception as exc:
-                error_str = str(exc)
-                detail = error_str.splitlines()[0][:120]
-                errors.append(f"{signature}: {exc.__class__.__name__} ({detail})")
-                # 429 / RESOURCE_EXHAUSTED is project-level — mark provider and
-                # skip all remaining candidates for it without retrying.
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str.upper():
-                    quota_exhausted_providers.add(provider)
-                continue
-        if pass_index == 0:
-            await asyncio.sleep(0.2)
-    reason = "; ".join(errors) if errors else "No eligible model provider"
-    raise RuntimeError(f"Sentiment analysis failed across providers: {reason}")
-
-
 def analyze_local_sentiment(text: str) -> dict:
     """
     Local sentiment analysis: all-MiniLM-L6-v2 (primary) + domain keyword supplement.
@@ -453,10 +315,10 @@ def analyze_local_sentiment(text: str) -> dict:
     """
     source_text = (text or "").strip() or "[empty message]"
 
-    # 1. Domain keyword supplement — always runs (fast, catches CRM-specific phrases)
+    # 1. Domain keyword supplement â€” always runs (fast, catches CRM-specific phrases)
     kw_score, keywords, pos_hits, neg_hits = _local_sentiment_components(source_text)
 
-    # 2. MiniLM primary — semantic understanding beyond keyword matching
+    # 2. MiniLM primary â€” semantic understanding beyond keyword matching
     ml_score: float = kw_score
     ml_confidence: float = 0.0
     ml_breakdown: dict | None = None
@@ -473,7 +335,7 @@ def analyze_local_sentiment(text: str) -> dict:
         logger.debug("analyze_local_sentiment minilm unavailable: %s", exc)
 
     # 3. Blend: MiniLM primary (78%), keyword supplement (22%)
-    #    Increase keyword weight when it has strong domain signal (≥2 hits)
+    #    Increase keyword weight when it has strong domain signal (â‰¥2 hits)
     if ml_available:
         if pos_hits + neg_hits >= 2:
             blended = 0.65 * ml_score + 0.35 * kw_score
@@ -507,7 +369,7 @@ def analyze_local_sentiment(text: str) -> dict:
     else:
         emotion = "confused" if "questioning" in keywords else "neutral"
 
-    # 6. Emotion breakdown — from MiniLM if available, else derive from score
+    # 6. Emotion breakdown â€” from MiniLM if available, else derive from score
     breakdown = ml_breakdown if (ml_available and ml_breakdown) else _normalize_breakdown(None, blended)
 
     model_name = "sentence-transformers/all-MiniLM-L6-v2+crm-keyword" if ml_available else "crm-keyword-heuristic-v1"
@@ -569,7 +431,6 @@ def get_sentiment_label(percentage: int) -> str:
 def normalize_sentiment_score(raw_score: float | None) -> float:
     score = max(-1.0, min(1.0, float(raw_score if raw_score is not None else 0.0)))
     return round((score + 1) / 2, 4)
-
 
 def build_sentiment_gate(message_text: str, sentiment: dict | None = None) -> dict:
     sentiment = sentiment or {}
@@ -670,61 +531,7 @@ def should_auto_escalate(message_text: str, sentiment: dict | None = None, inten
         return score < -0.1 or urgency in {"high", "critical"}
     return urgency == "critical" and score < -0.25
 
-
-async def analyze_sentiment(text: str, db=None, company_id: str = "", **kwargs) -> dict:
-    """Analyze single-message sentiment.
-
-    Primary path: all-MiniLM-L6-v2 (local, zero API cost).
-    LLM escalation: only when MiniLM confidence < 0.35 AND message > 20 words,
-    which covers edge cases like sarcasm or mixed-sentiment long text.
-    This reduces LLM sentiment API calls by ~90%.
-    """
-    source_text = (text or "").strip() or "[empty message]"
-
-    result = analyze_local_sentiment(source_text)
-    result["scope"] = "message"
-    result["source"] = result.get("source") or "local_minilm"
-    result["external_api_called"] = False
-    logger.info(
-        "sentiment_score score=%s path_taken=local_minilm escalation=false company_id=%s model=%s",
-        result.get("score"),
-        company_id or "",
-        result.get("model_name", ""),
-    )
-    return result
-
-    # Low-confidence on a long complex message — attempt LLM upgrade
-    _unused_prompt = _message_prompt(source_text)
-    try:
-        raw, engine = await _call_sentiment_api(prompt, db=db, company_id=company_id)
-        _log_sentiment_payload("raw", scope="message", source_text=source_text, payload=raw, engine=engine)
-        if _should_retry_for_zero_score(raw):
-            logger.info(
-                "sentiment_llm_retry scope=message company_id=%s reason=zero_score",
-                company_id or "",
-            )
-            raw, engine = await _call_sentiment_api(
-                _with_non_zero_retry_instruction(prompt),
-                db=db,
-                company_id=company_id,
-            )
-        upgraded = _finalize_sentiment(raw, source_text, scope="message")
-        upgraded["provider"] = str((engine or {}).get("provider") or "")
-        upgraded["model_name"] = str((engine or {}).get("model_name") or "")
-        upgraded["source"] = "provider"
-        _log_sentiment_payload("processed", scope="message", source_text=source_text, payload=upgraded, engine=engine)
-        return upgraded
-    except Exception as exc:
-        logger.debug(
-            "sentiment_llm_escalation_failed scope=message company_id=%s error=%s — using MiniLM result",
-            company_id or "",
-            exc,
-        )
-        result["source"] = "local_minilm_lowconf"
-        return result
-
-
-async def analyze_conversation_sentiment(
+def analyze_conversation_sentiment(
     conversation_context: list[dict] | None,
     *,
     latest_message: str = "",
@@ -732,7 +539,7 @@ async def analyze_conversation_sentiment(
     company_id: str = "",
     **kwargs,
 ) -> dict:
-    """Analyze multi-turn conversation sentiment with MiniLM — zero API calls.
+    """Analyze multi-turn conversation sentiment with MiniLM â€” zero API calls.
 
     Trend is derived by comparing MiniLM scores on the first half vs second half
     of the conversation history, giving an accurate arc without LLM cost.
@@ -786,64 +593,3 @@ async def analyze_conversation_sentiment(
     )
     return result
 
-
-
-
-async def analyze_message_and_conversation_sentiment(
-    message_text: str,
-    conversation_context: list[dict] | None = None,
-    *,
-    db=None,
-    company_id: str = "",
-) -> tuple[dict, dict]:
-    """Analyze message AND conversation sentiment — fully local via all-MiniLM-L6-v2.
-
-    Zero LLM API calls. Two MiniLM inference calls (~10-20 ms total).
-    Trend is derived from the delta between latest-message score and
-    conversation-history score — no extra inference needed.
-    """
-    source_text = (message_text or "").strip() or "[empty message]"
-
-    # Build conversation turns
-    turns: list[str] = []
-    for item in (conversation_context or [])[-20:]:
-        role = str((item or {}).get("sender_type") or "unknown").strip().lower()
-        content_text = str((item or {}).get("content") or "").strip()
-        if not content_text:
-            continue
-        turns.append(f"{role}: {content_text}")
-    if source_text and (not turns or source_text.strip() not in turns[-1]):
-        turns.append(f"customer: {source_text}")
-    history = "\n".join(turns[-16:])
-
-    # Message sentiment — MiniLM on current message
-    msg_sentiment = analyze_local_sentiment(source_text)
-    msg_sentiment["scope"] = "message"
-    msg_sentiment["source"] = "local_minilm"
-
-    # Conversation sentiment — MiniLM on full history
-    conv_sentiment = analyze_local_sentiment(history or source_text)
-    conv_sentiment["scope"] = "conversation"
-    conv_sentiment["source"] = "local_minilm"
-    conv_sentiment["turns_analyzed"] = len(turns)
-
-    # Trend: how has sentiment shifted from baseline to latest message?
-    delta = msg_sentiment["score"] - conv_sentiment["score"]
-    conv_sentiment["trend"] = (
-        "improving" if delta > 0.18
-        else ("declining" if delta < -0.18 else "stable")
-    )
-
-    return msg_sentiment, conv_sentiment
-
-__all__ = [
-    "analyze_local_sentiment",
-    "analyze_message_and_conversation_sentiment",
-    "analyze_sentiment",
-    "analyze_conversation_sentiment",
-    "build_sentiment_gate",
-    "get_sentiment_label",
-    "normalize_sentiment_score",
-    "sentiment_to_percentage",
-    "should_auto_escalate",
-]

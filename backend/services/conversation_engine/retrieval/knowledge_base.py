@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 
-from services.ai_service.embedding_service import search_similar_embeddings
+from services.conversation_engine.embedding_service import search_similar_embeddings
 from services.conversation_engine.schemas import ContextChunk
 
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from services.ai_service.routing_guards import is_low_value_message, lightweight_route_message
+from services.conversation_engine.routing_guards import is_low_value_message, lightweight_route_message
 from services.conversation_engine.schemas import SourceType
 
 

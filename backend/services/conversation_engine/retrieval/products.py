@@ -23,12 +23,13 @@ write the URL inline.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
 import time as _time
 
-from services.ai_service.rag import _format_product_context, rank_products_for_query
+from services.conversation_engine.product_ranker import _format_product_context, rank_products_for_query
 from services.conversation_engine.schemas import ContextChunk
 from shared.config import frontend_url
 from shared.product_ref_token import create_ref_token
@@ -287,9 +288,11 @@ class ProductRetriever:
         # fall back to the full catalog so the LLM always has product context.
         if not products:
             return await self._fetch_full_catalog(db, company_id=company_id, top_k=top_k)
-        company_slug = await _resolve_company_slug(db, company_id)
         product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
-        images = await _fetch_first_images(db, product_ids, company_id=company_id)
+        company_slug, images = await asyncio.gather(
+            _resolve_company_slug(db, company_id),
+            _fetch_first_images(db, product_ids, company_id=company_id),
+        )
         chunks: list[ContextChunk] = []
         denom = max(1, len(products))
         for index, product in enumerate(products):
@@ -341,9 +344,11 @@ class ProductRetriever:
             if not rows:
                 return []
             products = [dict(r) for r in rows]
-            company_slug = await _resolve_company_slug(db, company_id)
             product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
-            images = await _fetch_first_images(db, product_ids, company_id=company_id)
+            company_slug, images = await asyncio.gather(
+                _resolve_company_slug(db, company_id),
+                _fetch_first_images(db, product_ids, company_id=company_id),
+            )
             _CATALOG_CACHE[cache_key] = (now, products, company_slug, images)
 
         # Rebuild ContextChunks fresh for this request so URLs carry the

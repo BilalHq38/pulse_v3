@@ -13,6 +13,7 @@ pooled connection asyncpg returns.
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 from services.conversation_engine.schemas import ContextChunk
@@ -51,9 +52,11 @@ class TemplatesAndFaqsRetriever:
         query_tokens = _tokens(query)
         chunks: list[ContextChunk] = []
 
-        chunks.extend(await self._fetch_active_template(db, company_id))
-
-        faq_rows = await self._fetch_faqs(db, company_id)
+        template_chunks, faq_rows = await asyncio.gather(
+            self._fetch_active_template(db, company_id),
+            self._fetch_faqs(db, company_id),
+        )
+        chunks.extend(template_chunks)
 
         scored: list[tuple[float, dict]] = []
         for record in faq_rows:

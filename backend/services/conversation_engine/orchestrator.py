@@ -47,6 +47,12 @@ from services.conversation_engine.schemas import (
     TurnRequest,
     TurnResult,
 )
+from services.conversation_engine.sentiment import (
+    analyze_local_sentiment,
+    analyze_conversation_sentiment,
+    build_sentiment_gate,
+    should_auto_escalate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +149,16 @@ class Orchestrator:
     async def run_turn(self, db, request: TurnRequest) -> TurnResult:
         started_at = time.monotonic()
         decision = context_router.score(request.user_message)
+
+        # Sentiment - pure local CPU, no DB, no LLM, sub-millisecond.
+        # Runs before routing so escalation_required is available on every path.
+        message_sentiment = analyze_local_sentiment(request.user_message)
+        sentiment_gate = build_sentiment_gate(request.user_message, message_sentiment)
+        _ = sentiment_gate
+        escalation_required = should_auto_escalate(request.user_message, message_sentiment)
+        # conversation_sentiment is set later (needs history). Default to message-level.
+        conversation_sentiment: dict[str, Any] = dict(message_sentiment)
+
         logger.info(
             "guard_classification company_id=%s session_id=%s message_classified=%s path_selected=%s retrieval_triggered=%s sources=%s",
             request.company_id,
@@ -153,14 +169,35 @@ class Orchestrator:
             list(decision.sources or []),
         )
         if decision.low_value and decision.direct_response:
-            return await self._direct_low_value_turn(db, request, decision, started_at=started_at)
+            return await self._direct_low_value_turn(
+                db,
+                request,
+                decision,
+                started_at=started_at,
+                message_sentiment=message_sentiment,
+                conversation_sentiment=conversation_sentiment,
+                escalation_required=escalation_required,
+            )
 
-        retrieval_results = await self._retrieve(
-            db,
-            request,
-            decision.sources,
-            low_value=decision.low_value,
+        retrieval_results, history_dialogue = await asyncio.gather(
+            self._retrieve(db, request, decision.sources, low_value=decision.low_value),
+            self._history_dialogue(db, request),
         )
+
+        # Conversation sentiment - needs history, runs here after gather.
+        # Pure local, no DB, no LLM.
+        if history_dialogue:
+            history_as_context = [
+                {
+                    "sender_type": "customer" if line.startswith("User:") else "ai",
+                    "content": line.split(": ", 1)[1] if ": " in line else line,
+                }
+                for line in history_dialogue
+            ]
+            conversation_sentiment = analyze_conversation_sentiment(
+                history_as_context, latest_message=request.user_message
+            )
+
         chunks: list[ContextChunk] = []
         for result in retrieval_results:
             chunks.extend(result.chunks)
@@ -188,15 +225,11 @@ class Orchestrator:
                 completion=budget_module.count_tokens(answer),
                 total=budget_module.count_tokens(answer),
             )
-            turn_index = await memory_module.next_turn_index(
-                db, company_id=request.company_id, session_id=request.session_id
-            )
-            turn_id = await memory_module.persist_turn(
+            turn_id, _ = await memory_module.persist_turn_atomic(
                 db,
                 company_id=request.company_id,
                 session_id=request.session_id,
                 customer_id=request.customer_id,
-                turn_index=turn_index,
                 user_message=request.user_message,
                 ai_response=answer,
                 sources_used=sources_used,
@@ -207,19 +240,12 @@ class Orchestrator:
                 mode=request.mode,
             )
             if product_links and request.customer_id:
-                shown_ids = [pl.product_id for pl in product_links if pl.product_id]
-                if shown_ids:
-                    try:
-                        from memory_engine.long_term import LongTermMemory
-                        await LongTermMemory().store_shown_products(
-                            db,
-                            request.company_id,
-                            request.customer_id,
-                            shown_ids,
-                            conversation_id=request.session_id,
-                        )
-                    except Exception as exc:
-                        logger.debug("shown_products_update_failed: %s", exc)
+                _shown = [pl.product_id for pl in product_links if pl.product_id]
+                if _shown:
+                    asyncio.create_task(
+                        self._safe_store_shown_products(db, request, _shown),
+                        name=f"shown-products-{request.session_id}",
+                    )
             logger.info(
                 "ai_turn_deterministic company_id=%s session_id=%s turn_id=%s sources=%s confidence=%.3f latency_ms=%d",
                 request.company_id,
@@ -238,24 +264,20 @@ class Orchestrator:
                 tokens_used=tokens,
                 active_template="",
                 confidence=confidence,
+                sentiment=message_sentiment,
+                conversation_sentiment=conversation_sentiment,
+                escalation_required=escalation_required,
             )
 
-        history_dialogue = await self._history_dialogue(db, request)
         tier = budget_module.select_tier(request.user_message, compressed)
         target = budget_module.target_tokens(tier)
         style_prompt = _extract_style_prompt(compressed)
         active_template = _extract_template_name(compressed)
 
-        # Estimate the system+formatting overhead so the trimmer has a real
-        # budget to work against.
-        skeleton_prompt = prompt_builder.build_prompt(
-            user_message=request.user_message,
-            chunks=[],
-            history_turns=[],
-            style_prompt=style_prompt,
-            confidence_bucket=bucket,
+        system_tokens = (
+            prompt_builder.STATIC_SYSTEM_TOKEN_BASELINE
+            + budget_module.count_tokens(style_prompt)
         )
-        system_tokens = budget_module.count_tokens(skeleton_prompt)
         trimmed_chunks, trimmed_history = budget_module.trim_to_budget(
             compressed,
             history_dialogue,
@@ -277,6 +299,9 @@ class Orchestrator:
                 db, request, sources_used=[r.source_type for r in retrieval_results if r.chunks],
                 active_template=active_template, confidence=confidence,
                 reason="injection_detected",
+                message_sentiment=message_sentiment,
+                conversation_sentiment=conversation_sentiment,
+                escalation_required=escalation_required,
             )
 
         result = await self._gateway.generate(prompt)
@@ -290,6 +315,9 @@ class Orchestrator:
                 db, request, sources_used=[r.source_type for r in retrieval_results if r.chunks],
                 active_template=active_template, confidence=confidence,
                 reason="llm_gateway_failed",
+                message_sentiment=message_sentiment,
+                conversation_sentiment=conversation_sentiment,
+                escalation_required=escalation_required,
             )
         answer = result.text.strip()
         product_links = _extract_product_links(answer, trimmed_chunks)
@@ -346,6 +374,9 @@ class Orchestrator:
                     db, request, sources_used=[r.source_type for r in retrieval_results if r.chunks],
                     active_template=active_template, confidence=confidence,
                     reason="validation_failed",
+                    message_sentiment=message_sentiment,
+                    conversation_sentiment=conversation_sentiment,
+                    escalation_required=escalation_required,
                 )
 
         sources_used: list[SourceType] = [r.source_type for r in retrieval_results if r.chunks]
@@ -354,15 +385,11 @@ class Orchestrator:
             completion=budget_module.count_tokens(answer),
             total=budget_module.count_tokens(prompt) + budget_module.count_tokens(answer),
         )
-        turn_index = await memory_module.next_turn_index(
-            db, company_id=request.company_id, session_id=request.session_id
-        )
-        turn_id = await memory_module.persist_turn(
+        turn_id, turn_index = await memory_module.persist_turn_atomic(
             db,
             company_id=request.company_id,
             session_id=request.session_id,
             customer_id=request.customer_id,
-            turn_index=turn_index,
             user_message=request.user_message,
             ai_response=answer,
             sources_used=sources_used,
@@ -374,24 +401,20 @@ class Orchestrator:
         )
 
         if memory_module.should_summarise(turn_index):
-            await self._refresh_rolling_summary(db, request, turn_index, chunks=trimmed_chunks)
+            asyncio.create_task(
+                self._safe_refresh_rolling_summary(db, request, turn_index, chunks=trimmed_chunks),
+                name=f"rolling-summary-{request.session_id}",
+            )
 
         # Persist shown product IDs so future turns can avoid recommending the
         # same items and cross-sell logic can exclude already-seen products.
         if product_links and request.customer_id:
-            _shown_ids = [pl.product_id for pl in product_links if pl.product_id]
-            if _shown_ids:
-                try:
-                    from memory_engine.long_term import LongTermMemory
-                    await LongTermMemory().store_shown_products(
-                        db,
-                        request.company_id,
-                        request.customer_id,
-                        _shown_ids,
-                        conversation_id=request.session_id,
-                    )
-                except Exception as _sp_exc:
-                    logger.debug("shown_products_update_failed: %s", _sp_exc)
+            _shown = [pl.product_id for pl in product_links if pl.product_id]
+            if _shown:
+                asyncio.create_task(
+                    self._safe_store_shown_products(db, request, _shown),
+                    name=f"shown-products-{request.session_id}",
+                )
 
         logger.info(
             "ai_turn company_id=%s session_id=%s turn_id=%s tier=%s sources=%s confidence=%.3f latency_ms=%d",
@@ -413,6 +436,9 @@ class Orchestrator:
             tokens_used=tokens,
             active_template=active_template,
             confidence=confidence,
+            sentiment=message_sentiment,
+            conversation_sentiment=conversation_sentiment,
+            escalation_required=escalation_required,
         )
 
     async def _direct_low_value_turn(
@@ -422,6 +448,9 @@ class Orchestrator:
         decision: context_router.RoutingDecision,
         *,
         started_at: float,
+        message_sentiment: dict[str, Any],
+        conversation_sentiment: dict[str, Any],
+        escalation_required: bool,
     ) -> TurnResult:
         answer = decision.direct_response.strip()
         confidence = 0.96
@@ -430,15 +459,11 @@ class Orchestrator:
             completion=budget_module.count_tokens(answer),
             total=budget_module.count_tokens(answer),
         )
-        turn_index = await memory_module.next_turn_index(
-            db, company_id=request.company_id, session_id=request.session_id
-        )
-        turn_id = await memory_module.persist_turn(
+        turn_id, _ = await memory_module.persist_turn_atomic(
             db,
             company_id=request.company_id,
             session_id=request.session_id,
             customer_id=request.customer_id,
-            turn_index=turn_index,
             user_message=request.user_message,
             ai_response=answer,
             sources_used=[],
@@ -465,6 +490,9 @@ class Orchestrator:
             tokens_used=tokens,
             active_template="",
             confidence=confidence,
+            sentiment=message_sentiment,
+            conversation_sentiment=conversation_sentiment,
+            escalation_required=escalation_required,
         )
 
     async def _fetch_shown_product_chunks(
@@ -518,9 +546,11 @@ class Orchestrator:
         if not rows:
             return []
         products = [dict(r) for r in rows]
-        company_slug = await _resolve_company_slug(db, request.company_id)
         product_ids = [str(p.get("id") or "") for p in products if p.get("id")]
-        images = await _fetch_first_images(db, product_ids, company_id=request.company_id)
+        company_slug, images = await asyncio.gather(
+            _resolve_company_slug(db, request.company_id),
+            _fetch_first_images(db, product_ids, company_id=request.company_id),
+        )
         result_chunks: list[ContextChunk] = []
         for product in products:
             pid = str(product.get("id") or "")
@@ -604,18 +634,24 @@ class Orchestrator:
         return list(results)
 
     async def _history_dialogue(self, db, request: TurnRequest) -> list[str]:
-        turns = await memory_module.fetch_recent_turns(
-            db, company_id=request.company_id, session_id=request.session_id
-        )
-        rolling = await memory_module.fetch_rolling_summary(
-            db, company_id=request.company_id, session_id=request.session_id
+        turns, rolling = await asyncio.gather(
+            memory_module.fetch_recent_turns(
+                db, company_id=request.company_id, session_id=request.session_id
+            ),
+            memory_module.fetch_rolling_summary(
+                db, company_id=request.company_id, session_id=request.session_id
+            ),
         )
         lines: list[str] = []
         if rolling:
             lines.append(f"[summary of earlier conversation] {rolling}")
         engine_lines = memory_module.history_as_dialogue(turns)
         lines.extend(engine_lines)
-        extra_lines = [str(line).strip() for line in (request.extra_history or []) if str(line).strip()]
+        extra_lines = [
+            str(line).strip()
+            for line in (request.extra_history or [])
+            if str(line).strip()
+        ]
         if extra_lines and not engine_lines:
             lines.extend(extra_lines[-24:])
         return lines
@@ -675,6 +711,58 @@ class Orchestrator:
             covers_through_turn=turn_index,
         )
 
+    async def _safe_refresh_rolling_summary(
+        self,
+        db,
+        request: TurnRequest,
+        turn_index: int,
+        *,
+        chunks: list | None = None,
+    ) -> None:
+        """Fire-and-forget wrapper around _refresh_rolling_summary.
+
+        Swallows all exceptions so the background task never crashes
+        the event loop. Failures are logged and the next turn falls
+        back to reading individual turn rows from ai_conversation_turns.
+        """
+        try:
+            await self._refresh_rolling_summary(db, request, turn_index, chunks=chunks)
+        except Exception as exc:
+            logger.warning(
+                "rolling_summary_background_failed company_id=%s session_id=%s error=%s",
+                request.company_id,
+                request.session_id,
+                exc,
+            )
+
+    async def _safe_store_shown_products(
+        self,
+        db,
+        request: TurnRequest,
+        shown_ids: list[str],
+    ) -> None:
+        """Fire-and-forget wrapper for storing shown product IDs.
+
+        Swallows all exceptions. If this fails, the next turn's
+        _fetch_shown_product_chunks simply re-fetches the product
+        (which compression deduplicates). No correctness impact.
+        """
+        try:
+            from memory_engine.long_term import LongTermMemory  # noqa: PLC0415
+            await LongTermMemory().store_shown_products(
+                db,
+                request.company_id,
+                request.customer_id,
+                shown_ids,
+                conversation_id=request.session_id,
+            )
+        except Exception as exc:
+            logger.debug(
+                "shown_products_background_failed company_id=%s error=%s",
+                request.company_id,
+                exc,
+            )
+
     async def _fallback_turn(
         self,
         db,
@@ -684,18 +772,17 @@ class Orchestrator:
         active_template: str,
         confidence: float,
         reason: str,
+        message_sentiment: dict[str, Any],
+        conversation_sentiment: dict[str, Any],
+        escalation_required: bool,
     ) -> TurnResult:
         tokens = TokenUsage(prompt=0, completion=budget_module.count_tokens(_STATIC_FALLBACK))
         tokens.total = tokens.prompt + tokens.completion
-        turn_index = await memory_module.next_turn_index(
-            db, company_id=request.company_id, session_id=request.session_id
-        )
-        turn_id = await memory_module.persist_turn(
+        turn_id, _ = await memory_module.persist_turn_atomic(
             db,
             company_id=request.company_id,
             session_id=request.session_id,
             customer_id=request.customer_id,
-            turn_index=turn_index,
             user_message=request.user_message,
             ai_response=_STATIC_FALLBACK,
             sources_used=sources_used,
@@ -715,6 +802,9 @@ class Orchestrator:
             active_template=active_template,
             confidence=confidence,
             error=reason,
+            sentiment=message_sentiment,
+            conversation_sentiment=conversation_sentiment,
+            escalation_required=escalation_required,
         )
 
 

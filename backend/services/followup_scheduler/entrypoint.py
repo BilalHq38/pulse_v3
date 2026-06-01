@@ -52,11 +52,22 @@ app = FastAPI(title="Pulse Follow-up Scheduler", lifespan=lifespan)
 @app.get("/health")
 async def health():
     handle = _scheduler_handle
-    if handle is None or handle.task.done():
+    if handle is None:
         return JSONResponse({"status": "degraded", "scheduler": "not_running"}, status_code=503)
-    exc = handle.task.exception() if handle.task.done() else None
-    if exc:
-        return JSONResponse({"status": "degraded", "error": str(exc)}, status_code=503)
+    if handle.task.done():
+        exc_msg = "stopped_normally"
+        try:
+            exc = handle.task.exception()
+            if exc:
+                exc_msg = f"{type(exc).__name__}: {exc}"
+        except asyncio.CancelledError:
+            exc_msg = "cancelled"
+        except Exception:
+            pass
+        return JSONResponse(
+            {"status": "degraded", "scheduler": exc_msg},
+            status_code=503,
+        )
     return {"status": "ok", "scheduler": "running"}
 
 

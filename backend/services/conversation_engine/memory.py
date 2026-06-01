@@ -201,6 +201,78 @@ async def persist_turn(
     return turn_id
 
 
+async def persist_turn_atomic(
+    db,
+    *,
+    company_id: str,
+    session_id: str,
+    customer_id: str,
+    user_message: str,
+    ai_response: str,
+    sources_used: list[SourceType],
+    product_links: list[ProductLink],
+    confidence: float,
+    active_template: str,
+    token_usage: TokenUsage,
+    mode: Mode,
+) -> tuple[str, int]:
+    """Insert one conversation turn and compute its index in a single DB call.
+
+    Returns (turn_id, turn_index).
+    - turn_id is generated locally (no DB query needed for it).
+    - turn_index is computed inside the INSERT via a subquery and returned
+      via RETURNING, eliminating the separate next_turn_index() SELECT.
+
+    This replaces the two-call pattern:
+        turn_index = await next_turn_index(...)
+        turn_id    = await persist_turn(..., turn_index=turn_index, ...)
+
+    With a single round-trip that does both atomically.
+    """
+    turn_id = _new_turn_id()
+    row = await _rls_fetchrow(
+        db,
+        company_id,
+        "INSERT INTO ai_conversation_turns "
+        "(id, company_id, session_id, customer_id, turn_index, user_message, ai_response, "
+        " sources_used, product_links, confidence, active_template, token_usage, mode) "
+        "VALUES ("
+        "  $1, $2, $3, $4, "
+        "  (SELECT COALESCE(MAX(turn_index), 0) + 1 "
+        "     FROM ai_conversation_turns "
+        "    WHERE company_id = $2 AND session_id = $3), "
+        "  $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11::jsonb, $12"
+        ") "
+        "RETURNING turn_index",
+        turn_id,
+        company_id,
+        session_id,
+        customer_id or "",
+        user_message,
+        ai_response,
+        json.dumps(list(sources_used)),
+        json.dumps([
+            {
+                "product_id": pl.product_id,
+                "url": pl.url,
+                "name": pl.name,
+                "image_url": pl.image_url,
+            }
+            for pl in product_links
+        ]),
+        float(confidence),
+        active_template or "",
+        json.dumps({
+            "prompt": token_usage.prompt,
+            "completion": token_usage.completion,
+            "total": token_usage.total,
+        }),
+        mode,
+    )
+    turn_index = int((row or {}).get("turn_index") or 1)
+    return turn_id, turn_index
+
+
 async def upsert_rolling_summary(
     db,
     *,

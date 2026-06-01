@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 
 from services.ai_service.common import estimate_tokens
-from services.ai_service.llm_client import call_model_text
+from services.ai_runtime.llm_client import call_model_text
 from shared.config import (
     ai_api_call_timeout_seconds,
     ai_max_tokens,
