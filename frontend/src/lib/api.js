@@ -62,6 +62,12 @@ let accessToken = storedAccessToken();
 let refreshPromise = null;
 const MIN_ERROR_DISPLAY_DELAY_MS = 3000;
 const RETRYABLE_GET_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const NO_GUARDED_RETRY_PREFIXES = [
+  '/settings/company',
+  '/settings/personal',
+  '/notifications',
+  '/notification-settings',
+];
 
 function delay(ms) {
   return new Promise((resolve) => {
@@ -73,6 +79,8 @@ function isRetryableGetError(error) {
   const config = error?.config || {};
   const method = String(config.method || 'get').toLowerCase();
   if (method !== 'get' || config.skipGuardedRetry || config._guardedRetry) return false;
+  const requestUrl = String(config.url || '');
+  if (NO_GUARDED_RETRY_PREFIXES.some((prefix) => requestUrl.startsWith(prefix))) return false;
   const status = Number(error?.response?.status || 0);
   return !status || RETRYABLE_GET_STATUSES.has(status);
 }

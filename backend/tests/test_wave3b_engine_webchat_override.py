@@ -176,12 +176,12 @@ def test_engine_override_helper_handles_missing_sentiment_gate():
 
 def test_engine_override_helper_preserves_active_order_flow_response():
     support_plan = {
-        "response": "Please share your delivery address to complete the order.",
+        "response": "Please confirm your order.",
         "deliver_response": True,
         "escalate": False,
         "conversation_stage": "order_flow",
         "model_name": "deterministic-order-flow",
-        "next_action": "collect_order_details",
+        "next_action": "request_order_confirmation",
         "order_id": "order-1",
     }
 
@@ -194,11 +194,46 @@ def test_engine_override_helper_preserves_active_order_flow_response():
         engine_product_links=[ProductLink(product_id="p1", url="https://example.com/p1")],
     )
 
-    assert merged["response"] == "Please share your delivery address to complete the order."
-    assert merged["next_action"] == "collect_order_details"
+    assert merged["response"] == "Please confirm your order."
+    assert merged["next_action"] == "request_order_confirmation"
     assert merged["engine_override_skipped_reason"] == "active_order_flow"
     assert merged["engine_turn_id"] == "turn-1"
     assert "product_links" not in merged
+
+
+def test_engine_override_helper_uses_engine_for_collect_details_buy_link():
+    support_plan = {
+        "response": "Please share your delivery address to complete the order.",
+        "deliver_response": True,
+        "escalate": False,
+        "conversation_stage": "order_flow",
+        "model_name": "deterministic-order-flow",
+        "next_action": "collect_order_details",
+        "order_id": "order-1",
+    }
+
+    merged = apply_engine_response_to_support_plan(
+        support_plan=support_plan,
+        capture={"sentiment_gate": {"ai_response_allowed": True}},
+        engine_answer="You can buy Aquamarine Drop Earrings here:\nhttps://example.com/aqua",
+        engine_confidence=0.91,
+        engine_turn_id="turn-1",
+        engine_product_links=[
+            ProductLink(product_id="p1", url="https://example.com/aqua", name="Aquamarine Drop Earrings")
+        ],
+    )
+
+    assert merged["response"].startswith("You can buy Aquamarine Drop Earrings here:")
+    assert merged["next_action"] == "conversation_engine_reply"
+    assert merged["engine_turn_id"] == "turn-1"
+    assert merged["product_links"] == [
+        {
+            "product_id": "p1",
+            "url": "https://example.com/aqua",
+            "name": "Aquamarine Drop Earrings",
+            "image_url": "",
+        }
+    ]
 
 
 class _FakeSettingsDb:

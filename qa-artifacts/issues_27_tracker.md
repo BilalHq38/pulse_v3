@@ -49,4 +49,24 @@ Status legend: TODO, IN_PROGRESS, DONE, BLOCKED
 - 25: Added SAFE sanitization for fabricated product names, prices, URLs, internal context tags/source labels, invalid product links, missing purchase links, and duplicate response blocks; logged validation pass/fail plus stripped content; preserved fallback behavior when stripping removes the required grounded answer; verified SAFE and conversation validation suites pass.
 - 26: Added outbound delivery provider metadata for WhatsApp bridge/Meta API/SMTP/WebSocket paths, explicit logs for write success, channel used, delivery confirmed, and analytics event fired, and outbound AI response capture into the data pipeline after delivery; verified new outbound delivery contract tests plus WhatsApp idempotency, web chat, socket, email, inbound receipt, media URL, and WhatsApp bridge regressions pass.
 - 27: Added order/delivery trigger aliases for order completed, delivery completed, and delivered; logged post-conversation trigger pass/fail and message content checks; made post-delivery proactive prompts ask about experience/product satisfaction and use purchase-history related product retrieval; verified trigger scheduling, dispatch, content, order status alias emitters, related-product prompt grounding, and Wave 4/5 follow-up suites pass.
-- Final evaluation: DONE. Backend suite passes (`426 passed, 37 skipped, 4 FastAPI deprecation warnings`). Frontend suite passes (`68 passed`). Frontend production build passes. Targeted issue 26/27 suites and production hardening tests pass.
+- Final evaluation: DONE. Backend suite passes (`430 passed, 37 skipped, 4 warnings`). Frontend suite passes (`17 passed, 72 tests`). Frontend production build passes. Targeted issue 26/27 suites and production hardening tests pass.
+
+## 2026-06-01 Deployment/Auth Recheck
+
+- [x] 01. Google OAuth must stop at super admin verification before onboarding/dashboard - DONE
+- [x] 02. Credential login after payment must not return a generic 401 loop - DONE
+- [x] 03. Email verification deadlock must be removed - DONE
+- [x] 04. Super admin approval must not be skipped - DONE
+- [x] 05. `/settings/company`, `/settings/personal`, and `/notifications` must not fail with 500 during bootstrap/missing-record states - DONE
+- [x] 06. Partial workspace provisioning must surface as pending approval/status, not signup failure - DONE
+- [x] 07. Dashboard routing must wait for approval and onboarding completion - DONE
+- [x] 08. Frontend retry loop must not repeatedly hammer guarded bootstrap endpoints - DONE
+
+Evidence:
+
+- Backend full suite: `430 passed, 37 skipped, 4 warnings`.
+- Frontend full suite: `17 passed, 72 tests`.
+- Frontend production build: passed.
+- Local Docker cleanup: old `pulse-v3` and `pulse-engine` containers/volumes removed; accidental `database_complete.sql` directory removed.
+- Local Docker run: fresh `pulse-v3` stack is running with all containers healthy.
+- Database bootstrap: `backend/sql_schema.sql` now mounts into Postgres init; fresh local DB has 137 public tables including `users`, `companies`, `company_settings`, `notifications`, and `pending_signups`.

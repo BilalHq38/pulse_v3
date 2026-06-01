@@ -38,6 +38,63 @@ def _sentiment_label(score: float | int | None) -> str:
     return "neutral"
 
 
+async def _fetch_avg_ai_confidence(db, company_id: str) -> float:
+    confidence_queries = (
+        (
+            "SELECT AVG(m.ai_confidence) "
+            "FROM messages m "
+            "JOIN conversations c ON c.company_id=m.company_id AND c.id=m.conversation_id "
+            "WHERE m.company_id=$1 AND c.ai_handled=TRUE AND c.status=ANY($2) "
+            "AND m.ai_confidence IS NOT NULL",
+            (company_id, _ANALYTICS_INCLUDED_CONVERSATION_STATUSES),
+        ),
+        (
+            "SELECT AVG(confidence) FROM ai_conversation_turns "
+            "WHERE company_id=$1 AND confidence IS NOT NULL",
+            (company_id,),
+        ),
+    )
+    for query, args in confidence_queries:
+        try:
+            value = await db.fetchval(query, *args)
+        except Exception as exc:
+            logger.warning("analytics_ai_score_confidence_source_unavailable error=%s", exc)
+            continue
+        if value is not None:
+            return float(value or 0)
+    return 0.0
+
+
+async def _fetch_ai_confidence_nature_rows(db, company_id: str) -> list[dict]:
+    try:
+        rows = await db.fetch(
+            "SELECT m.ai_confidence AS confidence, c.status "
+            "FROM messages m "
+            "JOIN conversations c ON c.company_id=m.company_id AND c.id=m.conversation_id "
+            "WHERE m.company_id=$1 AND c.ai_handled=TRUE AND c.status=ANY($2) "
+            "AND m.ai_confidence IS NOT NULL "
+            "ORDER BY m.created_at DESC LIMIT 500",
+            company_id,
+            _ANALYTICS_INCLUDED_CONVERSATION_STATUSES,
+        )
+        if rows:
+            return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("analytics_ai_score_message_confidence_unavailable error=%s", exc)
+
+    try:
+        rows = await db.fetch(
+            "SELECT confidence, ''::text AS status FROM ai_conversation_turns "
+            "WHERE company_id=$1 AND confidence IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 500",
+            company_id,
+        )
+        return [dict(row) for row in rows or []]
+    except Exception as exc:
+        logger.warning("analytics_ai_score_turn_confidence_unavailable error=%s", exc)
+        return []
+
+
 def _summary_dedupe_key(item: dict) -> tuple[str, ...]:
     entity_type = str(item.get("entity_type") or "").strip().lower()
     if entity_type == "customer":
@@ -176,12 +233,8 @@ async def analytics_ai_score(request: Request):
         ) or 0
     )
 
-    # Average ai_confidence across AI-handled conversations that have the field populated.
-    avg_confidence_row = await db.fetchval(
-        "SELECT AVG(ai_confidence) FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND ai_confidence IS NOT NULL",
-        cid,
-    )
-    avg_confidence = float(avg_confidence_row or 0)
+    # Confidence is stored on AI messages and engine turns, not conversations.
+    avg_confidence = await _fetch_avg_ai_confidence(db, cid)
     confidence_pct = round(avg_confidence * 100 if avg_confidence <= 1 else avg_confidence, 1)
 
     resolution_rate = round((ai_resolved / ai_handled * 100) if ai_handled else 0, 1)
@@ -199,16 +252,13 @@ async def analytics_ai_score(request: Request):
             return "Good"
         return "Moderate"
 
-    nature_rows = await db.fetch(
-        "SELECT ai_confidence, status FROM conversations WHERE company_id=$1 AND ai_handled=TRUE AND ai_confidence IS NOT NULL LIMIT 500",
-        cid,
-    )
+    nature_rows = await _fetch_ai_confidence_nature_rows(db, cid)
     nature_counts = {"Excellent": 0, "Good": 0, "Moderate": 0, "Low": 0}
     for row in nature_rows or []:
-        conf = float(row["ai_confidence"] or 0)
+        conf = float(row.get("confidence") or 0)
         conf_pct = conf * 100 if conf <= 1 else conf
-        resolved = str(row["status"] or "") == "resolved"
-        escalated = str(row["status"] or "") == "escalated"
+        resolved = str(row.get("status") or "") == "resolved"
+        escalated = str(row.get("status") or "") == "escalated"
         nature_counts[_nature(conf_pct, resolved, escalated)] += 1
 
     return {

@@ -147,6 +147,28 @@ def test_post_conversation_triggers_schedule_dispatch_and_verify_content(monkeyp
     asyncio.run(_run_post_conversation_trigger_case(monkeypatch, caplog, trigger_status))
 
 
+@pytest.mark.parametrize("trigger_status", ["admin_review", "placed", "confirmed"])
+def test_order_placed_status_schedules_order_confirmed_followup(trigger_status):
+    asyncio.run(_run_order_placed_status_case(trigger_status))
+
+
+async def _run_order_placed_status_case(trigger_status: str):
+    db = _PostConversationDb()
+
+    scheduled = await scheduler_module.evaluate_order_event(
+        db,
+        company_id="company-1",
+        order_id=f"order-{trigger_status}",
+        customer_id="customer-1",
+        session_id="session-1",
+        to_status=trigger_status,
+    )
+
+    assert scheduled["scheduled"] is True
+    assert scheduled["workflow_kind"] == "order_confirmed"
+    assert db.followups[0]["workflow_kind"] == "order_confirmed"
+
+
 async def _run_post_conversation_trigger_case(monkeypatch, caplog, trigger_status: str):
     db = _PostConversationDb(
         conversations={

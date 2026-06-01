@@ -103,6 +103,7 @@ async def _ensure_company_settings_exists(db, company_id: str) -> Optional[str]:
     company_id = (company_id or "").strip()
     if not company_id:
         return None
+    await _ensure_company_profile_exists(db, company_id)
     row = r(await db.fetchrow("SELECT id FROM company_settings WHERE company_id=$1 LIMIT 1", company_id))
     if row:
         return row["id"]
@@ -118,10 +119,26 @@ async def _ensure_company_settings_exists(db, company_id: str) -> Optional[str]:
     return (row or {}).get("id")
 
 
+async def _ensure_company_profile_exists(db, company_id: str) -> None:
+    company_id = (company_id or "").strip()
+    if not company_id:
+        return
+    exists = await db.fetchval("SELECT EXISTS(SELECT 1 FROM companies WHERE id=$1)", company_id)
+    if exists:
+        return
+    await db.execute(
+        "INSERT INTO companies(id,name,is_active,created_at,updated_at) "
+        "VALUES($1,'My Company',TRUE,NOW(),NOW()) "
+        "ON CONFLICT (id) DO NOTHING",
+        company_id,
+    )
+
+
 async def _fetch_company_settings_profile(db, company_id: str) -> Optional[dict]:
     company_id = (company_id or "").strip()
     if not company_id:
         return None
+    await _ensure_company_profile_exists(db, company_id)
     return r(
         await db.fetchrow(
             "SELECT cs.*, c.name AS company_name "

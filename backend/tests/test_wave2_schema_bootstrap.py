@@ -145,6 +145,7 @@ def test_ai_followups_table(schema_sql: str):
             "scheduled_for   TIMESTAMPTZ NOT NULL",
             "idempotency_key TEXT NOT NULL DEFAULT ''",
             "chk_ai_followups_workflow_kind",
+            "order_confirmed",
             "chk_ai_followups_status",
             "idx_followups_due",
             "uq_followups_one_active_per_order",

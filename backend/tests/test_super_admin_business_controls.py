@@ -97,9 +97,10 @@ def test_auth_payload_exposes_account_status_for_frontend_routing():
     assert payload["account_status"] == "pending_approval"
 
 
-def test_public_signup_creates_active_user():
-    source = public_signup_service._complete_pending_signup_workspace.__code__.co_consts
-    assert any("public_signup_user_activated" in str(item) for item in source)
+def test_public_signup_creates_pending_approval_user():
+    source = public_signup_service._complete_pending_signup_workspace_in_tx.__code__.co_consts
+    assert any("pending_approval" in str(item) for item in source)
+    assert any("public_signup_user_pending_approval" in str(item) for item in source)
 
 
 @pytest.mark.asyncio
@@ -145,7 +146,7 @@ async def test_register_status_passes_request_to_paid_signup_fallback(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_register_status_waits_for_active_workspace_before_redirect(monkeypatch):
+async def test_register_status_reports_pending_approval_without_setup_failure(monkeypatch):
     async def noop(*_args, **_kwargs):
         return None
 
@@ -175,17 +176,25 @@ async def test_register_status_waits_for_active_workspace_before_redirect(monkey
     async def fake_pending_by_session(_db, _session_id):
         return pending
 
+    async def fake_records_ready(_db, _company_id):
+        return True
+
+    async def fake_email_verification_status(*_args):
+        return {"required": True}
+
     monkeypatch.setattr(public_signup_service, "ensure_pending_signup_primitives", noop)
     monkeypatch.setattr(public_signup_service, "_expire_stale_pending_signups", noop)
     monkeypatch.setattr(public_signup_service, "_pending_signup_by_session", fake_pending_by_session)
     monkeypatch.setattr(public_signup_service, "_ensure_public_signup_workspace_records", noop)
+    monkeypatch.setattr(public_signup_service, "_public_signup_workspace_records_ready", fake_records_ready)
+    monkeypatch.setattr(public_signup_service, "_email_verification_status_for_user", fake_email_verification_status)
 
     result = await public_signup_service.get_public_registration_status(Db(), "cs_test_123", _Request("/api/auth/register/status"))
 
-    assert result["account_created"] is False
-    assert result["setup_failed"] is True
+    assert result["account_created"] is True
+    assert result["setup_failed"] is False
+    assert result["awaiting_approval"] is True
     assert result["user_status"] == "pending_approval"
-    assert "Contact support" in result["support_message"]
 
 
 def test_starter_plan_alias_maps_to_free_plan():

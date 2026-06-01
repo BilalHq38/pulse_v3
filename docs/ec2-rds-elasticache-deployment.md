@@ -120,7 +120,7 @@ psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS vector;"
 Apply the consolidated schema:
 
 ```bash
-psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f database_complete.sql
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f backend/sql_schema.sql
 ```
 
 Verify:
@@ -208,7 +208,7 @@ docker compose --env-file .env.production -f "production docker-compose.yml" up 
 docker compose --env-file .env.production -f "production docker-compose.yml" ps
 ```
 
-Run `psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f database_complete.sql` only for first bootstrap. For later schema changes, use the project migration flow if you keep production data.
+Run `psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f backend/sql_schema.sql` only for first bootstrap. For later schema changes, use the project migration flow if you keep production data.
 
 ## Backups And Operations
 

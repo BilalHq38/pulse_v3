@@ -380,6 +380,133 @@ def test_orchestrator_end_to_end_with_fakes():
     assert result.tokens_used.completion > 0
 
 
+def test_orchestrator_uses_deterministic_catalog_answer_without_llm():
+    retrievers = {
+        "company_data": FakeRetriever("company_data", []),
+        "product": FakeRetriever(
+            "product",
+            [
+                _chunk(
+                    "product",
+                    "p1",
+                    "Product: Aquamarine Drop Earrings | Category: earrings | Price: 899 USD | Description: 18K white gold earrings | Product page: https://shop.test/aqua",
+                    score=0.9,
+                    metadata={
+                        "name": "Aquamarine Drop Earrings",
+                        "category": "earrings",
+                        "price": "899",
+                        "price_currency": "USD",
+                        "public_url": "https://shop.test/aqua",
+                    },
+                ),
+                _chunk(
+                    "product",
+                    "p2",
+                    "Product: Silver Snake Chain Bracelet | Category: bracelets | Price: 59 USD | Description: Sterling silver bracelet | Product page: https://shop.test/bracelet",
+                    score=0.8,
+                    metadata={
+                        "name": "Silver Snake Chain Bracelet",
+                        "category": "bracelets",
+                        "price": "59",
+                        "price_currency": "USD",
+                        "public_url": "https://shop.test/bracelet",
+                    },
+                ),
+            ],
+        ),
+        "faq": FakeRetriever("faq", []),
+        "knowledge_base": FakeRetriever("knowledge_base", []),
+    }
+    gateway = FakeGateway(response="model should not be called")
+    orch = Orchestrator(retrievers=retrievers, gateway=gateway)
+
+    result = asyncio.run(
+        orch.run_turn(FakeDb(), TurnRequest(session_id="s_test", company_id="co_1", user_message="What product do you have?"))
+    )
+
+    assert gateway.calls == 0
+    assert "Aquamarine Drop Earrings" in result.answer
+    assert "Category: earrings" in result.answer
+    assert "Budget/price: USD 899" in result.answer
+    assert result.product_links[0].url == "https://shop.test/aqua"
+
+
+def test_orchestrator_uses_deterministic_buy_link_without_llm():
+    retrievers = {
+        "company_data": FakeRetriever("company_data", []),
+        "product": FakeRetriever(
+            "product",
+            [
+                _chunk(
+                    "product",
+                    "p1",
+                    "Product: Aquamarine Drop Earrings | Category: earrings | Price: 899 USD | Description: 18K white gold earrings | Product page: https://shop.test/aqua",
+                    score=0.9,
+                    metadata={
+                        "name": "Aquamarine Drop Earrings",
+                        "category": "earrings",
+                        "price": "899",
+                        "price_currency": "USD",
+                        "public_url": "https://shop.test/aqua",
+                    },
+                )
+            ],
+        ),
+        "faq": FakeRetriever("faq", []),
+        "knowledge_base": FakeRetriever("knowledge_base", []),
+    }
+    gateway = FakeGateway(response="model should not be called")
+    orch = Orchestrator(retrievers=retrievers, gateway=gateway)
+
+    result = asyncio.run(
+        orch.run_turn(
+            FakeDb(),
+            TurnRequest(
+                session_id="s_test",
+                company_id="co_1",
+                user_message="I want to buy aquamarine drop earrings",
+            ),
+        )
+    )
+
+    assert gateway.calls == 0
+    assert result.answer.startswith("You can buy Aquamarine Drop Earrings here:")
+    assert "https://shop.test/aqua" in result.answer
+    assert "Budget/price: USD 899" in result.answer
+    assert result.product_links == [
+        ProductLink(product_id="p1", url="https://shop.test/aqua", name="Aquamarine Drop Earrings", image_url="")
+    ]
+
+
+def test_orchestrator_uses_deterministic_company_answer_without_llm():
+    retrievers = {
+        "company_data": FakeRetriever(
+            "company_data",
+            [
+                _chunk(
+                    "company_data",
+                    "c1",
+                    "Company name: Ash & Aura\nTagline: jewelry seller\nAbout: sale unique jewelry.\nIndustry: Manufacturing",
+                    score=1.0,
+                )
+            ],
+        ),
+        "product": FakeRetriever("product", []),
+        "faq": FakeRetriever("faq", []),
+        "knowledge_base": FakeRetriever("knowledge_base", []),
+    }
+    gateway = FakeGateway(response="model should not be called")
+    orch = Orchestrator(retrievers=retrievers, gateway=gateway)
+
+    result = asyncio.run(
+        orch.run_turn(FakeDb(), TurnRequest(session_id="s_test", company_id="co_1", user_message="What is your company about?"))
+    )
+
+    assert gateway.calls == 0
+    assert "Ash & Aura is jewelry seller." in result.answer
+    assert "sale unique jewelry" in result.answer
+
+
 @pytest.mark.parametrize("message", ["Hello", "ok", "yes", "no", "sure", "How are you?"])
 def test_orchestrator_skips_retrieval_and_llm_for_conversational_messages(message, caplog):
     retrievers = {

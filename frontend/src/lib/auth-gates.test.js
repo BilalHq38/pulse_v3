@@ -47,3 +47,15 @@ test('routes canceled paid users to billing', () => {
 test('routes unpaid users to billing', () => {
   expect(postAuthDestination({ ...activePaidUser, plan_selected: false })).toBe('/billing');
 });
+
+test('routes pending approval before verification, onboarding, billing, or dashboard', () => {
+  expect(
+    postAuthDestination({
+      ...activePaidUser,
+      status: 'pending_approval',
+      email_verified: false,
+      onboarding_completed: false,
+      plan_selected: false,
+    }),
+  ).toBe('/account-status');
+});

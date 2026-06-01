@@ -468,11 +468,18 @@ async def admin_update_user_status(user_id: str, request: Request) -> dict[str, 
     if status == "active" and previous_status != "active" and target.get("role") in {"admin", "company_agent"}:
         async with db.transaction() as conn:
             await assert_workspace_seat_available(conn, str(target.get("company_id") or ""))
-            await conn.execute(
-                "UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2",
-                status,
-                user_id,
-            )
+            if previous_status == "pending_approval" and target.get("role") == "admin":
+                await conn.execute(
+                    "UPDATE users SET status=$1,onboarding_completed=FALSE,updated_at=NOW() WHERE id=$2",
+                    status,
+                    user_id,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2",
+                    status,
+                    user_id,
+                )
     else:
         await db.execute(
             "UPDATE users SET status=$1,updated_at=NOW() WHERE id=$2",

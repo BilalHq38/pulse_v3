@@ -232,12 +232,6 @@ function CompanyStep({ user, form, onChange, onNext, onSkip }) {
   const [error, setError] = useState('');
   const phonePreview = buildInternationalPhoneNumber(form.phone_country, form.phone_local);
 
-  // #region agent log
-  useEffect(() => {
-    fetch('http://127.0.0.1:7649/ingest/e979188b-c6e0-4acc-966c-d0f2bc7abd6b',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'3ceefc'},body:JSON.stringify({sessionId:'3ceefc',runId:'pre-fix',hypothesisId:'H1',location:'OnboardingPage.js:CompanyStep',message:'CompanyStep render phone state',data:{phone_country:String(form?.phone_country||''),phone_local:String(form?.phone_local??''),phone_local_len:String(form?.phone_local??'').length,phonePreview:String(phonePreview||'')},timestamp:Date.now()})}).catch(()=>{});
-  }, [form?.phone_country, form?.phone_local, phonePreview]);
-  // #endregion agent log
-
   const handleSubmit = async (event) => {
     event.preventDefault();
     setError('');
@@ -357,9 +351,6 @@ function CompanyStep({ user, form, onChange, onNext, onSkip }) {
               value={form.phone_local}
               onChange={(event) => {
                 const nextValue = event.target.value;
-                // #region agent log
-                fetch('http://127.0.0.1:7649/ingest/e979188b-c6e0-4acc-966c-d0f2bc7abd6b',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'3ceefc'},body:JSON.stringify({sessionId:'3ceefc',runId:'pre-fix',hypothesisId:'H2',location:'OnboardingPage.js:phone_local_onChange',message:'phone_local changed',data:{nextValue:String(nextValue||''),len:String(nextValue||'').length},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion agent log
                 onChange('phone_local', nextValue);
               }}
               placeholder="555 000 0000"

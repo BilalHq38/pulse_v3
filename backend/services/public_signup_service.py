@@ -106,6 +106,13 @@ async def _public_signup_workspace_ready(db, user: dict[str, Any]) -> bool:
         return False
     if str(user.get("status") or "").strip().lower() != "active":
         return False
+    return await _public_signup_workspace_records_ready(db, company_id)
+
+
+async def _public_signup_workspace_records_ready(db, company_id: str) -> bool:
+    company_id = str(company_id or "").strip()
+    if not company_id:
+        return False
     row = r(
         await db.fetchrow(
             """
@@ -573,10 +580,12 @@ async def get_public_registration_status(db, session_id: str, request: Request |
         await _ensure_public_signup_workspace_records(db, str(user.get("company_id") or ""), pending_signup)
     except Exception:
         logger.exception("signup status workspace readiness repair failed user_id=%s", user_id)
-    workspace_ready = await _public_signup_workspace_ready(db, user)
-    response["workspace_ready"] = workspace_ready
-    response["user_status"] = str(user.get("status") or "").strip().lower()
-    if not workspace_ready:
+    account_status = str(user.get("status") or "").strip().lower() or "active"
+    workspace_records_ready = await _public_signup_workspace_records_ready(db, user.get("company_id", ""))
+    response["workspace_records_ready"] = workspace_records_ready
+    response["workspace_ready"] = workspace_records_ready and account_status == "active"
+    response["user_status"] = account_status
+    if not workspace_records_ready:
         response["account_created"] = False
         response["setup_failed"] = True
         response["support_message"] = _signup_setup_support_message(session_id)
@@ -584,6 +593,12 @@ async def get_public_registration_status(db, session_id: str, request: Request |
     response["account_created"] = True
     response["company_id"] = user.get("company_id", "")
     response["email_verified"] = bool(user.get("email_verified"))
+    if account_status == "pending_approval":
+        response["awaiting_approval"] = True
+        response["setup_failed"] = False
+        if not user.get("email_verified"):
+            response["email_verification"] = await _email_verification_status_for_user(db, user)
+        return response
     if not user.get("email_verified"):
         response["email_verification"] = await _email_verification_status_for_user(db, user)
     return response
@@ -605,10 +620,61 @@ async def _complete_pending_signup_workspace(
     system_log_event: str,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
+    if hasattr(db, "_get_pool") and hasattr(db, "transaction"):
+        async with db.transaction() as tx:
+            return await _complete_pending_signup_workspace_in_tx(
+                tx,
+                request,
+                pending_signup,
+                stripe_customer_id=stripe_customer_id,
+                stripe_subscription_id=stripe_subscription_id,
+                billing_payment_status=billing_payment_status,
+                subscription_status=subscription_status,
+                current_period_start=current_period_start,
+                current_period_end=current_period_end,
+                pending_signup_final_payment_status=pending_signup_final_payment_status,
+                auth_event_name=auth_event_name,
+                system_log_event=system_log_event,
+                background_tasks=background_tasks,
+            )
+    return await _complete_pending_signup_workspace_in_tx(
+        db,
+        request,
+        pending_signup,
+        stripe_customer_id=stripe_customer_id,
+        stripe_subscription_id=stripe_subscription_id,
+        billing_payment_status=billing_payment_status,
+        subscription_status=subscription_status,
+        current_period_start=current_period_start,
+        current_period_end=current_period_end,
+        pending_signup_final_payment_status=pending_signup_final_payment_status,
+        auth_event_name=auth_event_name,
+        system_log_event=system_log_event,
+        background_tasks=background_tasks,
+    )
+
+
+async def _complete_pending_signup_workspace_in_tx(
+    db,
+    request: Request | None,
+    pending_signup: dict[str, Any],
+    *,
+    stripe_customer_id: str,
+    stripe_subscription_id: str,
+    billing_payment_status: str,
+    subscription_status: str,
+    current_period_start: datetime | None,
+    current_period_end: datetime | None,
+    pending_signup_final_payment_status: str,
+    auth_event_name: str,
+    system_log_event: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
     """
     Create or attach workspace after payment (Stripe) or offline trial.
     Caller must have updated pending_signups pre-state (e.g. payment_succeeded).
     """
+    await set_public_auth_context(db, email=pending_signup["email"])
     existing_user = r(
         await db.fetchrow(
             "SELECT * FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1",
@@ -645,7 +711,7 @@ async def _complete_pending_signup_workspace(
             current_period_end=current_period_end,
         )
         await db.execute(
-            "UPDATE users SET status='active',onboarding_completed=TRUE,plan_selected=TRUE,billing_status='active',updated_at=NOW() "
+            "UPDATE users SET status='pending_approval',onboarding_completed=FALSE,plan_selected=TRUE,billing_status='active',updated_at=NOW() "
             "WHERE id=$1",
             existing_user["id"],
         )
@@ -708,7 +774,7 @@ async def _complete_pending_signup_workspace(
     user_id = make_id()
     await db.execute(
         "INSERT INTO users(id,email,password_hash,name,role,role_id,sub_role,status,avatar,company_id,phone,onboarding_completed,plan_selected,billing_status,auth_provider,email_verified,created_at,updated_at) "  # noqa: E501
-        "VALUES($1,$2,$3,$4,'admin',$5,'','active','',$6,'',TRUE,TRUE,'active','email',FALSE,NOW(),NOW())",
+        "VALUES($1,$2,$3,$4,'admin',$5,'','pending_approval','',$6,'',FALSE,TRUE,'active','email',FALSE,NOW(),NOW())",
         user_id,
         (pending_signup["email"] or "").strip().lower(),
         pending_signup["password_hash"],
@@ -737,12 +803,12 @@ async def _complete_pending_signup_workspace(
         },
     )
     logger.info(
-        "public_signup_user_activated actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
+        "public_signup_user_pending_approval actor_user_id=%s target_user_id=%s company_id=%s previous_status=%s new_status=%s reason=%s",
         user_id,
         user_id,
         company_id,
         "",
-        "active",
+        "pending_approval",
         "public_signup",
     )
 

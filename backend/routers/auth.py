@@ -614,7 +614,11 @@ async def verify_email(request: Request, token: str):
                 payload["message"] = (
                     "Email already verified. Continue with company setup before inviting your first teammate."
                 )
-                payload["next_path"] = "/onboarding" if user.get("onboarding_completed") is False else "/dashboard"
+                account_status = normalize_account_status(user.get("status"))
+                if account_status == "pending_approval":
+                    payload["next_path"] = "/account-status"
+                else:
+                    payload["next_path"] = "/onboarding" if user.get("onboarding_completed") is False else "/dashboard"
                 return _auth_response(payload, request)
         raise HTTPException(400, "Invalid or expired verification token")
     exp = row.get("expires_at")
@@ -647,7 +651,8 @@ async def verify_email(request: Request, token: str):
     payload["message"] = (
         "Email verified successfully. Continue with company setup before inviting your first teammate."
     )
-    payload["next_path"] = "/onboarding"
+    account_status = normalize_account_status(user.get("status"))
+    payload["next_path"] = "/account-status" if account_status == "pending_approval" else "/onboarding"
     return _auth_response(payload, request)
 
 

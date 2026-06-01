@@ -175,12 +175,12 @@ async def _resolve_company_slug(db, company_id: str) -> str:
 
 
 def _build_public_url(company_slug: str, product: dict) -> str:
-    manual = str(product.get("links") or "").strip()
-    if manual.startswith("http://") or manual.startswith("https://"):
-        return manual
     slug = str(product.get("slug") or "").strip()
     if company_slug and slug:
         return f"/c/{company_slug}/product/{slug}"
+    manual = str(product.get("links") or "").strip()
+    if manual.startswith("http://") or manual.startswith("https://"):
+        return manual
     return ""
 
 
@@ -230,6 +230,7 @@ def _product_row_to_chunk(
         metadata={
             "name": str(product.get("name") or ""),
             "price": product.get("price"),
+            "price_currency": str(product.get("price_currency") or ""),
             "category": str(product.get("category") or ""),
             "slug": str(product.get("slug") or ""),
             "links": str(product.get("links") or ""),

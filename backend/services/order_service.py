@@ -766,10 +766,7 @@ def _build_product_purchase_url(
     customer_id: str = "",
     conversation_id: str = "",
 ) -> str:
-    manual = _text(
-        product.get("purchase_link") or product.get("public_url") or product.get("links") or product.get("url"),
-        2000,
-    )
+    manual = _text(product.get("purchase_link") or product.get("public_url") or product.get("url"), 2000)
     if manual.startswith(("http://", "https://")):
         return _append_ref_to_purchase_url(
             manual,
@@ -778,15 +775,23 @@ def _build_product_purchase_url(
             conversation_id=conversation_id,
         )
     slug = _text(product.get("slug"), 160)
-    if not (company_slug and slug):
-        return ""
-    url = f"{frontend_url().rstrip('/')}/c/{company_slug}/product/{slug}"
-    return _append_ref_to_purchase_url(
-        url,
-        company_id=company_id,
-        customer_id=customer_id,
-        conversation_id=conversation_id,
-    )
+    if company_slug and slug:
+        url = f"{frontend_url().rstrip('/')}/c/{company_slug}/product/{slug}"
+        return _append_ref_to_purchase_url(
+            url,
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+        )
+    linked_url = _text(product.get("links"), 2000)
+    if linked_url.startswith(("http://", "https://")):
+        return _append_ref_to_purchase_url(
+            linked_url,
+            company_id=company_id,
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+        )
+    return ""
 
 
 def _purchase_link_from_order(order: dict | None) -> str:
@@ -1859,7 +1864,13 @@ async def handle_order_flow(
     if product_context:
         product_context = await _hydrate_product_purchase_fields(db, company_id, product_context)
         company_slug = ""
-        if not (
+        if product_context.get("slug") and not (
+            product_context.get("purchase_link")
+            or product_context.get("public_url")
+            or product_context.get("url")
+        ):
+            company_slug = await _resolve_company_slug(db, company_id)
+        elif not (
             product_context.get("purchase_link")
             or product_context.get("public_url")
             or product_context.get("links")
@@ -1985,6 +1996,14 @@ async def handle_order_flow(
             placed = {**order, "status": "admin_review"}
         placed = await sync_order_contact_records(db, placed, conversation_context=conversation)
         await notify_order_admins(db, placed, conversation_context=conversation)
+        await _maybe_enqueue_followup_evaluation(
+            db,
+            company_id=company_id,
+            order_id=str(placed.get("id") or order.get("id") or ""),
+            customer_id=str(placed.get("customer_id") or customer_id or ""),
+            session_id=str(placed.get("conversation_id") or conversation_id or ""),
+            to_status=str(placed.get("status") or "admin_review"),
+        )
         return _order_response_payload(format_order_placed_reply(placed), order=placed, next_action="order_placed", routing=route)
 
     order["status"] = "awaiting_confirmation"
@@ -2151,29 +2170,35 @@ async def _maybe_enqueue_followup_evaluation(
         from shared.background_queue import get_background_queue
 
         queue = get_background_queue()
-        coro = evaluate_order_event(
-            db,
-            company_id=company_id,
-            order_id=order_id,
-            customer_id=customer_id,
-            session_id=session_id,
-            to_status=to_status,
-        )
         if queue is not None and queue.enabled:
-            await queue.enqueue_coroutine(
-                coro,
-                name=f"followup-evaluate-{order_id}",
-                idempotency_key=f"followup_evaluate:{order_id}:{to_status}",
+            coro = evaluate_order_event(
+                db,
+                company_id=company_id,
+                order_id=order_id,
+                customer_id=customer_id,
+                session_id=session_id,
+                to_status=to_status,
             )
             try:
+                await queue.enqueue_coroutine(
+                    coro,
+                    name=f"followup-evaluate-{order_id}",
+                    idempotency_key=f"followup_evaluate:{order_id}:{to_status}",
+                )
+            finally:
                 coro.close()
-            except Exception:
-                pass
         else:
             # No queue available — run inline. Caller still completed the
             # status update before this; an exception here only loses the
             # follow-up, not the customer-visible state change.
-            await coro
+            await evaluate_order_event(
+                db,
+                company_id=company_id,
+                order_id=order_id,
+                customer_id=customer_id,
+                session_id=session_id,
+                to_status=to_status,
+            )
     except Exception as exc:
         logger.warning(
             "followup_evaluation_dispatch_failed order_id=%s to_status=%s error=%s",

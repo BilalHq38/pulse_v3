@@ -32,6 +32,7 @@ export function postAuthDestination(user, { skipBillingRedirect = false } = {}) 
   if (user.role === 'super_admin') return '/super-admin';
   const status = user.account_status || user.status || 'active';
   if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return '/account-status';
+  if (status === 'pending_approval') return '/account-status';
   if (user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return `/verify-email${q}`;
@@ -39,7 +40,6 @@ export function postAuthDestination(user, { skipBillingRedirect = false } = {}) 
   if (user.onboarding_completed === false) return '/onboarding';
   if (user.enterprise_invite_gate_pending) return '/onboarding';
   if (shouldRedirectToBilling(user, { skipBillingRedirect })) return '/billing';
-  if (status === 'pending_approval') return '/account-status';
   return '/dashboard';
 }
 

@@ -7402,56 +7402,83 @@ async def _process_incoming_message(
         )
         ai_generation_started_at = time.monotonic()
         import asyncio as _asyncio
-        _workflow_coro_in = orchestrate_message_workflow(
-            MessageWorkflowRequest(
-                trace_id=trace_id,
-                company_id=company_id,
-                conversation_id=convo_id,
-                customer_id=cid,
-                lead_id=str(result.get("lead_id") or ""),
-                message_id=msg_id,
-                external_message_id=inbound_external_message_id,
-                provider_event_id=inbound_external_message_id,
-                idempotency_key=usage_idempotency_key,
-                channel=channel,
-                source=str(metadata_payload.get("source") or channel),
-                message_text=message_text,
-                sender_name=customer.get("name", "Unknown"),
-                sender_contact=sender_contact,
-                actor_user_id=str(metadata_payload.get("bridge_user_id") or metadata_payload.get("actor_user_id") or ""),
-                conversation_context=msgs_history,
-                customer=customer,
-                lead=lead,
-                metadata={
-                    **metadata_payload,
-                    "source": metadata_payload.get("source") or f"webhook_{channel}",
-                    "trace_id": trace_id,
-                    "message_id": msg_id,
-                    "external_message_id": inbound_external_message_id,
-                    "provider_event_id": inbound_external_message_id,
-                    "idempotency_key": usage_idempotency_key,
-                },
-                suppress_response_generation=True,
-            ),
-            db=db,
-        )
-        _engine_coro_in = engine_run_turn(
+
+        async def _fire_orchestrator_background_inbound():
+            try:
+                await _asyncio.wait_for(
+                    orchestrate_message_workflow(
+                        MessageWorkflowRequest(
+                            trace_id=trace_id,
+                            company_id=company_id,
+                            conversation_id=convo_id,
+                            customer_id=cid,
+                            lead_id=str(result.get("lead_id") or ""),
+                            message_id=msg_id,
+                            external_message_id=inbound_external_message_id,
+                            provider_event_id=inbound_external_message_id,
+                            idempotency_key=usage_idempotency_key,
+                            channel=channel,
+                            source=str(metadata_payload.get("source") or channel),
+                            message_text=message_text,
+                            sender_name=customer.get("name", "Unknown"),
+                            sender_contact=sender_contact,
+                            actor_user_id=str(metadata_payload.get("bridge_user_id") or metadata_payload.get("actor_user_id") or ""),
+                            conversation_context=msgs_history,
+                            customer=customer,
+                            lead=lead,
+                            metadata={
+                                **metadata_payload,
+                                "source": metadata_payload.get("source") or f"webhook_{channel}",
+                                "trace_id": trace_id,
+                                "message_id": msg_id,
+                                "external_message_id": inbound_external_message_id,
+                                "provider_event_id": inbound_external_message_id,
+                                "idempotency_key": usage_idempotency_key,
+                            },
+                            suppress_response_generation=True,
+                        ),
+                        db=db,
+                    ),
+                    timeout=3.0,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "orchestrator_background_capture_failed company_id=%s conversation_id=%s channel=%s trace_id=%s error=%s",
+                    company_id,
+                    convo_id,
+                    channel,
+                    trace_id,
+                    exc,
+                )
+
+        _engine_exc_in = None
+        engine_result_in = None
+        try:
+            engine_result_in = await engine_run_turn(
+                db,
+                TurnRequest(
+                    session_id=convo_id,
+                    company_id=company_id,
+                    user_message=message_text,
+                    customer_id=cid,
+                    mode="reactive",
+                    extra_history=_format_msgs_as_dialogue(msgs_history),
+                ),
+            )
+        except Exception as exc:
+            _engine_exc_in = exc
+        workflow = None
+        create_safe_detached_task(
             db,
-            TurnRequest(
-                session_id=convo_id,
-                company_id=company_id,
-                user_message=message_text,
-                customer_id=cid,
-                mode="reactive",
-                extra_history=_format_msgs_as_dialogue(msgs_history),
-            ),
+            _fire_orchestrator_background_inbound(),
+            name=f"orchestrator-bg-{convo_id}",
+            company_id=company_id,
+            channel=channel,
+            trace_id=trace_id,
+            event_id=inbound_external_message_id or msg_id,
         )
-        _par = await _asyncio.gather(_workflow_coro_in, _engine_coro_in, return_exceptions=True)
-        workflow = _par[0] if not isinstance(_par[0], BaseException) else None
-        _engine_exc_in = _par[1] if isinstance(_par[1], BaseException) else None
-        engine_result_in = _par[1] if not isinstance(_par[1], BaseException) else None
         logger.info(
-            "ai_latency_stage stage=parallel_ai_call duration_ms=%s conversation_id=%s company_id=%s channel=%s trace_id=%s",
+            "ai_latency_stage stage=engine_only duration_ms=%s conversation_id=%s company_id=%s channel=%s trace_id=%s",
             _elapsed_ms(ai_generation_started_at), convo_id, company_id, channel, trace_id,
         )
         capture, _, support_output, _ = _extract_workflow_outputs(

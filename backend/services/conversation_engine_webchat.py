@@ -37,19 +37,23 @@ def _is_active_order_flow_plan(support_plan: dict) -> bool:
         return False
     if not plan.get("deliver_response", False):
         return False
-    if str(plan.get("conversation_stage") or "").strip().lower() == "order_flow":
-        return True
-    if str(plan.get("model_name") or "").strip().lower() == "deterministic-order-flow":
-        return True
-    return str(plan.get("next_action") or "").strip().lower() in {
-        "awaiting_product_selection",
-        "clarify_selected_product",
-        "collect_order_details",
+    action = str(plan.get("next_action") or "").strip().lower()
+    if action in {
         "request_order_confirmation",
         "order_placed",
         "order_cancelled",
         "order_already_placed",
-    }
+    }:
+        return True
+    if action in {
+        "awaiting_product_selection",
+        "clarify_selected_product",
+        "collect_order_details",
+    }:
+        return False
+    if str(plan.get("conversation_stage") or "").strip().lower() == "order_flow":
+        return True
+    return str(plan.get("model_name") or "").strip().lower() == "deterministic-order-flow"
 
 
 def apply_engine_response_to_support_plan(

@@ -180,6 +180,7 @@ function ProtectedRoute({ children }) {
   if (!user) return <Navigate to="/signin" replace />;
   const status = user.account_status || user.status || 'active';
   if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return <Navigate to="/account-status" replace />;
+  if (user.role !== 'super_admin' && status === 'pending_approval') return <Navigate to="/account-status" replace />;
   if (user.role !== 'super_admin' && user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return <Navigate to={`/verify-email${q}`} replace />;
@@ -193,7 +194,6 @@ function ProtectedRoute({ children }) {
   if (shouldRedirectToBilling(user) && !isOnboardingInviteRoute) {
     return <Navigate to="/billing" replace />;
   }
-  if (user.role !== 'super_admin' && status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout>{children}</Layout>;
 }
 
@@ -205,6 +205,7 @@ function RoleRoute({ children, allowedRoles }) {
   if (user.role === 'super_admin') return <Layout>{children}</Layout>;
   const status = user.account_status || user.status || 'active';
   if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return <Navigate to="/account-status" replace />;
+  if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   if (user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return <Navigate to={`/verify-email${q}`} replace />;
@@ -212,7 +213,6 @@ function RoleRoute({ children, allowedRoles }) {
   if (user.onboarding_completed === false) return <Navigate to="/onboarding" replace />;
   if (user.enterprise_invite_gate_pending) return <Navigate to="/onboarding" replace />;
   if (shouldRedirectToBilling(user)) return <Navigate to="/billing" replace />;
-  if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout>{children}</Layout>;
 }
 
@@ -233,6 +233,7 @@ function DashboardWithAuthCheck() {
   if (user.role === 'super_admin') return <Navigate to="/super-admin" replace />;
   const status = user.account_status || user.status || 'active';
   if (['blocked', 'paused', 'inactive', 'rejected'].includes(status)) return <Navigate to="/account-status" replace />;
+  if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   if (user.email_verified === false) {
     const q = user.email ? `?${new URLSearchParams({ email: user.email }).toString()}` : '';
     return <Navigate to={`/verify-email${q}`} replace />;
@@ -240,7 +241,6 @@ function DashboardWithAuthCheck() {
   if (user.onboarding_completed === false) return <Navigate to="/onboarding" replace />;
   if (user.enterprise_invite_gate_pending) return <Navigate to="/onboarding" replace />;
   if (shouldRedirectToBilling(user)) return <Navigate to="/billing" replace />;
-  if (status === 'pending_approval') return <Navigate to="/account-status" replace />;
   return <Layout><DashboardPage /></Layout>;
 }
 

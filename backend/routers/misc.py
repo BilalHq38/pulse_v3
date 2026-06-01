@@ -526,7 +526,10 @@ async def list_notifications(request: Request, unread_only: bool = False, limit:
     cu = await get_current_user_flexible(request)
     from core.socket import sio, connected_users
 
-    await ensure_setup_reminder_notifications(db, sio, connected_users, cu)
+    try:
+        await ensure_setup_reminder_notifications(db, sio, connected_users, cu)
+    except Exception:
+        logger.warning("setup reminder notification bootstrap skipped", exc_info=True)
     uid = cu["sub"]
     if unread_only:
         rows = await db.fetch(

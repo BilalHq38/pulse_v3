@@ -11,7 +11,7 @@ const F = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
 export default function EmailVerificationPage() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { setAuthFromOAuth } = useAuth();
+  const { setAuthFromOAuth, logout } = useAuth();
   const initialToken = (() => {
     const hashParams = new URLSearchParams(window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '');
     return (hashParams.get('token') || searchParams.get('token') || '').trim();
@@ -173,7 +173,7 @@ export default function EmailVerificationPage() {
                             : 'Resend Email'}
                     </button>
                   )}
-                  <button onClick={() => navigate('/signin')} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 24px', borderRadius: 10, border: '1.5px solid #e2e8f0', background: '#fff', color: '#475569', fontSize: 14, fontWeight: 500, cursor: 'pointer', fontFamily: F }}>
+                  <button onClick={async () => { await logout(); navigate('/signin', { replace: true }); }} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 24px', borderRadius: 10, border: '1.5px solid #e2e8f0', background: '#fff', color: '#475569', fontSize: 14, fontWeight: 500, cursor: 'pointer', fontFamily: F }}>
                     Back to Sign In
                   </button>
                 </div>

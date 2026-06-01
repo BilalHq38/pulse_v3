@@ -60,6 +60,12 @@ export default function SignupCompletePage() {
         }
 
         if (data.account_created) {
+          if (data.awaiting_approval) {
+            localStorage.setItem('pe_account_status', 'pending_approval');
+            setStatus('approval');
+            setMessage('Payment succeeded and your account is waiting for Super Admin verification. After approval, sign in to complete email verification and onboarding.');
+            return;
+          }
           if (data.email_verified) {
             setStatus('success');
             setMessage('Your workspace is ready. Redirecting you to sign in.');
@@ -120,6 +126,7 @@ export default function SignupCompletePage() {
   const iconMap = {
     processing: <Loader size={30} color="#2563eb" style={{ animation: 'spin 1s linear infinite' }} />,
     pending: <CreditCard size={30} color="#2563eb" />,
+    approval: <ShieldAlert size={30} color="#d97706" />,
     verifying: <Mail size={30} color="#2563eb" />,
     success: <CheckCircle size={30} color="#16a34a" />,
     error: <ShieldAlert size={30} color="#dc2626" />,
@@ -129,6 +136,7 @@ export default function SignupCompletePage() {
   const accentMap = {
     processing: 'linear-gradient(135deg,#dbeafe,#eff6ff)',
     pending: 'linear-gradient(135deg,#dbeafe,#eff6ff)',
+    approval: 'linear-gradient(135deg,#fef3c7,#fffbeb)',
     verifying: 'linear-gradient(135deg,#e0f2fe,#eff6ff)',
     success: 'linear-gradient(135deg,#dcfce7,#ecfdf5)',
     error: 'linear-gradient(135deg,#fee2e2,#fef2f2)',
@@ -151,6 +159,7 @@ export default function SignupCompletePage() {
           <h1 style={{ fontSize: 28, lineHeight: 1.15, fontWeight: 800, color: '#0f172a', marginBottom: 10 }}>
             {status === 'success' && 'Workspace Ready'}
             {status === 'verifying' && 'Verify Your Email'}
+            {status === 'approval' && 'Waiting for Approval'}
             {status === 'processing' && 'Finalizing Signup'}
             {status === 'pending' && 'Still Working'}
             {(status === 'error' || status === 'missing') && 'Signup Confirmation Problem'}
@@ -172,7 +181,7 @@ export default function SignupCompletePage() {
             <Link to="/signup" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 20px', borderRadius: 12, border: '1px solid #d7dce5', background: '#fff', color: '#475569', textDecoration: 'none', fontSize: 14, fontWeight: 600 }}>
               Start Over
             </Link>
-            {(status === 'error' || status === 'pending') && (
+            {(status === 'error' || status === 'pending' || status === 'approval') && (
               <Link to="/contact" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 20px', borderRadius: 12, border: '1px solid #bfdbfe', background: '#eff6ff', color: '#1d4ed8', textDecoration: 'none', fontSize: 14, fontWeight: 700 }}>
                 Contact Support
               </Link>

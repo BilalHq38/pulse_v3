@@ -46,3 +46,16 @@ def test_compose_does_not_publish_internal_services_or_mount_cloud_credentials()
         '"noeviction"',
     ):
         assert blocked not in compose
+
+
+def test_frontend_csp_allows_configured_google_fonts():
+    nginx_conf = (REPO_ROOT / "frontend/nginx.conf").read_text(encoding="utf-8")
+
+    assert "https://fonts.googleapis.com" in nginx_conf
+    assert "https://fonts.gstatic.com" in nginx_conf
+
+
+def test_frontend_csp_allows_local_api_media_in_dev():
+    nginx_conf = (REPO_ROOT / "frontend/nginx.conf").read_text(encoding="utf-8")
+
+    assert "img-src 'self' data: blob: https: http://localhost:8000 http://127.0.0.1:8000" in nginx_conf

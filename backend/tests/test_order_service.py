@@ -603,7 +603,13 @@ async def test_order_placed_and_admin_notification_created(monkeypatch):
         db_arg.notifications.append(kwargs)
         return {"id": "note-1"}
 
+    followup_evaluations = []
+
+    async def fake_followup_evaluation(_db, **kwargs):
+        followup_evaluations.append(kwargs)
+
     monkeypatch.setattr(order_service, "create_notification", fake_notification)
+    monkeypatch.setattr(order_service, "_maybe_enqueue_followup_evaluation", fake_followup_evaluation)
     result = await order_service.handle_order_flow(
         db=db,
         company_id="co-1",
@@ -621,6 +627,15 @@ async def test_order_placed_and_admin_notification_created(monkeypatch):
     assert len(db.notifications) == 2
     assert db.lead_updates
     assert db.customer_updates
+    assert followup_evaluations == [
+        {
+            "company_id": "co-1",
+            "order_id": db.orders[0]["id"],
+            "customer_id": "cust-1",
+            "session_id": "convo-1",
+            "to_status": "admin_review",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -812,7 +827,7 @@ async def test_combined_purchase_question_uses_order_flow_not_catalog(monkeypatc
     assert result["intent"]["intent"] == "order_intent"
     assert ai_response["attachments"] == []
     assert ai_response["product_images"] == []
-    assert "https://shop.example.test/product-alpha" in ai_response["response"]
-    assert ai_response["product_links"][0]["url"].startswith("https://shop.example.test/product-alpha")
+    assert "/c/pulse-store/product/product-alpha" in ai_response["response"]
+    assert "/c/pulse-store/product/product-alpha" in ai_response["product_links"][0]["url"]
     assert not re.search(r"\b(ai|llm|gemini|google|model|provider)\b", ai_response["response"].lower())
     assert "gemini" not in ai_response["response"].lower()

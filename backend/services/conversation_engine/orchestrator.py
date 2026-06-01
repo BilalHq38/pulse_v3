@@ -28,6 +28,7 @@ from services.conversation_engine import context_router
 from services.conversation_engine import memory as memory_module
 from services.conversation_engine import prompt_builder
 from services.conversation_engine import validator
+from services.conversation_engine.deterministic_answers import build_grounded_answer
 from services.conversation_engine.llm_gateway import LlmGateway
 from services.conversation_engine.retrieval import (
     CompanyDataRetriever,
@@ -175,6 +176,69 @@ class Orchestrator:
         compressed = compression_module.compress(chunks)
         confidence = validator.compute_confidence(compressed)
         bucket = validator.confidence_bucket(confidence)
+
+        deterministic = build_grounded_answer(request.user_message, compressed)
+        if deterministic is not None:
+            answer = deterministic.answer
+            product_links = deterministic.product_links
+            sources_used = deterministic.sources_used
+            confidence = max(confidence, deterministic.confidence)
+            tokens = TokenUsage(
+                prompt=0,
+                completion=budget_module.count_tokens(answer),
+                total=budget_module.count_tokens(answer),
+            )
+            turn_index = await memory_module.next_turn_index(
+                db, company_id=request.company_id, session_id=request.session_id
+            )
+            turn_id = await memory_module.persist_turn(
+                db,
+                company_id=request.company_id,
+                session_id=request.session_id,
+                customer_id=request.customer_id,
+                turn_index=turn_index,
+                user_message=request.user_message,
+                ai_response=answer,
+                sources_used=sources_used,
+                product_links=product_links,
+                confidence=confidence,
+                active_template="",
+                token_usage=tokens,
+                mode=request.mode,
+            )
+            if product_links and request.customer_id:
+                shown_ids = [pl.product_id for pl in product_links if pl.product_id]
+                if shown_ids:
+                    try:
+                        from memory_engine.long_term import LongTermMemory
+                        await LongTermMemory().store_shown_products(
+                            db,
+                            request.company_id,
+                            request.customer_id,
+                            shown_ids,
+                            conversation_id=request.session_id,
+                        )
+                    except Exception as exc:
+                        logger.debug("shown_products_update_failed: %s", exc)
+            logger.info(
+                "ai_turn_deterministic company_id=%s session_id=%s turn_id=%s sources=%s confidence=%.3f latency_ms=%d",
+                request.company_id,
+                request.session_id,
+                turn_id,
+                sources_used,
+                confidence,
+                int((time.monotonic() - started_at) * 1000),
+            )
+            return TurnResult(
+                answer=answer,
+                session_id=request.session_id,
+                turn_id=turn_id,
+                sources_used=sources_used,
+                product_links=product_links,
+                tokens_used=tokens,
+                active_template="",
+                confidence=confidence,
+            )
 
         history_dialogue = await self._history_dialogue(db, request)
         tier = budget_module.select_tier(request.user_message, compressed)

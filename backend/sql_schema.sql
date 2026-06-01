@@ -3995,7 +3995,7 @@ CREATE TABLE IF NOT EXISTS ai_followups (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_ai_followups_workflow_kind
-        CHECK (workflow_kind IN ('post_delivery_feedback','upsell')),
+        CHECK (workflow_kind IN ('post_delivery_feedback','upsell','order_confirmed')),
     CONSTRAINT chk_ai_followups_status
         CHECK (status IN ('scheduled','running','completed','customer_declined','expired','cancelled'))
 );

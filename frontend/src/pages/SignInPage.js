@@ -110,6 +110,9 @@ export default function SignInPage() {
         setWorkspaceRequired(true);
         setWorkspaceOptions(Array.isArray(detail.workspaces) ? detail.workspaces : []);
         setError(detail.message || 'Please enter your workspace to continue.');
+      } else if (code === 'ACCOUNT_PENDING_APPROVAL' || err.response?.data?.status === 'pending_approval') {
+        localStorage.setItem('pe_account_status', 'pending_approval');
+        navigate('/account-status', { replace: true });
       } else if (code === 'admin_login_required' || /\/admin\/login/i.test(String(detail || ''))) {
         setError('This account is a platform super admin. Use the dedicated admin sign-in page.');
       } else {

@@ -24,7 +24,7 @@ from typing import Any, Literal
 logger = logging.getLogger(__name__)
 
 WorkflowKind = Literal["post_delivery_feedback", "upsell", "order_confirmed"]
-_ORDER_CONFIRMED_STATUSES = {"confirmed"}
+_ORDER_CONFIRMED_STATUSES = {"admin_review", "placed", "confirmed"}
 _DELIVERY_COMPLETION_STATUSES = {"delivered", "completed", "delivery_completed", "order_completed"}
 
 # Defaults; overridable via env vars without redeploy.
@@ -53,6 +53,8 @@ def _normalize_trigger_status(to_status: str) -> str:
         "order_completed": "order_completed",
         "delivered": "delivered",
         "completed": "completed",
+        "admin_review": "admin_review",
+        "placed": "placed",
         "confirmed": "confirmed",
     }
     return aliases.get(normalized, normalized)
@@ -166,7 +168,7 @@ async def evaluate_order_event(
             "(id, company_id, order_id, customer_id, session_id, workflow_kind, "
             " status, scheduled_for, idempotency_key) "
             "VALUES ($1, $2, $3, $4, $5, $6, 'scheduled', NOW() + ($7 || ' seconds')::interval, $8) "
-            "ON CONFLICT (idempotency_key) DO NOTHING "
+            "ON CONFLICT (idempotency_key) WHERE BTRIM(idempotency_key) <> '' DO NOTHING "
             "RETURNING id",
             followup_id,
             company_id,
@@ -294,7 +296,7 @@ async def schedule_upsell_followup(
             "(id, company_id, order_id, customer_id, session_id, workflow_kind, "
             " status, scheduled_for, idempotency_key) "
             "VALUES ($1, $2, $3, $4, $5, $6, 'scheduled', NOW() + ($7 || ' seconds')::interval, $8) "
-            "ON CONFLICT (idempotency_key) DO NOTHING "
+            "ON CONFLICT (idempotency_key) WHERE BTRIM(idempotency_key) <> '' DO NOTHING "
             "RETURNING id",
             followup_id,
             company_id,
