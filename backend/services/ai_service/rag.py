@@ -23,8 +23,9 @@ from shared.metrics import increment_counter, observe_histogram, timed_metric
 from shared.product_ref_token import create_ref_token
 from services.ai_service.llm_tracking import has_embedding_budget_remaining
 from services.ai_service.routing_guards import is_low_value_message
+from services.conversation_engine import product_ranker as _product_ranker
+from services.conversation_engine.embedding_service import search_similar_embeddings
 from services.conversation_engine.product_ranker import (  # noqa: F401
-    rank_products_for_query,
     _format_product_context,
     understand_product_query,
     _should_skip_rag_query,
@@ -36,6 +37,45 @@ from services.conversation_engine.product_ranker import (  # noqa: F401
     _build_product_attachment,
     _pick_product_image_url,
 )
+
+_CATALOG_CACHE = _product_ranker._CATALOG_CACHE
+_RANKING_CACHE = _product_ranker._RANKING_CACHE
+_COMPANY_PRODUCTS_COLUMNS = _product_ranker._COMPANY_PRODUCTS_COLUMNS
+_ensure_product_embeddings = _product_ranker._ensure_product_embeddings
+_keyword_retrieve_products = _product_ranker._keyword_retrieve_products
+_fuse_product_scores = _product_ranker._fuse_product_scores
+
+
+def _sync_product_ranker_hooks() -> None:
+    for name in (
+        "_CATALOG_CACHE",
+        "_RANKING_CACHE",
+        "_COMPANY_PRODUCTS_COLUMNS",
+        "search_similar_embeddings",
+        "_ensure_product_embeddings",
+        "has_embedding_budget_remaining",
+    ):
+        setattr(_product_ranker, name, globals()[name])
+
+
+async def rank_products_for_query(*args, **kwargs):
+    _sync_product_ranker_hooks()
+    return await _product_ranker.rank_products_for_query(*args, **kwargs)
+
+
+async def _load_product_catalog(*args, **kwargs):
+    _sync_product_ranker_hooks()
+    return await _product_ranker._load_product_catalog(*args, **kwargs)
+
+
+async def _keyword_retrieve_products(*args, **kwargs):
+    _sync_product_ranker_hooks()
+    return await _product_ranker._keyword_retrieve_products(*args, **kwargs)
+
+
+def _fuse_product_scores(*args, **kwargs):
+    return _product_ranker._fuse_product_scores(*args, **kwargs)
+
 
 async def build_ai_context(
     db,

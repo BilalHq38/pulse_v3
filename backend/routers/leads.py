@@ -1190,7 +1190,10 @@ async def _fetch_lead_conversation_context(db, lead_id: str, cid: str) -> dict:
         # MiniLM buying signal + lead quality from conversation content
         if result["conversation_history"]:
             try:
-                from services.ai_service.local_ml import classify_buying_signal, classify_lead_quality  # noqa: PLC0415
+                from services.conversation_engine.local_ml import (  # noqa: PLC0415
+                    classify_buying_signal,
+                    classify_lead_quality,
+                )
                 buying = classify_buying_signal(result["conversation_history"])
                 quality = classify_lead_quality(result["conversation_history"])
                 result["buying_signal"] = buying.get("signal", "")

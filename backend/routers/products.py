@@ -1175,7 +1175,7 @@ async def list_faqs(request: Request):
     cid = cu.get("company_id", "")
     return rs(
         await db.fetch(
-            "SELECT * FROM company_faqs WHERE company_id=$1 ORDER BY created_at DESC",
+            "SELECT * FROM company_faqs WHERE company_id=$1 ORDER BY updated_at DESC, created_at DESC",
             cid,
         )
     )
@@ -1195,7 +1195,8 @@ async def create_faq(request: Request):
         raise HTTPException(400, "answer is required")
     faq_id = make_id()
     await db.execute(
-        "INSERT INTO company_faqs(id,company_id,question,answer,category,created_at) VALUES($1,$2,$3,$4,$5,NOW())",
+        "INSERT INTO company_faqs(id,company_id,question,answer,category,created_at,updated_at) "
+        "VALUES($1,$2,$3,$4,$5,NOW(),NOW())",
         faq_id,
         cid,
         question,

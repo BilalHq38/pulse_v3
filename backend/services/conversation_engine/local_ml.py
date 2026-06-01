@@ -16,6 +16,7 @@ Model: sentence-transformers/all-MiniLM-L6-v2  (ONNX via fastembed)
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 
@@ -188,6 +189,14 @@ _model_lock = threading.Lock()
 _anchor_embeddings: dict[str, dict[str, np.ndarray]] = {}
 _anchors_ready = False
 _init_lock = threading.Lock()
+_disabled_logged = False
+
+
+def _local_ml_enabled() -> bool:
+    raw = os.environ.get("LOCAL_ML_ENABLED")
+    if raw is None:
+        return True
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_model() -> Any:
@@ -239,9 +248,14 @@ def _build_anchor_embeddings() -> None:
 
 def _ensure_ready() -> bool:
     """Load model + build anchors on first call. Thread-safe. Returns True on success."""
-    global _anchors_ready
+    global _anchors_ready, _disabled_logged
     if _anchors_ready:
         return True
+    if not _local_ml_enabled():
+        if not _disabled_logged:
+            logger.info("local_ml disabled by LOCAL_ML_ENABLED")
+            _disabled_logged = True
+        return False
     with _init_lock:
         if _anchors_ready:
             return True
@@ -257,7 +271,7 @@ def _ensure_ready() -> bool:
 def _classify(text: str, classifier: str) -> dict:
     """Embed text; return best label by cosine similarity to anchor embeddings."""
     if not _ensure_ready():
-        return {"label": None, "confidence": 0.0, "scores": {}}
+        return {"label": None, "confidence": 0.0, "scores": {}, "model_available": False}
     emb = _embed(text)
     norm = float(np.linalg.norm(emb))
     emb_unit = emb / (norm + 1e-10)
@@ -269,7 +283,7 @@ def _classify(text: str, classifier: str) -> dict:
     vals = list(scores.values())
     spread = max(vals) - min(vals)
     confidence = round(min(spread / 0.25, 1.0), 3) if spread > 0 else 0.5
-    return {"label": best, "confidence": confidence, "scores": scores}
+    return {"label": best, "confidence": confidence, "scores": scores, "model_available": True}
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +337,7 @@ def classify_sentiment(text: str) -> dict:
             "confidence": confidence,
             "emotion": emotion,
             "breakdown": breakdown,
+            "model_available": bool(result.get("model_available", True)),
         }
     except Exception as exc:
         logger.debug("classify_sentiment failed: %s", exc)
@@ -358,10 +373,17 @@ def classify_intent(text: str) -> dict:
             "confidence": confidence,
             "urgency": urgency_map.get(label, "low"),
             "source": "local_minilm",
+            "model_available": bool(result.get("model_available", True)),
         }
     except Exception as exc:
         logger.debug("classify_intent failed: %s", exc)
-        return {"intent": "general_question", "confidence": 0.0, "urgency": "low", "source": "local_minilm"}
+        return {
+            "intent": "general_question",
+            "confidence": 0.0,
+            "urgency": "low",
+            "source": "local_minilm",
+            "model_available": False,
+        }
 
 
 def classify_buying_signal(text: str) -> dict:
@@ -383,10 +405,15 @@ def classify_buying_signal(text: str) -> dict:
         cold = scores.get("cold", 0.0)
         raw = (high * 1.0 + interested * 0.6) - (cold * 0.8)
         buying_score = round(max(0.0, min(1.0, (raw + 1.0) / 2.0)), 3)
-        return {"signal": label, "confidence": confidence, "buying_score": buying_score}
+        return {
+            "signal": label,
+            "confidence": confidence,
+            "buying_score": buying_score,
+            "model_available": bool(result.get("model_available", True)),
+        }
     except Exception as exc:
         logger.debug("classify_buying_signal failed: %s", exc)
-        return {"signal": "cold", "confidence": 0.0, "buying_score": 0.3}
+        return {"signal": "cold", "confidence": 0.0, "buying_score": 0.3, "model_available": False}
 
 
 def classify_lead_quality(text: str) -> dict:
@@ -404,7 +431,12 @@ def classify_lead_quality(text: str) -> dict:
         confidence = result["confidence"]
         base = {"hot": 0.9, "warm": 0.55, "cold": 0.1}.get(label, 0.3)
         quality_score = round(base * confidence + base * (1 - confidence) * 0.5, 3)
-        return {"quality": label, "confidence": confidence, "quality_score": quality_score}
+        return {
+            "quality": label,
+            "confidence": confidence,
+            "quality_score": quality_score,
+            "model_available": bool(result.get("model_available", True)),
+        }
     except Exception as exc:
         logger.debug("classify_lead_quality failed: %s", exc)
-        return {"quality": "cold", "confidence": 0.0, "quality_score": 0.1}
+        return {"quality": "cold", "confidence": 0.0, "quality_score": 0.1, "model_available": False}

@@ -326,7 +326,7 @@ def analyze_local_sentiment(text: str) -> dict:
     try:
         from services.conversation_engine.local_ml import classify_sentiment as _ml_classify  # noqa: PLC0415
         ml_result = _ml_classify(source_text)
-        if ml_result.get("label"):
+        if ml_result.get("model_available", True) and ml_result.get("label"):
             ml_score = float(ml_result["score"])
             ml_confidence = float(ml_result["confidence"])
             ml_breakdown = ml_result.get("breakdown")

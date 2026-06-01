@@ -1,3 +1,6 @@
+x-vertex-credentials-volume: &vertex-credentials-volume
+  ./secrets/gcp-vertex-sa.json:/app/secrets/gcp-vertex-sa.json:ro
+
 x-common-env: &common-env
   ENVIRONMENT: ${ENVIRONMENT:-development}
   APP_ENV: ${APP_ENV:-development}
@@ -60,6 +63,8 @@ x-common-env: &common-env
   UPLOAD_STORAGE_DIR: ${UPLOAD_STORAGE_DIR:-/app/uploads}
   STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
   MEDIA_STORAGE_BACKEND: ${MEDIA_STORAGE_BACKEND:-${STORAGE_BACKEND:-local}}
+  GOOGLE_APPLICATION_CREDENTIALS: "${GOOGLE_APPLICATION_CREDENTIALS:-/app/secrets/gcp-vertex-sa.json}"
+  LOCAL_ML_ENABLED: "${LOCAL_ML_ENABLED:-false}"
 
 x-service-defaults: &service-defaults
   env_file:
@@ -258,10 +263,10 @@ services:
       SERVICE_NAME: customer-service
       PORT: 8003
       DB_SCHEMA: customer_service
-      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_GENAI_USE_VERTEXAI: "${GOOGLE_GENAI_USE_VERTEXAI:-true}"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_ENABLED: "${VERTEX_AI_ENABLED:-true}"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
@@ -280,6 +285,7 @@ services:
       - "${CUSTOMER_HOST_PORT:-8003}:8003"
     volumes:
       - uploads-data:/app/uploads
+      - *vertex-credentials-volume
     logging: *default-logging
     deploy:
       resources:
@@ -323,10 +329,10 @@ services:
       SERVICE_NAME: email-campaign-service
       PORT: 8013
       DB_SCHEMA: email_campaign_service
-      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_GENAI_USE_VERTEXAI: "${GOOGLE_GENAI_USE_VERTEXAI:-true}"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_ENABLED: "${VERTEX_AI_ENABLED:-true}"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
@@ -341,6 +347,8 @@ services:
       retries: 10
     expose:
       - "8013"
+    volumes:
+      - *vertex-credentials-volume
     logging: *default-logging
 
   ai:
@@ -353,10 +361,10 @@ services:
       SERVICE_NAME: ai-service
       PORT: 8005
       DB_SCHEMA: ai_service
-      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_GENAI_USE_VERTEXAI: "${GOOGLE_GENAI_USE_VERTEXAI:-true}"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_ENABLED: "${VERTEX_AI_ENABLED:-true}"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
@@ -371,6 +379,8 @@ services:
       retries: 10
     expose:
       - "8005"
+    volumes:
+      - *vertex-credentials-volume
     logging: *default-logging
 
   agent-orchestrator:
@@ -383,10 +393,10 @@ services:
       SERVICE_NAME: agent-orchestrator-service
       PORT: 8009
       DB_SCHEMA: agent_orchestrator
-      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_GENAI_USE_VERTEXAI: "${GOOGLE_GENAI_USE_VERTEXAI:-true}"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_ENABLED: "${VERTEX_AI_ENABLED:-true}"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
@@ -396,6 +406,7 @@ services:
         condition: service_healthy
     volumes:
       - fastembed-cache:/root/.cache/fastembed
+      - *vertex-credentials-volume
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3).read()\""]
       interval: 15s
@@ -562,10 +573,10 @@ services:
       PORT: 8000
       GATEWAY_RATE_LIMIT_REQUESTS: ${GATEWAY_RATE_LIMIT_REQUESTS:-120}
       GATEWAY_RATE_LIMIT_WINDOW_SECONDS: ${GATEWAY_RATE_LIMIT_WINDOW_SECONDS:-60}
-      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_GENAI_USE_VERTEXAI: "${GOOGLE_GENAI_USE_VERTEXAI:-true}"
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION}
-      VERTEX_AI_ENABLED: "true"
+      VERTEX_AI_ENABLED: "${VERTEX_AI_ENABLED:-true}"
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL}
       GEMINI_FLASH_MODEL: ${GEMINI_FLASH_MODEL:-gemini-2.5-flash-lite}
     depends_on:
@@ -602,6 +613,8 @@ services:
       retries: 10
     ports:
       - "${GATEWAY_HOST_PORT:-8000}:8000"
+    volumes:
+      - *vertex-credentials-volume
     logging: *default-logging
 
   frontend:

@@ -17,6 +17,10 @@ from agent_orchestrator.schemas import (
 from core.utils import make_id
 from shared.cache import get_cache_client
 
+_WORKFLOWS_TABLE = "agent_orchestrator.workflows"
+_WORKFLOW_EXECUTIONS_TABLE = "agent_orchestrator.workflow_executions"
+_WORKFLOW_TRANSITIONS_TABLE = "agent_orchestrator.workflow_transitions"
+
 
 class WorkflowStateStore:
     def __init__(self, db) -> None:
@@ -46,7 +50,7 @@ class WorkflowStateStore:
         resolved_workflow_id = str(workflow_id or make_id())
         encoded_input_payload = jsonable_encoder(input_payload or {})
         inserted = await self.db.fetchval(
-            "INSERT INTO workflows("
+            f"INSERT INTO {_WORKFLOWS_TABLE}("
             "id,company_id,trace_id,workflow_kind,status,entity_type,entity_id,conversation_id,"
             "customer_id,lead_id,channel,source,current_agent,routing_mode,requested_by,input_payload,"
             "shared_context,final_output,error,created_at,updated_at"
@@ -70,7 +74,7 @@ class WorkflowStateStore:
         if inserted:
             return str(inserted), True
         existing = await self.db.fetchval(
-            "SELECT id FROM workflows "
+            f"SELECT id FROM {_WORKFLOWS_TABLE} "
             "WHERE id=$1 OR (company_id=$2 AND workflow_kind=$3 AND entity_type=$4 AND entity_id=$5) "
             "ORDER BY created_at DESC LIMIT 1",
             resolved_workflow_id,
@@ -82,7 +86,7 @@ class WorkflowStateStore:
         return str(existing or resolved_workflow_id), False
 
     async def get_record(self, workflow_id: str) -> dict[str, Any]:
-        row = await self.db.fetchrow("SELECT * FROM workflows WHERE id=$1 LIMIT 1", workflow_id)
+        row = await self.db.fetchrow(f"SELECT * FROM {_WORKFLOWS_TABLE} WHERE id=$1 LIMIT 1", workflow_id)
         return dict(row) if row else {}
 
     async def find_existing_message_workflow(
@@ -94,7 +98,7 @@ class WorkflowStateStore:
         if not company_id or not message_id:
             return {}
         row = await self.db.fetchrow(
-            "SELECT * FROM workflows "
+            f"SELECT * FROM {_WORKFLOWS_TABLE} "
             "WHERE company_id=$1 AND workflow_kind=$2 AND entity_type='conversation_message' "
             "AND entity_id=$3 AND status<>$4 "
             "ORDER BY created_at DESC LIMIT 1",
@@ -117,7 +121,7 @@ class WorkflowStateStore:
     ) -> None:
         effective_route = route or WorkflowRouteDecision()
         record = await self.db.fetchrow(
-            "SELECT shared_context, final_output FROM workflows WHERE id=$1 LIMIT 1",
+            f"SELECT shared_context, final_output FROM {_WORKFLOWS_TABLE} WHERE id=$1 LIMIT 1",
             workflow_id,
         )
         payload = dict(record) if record else {}
@@ -131,7 +135,7 @@ class WorkflowStateStore:
         encoded_shared_context = jsonable_encoder(shared_context)
         encoded_final_output = jsonable_encoder(final_output)
         await self.db.execute(
-            "UPDATE workflows SET current_agent=$1,status=$2,routing_mode=$3,intent=$4,lead_status=$5,"
+            f"UPDATE {_WORKFLOWS_TABLE} SET current_agent=$1,status=$2,routing_mode=$3,intent=$4,lead_status=$5,"
             "shared_context=$6,final_output=$7,error='',updated_at=NOW() WHERE id=$8",
             current_agent,
             WorkflowStatus.RUNNING.value,
@@ -159,7 +163,7 @@ class WorkflowStateStore:
         encoded_input_payload = jsonable_encoder(input_payload or {})
         encoded_output_payload = jsonable_encoder(result.payload or {})
         await self.db.execute(
-            "INSERT INTO workflow_executions("
+            f"INSERT INTO {_WORKFLOW_EXECUTIONS_TABLE}("
             "id,workflow_id,company_id,trace_id,agent_name,status,routing_decision,input_payload,"
             "output_payload,error,duration_ms,attempt,started_at,completed_at"
             ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW())",
@@ -190,7 +194,7 @@ class WorkflowStateStore:
     ) -> None:
         encoded_snapshot = jsonable_encoder(snapshot or {})
         await self.db.execute(
-            "INSERT INTO workflow_transitions("
+            f"INSERT INTO {_WORKFLOW_TRANSITIONS_TABLE}("
             "id,workflow_id,company_id,trace_id,from_agent,to_agent,decision_reason,decision_mode,state_snapshot,created_at"
             ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())",
             make_id(),
@@ -211,11 +215,11 @@ class WorkflowStateStore:
         async_jobs: list[AsyncJobStatus],
         current_agent: str,
     ) -> None:
-        record = await self.db.fetchrow("SELECT shared_context FROM workflows WHERE id=$1 LIMIT 1", workflow_id)
+        record = await self.db.fetchrow(f"SELECT shared_context FROM {_WORKFLOWS_TABLE} WHERE id=$1 LIMIT 1", workflow_id)
         shared_context = dict((dict(record).get("shared_context") if record else {}) or {})
         shared_context["async_jobs"] = [job.model_dump(mode="json") for job in async_jobs]
         await self.db.execute(
-            "UPDATE workflows SET status=$1,current_agent=$2,shared_context=$3,updated_at=NOW() WHERE id=$4",
+            f"UPDATE {_WORKFLOWS_TABLE} SET status=$1,current_agent=$2,shared_context=$3,updated_at=NOW() WHERE id=$4",
             WorkflowStatus.WAITING.value,
             current_agent,
             jsonable_encoder(shared_context),
@@ -229,7 +233,7 @@ class WorkflowStateStore:
         final_output: WorkflowOutputs,
     ) -> None:
         await self.db.execute(
-            "UPDATE workflows SET status=$1,final_output=$2,completed_at=NOW(),updated_at=NOW() WHERE id=$3",
+            f"UPDATE {_WORKFLOWS_TABLE} SET status=$1,final_output=$2,completed_at=NOW(),updated_at=NOW() WHERE id=$3",
             WorkflowStatus.COMPLETED.value,
             jsonable_encoder(final_output.model_dump(mode="json")),
             workflow_id,
@@ -237,7 +241,7 @@ class WorkflowStateStore:
 
     async def fail_workflow(self, *, workflow_id: str, error: str) -> None:
         await self.db.execute(
-            "UPDATE workflows SET status=$1,error=$2,updated_at=NOW() WHERE id=$3",
+            f"UPDATE {_WORKFLOWS_TABLE} SET status=$1,error=$2,updated_at=NOW() WHERE id=$3",
             WorkflowStatus.FAILED.value,
             str(error or "")[:2000],
             workflow_id,

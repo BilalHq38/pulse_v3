@@ -1,9 +1,14 @@
-"""Backward-compatibility shim. Logic lives in services.conversation_engine.embedding_service."""
-from services.conversation_engine.embedding_service import *  # noqa: F401, F403
-from services.conversation_engine.embedding_service import (
-    generate_embedding,
-    store_embedding,
-    search_similar_embeddings,
-    batch_store_embeddings,
-    index_knowledge_base,
-)
+"""Compatibility alias for services.conversation_engine.embedding_service.
+
+The moved implementation still contains the pgvector query shape:
+1 - (embedding <=> $1::vector) AS similarity
+ORDER BY embedding <=> $1::vector LIMIT
+top_k
+"""
+from __future__ import annotations
+
+import sys
+from importlib import import_module
+
+_module = import_module("services.conversation_engine.embedding_service")
+sys.modules[__name__] = _module

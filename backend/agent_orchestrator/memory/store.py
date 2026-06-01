@@ -19,6 +19,9 @@ from shared.cache import get_cache_client
 
 logger = logging.getLogger(__name__)
 
+_AGENT_MEMORY_TABLE = "agent_orchestrator.agent_memory"
+_GLOBAL_MEMORY_TABLE = "agent_orchestrator.global_memory"
+
 
 class MemoryStore:
     def __init__(self, db) -> None:
@@ -62,7 +65,7 @@ class MemoryStore:
             memory = GlobalMemory.model_validate(cached)
         else:
             row = await self.db.fetchrow(
-                "SELECT * FROM global_memory WHERE memory_key=$1 LIMIT 1",
+                f"SELECT * FROM {_GLOBAL_MEMORY_TABLE} WHERE memory_key=$1 LIMIT 1",
                 memory_key,
             )
             memory = GlobalMemory.model_validate(dict(row)) if row else GlobalMemory()
@@ -100,7 +103,7 @@ class MemoryStore:
             logger.debug("global_memory_save_skipped reason=unchanged memory_key=%s", payload["memory_key"])
             return
         await self.db.execute(
-            "INSERT INTO global_memory("
+            f"INSERT INTO {_GLOBAL_MEMORY_TABLE}("
             "id,memory_key,company_id,conversation_id,customer_id,lead_id,identity_context,"
             "conversation_history,knowledge_context,summary,shared_context,created_at,updated_at"
             ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW()) "
@@ -137,7 +140,7 @@ class MemoryStore:
     ) -> None:
         encoded_memory_value = jsonable_encoder(memory_value or {})
         await self.db.execute(
-            "INSERT INTO agent_memory("
+            f"INSERT INTO {_AGENT_MEMORY_TABLE}("
             "id,workflow_id,company_id,trace_id,agent_name,memory_key,memory_value,created_at,updated_at"
             ") VALUES($1,$2,$3,$4,$5,$6,$7,NOW(),NOW()) "
             "ON CONFLICT(workflow_id,agent_name,memory_key) DO UPDATE SET "

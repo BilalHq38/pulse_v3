@@ -108,7 +108,7 @@ def classify_sentiment(text: str) -> Sentiment:
         from services.conversation_engine.local_ml import classify_sentiment as _ml  # noqa: PLC0415
         result = _ml(text or "")
         label = result.get("label", "neutral")
-        if label in {"positive", "neutral", "negative"}:
+        if result.get("model_available", True) and label in {"positive", "neutral", "negative"}:
             return label  # type: ignore[return-value]
     except Exception:
         pass
